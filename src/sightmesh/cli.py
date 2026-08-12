@@ -164,6 +164,9 @@ def _primary_session_id(result: dict[str, Any]) -> str | None:
     session = result.get("session") if isinstance(result, dict) else None
     if isinstance(session, dict) and session.get("id"):
         return str(session["id"])
+    execution = result.get("execution_process") if isinstance(result, dict) else None
+    if isinstance(execution, dict) and execution.get("session_id"):
+        return str(execution["session_id"])
     return None
 
 

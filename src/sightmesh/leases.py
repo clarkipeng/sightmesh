@@ -392,6 +392,10 @@ def sync_active_workspaces(client: Any, ttl_seconds: int = DEFAULT_TTL_SECONDS) 
         workspace_id = str(workspace["id"])
         renewed = store.renew_workspace(workspace_id, ttl_seconds)
         if renewed:
+            sessions = client.sessions(workspace_id)
+            session_id = str(sessions[0]["id"]) if sessions else None
+            if session_id and renewed.session_id != session_id:
+                renewed = store.attach_workspace(renewed.token, workspace_id, session_id)
             synced.append(renewed)
             continue
         repos = client.workspace_repos(workspace_id)

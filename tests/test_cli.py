@@ -7,6 +7,7 @@ import pytest
 from sightmesh import cli
 from sightmesh import delivery
 from sightmesh.cli import _read_text
+from sightmesh.cli import _primary_session_id
 from sightmesh.cli import parser
 from sightmesh.delivery import DeliveryStore, make_record
 from sightmesh.leases import LeaseStore
@@ -21,6 +22,10 @@ def test_read_text_requires_one_source(tmp_path) -> None:
 
 def test_namespace_import_is_available() -> None:
     assert argparse.Namespace is not None
+
+
+def test_primary_session_id_reads_execution_process() -> None:
+    assert _primary_session_id({"execution_process": {"session_id": "session-a"}}) == "session-a"
 
 
 def test_delivery_status_and_list_commands(monkeypatch, tmp_path, capsys) -> None:
