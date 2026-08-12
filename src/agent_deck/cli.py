@@ -13,6 +13,7 @@ from typing import Any
 from .cdesktop import CdesktopClient, CdesktopError
 from . import service
 from .bridge import run_bridge
+from .delivery import DeliveryStore, DeliveryStoreError, to_dict
 from . import routing
 from .repowire import RepowireError, reply as repowire_reply
 
@@ -317,6 +318,33 @@ def cmd_bridge_reply(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_delivery(args: argparse.Namespace) -> int:
+    store = DeliveryStore()
+    if args.delivery_action == "status":
+        _emit(store.status(), args.json)
+        return 0
+    if args.delivery_action == "list":
+        rows = [
+            to_dict(record)
+            for record in store.list(
+                status=args.status,
+                session_id=args.session_id,
+                limit=args.limit,
+            )
+        ]
+        _emit(rows, args.json)
+        return 0
+    if args.delivery_action == "retry":
+        rows = [to_dict(store.retry(key)) for key in args.idempotency_key]
+        _emit(rows, args.json)
+        return 0
+    if args.delivery_action == "purge":
+        deleted = store.purge(args.idempotency_key)
+        _emit({"deleted": deleted, "requested": args.idempotency_key}, args.json)
+        return 0
+    raise ValueError(f"Unknown delivery action: {args.delivery_action}")
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="agent-deck")
     root.add_argument("--url", help="Exact local cdesktop backend URL")
@@ -431,6 +459,26 @@ def parser() -> argparse.ArgumentParser:
         default="http://127.0.0.1:8377",
     )
     bridge_reply.set_defaults(func=cmd_bridge_reply)
+
+    delivery = sub.add_parser("delivery", help="Inspect and operate bridge delivery records")
+    delivery_sub = delivery.add_subparsers(dest="delivery_action", required=True)
+
+    delivery_status = delivery_sub.add_parser("status", help="Show delivery store status")
+    delivery_status.set_defaults(func=cmd_delivery)
+
+    delivery_list = delivery_sub.add_parser("list", help="List delivery records")
+    delivery_list.add_argument("--status", choices=["pending", "injected", "dead"])
+    delivery_list.add_argument("--session-id")
+    delivery_list.add_argument("--limit", type=int, default=50)
+    delivery_list.set_defaults(func=cmd_delivery)
+
+    delivery_retry = delivery_sub.add_parser("retry", help="Retry exact delivery keys")
+    delivery_retry.add_argument("idempotency_key", nargs="+")
+    delivery_retry.set_defaults(func=cmd_delivery)
+
+    delivery_purge = delivery_sub.add_parser("purge", help="Purge exact delivery keys")
+    delivery_purge.add_argument("idempotency_key", nargs="+")
+    delivery_purge.set_defaults(func=cmd_delivery)
     return root
 
 
@@ -438,7 +486,7 @@ def main() -> None:
     args = parser().parse_args()
     try:
         code = args.func(args)
-    except (CdesktopError, RepowireError, OSError, ValueError) as exc:
+    except (CdesktopError, DeliveryStoreError, RepowireError, OSError, ValueError) as exc:
         print(f"agent-deck: {exc}", file=sys.stderr)
         code = 2
     raise SystemExit(code)

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,13 @@ from typing import Any
 import websockets
 
 from .cdesktop import CdesktopClient, CdesktopError
+from .delivery import (
+    DeliveryCapacityError,
+    DeliveryRecord,
+    DeliveryStore,
+    DeliveryStoreError,
+    make_record,
+)
 from .routing import clear_peer_identity, enabled_workspaces, peer_identity, set_peer_identity
 
 
@@ -55,10 +63,12 @@ class RepowireSessionBridge:
         client: CdesktopClient,
         bridged: BridgedSession,
         repowire_url: str,
+        delivery_store: DeliveryStore | None = None,
     ) -> None:
         self.client = client
         self.bridged = bridged
         self.repowire_url = repowire_url
+        self.delivery_store = delivery_store or DeliveryStore()
         self.assigned_name = _peer_name(bridged.workspace, bridged.session)
 
     async def run(self) -> None:
@@ -106,9 +116,17 @@ class RepowireSessionBridge:
                 self.assigned_name,
                 self.bridged.session["id"],
             )
-            async for raw in ws:
-                message = json.loads(raw)
-                await self._handle(ws, message)
+            retry_task = asyncio.create_task(self._retry_loop(ws), name=f"retry-{self.assigned_name}")
+            try:
+                async for raw in ws:
+                    message = json.loads(raw)
+                    await self._handle(ws, message)
+            finally:
+                retry_task.cancel()
+                try:
+                    await retry_task
+                except asyncio.CancelledError:
+                    pass
 
     async def _handle(self, ws: Any, message: dict[str, Any]) -> None:
         message_type = message.get("type")
@@ -144,51 +162,134 @@ class RepowireSessionBridge:
         else:
             prompt = f"Repowire {message_type} from @{from_peer}:\n\n{text}\n\nDo not use native subagents."
 
+        record = make_record(
+            session_id=self.bridged.session["id"],
+            message_type=message_type,
+            prompt=prompt,
+            delivery_id=message.get("delivery_id"),
+            correlation_id=correlation_id,
+            from_peer=from_peer,
+            text=text,
+        )
+        try:
+            stored = await asyncio.to_thread(self.delivery_store.enqueue, record)
+        except (DeliveryCapacityError, DeliveryStoreError) as exc:
+            await self._send_delivery_failure(ws, message, str(exc))
+            return
+        if stored.status == "injected":
+            await self._send_delivery_ack(ws, stored, "injected")
+            return
+        if stored.status == "dead":
+            await self._send_delivery_ack(ws, stored, "dead")
+            if stored.correlation_id:
+                await self._send_error(ws, stored.correlation_id, stored.last_error or "dead-lettered")
+            return
+        if stored.next_attempt_at > time.time():
+            return
+        await self._process_record(ws, stored)
+
+    async def _retry_loop(self, ws: Any) -> None:
+        while True:
+            await self._process_due(ws)
+            await asyncio.sleep(1)
+
+    async def _process_due(self, ws: Any) -> None:
+        try:
+            records = await asyncio.to_thread(
+                self.delivery_store.due,
+                None,
+                25,
+                self.bridged.session["id"],
+            )
+        except DeliveryStoreError as exc:
+            LOGGER.error("Cannot read delivery retry queue: %s", exc)
+            return
+        for record in records:
+            await self._process_record(ws, record)
+
+    async def _process_record(self, ws: Any, record: DeliveryRecord) -> None:
+        if record.status != "pending":
+            await self._send_delivery_ack(ws, record, record.status)
+            return
+        if record.prompt is None:
+            failed = await asyncio.to_thread(
+                self.delivery_store.mark_failed,
+                record.idempotency_key,
+                "Pending delivery has no retained prompt",
+            )
+            await self._send_delivery_ack(ws, failed, failed.status)
+            return
         try:
             await asyncio.to_thread(
                 self.client.send,
-                self.bridged.session["id"],
-                prompt,
+                record.session_id,
+                record.prompt,
                 None,
             )
-            delivery_id = message.get("delivery_id")
-            if delivery_id:
-                await ws.send(
-                    json.dumps(
-                        {
-                            "type": "delivery_ack",
-                            "delivery_id": delivery_id,
-                            "message_type": message_type,
-                            "status": "injected",
-                        }
-                    )
-                )
+            injected = await asyncio.to_thread(
+                self.delivery_store.mark_injected,
+                record.idempotency_key,
+            )
+            await self._send_delivery_ack(ws, injected, "injected")
         except Exception as exc:
-            delivery_id = message.get("delivery_id")
-            if delivery_id:
-                await ws.send(
-                    json.dumps(
-                        {
-                            "type": "delivery_ack",
-                            "delivery_id": delivery_id,
-                            "message_type": message_type,
-                            "status": "failed",
-                            "detail": str(exc),
-                        }
-                    )
+            failed = await asyncio.to_thread(
+                self.delivery_store.mark_failed,
+                record.idempotency_key,
+                str(exc),
+            )
+            await self._send_delivery_ack(ws, failed, failed.status)
+            if failed.status == "dead" and failed.correlation_id:
+                await self._send_error(ws, failed.correlation_id, failed.last_error or str(exc))
+
+    async def _send_delivery_ack(
+        self, ws: Any, record: DeliveryRecord, status: str
+    ) -> None:
+        if not record.delivery_id:
+            return
+        payload: dict[str, Any] = {
+            "type": "delivery_ack",
+            "delivery_id": record.delivery_id,
+            "message_type": record.message_type,
+            "status": "injected" if status == "injected" else "failed",
+        }
+        if status != "injected":
+            payload["detail"] = record.last_error or status
+        await ws.send(json.dumps(payload))
+
+    async def _send_delivery_failure(
+        self, ws: Any, message: dict[str, Any], detail: str
+    ) -> None:
+        delivery_id = message.get("delivery_id")
+        if delivery_id:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "delivery_ack",
+                        "delivery_id": delivery_id,
+                        "message_type": message.get("type"),
+                        "status": "failed",
+                        "detail": detail,
+                    }
                 )
-            if correlation_id:
-                await ws.send(
-                    json.dumps(
-                        {"type": "error", "correlation_id": correlation_id, "error": str(exc)}
-                    )
-                )
+            )
+        correlation_id = message.get("correlation_id")
+        if correlation_id:
+            await self._send_error(ws, correlation_id, detail)
+
+    async def _send_error(self, ws: Any, correlation_id: str, error: str) -> None:
+        await ws.send(json.dumps({"type": "error", "correlation_id": correlation_id, "error": error}))
 
 
 class BridgeSupervisor:
-    def __init__(self, client: CdesktopClient, repowire_url: str) -> None:
+    def __init__(
+        self,
+        client: CdesktopClient,
+        repowire_url: str,
+        delivery_store: DeliveryStore | None = None,
+    ) -> None:
         self.client = client
         self.repowire_url = repowire_url
+        self.delivery_store = delivery_store or DeliveryStore()
         self.tasks: dict[str, asyncio.Task[None]] = {}
 
     async def run(self) -> None:
@@ -222,7 +323,12 @@ class BridgeSupervisor:
             task = self.tasks.get(session_id)
             if task is None or task.done():
                 self.tasks[session_id] = asyncio.create_task(
-                    RepowireSessionBridge(self.client, bridged, self.repowire_url).run(),
+                    RepowireSessionBridge(
+                        self.client,
+                        bridged,
+                        self.repowire_url,
+                        self.delivery_store,
+                    ).run(),
                     name=f"bridge-{session_id}",
                 )
 
