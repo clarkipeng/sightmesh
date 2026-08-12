@@ -115,6 +115,38 @@ class CdesktopClient:
             {"path": str(resolved), "display_name": display_name or resolved.name},
         )
 
+    def create_workspace_record(
+        self, name: str, *, use_worktree: bool
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            "/workspaces",
+            {"name": name, "use_worktree": use_worktree},
+        )
+
+    def add_workspace_repo(
+        self,
+        workspace_id: str,
+        repo_path: Path,
+        target_branch: str,
+        display_name: str | None = None,
+    ) -> dict[str, Any]:
+        repo = self.register_repo(repo_path, display_name)
+        return self.request(
+            "POST",
+            f"/workspaces/{workspace_id}/repos",
+            {"repo_id": repo["id"], "target_branch": target_branch},
+        )
+
+    def create_session_record(
+        self, workspace_id: str, *, executor: str | None, name: str | None
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            "/sessions",
+            {"workspace_id": workspace_id, "executor": executor, "name": name},
+        )
+
     def workspaces(self) -> list[dict[str, Any]]:
         return self.request("GET", "/workspaces")
 

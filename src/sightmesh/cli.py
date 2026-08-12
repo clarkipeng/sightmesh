@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import leases, routing, service
+from . import conductor_migrate, leases, routing, service
 from .bridge import run_bridge
 from .cdesktop import CdesktopClient, CdesktopError
 from .delivery import DeliveryStore, DeliveryStoreError, to_dict
@@ -863,6 +863,58 @@ def cmd_migration_dry_run(args: argparse.Namespace) -> int:
     return result.returncode
 
 
+def cmd_migrate(args: argparse.Namespace) -> int:
+    if args.migrate_action == "plan":
+        plan = conductor_migrate.build_plan(
+            conductor_roots=args.conductor_root or None,
+            database=args.database,
+        )
+        path = conductor_migrate.write_plan(plan, args.output)
+        counts = {
+            "total": len(plan["workspaces"]),
+            "active": sum(
+                item["state"] not in {"archived", "orphaned-checkout"}
+                and item["kind"] != "orphaned-archive"
+                for item in plan["workspaces"]
+            ),
+            "archived": sum(
+                item["state"] in {"archived", "orphaned-checkout"}
+                or item["kind"] == "orphaned-archive"
+                for item in plan["workspaces"]
+            ),
+            "blocked": sum(bool(item["blockers"]) for item in plan["workspaces"]),
+            "dirty": sum(
+                bool(item.get("git", {}).get("dirty_paths"))
+                for item in plan["workspaces"]
+            ),
+        }
+        _emit({"plan_path": str(path), "run_id": plan["run_id"], **counts}, args.json)
+    elif args.migrate_action == "apply":
+        result = conductor_migrate.apply_plan(
+            args.plan,
+            names=args.workspace or (),
+            include_archived=args.include_archived,
+            include_dirty=args.include_dirty,
+            confirm_conductor_paused=args.confirm_conductor_paused,
+            confirm_checkpointed=args.confirm_checkpointed,
+            semantic_limit=args.semantic_messages,
+            client=CdesktopClient(args.url),
+        )
+        _emit(result, args.json)
+    elif args.migrate_action == "status":
+        _emit(conductor_migrate.migration_status(args.run), args.json)
+    elif args.migrate_action == "rollback":
+        result = conductor_migrate.rollback_run(
+            args.run,
+            confirm=args.confirm,
+            client=CdesktopClient(args.url),
+        )
+        _emit(result, args.json)
+    else:
+        raise ValueError(f"Unknown migration action: {args.migrate_action}")
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="sightmesh")
     root.add_argument("--url", help="Exact local cdesktop backend URL")
@@ -1154,6 +1206,46 @@ def parser() -> argparse.ArgumentParser:
     )
     migration.add_argument("--conductor-root", action="append", default=[])
     migration.set_defaults(func=cmd_migration_dry_run)
+
+    migrate = sub.add_parser(
+        "migrate", help="Plan, apply, inspect, or roll back Conductor imports"
+    )
+    migrate_sub = migrate.add_subparsers(dest="migrate_action", required=True)
+    migrate_plan = migrate_sub.add_parser(
+        "plan", help="Write a private, resumable Conductor migration plan"
+    )
+    migrate_plan.add_argument("--conductor-root", action="append", default=[])
+    migrate_plan.add_argument("--database", help="Read-only Conductor SQLite path")
+    migrate_plan.add_argument("--output", help="Exact output plan.json path")
+    migrate_plan.set_defaults(func=cmd_migrate)
+
+    migrate_apply = migrate_sub.add_parser(
+        "apply",
+        help="Adopt selected Conductor sources into cdesktop without starting agents",
+    )
+    migrate_apply.add_argument("plan")
+    selection = migrate_apply.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--all", action="store_true")
+    selection.add_argument("--workspace", action="append")
+    migrate_apply.add_argument("--include-archived", action="store_true")
+    migrate_apply.add_argument("--include-dirty", action="store_true")
+    migrate_apply.add_argument("--confirm-conductor-paused", action="store_true")
+    migrate_apply.add_argument("--confirm-checkpointed", action="store_true")
+    migrate_apply.add_argument("--semantic-messages", type=int, default=20)
+    migrate_apply.set_defaults(func=cmd_migrate)
+
+    migrate_status = migrate_sub.add_parser(
+        "status", help="Inspect a resumable migration run"
+    )
+    migrate_status.add_argument("run", help="run.json or its sibling plan.json")
+    migrate_status.set_defaults(func=cmd_migrate)
+
+    migrate_rollback = migrate_sub.add_parser(
+        "rollback", help="Archive empty workspaces created by a migration run"
+    )
+    migrate_rollback.add_argument("run", help="run.json or its sibling plan.json")
+    migrate_rollback.add_argument("--confirm", action="store_true")
+    migrate_rollback.set_defaults(func=cmd_migrate)
     return root
 
 

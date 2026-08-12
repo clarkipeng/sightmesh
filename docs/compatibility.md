@@ -24,6 +24,9 @@
 - Repowire ask injection as a visible cdesktop follow-up;
 - correlated plain-ask acknowledgement and structured-question response;
 - bridge peer identity reuse across bridge reconnects.
+- worktree-disabled migration import without starting an agent, followed by empty-workspace rollback.
+
+The migration planner was also run read-only against the local Conductor installation on 2026-08-12. It found 365 database and filesystem workspace/context records. Two were blocked because their Conductor sessions were active; all other records had an in-place source or were eligible for a private transcript-only handoff. No real Conductor workspace was migrated during this validation.
 
 The isolated bridge run on 2026-08-12 proved both transports. A blocking `repowire peer ask` returned `REPOWIRE_VISIBLE_OK`. A normal non-blocking ask returned `PLAIN_REPLY_OK`, and its trace recorded `created`, `resolved_peer`, `routed`, `hook_received`, `pane_injected`, `acked`, and `closed`. Restarting the foreground bridge reclaimed the same Repowire peer ID.
 

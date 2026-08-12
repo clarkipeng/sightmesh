@@ -35,6 +35,8 @@ Before spawning, write a bounded prompt containing:
 
 Search cdesktop and Repowire inventories first. Do not spawn a duplicate worker for a branch, PR, or assignment already owned.
 
+When taking over a workspace imported from Conductor, check for `.context/sightmesh-migration.json`. Read the referenced handoff before writing, then validate the live branch, HEAD, dirty state, and remaining scope against it. The original checkout and Conductor database remain authoritative historical sources.
+
 ## Spawn visible workers
 
 For isolated implementation:

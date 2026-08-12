@@ -66,6 +66,22 @@ sightmesh delivery status
 sightmesh lease list
 ```
 
+## Migrate from Conductor
+
+Create a private, read-only plan first:
+
+```sh
+sightmesh --json migrate plan --conductor-root ~/conductor
+```
+
+After pausing the selected Conductor sessions, adopt current workspaces without launching agents:
+
+```sh
+sightmesh migrate apply PLAN_PATH --all --confirm-conductor-paused
+```
+
+The migration is resumable and preserves checkouts, dirty files, `.context`, archived contexts, and the original Conductor transcript database in place. It exports bounded handoffs, reuses exact-path cdesktop imports, and supports status plus guarded rollback. See [Conductor migration](docs/migration.md) before applying it to real workspaces.
+
 Archive refuses dirty repositories by default. `--preserve-dirty` is available only for explicitly reconciled state. Spawn acquires an expiring ownership lease; isolated worktrees from the same repository may coexist, while direct-checkout ownership conflicts fail closed.
 
 ## Local architecture

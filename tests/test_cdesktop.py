@@ -37,6 +37,38 @@ def test_send_marks_sender_when_provided() -> None:
     ]
 
 
+def test_create_direct_workspace_record_and_attach_repo(tmp_path) -> None:
+    client = FakeClient()
+    client.repos = list
+
+    client.create_workspace_record("migrated-work", use_worktree=False)
+    client.add_workspace_repo("workspace", tmp_path, "main", "source")
+
+    assert client.calls == [
+        (
+            "POST",
+            "/workspaces",
+            {"name": "migrated-work", "use_worktree": False},
+            None,
+            None,
+        ),
+        (
+            "POST",
+            "/repos",
+            {"path": str(tmp_path.resolve()), "display_name": "source"},
+            None,
+            None,
+        ),
+        (
+            "POST",
+            "/workspaces/workspace/repos",
+            {"repo_id": "created", "target_branch": "main"},
+            None,
+            None,
+        ),
+    ]
+
+
 def test_configure_local_preserves_config_and_forces_privacy(tmp_path) -> None:
     client = FakeClient()
     client.info = lambda: {
@@ -63,7 +95,9 @@ def test_dirty_repositories_reports_direct_checkout(monkeypatch, tmp_path) -> No
         stdout = "?? pending.txt\n"
         stderr = ""
 
-    monkeypatch.setattr("sightmesh.cdesktop.subprocess.run", lambda *args, **kwargs: Result())
+    monkeypatch.setattr(
+        "sightmesh.cdesktop.subprocess.run", lambda *args, **kwargs: Result()
+    )
     assert client.dirty_repositories("workspace") == [
         {"path": str(tmp_path), "status": "?? pending.txt"}
     ]

@@ -2,7 +2,7 @@
 
 SightMesh is designed for a different center of gravity than Conductor. It does not claim universal superiority.
 
-| Requirement | SightMesh 0.2 | Conductor | Current verdict |
+| Requirement | SightMesh 0.3 | Conductor | Current verdict |
 | --- | --- | --- | --- |
 | Local full Claude Code and Codex processes | Yes | Yes | Parity |
 | Isolated Git worktrees | Yes | Yes | Parity |
@@ -22,7 +22,7 @@ SightMesh is designed for a different center of gravity than Conductor. It does 
 | Mobile control | Local network or separately configured Repowire surfaces; relay disabled by default | iOS app for supported workspaces | Conductor advantage |
 | Cloud workspaces and public API | Intentionally no cloud | Yes | Conductor advantage unless local-only is mandatory |
 | Open-source policy and lifecycle layer | Apache-2.0 | Proprietary app | SightMesh advantage |
-| Read-only Conductor migration inventory | Yes | Not applicable | SightMesh transition aid |
+| Resumable Conductor workspace and context migration | In-place adoption, transcript handoffs, leases, status, and rollback | Not applicable | SightMesh transition aid |
 
 ## What automatic failover means
 
