@@ -1,0 +1,83 @@
+{
+  "schema_version": "2026-08-12.bakeoff.v1",
+  "base_commit": "6f17700d931449ac576fae17de9b6e54cfda1b90",
+  "generated_for": "agent-deck visible competitor bake-off",
+  "competitors": [
+    {
+      "id": "local_agent_deck",
+      "name": "agent-deck (local cdesktop/Repowire bridge)",
+      "kind": "local",
+      "source": ".",
+      "version_ref": "6f17700d931449ac576fae17de9b6e54cfda1b90"
+    },
+    {
+      "id": "ashesh_agent_deck",
+      "name": "asheshgoplani/agent-deck",
+      "kind": "git",
+      "repo": "https://github.com/asheshgoplani/agent-deck.git",
+      "github_repo": "asheshgoplani/agent-deck",
+      "version_ref": "refs/tags/v1.11.0"
+    },
+    {
+      "id": "ccb",
+      "name": "SeemSeam/claude_codex_bridge",
+      "kind": "git",
+      "repo": "https://github.com/SeemSeam/claude_codex_bridge.git",
+      "github_repo": "SeemSeam/claude_codex_bridge",
+      "version_ref": "refs/tags/v8.6.1"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "launch_claude_worker",
+      "label": "Launch full Claude Code worker",
+      "weight": 1
+    },
+    {
+      "id": "launch_codex_worker",
+      "label": "Launch full Codex worker",
+      "weight": 1
+    },
+    {
+      "id": "human_visibility_takeover",
+      "label": "Human visibility and takeover",
+      "weight": 1
+    },
+    {
+      "id": "cross_agent_request_reply",
+      "label": "Cross-agent request/reply",
+      "weight": 1
+    },
+    {
+      "id": "isolated_worktrees",
+      "label": "Isolated worktrees",
+      "weight": 1
+    },
+    {
+      "id": "dirty_work_refusal",
+      "label": "Dirty-work refusal or equivalent",
+      "weight": 1
+    },
+    {
+      "id": "crash_restart_recovery",
+      "label": "Crash/restart recovery",
+      "weight": 1
+    },
+    {
+      "id": "local_only_operation",
+      "label": "Local-only operation",
+      "weight": 1
+    },
+    {
+      "id": "install_uninstall_containment",
+      "label": "Install/uninstall containment",
+      "weight": 1
+    }
+  ],
+  "evidence_policy": {
+    "observed_runtime": "A command was executed by the runner in an isolated temp HOME/tmux context.",
+    "observed_static": "The runner inspected source files from the pinned version.",
+    "documented_claim": "The pinned README/docs claim support but the runner did not execute the scenario.",
+    "blocked": "The scenario requires credentials, a real provider session, or mutation of user-global state and was not executed."
+  }
+}
