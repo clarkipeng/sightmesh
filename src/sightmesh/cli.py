@@ -215,9 +215,10 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         permission_policy = args.permission or "SUPERVISED"
         if permission_policy == "BYPASS_PERMISSIONS":
             raise ValueError("BYPASS_PERMISSIONS requires explicit --unattended")
+    lease_store = leases.LeaseStore()
+    lease_store.assert_spawn_allowed(repo_path, use_worktree=args.worktree)
     client = CdesktopClient(args.url)
     leases.sync_active_workspaces(client)
-    lease_store = leases.LeaseStore()
     lease_owner = f"cdesktop-spawn:{args.name}"
     pending_lease: leases.Lease | None = None
     if args.worktree:
