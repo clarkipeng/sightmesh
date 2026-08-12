@@ -216,7 +216,7 @@ def cmd_service(args: argparse.Namespace) -> int:
         path = service.install(args.port, start_now=not args.no_start)
         result = {"installed": str(path), **service.status(args.port)}
     elif args.action == "start":
-        service.start()
+        service.start(args.port)
         result = service.status(args.port)
     elif args.action == "stop":
         service.stop()

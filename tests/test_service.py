@@ -40,6 +40,7 @@ def test_start_reloads_only_the_owned_launch_agent(monkeypatch, tmp_path) -> Non
     bridge_target.write_text("fixture", encoding="utf-8")
     monkeypatch.setattr(service, "plist_path", lambda: target)
     monkeypatch.setattr(service, "bridge_plist_path", lambda: bridge_target)
+    monkeypatch.setattr(service, "is_healthy", lambda _port: True)
     calls = []
 
     class Result:
@@ -59,3 +60,10 @@ def test_start_reloads_only_the_owned_launch_agent(monkeypatch, tmp_path) -> Non
     assert calls[1][-1] == str(target)
     assert calls[3][0:2] == ["launchctl", "bootstrap"]
     assert calls[3][-1] == str(bridge_target)
+
+
+def test_wait_until_healthy_retries_until_ready(monkeypatch) -> None:
+    results = iter([False, False, True])
+    monkeypatch.setattr(service, "is_healthy", lambda _port: next(results))
+    monkeypatch.setattr(service.time, "sleep", lambda _seconds: None)
+    service.wait_until_healthy(4321, timeout=1)

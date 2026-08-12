@@ -4,6 +4,7 @@ import os
 import plistlib
 import shutil
 import subprocess
+import time
 import webbrowser
 from pathlib import Path
 from typing import Any
@@ -103,30 +104,45 @@ def install(port: int = DEFAULT_PORT, start_now: bool = True) -> Path:
     bridge_target = bridge_plist_path()
     bridge_target.write_bytes(plistlib.dumps(bridge_definition(port)))
     if start_now:
-        start()
+        start(port)
     return target
 
 
-def start() -> None:
+def _bootstrap(label: str, service_path: Path) -> None:
+    subprocess.run(
+        ["launchctl", "bootout", _service_target(label)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    result = subprocess.run(
+        ["launchctl", "bootstrap", _domain(), str(service_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout).strip())
+
+
+def wait_until_healthy(port: int = DEFAULT_PORT, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if is_healthy(port):
+            return
+        time.sleep(0.1)
+    raise RuntimeError(f"Managed cdesktop did not become healthy at {service_url(port)}")
+
+
+def start(port: int = DEFAULT_PORT) -> None:
     target = plist_path()
     bridge_target = bridge_plist_path()
-    for label, service_path in ((LABEL, target), (BRIDGE_LABEL, bridge_target)):
+    for service_path in (target, bridge_target):
         if not service_path.exists():
             raise RuntimeError(f"Service is not installed: {service_path}")
-        subprocess.run(
-            ["launchctl", "bootout", _service_target(label)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        result = subprocess.run(
-            ["launchctl", "bootstrap", _domain(), str(service_path)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError((result.stderr or result.stdout).strip())
+    _bootstrap(LABEL, target)
+    wait_until_healthy(port)
+    _bootstrap(BRIDGE_LABEL, bridge_target)
 
 
 def stop() -> None:
