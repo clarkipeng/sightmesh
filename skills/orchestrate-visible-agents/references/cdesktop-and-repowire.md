@@ -39,7 +39,15 @@ repowire trace <correlation-id>
 
 Prefer Repowire's in-agent MCP tools when available. Use the CLI as a diagnostic and fallback surface. A new cdesktop session must appear online in `repowire peer list` before relying on cross-workspace delivery.
 
-If a cdesktop app-server session appears offline in Repowire, route the immediate message with `agent-deck message` so it becomes a visible follow-up in the target transcript. Do not claim Repowire delivery when the peer is offline.
+Target the online proxy identity created by agent-deck by matching repository path and backend. Repowire assigns its displayed name. The executor's own app-server hook may appear offline and is not the inbound route. If the proxy is not online, route the immediate message with `agent-deck message` so it becomes a visible follow-up in the target transcript. Do not claim Repowire delivery when the proxy is offline.
+
+Existing workspaces are opted in explicitly:
+
+```sh
+agent-deck bridge-route <workspace-id> --enabled
+```
+
+`agent-deck spawn` enables its new workspace automatically. Archiving through `agent-deck close` disables the route.
 
 ## Safety
 

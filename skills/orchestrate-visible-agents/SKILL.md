@@ -80,6 +80,8 @@ repowire peer list -a
 repowire peer ask <peer-name> "<bounded request>"
 ```
 
+For cdesktop, target the online bridge peer whose repository path and backend match the intended session. Repowire chooses the displayed name. Do not target a stale offline identity created by an executor's short-lived app-server hook. If no matching bridge peer is online, use `agent-deck message` and report that Repowire delivery was unavailable.
+
 Use messages for decisions, exact SHAs, ownership transfers, and blockers. Keep durable evidence in the repository or its ignored handoff directory. Repowire is transport, not the sole record.
 
 ## Supervise and finish

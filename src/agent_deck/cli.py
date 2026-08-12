@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import shutil
 import subprocess
@@ -11,6 +12,9 @@ from typing import Any
 
 from .cdesktop import CdesktopClient, CdesktopError
 from . import service
+from .bridge import run_bridge
+from . import routing
+from .repowire import RepowireError, reply as repowire_reply
 
 
 def _read_text(value: str | None, path: str | None, label: str) -> str:
@@ -162,6 +166,8 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         reasoning=args.reasoning,
         provider_id=args.provider,
     )
+    if not args.no_bridge:
+        routing.enable(result["workspace"]["id"])
     _emit(result, args.json)
     return 0
 
@@ -243,6 +249,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             )
         client.stop_workspace(args.workspace_id)
         archived = client.archive_workspace(args.workspace_id)
+        routing.disable(args.workspace_id)
         _emit(
             {
                 "workspace": archived,
@@ -267,6 +274,46 @@ def cmd_close(args: argparse.Namespace) -> int:
         },
         args.json,
     )
+    return 0
+
+
+def cmd_bridge(args: argparse.Namespace) -> int:
+    logging_level = "DEBUG" if args.verbose else "INFO"
+    import logging
+
+    logging.basicConfig(level=getattr(logging, logging_level))
+    try:
+        asyncio.run(run_bridge(args.url, args.repowire_url))
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+def cmd_bridge_route(args: argparse.Namespace) -> int:
+    if args.enabled:
+        routing.enable(args.workspace_id)
+    else:
+        routing.disable(args.workspace_id)
+    _emit(
+        {
+            "workspace_id": args.workspace_id,
+            "bridge_enabled": args.workspace_id in routing.enabled_workspaces(),
+        },
+        args.json,
+    )
+    return 0
+
+
+def cmd_bridge_reply(args: argparse.Namespace) -> int:
+    message = _read_text(args.message, args.message_file, "message")
+    result = repowire_reply(
+        args.correlation_id,
+        message,
+        from_peer=args.from_peer,
+        question=args.question,
+        base_url=args.repowire_http_url,
+    )
+    _emit(result or {"ok": True}, args.json)
     return 0
 
 
@@ -308,6 +355,7 @@ def parser() -> argparse.ArgumentParser:
     spawn.add_argument("--model")
     spawn.add_argument("--reasoning", choices=["low", "medium", "high", "max"])
     spawn.add_argument("--provider", help="Configured cdesktop provider UUID")
+    spawn.add_argument("--no-bridge", action="store_true")
     spawn.set_defaults(func=cmd_spawn)
 
     message = sub.add_parser("message", help="Send a visible cdesktop follow-up")
@@ -360,6 +408,29 @@ def parser() -> argparse.ArgumentParser:
     managed.add_argument("--port", type=int, default=service.DEFAULT_PORT)
     managed.add_argument("--no-start", action="store_true")
     managed.set_defaults(func=cmd_service)
+
+    bridge = sub.add_parser("bridge", help="Bridge enabled cdesktop sessions into Repowire")
+    bridge.add_argument("--repowire-url", default="ws://127.0.0.1:8377/ws")
+    bridge.add_argument("--verbose", action="store_true")
+    bridge.set_defaults(func=cmd_bridge)
+
+    bridge_route = sub.add_parser("bridge-route", help="Enable or disable Repowire routing")
+    bridge_route.add_argument("workspace_id")
+    bridge_route.add_argument("--enabled", action=argparse.BooleanOptionalAction, default=True)
+    bridge_route.set_defaults(func=cmd_bridge_route)
+
+    bridge_reply = sub.add_parser("bridge-reply", help="Reply to a bridged Repowire ask")
+    bridge_reply.add_argument("correlation_id")
+    bridge_reply.add_argument("--from-peer", required=True)
+    reply_group = bridge_reply.add_mutually_exclusive_group(required=True)
+    reply_group.add_argument("--message")
+    reply_group.add_argument("--message-file")
+    bridge_reply.add_argument("--question", action="store_true")
+    bridge_reply.add_argument(
+        "--repowire-http-url",
+        default="http://127.0.0.1:8377",
+    )
+    bridge_reply.set_defaults(func=cmd_bridge_reply)
     return root
 
 
@@ -367,7 +438,7 @@ def main() -> None:
     args = parser().parse_args()
     try:
         code = args.func(args)
-    except (CdesktopError, OSError, ValueError) as exc:
+    except (CdesktopError, RepowireError, OSError, ValueError) as exc:
         print(f"agent-deck: {exc}", file=sys.stderr)
         code = 2
     raise SystemExit(code)

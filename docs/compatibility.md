@@ -19,7 +19,13 @@
 - completed-session stop and archive;
 - dirty-repository retirement refusal;
 - shared skill discovery through links in both Claude and Codex skill roots;
-- Repowire local daemon, hooks, MCP installation, and peer registration.
+- Repowire local daemon, hooks, MCP installation, and peer registration;
+- opt-in Repowire proxy peer registration for cdesktop sessions;
+- Repowire ask injection as a visible cdesktop follow-up;
+- correlated plain-ask acknowledgement and structured-question response;
+- bridge peer identity reuse across bridge reconnects.
+
+The isolated bridge run on 2026-08-12 proved both transports. A blocking `repowire peer ask` returned `REPOWIRE_VISIBLE_OK`. A normal non-blocking ask returned `PLAIN_REPLY_OK`, and its trace recorded `created`, `resolved_peer`, `routed`, `hook_received`, `pane_injected`, `acked`, and `closed`. Restarting the foreground bridge reclaimed the same Repowire peer ID.
 
 ## Current constraints
 
@@ -31,12 +37,14 @@ cdesktop 0.2.3 uses Codex app-server protocol types from Codex 0.121. An explici
 
 Claude Code launches through cdesktop, but the live end-to-end run on 2026-08-12 encountered the account's weekly Max limit. agent-deck treats this as a checkpoint and supported-profile failover event. It does not bypass the limit or manipulate subscription credentials.
 
-### Repowire inbound push for cdesktop app-server sessions
+### Repowire app-server hook replacement
 
 Repowire registers cdesktop Codex app-server sessions and starts its MCP process, but the session's WebSocket inbound hook does not remain online. Direct `repowire peer ask` therefore rejects the offline peer. `agent-deck message` is the supported immediate cross-workspace transport because it creates a visible follow-up in the target cdesktop transcript.
 
-A future Repowire proxy bridge may keep a durable peer online and translate asks into cdesktop follow-ups. Until that bridge can preserve correlation, response, and audit semantics, the skills must not claim Repowire push delivery for an offline cdesktop peer.
+The agent-deck bridge provides a separate durable proxy peer for every session in an explicitly enabled workspace. Repowire asks to that proxy become cdesktop follow-ups, and `agent-deck bridge-reply` closes the original correlation. Repowire assigns the displayed name from its own session mapper, so identify the online proxy by its repository path, backend, and peer ID in `repowire peer list -a` or `repowire peer describe`. Do not target the offline app-server hook identity.
+
+The bridge is local and opt-in. It does not inspect or migrate existing cdesktop workspaces until their workspace IDs are enabled. Workspaces created through `agent-deck spawn` are enabled automatically unless `--no-bridge` is passed.
 
 ## Service activation boundary
 
-The managed LaunchAgent is installed without starting it when an unmanaged cdesktop instance already exists. Close unmanaged instances before starting `io.agent-deck.cdesktop` so only one process owns cdesktop's local database and port file.
+The managed LaunchAgents are installed without starting them when an unmanaged cdesktop instance already exists. Close unmanaged instances before starting `io.agent-deck.cdesktop` and `io.agent-deck.bridge` so only one process owns cdesktop's local database and port file.
