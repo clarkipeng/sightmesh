@@ -16,6 +16,7 @@ SCHEMA_VERSION = run_bakeoff.SCHEMA_VERSION
 isolated_env = run_bakeoff.isolated_env
 validate_manifest = run_bakeoff.validate_manifest
 validate_results = run_bakeoff.validate_results
+evaluate_ash = run_bakeoff.evaluate_ash
 
 
 def test_manifest_schema_contains_required_scenarios() -> None:
@@ -43,7 +44,7 @@ def test_result_schema_rejects_missing_scenario() -> None:
     valid_scenario = {
         "status": "pass",
         "score": 1.0,
-        "evidence_type": "observed_static",
+        "evidence_type": "documented_claim",
         "summary": "ok",
         "commands": [],
     }
@@ -74,3 +75,57 @@ def test_result_schema_rejects_missing_scenario() -> None:
         assert "missing results" in str(exc)
     else:
         raise AssertionError("validate_results accepted an incomplete result set")
+
+
+def test_observed_static_requires_source_evidence() -> None:
+    scenario = {
+        "status": "pass",
+        "score": 1.0,
+        "evidence_type": "observed_static",
+        "summary": "unsupported",
+        "commands": [],
+    }
+    results = {
+        "schema_version": SCHEMA_VERSION,
+        "competitors": [
+            {
+                "id": "x",
+                "scenarios": {scenario_id: dict(scenario) for scenario_id in run_bakeoff.SCENARIO_IDS},
+            }
+        ],
+    }
+    try:
+        validate_results(results)
+    except ValueError as exc:
+        assert "observed_static missing source_evidence" in str(exc)
+    else:
+        raise AssertionError("validate_results accepted observed_static without source_evidence")
+
+
+def test_evaluator_changes_when_required_source_evidence_is_absent() -> None:
+    present = {
+        "README.md": "\n".join(
+            [
+                "agent-deck add . -c claude",
+                "One terminal shows every session",
+                "| `Enter` | Attach to session |",
+                "agent-deck add . --worktree develop -c claude",
+                "agent-deck worktree cleanup",
+                "Agent Deck creates its own tmux sessions",
+                "Your existing sessions are untouched",
+            ]
+        ),
+        "cmd/agent-deck/main.go": "agent-deck add -c codex\nTool/command to run (e.g., 'claude' or 'codex')\n",
+        "cmd/agent-deck/session_cmd.go": "session output\nsession restart\nrevive\n",
+        "cmd/agent-deck/hook_children_context.go": "session send\n",
+        "docs/SESSION-PERSISTENCE-SPEC.md": "session restart\n",
+        "install.sh": "--dir\n--non-interactive\n",
+        "uninstall.sh": "--dry-run\n",
+    }
+    assert evaluate_ash(present)["launch_codex_worker"]["status"] == "pass"
+
+    absent = dict(present)
+    absent["cmd/agent-deck/main.go"] = absent["cmd/agent-deck/main.go"].replace("agent-deck add -c codex", "agent-deck add -c shell")
+    changed = evaluate_ash(absent)["launch_codex_worker"]
+    assert changed["status"] == "unknown"
+    assert changed["evidence_type"] == "unknown"

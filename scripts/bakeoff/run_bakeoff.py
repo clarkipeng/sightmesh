@@ -18,6 +18,7 @@ from typing import Any
 
 SCHEMA_VERSION = "2026-08-12.bakeoff-results.v1"
 STATUS_SCORE = {"pass": 1.0, "partial": 0.5, "blocked": 0.0, "fail": 0.0, "unknown": 0.0}
+EVIDENCE_TYPES = {"observed_static", "recorded_historical", "documented_claim", "blocked", "unknown"}
 SCENARIO_IDS = {
     "launch_claude_worker",
     "launch_codex_worker",
@@ -129,10 +130,16 @@ def read_texts(root: Path) -> dict[str, str]:
         "install.sh",
         "uninstall.sh",
         "ccb.py",
+        "cmd/agent-deck/main.go",
+        "cmd/agent-deck/session_cmd.go",
+        "cmd/agent-deck/hook_children_context.go",
         "src/agent_deck/cli.py",
         "src/agent_deck/cdesktop.py",
         "src/agent_deck/service.py",
         "src/agent_deck/bridge.py",
+        "docs/compatibility.md",
+        "docs/conductor/README.md",
+        "docs/SESSION-PERSISTENCE-SPEC.md",
         "docs/ccbd-lifecycle-test-plan.md",
         "docs/claude-binary-cache-dedup-plan.md",
     ]:
@@ -142,60 +149,271 @@ def read_texts(root: Path) -> dict[str, str]:
     return texts
 
 
-def has(texts: dict[str, str], *patterns: str) -> bool:
-    haystack = "\n".join(texts.values()).lower()
-    return all(re.search(pattern.lower(), haystack, re.MULTILINE | re.DOTALL) for pattern in patterns)
+def source_match(texts: dict[str, str], rel_file: str, pattern: str) -> dict[str, Any] | None:
+    text = texts.get(rel_file)
+    if text is None:
+        return None
+    regex = re.compile(pattern)
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        if regex.search(line):
+            return {
+                "file": rel_file,
+                "line": line_no,
+                "pattern": pattern,
+                "excerpt": line.strip(),
+            }
+    return None
 
 
-def evidence(status: str, evidence_type: str, summary: str, commands: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    return {
+def source_matches(texts: dict[str, str], specs: list[tuple[str, str]]) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for rel_file, pattern in specs:
+        match = source_match(texts, rel_file, pattern)
+        if match:
+            matches.append(match)
+    return matches
+
+
+def evidence(
+    status: str,
+    evidence_type: str,
+    summary: str,
+    *,
+    source_evidence: list[dict[str, Any]] | None = None,
+    commands: list[dict[str, Any]] | None = None,
+    limitations: list[str] | None = None,
+) -> dict[str, Any]:
+    result = {
         "status": status,
         "score": STATUS_SCORE[status],
         "evidence_type": evidence_type,
         "summary": summary,
         "commands": commands or [],
     }
+    if source_evidence is not None:
+        result["source_evidence"] = source_evidence
+    if limitations:
+        result["limitations"] = limitations
+    return result
+
+
+def static_result(
+    texts: dict[str, str],
+    status: str,
+    summary: str,
+    specs: list[tuple[str, str]],
+    *,
+    commands: list[dict[str, Any]] | None = None,
+    limitations: list[str] | None = None,
+    missing_status: str = "unknown",
+    missing_summary: str | None = None,
+) -> dict[str, Any]:
+    matches = source_matches(texts, specs)
+    if len(matches) != len(specs):
+        found = {(item["file"], item["pattern"]) for item in matches}
+        missing = [{"file": file, "pattern": pattern} for file, pattern in specs if (file, pattern) not in found]
+        return evidence(
+            missing_status,
+            "unknown" if missing_status == "unknown" else "observed_static",
+            missing_summary or "Required source evidence was not found in the pinned source.",
+            source_evidence=matches,
+            limitations=[*(limitations or []), f"missing_source_evidence={missing}"],
+            commands=commands,
+        )
+    return evidence(
+        status,
+        "observed_static",
+        summary,
+        source_evidence=matches,
+        commands=commands,
+        limitations=limitations,
+    )
 
 
 def evaluate_local(texts: dict[str, str], commands: list[dict[str, Any]]) -> dict[str, Any]:
+    codex_stall = (
+        "Historical local stack note from this bake-off: cdesktop 0.2.3 plus Codex CLI "
+        "0.147.0 reached supervised approval/MCP elicitation but stalled, so unattended "
+        "Codex launch and recovery are qualified rather than counted as fresh runtime pass."
+    )
     return {
-        "launch_claude_worker": evidence("pass", "observed_static", "CLI spawn accepts executor=CLAUDE_CODE and posts to cdesktop /workspaces/start.", commands),
-        "launch_codex_worker": evidence("pass", "observed_static", "CLI spawn accepts executor=CODEX and posts to cdesktop /workspaces/start.", commands),
-        "human_visibility_takeover": evidence("pass", "observed_static", "Workers are cdesktop workspaces/sessions; message and closeout commands route visible follow-ups."),
-        "cross_agent_request_reply": evidence("pass", "observed_static", "Repowire bridge handles ask frames and bridge-reply sends ack/answer callbacks."),
-        "isolated_worktrees": evidence("pass", "observed_static", "spawn requires explicit --worktree/--direct and passes use_worktree into cdesktop."),
-        "dirty_work_refusal": evidence("pass", "observed_static", "close --archive refuses dirty git repositories unless --preserve-dirty is explicit."),
-        "crash_restart_recovery": evidence("partial", "observed_static", "launchd KeepAlive covers local cdesktop/bridge services, but provider crash recovery is delegated to cdesktop."),
-        "local_only_operation": evidence("pass", "observed_static", "configure_local sets analytics_enabled=false, relay_enabled=false, and loopback service URL."),
-        "install_uninstall_containment": evidence("partial", "observed_static", "service install/uninstall is contained to user LaunchAgents and ~/.local/state logs, but it mutates user launchd state so runtime install is blocked."),
+        "launch_claude_worker": static_result(
+            texts,
+            "pass",
+            "Static launch surface supports full visible cdesktop Claude Code workspaces; no fresh provider runtime launch was executed.",
+            [("src/agent_deck/cli.py", r'choices=\["CLAUDE_CODE", "CODEX"\]'), ("src/agent_deck/cdesktop.py", r'"/workspaces/start"')],
+        ),
+        "launch_codex_worker": static_result(
+            texts,
+            "partial",
+            "Static launch surface supports Codex workspaces, but current local compatibility is qualified by the recorded supervised-approval/MCP-elicitation stall.",
+            [
+                ("src/agent_deck/cli.py", r'choices=\["CLAUDE_CODE", "CODEX"\]'),
+                ("src/agent_deck/cdesktop.py", r'"/workspaces/start"'),
+                ("docs/compatibility.md", r"cdesktop 0\.2\.3"),
+                ("docs/compatibility.md", r"Codex CLI 0\.147\.0"),
+            ],
+            limitations=[codex_stall],
+        ),
+        "human_visibility_takeover": static_result(
+            texts,
+            "pass",
+            "cdesktop workspace/session APIs and visible follow-up commands provide human-visible worker control surfaces.",
+            [("src/agent_deck/cli.py", r"Send a visible cdesktop follow-up"), ("src/agent_deck/cdesktop.py", r'"/sessions/\{session_id\}/follow-up"')],
+        ),
+        "cross_agent_request_reply": static_result(
+            texts,
+            "pass",
+            "Repowire asks are injected as cdesktop follow-ups and closed through bridge-reply.",
+            [("src/agent_deck/bridge.py", r'Repowire ask from @\{from_peer\}'), ("src/agent_deck/cli.py", r"bridge-reply")],
+        ),
+        "isolated_worktrees": static_result(
+            texts,
+            "pass",
+            "spawn requires an explicit worktree/direct choice and passes use_worktree into cdesktop.",
+            [("src/agent_deck/cli.py", r"--worktree"), ("src/agent_deck/cdesktop.py", r'"use_worktree": use_worktree')],
+        ),
+        "dirty_work_refusal": static_result(
+            texts,
+            "pass",
+            "close --archive refuses dirty git repositories unless --preserve-dirty is explicit.",
+            [("src/agent_deck/cli.py", r"Refusing to archive dirty repositories"), ("src/agent_deck/cdesktop.py", r'"git", "status", "--porcelain=v1"')],
+        ),
+        "crash_restart_recovery": static_result(
+            texts,
+            "partial",
+            "launchd KeepAlive covers local cdesktop/bridge services; provider-level crash recovery remains qualified by cdesktop/Codex stall evidence.",
+            [("src/agent_deck/service.py", r'"KeepAlive": True'), ("src/agent_deck/bridge.py", r"Bridge .* disconnected")],
+            limitations=[codex_stall],
+        ),
+        "local_only_operation": static_result(
+            texts,
+            "pass",
+            "Local configuration disables analytics/relay and binds the managed service to loopback.",
+            [("src/agent_deck/cdesktop.py", r'"analytics_enabled": False'), ("src/agent_deck/cdesktop.py", r'"relay_enabled": False'), ("src/agent_deck/service.py", r"http://127\.0\.0\.1:\{port\}")],
+        ),
+        "install_uninstall_containment": static_result(
+            texts,
+            "partial",
+            "service install/uninstall is scoped to user LaunchAgents and local state paths, but actual install mutates user launchd state so it is not executed by the bake-off.",
+            [("src/agent_deck/service.py", r'Library.*LaunchAgents'), ("src/agent_deck/service.py", r'\.local.*state.*agent-deck'), ("src/agent_deck/service.py", r"def uninstall")],
+        ),
     }
 
 
 def evaluate_ash(texts: dict[str, str]) -> dict[str, Any]:
     return {
-        "launch_claude_worker": evidence("pass", "observed_static", "README/CLI source show `agent-deck add ... -c claude` support."),
-        "launch_codex_worker": evidence("partial", "observed_static", "README lists Codex status/organization and demos, but source guidance warns manual Codex creation should use helper scripts."),
-        "human_visibility_takeover": evidence("pass", "documented_claim", "README describes tmux/TUI sessions, attach, pane output, and direct takeover."),
-        "cross_agent_request_reply": evidence("partial", "observed_static", "session send/inbox/conductor bridge exists; no host-neutral request/reply bus equivalent to Repowire was observed."),
-        "isolated_worktrees": evidence("pass", "observed_static", "README and worktree command source support `agent-deck add --worktree` and cleanup."),
-        "dirty_work_refusal": evidence("partial", "observed_static", "Source contains several refusal guards and tests for real-HOME/test safety, but no exact close/archive dirty-work refusal matched the local runner contract."),
-        "crash_restart_recovery": evidence("pass", "observed_static", "session restart/revive and persistence tests are present; conductor bridge drain supervisor restarts after unexpected crashes."),
-        "local_only_operation": evidence("partial", "observed_static", "Core TUI is local tmux/XDG state, but optional conductor/remote/mobile channels and account-switching features are in scope."),
-        "install_uninstall_containment": evidence("partial", "observed_static", "Installer supports --dir and --non-interactive; uninstall has --dry-run, but defaults target ~/.local/bin, ~/.agent-deck, Homebrew, and ~/.tmux.conf."),
+        "launch_claude_worker": static_result(
+            texts,
+            "pass",
+            "Pinned source documents direct Claude session launch with `-c claude`.",
+            [("README.md", r"agent-deck add .* -c claude")],
+        ),
+        "launch_codex_worker": static_result(
+            texts,
+            "pass",
+            "Pinned source proves direct Codex launch selection with `-c codex`; helper recommendations do not reduce this static launch score.",
+            [("cmd/agent-deck/main.go", r"agent-deck add -c codex"), ("cmd/agent-deck/main.go", r"Tool/command to run .*codex")],
+        ),
+        "human_visibility_takeover": static_result(
+            texts,
+            "pass",
+            "Pinned source describes tmux-backed sessions and attach/takeover behavior.",
+            [("README.md", r"One terminal shows every session"), ("README.md", r"Enter.*Attach to session")],
+        ),
+        "cross_agent_request_reply": static_result(
+            texts,
+            "partial",
+            "Pinned source includes session send/inbox/conductor reply paths, but no neutral Repowire-equivalent mesh bridge was found.",
+            [("cmd/agent-deck/session_cmd.go", r"session output"), ("cmd/agent-deck/hook_children_context.go", r"session send")],
+        ),
+        "isolated_worktrees": static_result(
+            texts,
+            "pass",
+            "Pinned source documents worktree session creation and cleanup.",
+            [("README.md", r"agent-deck add .*--worktree"), ("README.md", r"agent-deck worktree cleanup")],
+        ),
+        "dirty_work_refusal": evidence(
+            "unknown",
+            "unknown",
+            "The runner did not find an exact dirty close/archive refusal criterion in the inspected source; this is not blocked by execution, it is unverified.",
+        ),
+        "crash_restart_recovery": static_result(
+            texts,
+            "pass",
+            "Pinned source documents restart/revive and session persistence paths.",
+            [("cmd/agent-deck/session_cmd.go", r"session restart"), ("cmd/agent-deck/session_cmd.go", r"revive"), ("docs/SESSION-PERSISTENCE-SPEC.md", r"session restart")],
+        ),
+        "local_only_operation": static_result(
+            texts,
+            "pass",
+            "Pinned source describes local tmux sessions and says existing tmux sessions are untouched; remote/conductor channels are optional.",
+            [("README.md", r"Agent Deck creates its own tmux sessions"), ("README.md", r"Your existing sessions are untouched")],
+        ),
+        "install_uninstall_containment": static_result(
+            texts,
+            "partial",
+            "Installer supports custom install dir and non-interactive mode, and uninstall supports dry-run, but default paths still target user-global locations.",
+            [("install.sh", r"--dir"), ("install.sh", r"--non-interactive"), ("uninstall.sh", r"--dry-run")],
+        ),
     }
 
 
 def evaluate_ccb(texts: dict[str, str]) -> dict[str, Any]:
     return {
-        "launch_claude_worker": evidence("pass", "observed_static", "README config examples launch `claude` agents in visible panes."),
-        "launch_codex_worker": evidence("pass", "observed_static", "README config examples launch `codex` agents in visible panes."),
-        "human_visibility_takeover": evidence("pass", "documented_claim", "README claims every agent is a full native terminal with visible layout control and takeover."),
-        "cross_agent_request_reply": evidence("pass", "observed_static", "`/ask`, `ccb ask`, mailbox, ccbd, and reply lifecycle docs/source are present."),
-        "isolated_worktrees": evidence("pass", "observed_static", "README v2 config supports `agent:provider(worktree)` entries."),
-        "dirty_work_refusal": evidence("blocked", "observed_static", "No exact dirty-work archive/close refusal was found; CCB has guarded cleanup/update policies instead."),
-        "crash_restart_recovery": evidence("pass", "observed_static", "ccbd lifecycle docs and source cover keeper, restart, kill, stale socket, and crash recovery scenarios."),
-        "local_only_operation": evidence("partial", "observed_static", "Config UI and gateways bind loopback by default, but mobile remote/relay features exist and must be explicitly scoped."),
-        "install_uninstall_containment": evidence("partial", "observed_static", "Installer supports CODEX_INSTALL_PREFIX/CODEX_BIN_DIR and managed prefixes, but default install writes global wrappers and may pip-install dependencies."),
+        "launch_claude_worker": static_result(
+            texts,
+            "pass",
+            "Pinned source config examples launch Claude agents in visible panes.",
+            [("README.md", r"worker2:claude\(worktree\)"), ("README.md", r"reviewer:claude")],
+        ),
+        "launch_codex_worker": static_result(
+            texts,
+            "pass",
+            "Pinned source config examples launch Codex agents in visible panes.",
+            [("README.md", r"main:codex"), ("README.md", r"worker1:codex")],
+        ),
+        "human_visibility_takeover": static_result(
+            texts,
+            "pass",
+            "Pinned source states every agent is a full native terminal with visible layout control and direct takeover.",
+            [("README.md", r"Every agent is a full native terminal"), ("README.md", r"direct takeover")],
+        ),
+        "cross_agent_request_reply": static_result(
+            texts,
+            "pass",
+            "Pinned source includes `/ask`, `ccb ask`, mailbox, and ccbd request/reply lifecycle coverage.",
+            [("README.md", r"/ask reviewer"), ("docs/ccbd-lifecycle-test-plan.md", r"ccb ask"), ("docs/ccbd-lifecycle-test-plan.md", r"reply")],
+        ),
+        "isolated_worktrees": static_result(
+            texts,
+            "pass",
+            "Pinned source supports worktree-tagged agents.",
+            [("README.md", r"worker1:codex\(worktree\)"), ("README.md", r"worker2:claude\(worktree\)")],
+        ),
+        "dirty_work_refusal": evidence(
+            "unknown",
+            "unknown",
+            "The runner did not find an exact dirty close/archive refusal criterion in the inspected source; this is unverified rather than blocked.",
+        ),
+        "crash_restart_recovery": static_result(
+            texts,
+            "pass",
+            "Pinned source covers keeper, restart, kill, stale socket, and crash recovery scenarios.",
+            [("docs/ccbd-lifecycle-test-plan.md", r"kill ccbd pid"), ("docs/ccbd-lifecycle-test-plan.md", r"stale socket"), ("docs/ccbd-lifecycle-test-plan.md", r"crash")],
+        ),
+        "local_only_operation": static_result(
+            texts,
+            "pass",
+            "Pinned source records loopback defaults and opt-in LAN boundary; optional remote/mobile features are not penalized when disabled.",
+            [("README.md", r"always binds to loopback"), ("README.md", r"binds to loopback by default"), ("README.md", r"For direct LAN access")],
+        ),
+        "install_uninstall_containment": static_result(
+            texts,
+            "partial",
+            "Installer supports prefix/bin overrides and managed prefixes, but default install can write global wrappers and dependencies.",
+            [("install.sh", r"CODEX_INSTALL_PREFIX"), ("install.sh", r"CODEX_BIN_DIR"), ("install.sh", r"global wrappers")],
+        ),
     }
 
 
@@ -223,8 +441,12 @@ def validate_results(results: dict[str, Any]) -> None:
         for scenario_id, result in competitor["scenarios"].items():
             if result["status"] not in STATUS_SCORE:
                 raise ValueError(f"{competitor.get('id')} {scenario_id} has invalid status")
+            if result["evidence_type"] not in EVIDENCE_TYPES:
+                raise ValueError(f"{competitor.get('id')} {scenario_id} has invalid evidence_type")
             if result["score"] != STATUS_SCORE[result["status"]]:
                 raise ValueError(f"{competitor.get('id')} {scenario_id} score/status mismatch")
+            if result["evidence_type"] == "observed_static" and not result.get("source_evidence"):
+                raise ValueError(f"{competitor.get('id')} {scenario_id} observed_static missing source_evidence")
 
 
 def clone_or_locate(competitor: dict[str, Any], *, repo_root: Path, work_root: Path, env: dict[str, str]) -> tuple[Path, dict[str, Any]]:
@@ -282,6 +504,7 @@ def run_bakeoff(manifest_path: Path, repo_root: Path, out_path: Path) -> dict[st
                     "source": {**pin, "path": str(source_path), "version_ref": competitor["version_ref"]},
                     "release": release,
                     "npm": npm,
+                    "introspection_commands": commands,
                     "safe_runtime_scope": {
                         "home": env["HOME"],
                         "xdg_config_home": env["XDG_CONFIG_HOME"],

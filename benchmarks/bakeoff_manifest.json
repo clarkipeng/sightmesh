@@ -74,10 +74,12 @@
       "weight": 1
     }
   ],
-  "evidence_policy": {
-    "observed_runtime": "A command was executed by the runner in an isolated temp HOME/tmux context.",
-    "observed_static": "The runner inspected source files from the pinned version.",
-    "documented_claim": "The pinned README/docs claim support but the runner did not execute the scenario.",
-    "blocked": "The scenario requires credentials, a real provider session, or mutation of user-global state and was not executed."
+    "evidence_policy": {
+      "observed_runtime": "A command was executed by the runner in an isolated temp HOME/tmux context.",
+    "observed_static": "The runner inspected source files from the pinned version and recorded exact source_evidence entries with relative file, line, pattern, and excerpt.",
+    "recorded_historical": "A prior local compatibility record or human-observed run note is recorded, but the runner did not freshly execute the runtime scenario.",
+      "documented_claim": "The pinned README/docs claim support but the runner did not execute the scenario.",
+    "unknown": "The runner could not verify the criterion from the pinned source and did not execute a runtime check.",
+      "blocked": "The scenario requires credentials, a real provider session, or mutation of user-global state and was not executed."
+    }
   }
-}

@@ -3,35 +3,95 @@
   "competitors": [
     {
       "id": "local_agent_deck",
+      "introspection_commands": [
+        {
+          "cmd": [
+            "/Users/clarkpeng/.cache/uv/builds-v0/.tmpKFRUEL/bin/python",
+            "-m",
+            "agent_deck.cli",
+            "--help"
+          ],
+          "cwd": "/Users/clarkpeng/.local/share/agent-deck/.cdesktop-workspaces/6897-witnessmesh-bake/agent-deck",
+          "returncode": 0,
+          "started_at": "2026-08-12T22:33:07.068860+00:00",
+          "stderr": "",
+          "stdout": "usage: agent-deck [-h] [--url URL] [--json]\n                  {doctor,list,configure,spawn,message,teammate-spawn,teammate-list,close,service,bridge,bridge-route,bridge-reply} ...\n\npositional arguments:\n  {doctor,list,configure,spawn,message,teammate-spawn,teammate-list,close,service,bridge,bridge-route,bridge-reply}\n    doctor              Verify local orchestration dependencies\n    list                List cdesktop workspaces and sessions\n    configure           Enforce local-only cdesktop settings\n    spawn               Launch a full visible cdesktop workspace\n    message             Send a visible cdesktop follow-up\n    teammate-spawn      Launch a visible same-workspace teammate\n    teammate-list       List the caller's cdesktop team\n    close               Request closeout or archive reconciled work\n    service             Manage the local cdesktop service\n    bridge              Bridge enabled cdesktop sessions into Repowire\n    bridge-route        Enable or disable Repowire routing\n    bridge-reply        Reply to a bridged Repowire ask\n\noptions:\n  -h, --help            show this help message and exit\n  --url URL             Exact local cdesktop backend URL\n  --json                Emit JSON\n"
+        }
+      ],
       "name": "agent-deck (local cdesktop/Repowire bridge)",
       "npm": null,
       "release": null,
       "safe_runtime_scope": {
         "global_install_ran": false,
-        "home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.afqe3a3y/home",
+        "home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/home",
         "provider_sessions_started": false,
-        "tmux_tmpdir": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.afqe3a3y/tmux",
-        "xdg_config_home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.afqe3a3y/home/.config"
+        "tmux_tmpdir": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/tmux",
+        "xdg_config_home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/home/.config"
       },
       "scenarios": {
         "crash_restart_recovery": {
           "commands": [],
           "evidence_type": "observed_static",
+          "limitations": [
+            "Historical local stack note from this bake-off: cdesktop 0.2.3 plus Codex CLI 0.147.0 reached supervised approval/MCP elicitation but stalled, so unattended Codex launch and recovery are qualified rather than counted as fresh runtime pass."
+          ],
           "score": 0.5,
+          "source_evidence": [
+            {
+              "excerpt": "\"KeepAlive\": True,",
+              "file": "src/agent_deck/service.py",
+              "line": 62,
+              "pattern": "\"KeepAlive\": True"
+            },
+            {
+              "excerpt": "LOGGER.warning(\"Bridge %s disconnected: %s\", self.assigned_name, exc)",
+              "file": "src/agent_deck/bridge.py",
+              "line": 73,
+              "pattern": "Bridge .* disconnected"
+            }
+          ],
           "status": "partial",
-          "summary": "launchd KeepAlive covers local cdesktop/bridge services, but provider crash recovery is delegated to cdesktop."
+          "summary": "launchd KeepAlive covers local cdesktop/bridge services; provider-level crash recovery remains qualified by cdesktop/Codex stall evidence."
         },
         "cross_agent_request_reply": {
           "commands": [],
           "evidence_type": "observed_static",
           "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "f\"Repowire ask from @{from_peer}, correlation ID {correlation_id}:\\n\\n{text}\\n\\n\"",
+              "file": "src/agent_deck/bridge.py",
+              "line": 137,
+              "pattern": "Repowire ask from @\\{from_peer\\}"
+            },
+            {
+              "excerpt": "bridge_reply = sub.add_parser(\"bridge-reply\", help=\"Reply to a bridged Repowire ask\")",
+              "file": "src/agent_deck/cli.py",
+              "line": 422,
+              "pattern": "bridge-reply"
+            }
+          ],
           "status": "pass",
-          "summary": "Repowire bridge handles ask frames and bridge-reply sends ack/answer callbacks."
+          "summary": "Repowire asks are injected as cdesktop follow-ups and closed through bridge-reply."
         },
         "dirty_work_refusal": {
           "commands": [],
           "evidence_type": "observed_static",
           "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "\"Refusing to archive dirty repositories. Reconcile them or pass \"",
+              "file": "src/agent_deck/cli.py",
+              "line": 247,
+              "pattern": "Refusing to archive dirty repositories"
+            },
+            {
+              "excerpt": "[\"git\", \"status\", \"--porcelain=v1\", \"--untracked-files=all\"],",
+              "file": "src/agent_deck/cdesktop.py",
+              "line": 136,
+              "pattern": "\"git\", \"status\", \"--porcelain=v1\""
+            }
+          ],
           "status": "pass",
           "summary": "close --archive refuses dirty git repositories unless --preserve-dirty is explicit."
         },
@@ -39,90 +99,187 @@
           "commands": [],
           "evidence_type": "observed_static",
           "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "message = sub.add_parser(\"message\", help=\"Send a visible cdesktop follow-up\")",
+              "file": "src/agent_deck/cli.py",
+              "line": 361,
+              "pattern": "Send a visible cdesktop follow-up"
+            },
+            {
+              "excerpt": "f\"/sessions/{session_id}/follow-up\",",
+              "file": "src/agent_deck/cdesktop.py",
+              "line": 193,
+              "pattern": "\"/sessions/\\{session_id\\}/follow-up\""
+            }
+          ],
           "status": "pass",
-          "summary": "Workers are cdesktop workspaces/sessions; message and closeout commands route visible follow-ups."
+          "summary": "cdesktop workspace/session APIs and visible follow-up commands provide human-visible worker control surfaces."
         },
         "install_uninstall_containment": {
           "commands": [],
           "evidence_type": "observed_static",
           "score": 0.5,
+          "source_evidence": [
+            {
+              "excerpt": "return Path.home() / \"Library\" / \"LaunchAgents\" / f\"{LABEL}.plist\"",
+              "file": "src/agent_deck/service.py",
+              "line": 25,
+              "pattern": "Library.*LaunchAgents"
+            },
+            {
+              "excerpt": "return Path.home() / \".local\" / \"state\" / \"agent-deck\"",
+              "file": "src/agent_deck/service.py",
+              "line": 33,
+              "pattern": "\\.local.*state.*agent-deck"
+            },
+            {
+              "excerpt": "def uninstall() -> None:",
+              "file": "src/agent_deck/service.py",
+              "line": 160,
+              "pattern": "def uninstall"
+            }
+          ],
           "status": "partial",
-          "summary": "service install/uninstall is contained to user LaunchAgents and ~/.local/state logs, but it mutates user launchd state so runtime install is blocked."
+          "summary": "service install/uninstall is scoped to user LaunchAgents and local state paths, but actual install mutates user launchd state so it is not executed by the bake-off."
         },
         "isolated_worktrees": {
           "commands": [],
           "evidence_type": "observed_static",
           "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "topology.add_argument(\"--worktree\", action=\"store_true\")",
+              "file": "src/agent_deck/cli.py",
+              "line": 348,
+              "pattern": "--worktree"
+            },
+            {
+              "excerpt": "\"use_worktree\": use_worktree,",
+              "file": "src/agent_deck/cdesktop.py",
+              "line": 182,
+              "pattern": "\"use_worktree\": use_worktree"
+            }
+          ],
           "status": "pass",
-          "summary": "spawn requires explicit --worktree/--direct and passes use_worktree into cdesktop."
+          "summary": "spawn requires an explicit worktree/direct choice and passes use_worktree into cdesktop."
         },
         "launch_claude_worker": {
-          "commands": [
-            {
-              "cmd": [
-                "/Users/clarkpeng/.cache/uv/builds-v0/.tmpLpgIMV/bin/python",
-                "-m",
-                "agent_deck.cli",
-                "--help"
-              ],
-              "cwd": "/Users/clarkpeng/.local/share/agent-deck/.cdesktop-workspaces/6897-witnessmesh-bake/agent-deck",
-              "returncode": 0,
-              "started_at": "2026-08-12T22:26:22.051264+00:00",
-              "stderr": "",
-              "stdout": "usage: agent-deck [-h] [--url URL] [--json]\n                  {doctor,list,configure,spawn,message,teammate-spawn,teammate-list,close,service,bridge,bridge-route,bridge-reply} ...\n\npositional arguments:\n  {doctor,list,configure,spawn,message,teammate-spawn,teammate-list,close,service,bridge,bridge-route,bridge-reply}\n    doctor              Verify local orchestration dependencies\n    list                List cdesktop workspaces and sessions\n    configure           Enforce local-only cdesktop settings\n    spawn               Launch a full visible cdesktop workspace\n    message             Send a visible cdesktop follow-up\n    teammate-spawn      Launch a visible same-workspace teammate\n    teammate-list       List the caller's cdesktop team\n    close               Request closeout or archive reconciled work\n    service             Manage the local cdesktop service\n    bridge              Bridge enabled cdesktop sessions into Repowire\n    bridge-route        Enable or disable Repowire routing\n    bridge-reply        Reply to a bridged Repowire ask\n\noptions:\n  -h, --help            show this help message and exit\n  --url URL             Exact local cdesktop backend URL\n  --json                Emit JSON\n"
-            }
-          ],
+          "commands": [],
           "evidence_type": "observed_static",
           "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "spawn.add_argument(\"--executor\", choices=[\"CLAUDE_CODE\", \"CODEX\"], required=True)",
+              "file": "src/agent_deck/cli.py",
+              "line": 343,
+              "pattern": "choices=\\[\"CLAUDE_CODE\", \"CODEX\"\\]"
+            },
+            {
+              "excerpt": "\"/workspaces/start\",",
+              "file": "src/agent_deck/cdesktop.py",
+              "line": 174,
+              "pattern": "\"/workspaces/start\""
+            }
+          ],
           "status": "pass",
-          "summary": "CLI spawn accepts executor=CLAUDE_CODE and posts to cdesktop /workspaces/start."
+          "summary": "Static launch surface supports full visible cdesktop Claude Code workspaces; no fresh provider runtime launch was executed."
         },
         "launch_codex_worker": {
-          "commands": [
+          "commands": [],
+          "evidence_type": "observed_static",
+          "limitations": [
+            "Historical local stack note from this bake-off: cdesktop 0.2.3 plus Codex CLI 0.147.0 reached supervised approval/MCP elicitation but stalled, so unattended Codex launch and recovery are qualified rather than counted as fresh runtime pass."
+          ],
+          "score": 0.5,
+          "source_evidence": [
             {
-              "cmd": [
-                "/Users/clarkpeng/.cache/uv/builds-v0/.tmpLpgIMV/bin/python",
-                "-m",
-                "agent_deck.cli",
-                "--help"
-              ],
-              "cwd": "/Users/clarkpeng/.local/share/agent-deck/.cdesktop-workspaces/6897-witnessmesh-bake/agent-deck",
-              "returncode": 0,
-              "started_at": "2026-08-12T22:26:22.051264+00:00",
-              "stderr": "",
-              "stdout": "usage: agent-deck [-h] [--url URL] [--json]\n                  {doctor,list,configure,spawn,message,teammate-spawn,teammate-list,close,service,bridge,bridge-route,bridge-reply} ...\n\npositional arguments:\n  {doctor,list,configure,spawn,message,teammate-spawn,teammate-list,close,service,bridge,bridge-route,bridge-reply}\n    doctor              Verify local orchestration dependencies\n    list                List cdesktop workspaces and sessions\n    configure           Enforce local-only cdesktop settings\n    spawn               Launch a full visible cdesktop workspace\n    message             Send a visible cdesktop follow-up\n    teammate-spawn      Launch a visible same-workspace teammate\n    teammate-list       List the caller's cdesktop team\n    close               Request closeout or archive reconciled work\n    service             Manage the local cdesktop service\n    bridge              Bridge enabled cdesktop sessions into Repowire\n    bridge-route        Enable or disable Repowire routing\n    bridge-reply        Reply to a bridged Repowire ask\n\noptions:\n  -h, --help            show this help message and exit\n  --url URL             Exact local cdesktop backend URL\n  --json                Emit JSON\n"
+              "excerpt": "spawn.add_argument(\"--executor\", choices=[\"CLAUDE_CODE\", \"CODEX\"], required=True)",
+              "file": "src/agent_deck/cli.py",
+              "line": 343,
+              "pattern": "choices=\\[\"CLAUDE_CODE\", \"CODEX\"\\]"
+            },
+            {
+              "excerpt": "\"/workspaces/start\",",
+              "file": "src/agent_deck/cdesktop.py",
+              "line": 174,
+              "pattern": "\"/workspaces/start\""
+            },
+            {
+              "excerpt": "- cdesktop 0.2.3",
+              "file": "docs/compatibility.md",
+              "line": 6,
+              "pattern": "cdesktop 0\\.2\\.3"
+            },
+            {
+              "excerpt": "- Codex CLI 0.147.0",
+              "file": "docs/compatibility.md",
+              "line": 8,
+              "pattern": "Codex CLI 0\\.147\\.0"
             }
           ],
-          "evidence_type": "observed_static",
-          "score": 1.0,
-          "status": "pass",
-          "summary": "CLI spawn accepts executor=CODEX and posts to cdesktop /workspaces/start."
+          "status": "partial",
+          "summary": "Static launch surface supports Codex workspaces, but current local compatibility is qualified by the recorded supervised-approval/MCP-elicitation stall."
         },
         "local_only_operation": {
           "commands": [],
           "evidence_type": "observed_static",
           "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "\"analytics_enabled\": False,",
+              "file": "src/agent_deck/cdesktop.py",
+              "line": 86,
+              "pattern": "\"analytics_enabled\": False"
+            },
+            {
+              "excerpt": "\"relay_enabled\": False,",
+              "file": "src/agent_deck/cdesktop.py",
+              "line": 87,
+              "pattern": "\"relay_enabled\": False"
+            },
+            {
+              "excerpt": "return f\"http://127.0.0.1:{port}\"",
+              "file": "src/agent_deck/service.py",
+              "line": 21,
+              "pattern": "http://127\\.0\\.0\\.1:\\{port\\}"
+            }
+          ],
           "status": "pass",
-          "summary": "configure_local sets analytics_enabled=false, relay_enabled=false, and loopback service URL."
+          "summary": "Local configuration disables analytics/relay and binds the managed service to loopback."
         }
       },
       "source": {
-        "commit": "6f17700d931449ac576fae17de9b6e54cfda1b90",
+        "commit": "7cb660e34adc0f9cfb5b25fe171d449f9104c20f",
         "path": "/Users/clarkpeng/.local/share/agent-deck/.cdesktop-workspaces/6897-witnessmesh-bake/agent-deck",
         "source_mode": "local",
         "version_ref": "6f17700d931449ac576fae17de9b6e54cfda1b90"
       },
       "total": {
-        "percent": 88.9,
+        "percent": 83.3,
         "possible": 9,
-        "score": 8.0
+        "score": 7.5
       }
     },
     {
       "id": "ashesh_agent_deck",
+      "introspection_commands": [
+        {
+          "cmd": [
+            "git",
+            "status",
+            "--short"
+          ],
+          "cwd": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ashesh_agent_deck",
+          "returncode": 0,
+          "started_at": "2026-08-12T22:33:11.743781+00:00",
+          "stderr": "",
+          "stdout": ""
+        }
+      ],
       "name": "asheshgoplani/agent-deck",
       "npm": {
-        "error": "npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/agent-deck - Not found\nnpm error 404\nnpm error 404  'agent-deck@*' is not in this registry.\nnpm error 404\nnpm error 404 Note that you can also install from a\nnpm error 404 tarball, folder, http url, or git url.\nnpm error A complete log of this run can be found in: /var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.afqe3a3y/home/.npm/_logs/2026-08-12T22_26_29_083Z-debug-0.log"
+        "error": "npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/agent-deck - Not found\nnpm error 404\nnpm error 404  'agent-deck@*' is not in this registry.\nnpm error 404\nnpm error 404 Note that you can also install from a\nnpm error 404 tarball, folder, http url, or git url.\nnpm error A complete log of this run can be found in: /var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/home/.npm/_logs/2026-08-12T22_33_12_429Z-debug-0.log"
       },
       "release": {
         "assets": [
@@ -158,91 +315,223 @@
       },
       "safe_runtime_scope": {
         "global_install_ran": false,
-        "home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.afqe3a3y/home",
+        "home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/home",
         "provider_sessions_started": false,
-        "tmux_tmpdir": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.afqe3a3y/tmux",
-        "xdg_config_home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.afqe3a3y/home/.config"
+        "tmux_tmpdir": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/tmux",
+        "xdg_config_home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/home/.config"
       },
       "scenarios": {
         "crash_restart_recovery": {
           "commands": [],
           "evidence_type": "observed_static",
           "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "fmt.Println(\"  agent-deck session restart my-project\")",
+              "file": "cmd/agent-deck/session_cmd.go",
+              "line": 149,
+              "pattern": "session restart"
+            },
+            {
+              "excerpt": "case \"revive\":",
+              "file": "cmd/agent-deck/session_cmd.go",
+              "line": 51,
+              "pattern": "revive"
+            },
+            {
+              "excerpt": "**Rule:** Any code path that starts a Claude session for an `Instance` with a non-empty `ClaudeSessionID` must launch `claude --resume <id>` if `sessionHasConversationData()` returns true, else `claude --session-id <id>`. This applies to `session start`, `session restart`, automatic error-recovery, and conductor-driven restart after tmux teardown.",
+              "file": "docs/SESSION-PERSISTENCE-SPEC.md",
+              "line": 56,
+              "pattern": "session restart"
+            }
+          ],
           "status": "pass",
-          "summary": "session restart/revive and persistence tests are present; conductor bridge drain supervisor restarts after unexpected crashes."
+          "summary": "Pinned source documents restart/revive and session persistence paths."
         },
         "cross_agent_request_reply": {
           "commands": [],
           "evidence_type": "observed_static",
           "score": 0.5,
+          "source_evidence": [
+            {
+              "excerpt": "fmt.Println(\"  agent-deck session output my-project                 # Get last response from session\")",
+              "file": "cmd/agent-deck/session_cmd.go",
+              "line": 161,
+              "pattern": "session output"
+            },
+            {
+              "excerpt": "fmt.Fprintf(&b, \"\\n- waiting on input: %s \u2014 see `agent-deck session output %s --json`, answer with `agent-deck session send %s \\\"...\\\"`\",",
+              "file": "cmd/agent-deck/hook_children_context.go",
+              "line": 96,
+              "pattern": "session send"
+            }
+          ],
           "status": "partial",
-          "summary": "session send/inbox/conductor bridge exists; no host-neutral request/reply bus equivalent to Repowire was observed."
+          "summary": "Pinned source includes session send/inbox/conductor reply paths, but no neutral Repowire-equivalent mesh bridge was found."
         },
         "dirty_work_refusal": {
           "commands": [],
-          "evidence_type": "observed_static",
-          "score": 0.5,
-          "status": "partial",
-          "summary": "Source contains several refusal guards and tests for real-HOME/test safety, but no exact close/archive dirty-work refusal matched the local runner contract."
+          "evidence_type": "unknown",
+          "score": 0.0,
+          "status": "unknown",
+          "summary": "The runner did not find an exact dirty close/archive refusal criterion in the inspected source; this is not blocked by execution, it is unverified."
         },
         "human_visibility_takeover": {
           "commands": [],
-          "evidence_type": "documented_claim",
+          "evidence_type": "observed_static",
           "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "**Agent Deck is mission control for your AI coding agents.** Running Claude Code on ten projects, OpenCode on five more, another agent somewhere in the background? One terminal shows every session \u2014 running, waiting, or done \u2014 and one keystroke switches between them. Groups, search, forking, git worktrees, cost tracking, and a phone-controlled [conductor](#conductor) keep a whole fleet manageable.",
+              "file": "README.md",
+              "line": 22,
+              "pattern": "One terminal shows every session"
+            },
+            {
+              "excerpt": "| `Enter` | Attach to session |",
+              "file": "README.md",
+              "line": 100,
+              "pattern": "Enter.*Attach to session"
+            }
+          ],
           "status": "pass",
-          "summary": "README describes tmux/TUI sessions, attach, pane output, and direct takeover."
+          "summary": "Pinned source describes tmux-backed sessions and attach/takeover behavior."
         },
         "install_uninstall_containment": {
           "commands": [],
           "evidence_type": "observed_static",
           "score": 0.5,
+          "source_evidence": [
+            {
+              "excerpt": "#   --dir <path>        Installation directory (default: ~/.local/bin)",
+              "file": "install.sh",
+              "line": 11,
+              "pattern": "--dir"
+            },
+            {
+              "excerpt": "#   --non-interactive   Skip all prompts (for CI/automated installs)",
+              "file": "install.sh",
+              "line": 14,
+              "pattern": "--non-interactive"
+            },
+            {
+              "excerpt": "#   --dry-run           Show what would be removed without removing",
+              "file": "uninstall.sh",
+              "line": 13,
+              "pattern": "--dry-run"
+            }
+          ],
           "status": "partial",
-          "summary": "Installer supports --dir and --non-interactive; uninstall has --dry-run, but defaults target ~/.local/bin, ~/.agent-deck, Homebrew, and ~/.tmux.conf."
+          "summary": "Installer supports custom install dir and non-interactive mode, and uninstall supports dry-run, but default paths still target user-global locations."
         },
         "isolated_worktrees": {
           "commands": [],
           "evidence_type": "observed_static",
           "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "- `agent-deck add . -c claude --worktree feature/a --new-branch` creates a session in a new worktree",
+              "file": "README.md",
+              "line": 307,
+              "pattern": "agent-deck add .*--worktree"
+            },
+            {
+              "excerpt": "- `agent-deck worktree cleanup` finds and removes orphaned worktrees",
+              "file": "README.md",
+              "line": 310,
+              "pattern": "agent-deck worktree cleanup"
+            }
+          ],
           "status": "pass",
-          "summary": "README and worktree command source support `agent-deck add --worktree` and cleanup."
+          "summary": "Pinned source documents worktree session creation and cleanup."
         },
         "launch_claude_worker": {
           "commands": [],
           "evidence_type": "observed_static",
           "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "agent-deck add . -c claude        # Add current dir with Claude",
+              "file": "README.md",
+              "line": 86,
+              "pattern": "agent-deck add .* -c claude"
+            }
+          ],
           "status": "pass",
-          "summary": "README/CLI source show `agent-deck add ... -c claude` support."
+          "summary": "Pinned source documents direct Claude session launch with `-c claude`."
         },
         "launch_codex_worker": {
           "commands": [],
           "evidence_type": "observed_static",
-          "score": 0.5,
-          "status": "partial",
-          "summary": "README lists Codex status/organization and demos, but source guidance warns manual Codex creation should use helper scripts."
+          "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "fmt.Println(\"  agent-deck add -c codex --model gpt-5.5 .\")",
+              "file": "cmd/agent-deck/main.go",
+              "line": 1413,
+              "pattern": "agent-deck add -c codex"
+            },
+            {
+              "excerpt": "command := fs.String(\"cmd\", \"\", \"Tool/command to run (e.g., 'claude' or 'codex --dangerously-bypass-approvals-and-sandbox')\")",
+              "file": "cmd/agent-deck/main.go",
+              "line": 1300,
+              "pattern": "Tool/command to run .*codex"
+            }
+          ],
+          "status": "pass",
+          "summary": "Pinned source proves direct Codex launch selection with `-c codex`; helper recommendations do not reduce this static launch score."
         },
         "local_only_operation": {
           "commands": [],
           "evidence_type": "observed_static",
-          "score": 0.5,
-          "status": "partial",
-          "summary": "Core TUI is local tmux/XDG state, but optional conductor/remote/mobile channels and account-switching features are in scope."
+          "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "No. Agent Deck creates its own tmux sessions with the prefix `agentdeck_*`. Your existing sessions are untouched. The installer backs up your `~/.tmux.conf` before adding optional config, and you can skip it with `--skip-tmux-config`.",
+              "file": "README.md",
+              "line": 1036,
+              "pattern": "Agent Deck creates its own tmux sessions"
+            },
+            {
+              "excerpt": "No. Agent Deck creates its own tmux sessions with the prefix `agentdeck_*`. Your existing sessions are untouched. The installer backs up your `~/.tmux.conf` before adding optional config, and you can skip it with `--skip-tmux-config`.",
+              "file": "README.md",
+              "line": 1036,
+              "pattern": "Your existing sessions are untouched"
+            }
+          ],
+          "status": "pass",
+          "summary": "Pinned source describes local tmux sessions and says existing tmux sessions are untouched; remote/conductor channels are optional."
         }
       },
       "source": {
         "commit": "2f586c5ca97d0e783bb16213d388bcce9e675e67",
-        "path": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.afqe3a3y/ashesh_agent_deck",
+        "path": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ashesh_agent_deck",
         "source_mode": "git-clone",
         "tag_object": "7262d500c01872fc594e482f2607ecc892572e40",
         "version_ref": "refs/tags/v1.11.0"
       },
       "total": {
-        "percent": 72.2,
+        "percent": 77.8,
         "possible": 9,
-        "score": 6.5
+        "score": 7.0
       }
     },
     {
       "id": "ccb",
+      "introspection_commands": [
+        {
+          "cmd": [
+            "/Users/clarkpeng/.cache/uv/builds-v0/.tmpKFRUEL/bin/python",
+            "ccb.py",
+            "--print-version"
+          ],
+          "cwd": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb",
+          "returncode": 1,
+          "started_at": "2026-08-12T22:33:15.649508+00:00",
+          "stderr": "Traceback (most recent call last):\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/ccb.py\", line 31, in <module>\n    from cli.entrypoint import run_cli_entrypoint\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/cli/entrypoint.py\", line 3, in <module>\n    from .entrypoint_runtime import run_cli_entrypoint\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/cli/entrypoint_runtime.py\", line 9, in <module>\n    from cli.management import cmd_install, cmd_reinstall, cmd_uninstall, cmd_update, cmd_version\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/cli/management.py\", line 3, in <module>\n    from .management_runtime import (\n    ...<18 lines>...\n    )\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/cli/management_runtime/__init__.py\", line 2, in <module>\n    from .commands import cmd_install, cmd_reinstall, cmd_uninstall, cmd_update, cmd_version, find_matching_version, is_newer_version, latest_version\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/cli/management_runtime/commands.py\", line 5, in <module>\n    from .commands_runtime import cmd_install, cmd_reinstall, cmd_uninstall, cmd_update, cmd_version, find_matching_version, is_newer_version, latest_version\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/cli/management_runtime/commands_runtime/__init__.py\", line 3, in <module>\n    from .install import cmd_install, cmd_reinstall, cmd_uninstall\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/cli/management_runtime/commands_runtime/install.py\", line 6, in <module>\n    from cli.services.mobile import prepare_server_mobile_gateway\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/cli/services/mobile.py\", line 11, in <module>\n    from mobile_gateway import (\n    ...<9 lines>...\n    )\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/mobile_gateway/__init__.py\", line 10, in <module>\n    from .relay_admission import RelayAdmissionError, RelayAdmissionSecrets, RelayAdmissionStore\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/mobile_gateway/relay_admission.py\", line 16, in <module>\n    from cryptography.hazmat.primitives import serialization\nModuleNotFoundError: No module named 'cryptography'\n",
+          "stdout": ""
+        }
+      ],
       "name": "SeemSeam/claude_codex_bridge",
       "npm": {
         "dist.tarball": "https://registry.npmjs.org/@seemseam/ccb/-/ccb-8.6.1.tgz",
@@ -308,91 +597,227 @@
       },
       "safe_runtime_scope": {
         "global_install_ran": false,
-        "home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.afqe3a3y/home",
+        "home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/home",
         "provider_sessions_started": false,
-        "tmux_tmpdir": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.afqe3a3y/tmux",
-        "xdg_config_home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.afqe3a3y/home/.config"
+        "tmux_tmpdir": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/tmux",
+        "xdg_config_home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/home/.config"
       },
       "scenarios": {
         "crash_restart_recovery": {
           "commands": [],
           "evidence_type": "observed_static",
           "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "- kill ccbd pid \u540e\u6267\u884c `ccb ask`\uff0c\u786e\u8ba4 keeper / lifecycle \u8fdb\u5165\u786e\u5b9a\u6027\u6062\u590d",
+              "file": "docs/ccbd-lifecycle-test-plan.md",
+              "line": 406,
+              "pattern": "kill ccbd pid"
+            },
+            {
+              "excerpt": "- stale socket path \u5b58\u5728",
+              "file": "docs/ccbd-lifecycle-test-plan.md",
+              "line": 189,
+              "pattern": "stale socket"
+            },
+            {
+              "excerpt": "- crash \u6ce8\u5165\u540e orphan sweep \u662f\u5426\u6536\u53e3",
+              "file": "docs/ccbd-lifecycle-test-plan.md",
+              "line": 134,
+              "pattern": "crash"
+            }
+          ],
           "status": "pass",
-          "summary": "ccbd lifecycle docs and source cover keeper, restart, kill, stale socket, and crash recovery scenarios."
+          "summary": "Pinned source covers keeper, restart, kill, stale socket, and crash recovery scenarios."
         },
         "cross_agent_request_reply": {
           "commands": [],
           "evidence_type": "observed_static",
           "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "/ask reviewer review the latest parser changes and list blocking issues.",
+              "file": "README.md",
+              "line": 216,
+              "pattern": "/ask reviewer"
+            },
+            {
+              "excerpt": "- \u540c\u9879\u76ee\u53cc\u7ec8\u7aef\u5e76\u53d1 `ccb` / `ccb ask`",
+              "file": "docs/ccbd-lifecycle-test-plan.md",
+              "line": 73,
+              "pattern": "ccb ask"
+            },
+            {
+              "excerpt": "| D. Communication matrix | \u9a8c\u8bc1\u8de8 provider \u901a\u8baf\u7a33\u5b9a | codex / claude / gemini / opencode \u95f4 ask\u3001broadcast\u3001reply\u3001interrupted abort\u3001tracker terminal path | reply \u53ef\u8fbe\uff1bprovider-driven terminal progression \u4e0d\u505c\u5728 `accepted` |",
+              "file": "docs/ccbd-lifecycle-test-plan.md",
+              "line": 343,
+              "pattern": "reply"
+            }
+          ],
           "status": "pass",
-          "summary": "`/ask`, `ccb ask`, mailbox, ccbd, and reply lifecycle docs/source are present."
+          "summary": "Pinned source includes `/ask`, `ccb ask`, mailbox, and ccbd request/reply lifecycle coverage."
         },
         "dirty_work_refusal": {
           "commands": [],
-          "evidence_type": "observed_static",
+          "evidence_type": "unknown",
           "score": 0.0,
-          "status": "blocked",
-          "summary": "No exact dirty-work archive/close refusal was found; CCB has guarded cleanup/update policies instead."
+          "status": "unknown",
+          "summary": "The runner did not find an exact dirty close/archive refusal criterion in the inspected source; this is unverified rather than blocked."
         },
         "human_visibility_takeover": {
           "commands": [],
-          "evidence_type": "documented_claim",
+          "evidence_type": "observed_static",
           "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "- Every agent is a full native terminal with visible layout control and direct takeover.",
+              "file": "README.md",
+              "line": 48,
+              "pattern": "Every agent is a full native terminal"
+            },
+            {
+              "excerpt": "- Every agent is a full native terminal with visible layout control and direct takeover.",
+              "file": "README.md",
+              "line": 48,
+              "pattern": "direct takeover"
+            }
+          ],
           "status": "pass",
-          "summary": "README claims every agent is a full native terminal with visible layout control and takeover."
+          "summary": "Pinned source states every agent is a full native terminal with visible layout control and direct takeover."
         },
         "install_uninstall_containment": {
           "commands": [],
           "evidence_type": "observed_static",
           "score": 0.5,
+          "source_evidence": [
+            {
+              "excerpt": "INSTALL_PREFIX=\"${CODEX_INSTALL_PREFIX:-$HOME/.local/share/codex-dual}\"",
+              "file": "install.sh",
+              "line": 5,
+              "pattern": "CODEX_INSTALL_PREFIX"
+            },
+            {
+              "excerpt": "BIN_DIR=\"${CODEX_BIN_DIR:-$HOME/.local/bin}\"",
+              "file": "install.sh",
+              "line": 6,
+              "pattern": "CODEX_BIN_DIR"
+            },
+            {
+              "excerpt": "# which also writes global wrappers, skills, settings, and tmux assets.",
+              "file": "install.sh",
+              "line": 1954,
+              "pattern": "global wrappers"
+            }
+          ],
           "status": "partial",
-          "summary": "Installer supports CODEX_INSTALL_PREFIX/CODEX_BIN_DIR and managed prefixes, but default install writes global wrappers and may pip-install dependencies."
+          "summary": "Installer supports prefix/bin overrides and managed prefixes, but default install can write global wrappers and dependencies."
         },
         "isolated_worktrees": {
           "commands": [],
           "evidence_type": "observed_static",
           "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "work = \"worker1:codex(worktree), worker2:claude(worktree)\"",
+              "file": "README.md",
+              "line": 191,
+              "pattern": "worker1:codex\\(worktree\\)"
+            },
+            {
+              "excerpt": "work = \"worker1:codex(worktree), worker2:claude(worktree)\"",
+              "file": "README.md",
+              "line": 191,
+              "pattern": "worker2:claude\\(worktree\\)"
+            }
+          ],
           "status": "pass",
-          "summary": "README v2 config supports `agent:provider(worktree)` entries."
+          "summary": "Pinned source supports worktree-tagged agents."
         },
         "launch_claude_worker": {
           "commands": [],
           "evidence_type": "observed_static",
           "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "work = \"worker1:codex(worktree), worker2:claude(worktree)\"",
+              "file": "README.md",
+              "line": 191,
+              "pattern": "worker2:claude\\(worktree\\)"
+            },
+            {
+              "excerpt": "review = \"reviewer:claude, qa:gemini\"",
+              "file": "README.md",
+              "line": 192,
+              "pattern": "reviewer:claude"
+            }
+          ],
           "status": "pass",
-          "summary": "README config examples launch `claude` agents in visible panes."
+          "summary": "Pinned source config examples launch Claude agents in visible panes."
         },
         "launch_codex_worker": {
           "commands": [],
           "evidence_type": "observed_static",
           "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "main = \"main:codex\"",
+              "file": "README.md",
+              "line": 190,
+              "pattern": "main:codex"
+            },
+            {
+              "excerpt": "work = \"worker1:codex(worktree), worker2:claude(worktree)\"",
+              "file": "README.md",
+              "line": 191,
+              "pattern": "worker1:codex"
+            }
+          ],
           "status": "pass",
-          "summary": "README config examples launch `codex` agents in visible panes."
+          "summary": "Pinned source config examples launch Codex agents in visible panes."
         },
         "local_only_operation": {
           "commands": [],
           "evidence_type": "observed_static",
-          "score": 0.5,
-          "status": "partial",
-          "summary": "Config UI and gateways bind loopback by default, but mobile remote/relay features exist and must be explicitly scoped."
+          "score": 1.0,
+          "source_evidence": [
+            {
+              "excerpt": "The Config UI always binds to loopback. To use a stable local port and token, configure a token **source** in `.ccb/ccb.config`; never put a literal token in that file:",
+              "file": "README.md",
+              "line": 166,
+              "pattern": "always binds to loopback"
+            },
+            {
+              "excerpt": "- The CCB gateway binds to loopback by default, for example `127.0.0.1:8787`.",
+              "file": "README.md",
+              "line": 253,
+              "pattern": "binds to loopback by default"
+            },
+            {
+              "excerpt": "- For direct LAN access, bind one specific private interface address (wildcard and public addresses are rejected): `ccb install mobile --route-provider lan --listen 192.168.31.155:8787`. The pairing URL is inferred from `--listen`; no forwarding process or `--public-url` is needed.",
+              "file": "README.md",
+              "line": 254,
+              "pattern": "For direct LAN access"
+            }
+          ],
+          "status": "pass",
+          "summary": "Pinned source records loopback defaults and opt-in LAN boundary; optional remote/mobile features are not penalized when disabled."
         }
       },
       "source": {
         "commit": "17bca73f2b1f26debe14a46bb9e166581341c1a3",
-        "path": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.afqe3a3y/ccb",
+        "path": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb",
         "source_mode": "git-clone",
         "tag_object": "8e24ec25921ed1d62fd31d18f7fc84c4e9537e9a",
         "version_ref": "refs/tags/v8.6.1"
       },
       "total": {
-        "percent": 77.8,
+        "percent": 83.3,
         "possible": 9,
-        "score": 7.0
+        "score": 7.5
       }
     }
   ],
-  "generated_at": "2026-08-12T22:26:33.732990+00:00",
+  "generated_at": "2026-08-12T22:33:17.104738+00:00",
   "manifest": "/Users/clarkpeng/.local/share/agent-deck/.cdesktop-workspaces/6897-witnessmesh-bake/agent-deck/benchmarks/bakeoff_manifest.json",
   "schema_version": "2026-08-12.bakeoff-results.v1"
 }
