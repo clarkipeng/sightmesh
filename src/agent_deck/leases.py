@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import socket
@@ -35,18 +36,6 @@ def _identity_key(repo_path: str, worktree_path: str | None) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
-def _pid_is_alive(pid: int | None, hostname: str | None) -> bool:
-    if not pid or hostname not in {None, "", socket.gethostname()}:
-        return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 @dataclass(frozen=True)
 class Lease:
     token: str
@@ -55,8 +44,9 @@ class Lease:
     worktree_path: str | None
     created_at: float
     expires_at: float
-    pid: int
     hostname: str
+    workspace_id: str | None = None
+    session_id: str | None = None
 
     @property
     def expired(self) -> bool:
@@ -64,12 +54,14 @@ class Lease:
 
     @property
     def live(self) -> bool:
-        return not self.expired and _pid_is_alive(self.pid, self.hostname)
+        return not self.expired
 
     def conflicts(self, repo_path: str, worktree_path: str | None) -> bool:
-        return self.repo_path == repo_path or (
-            bool(self.worktree_path) and bool(worktree_path) and self.worktree_path == worktree_path
-        )
+        if self.repo_path != repo_path:
+            return bool(self.worktree_path) and bool(worktree_path) and self.worktree_path == worktree_path
+        if self.worktree_path is None or worktree_path is None:
+            return True
+        return self.worktree_path == worktree_path
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -79,8 +71,9 @@ class Lease:
             "worktree_path": self.worktree_path,
             "created_at": self.created_at,
             "expires_at": self.expires_at,
-            "pid": self.pid,
             "hostname": self.hostname,
+            "workspace_id": self.workspace_id,
+            "session_id": self.session_id,
         }
 
     @classmethod
@@ -92,8 +85,9 @@ class Lease:
             worktree_path=data.get("worktree_path"),
             created_at=float(data["created_at"]),
             expires_at=float(data["expires_at"]),
-            pid=int(data.get("pid") or 0),
             hostname=str(data.get("hostname") or ""),
+            workspace_id=data.get("workspace_id"),
+            session_id=data.get("session_id"),
         )
 
 
@@ -103,6 +97,9 @@ class LeaseStore:
 
     def _lease_path(self, repo_path: str, worktree_path: str | None) -> Path:
         return self.root / f"{_identity_key(repo_path, worktree_path)}.json"
+
+    def _workspace_path(self, workspace_id: str) -> Path:
+        return self.root / "workspaces" / f"{workspace_id}.json"
 
     def _read(self, path: Path) -> Lease | None:
         try:
@@ -118,7 +115,7 @@ class LeaseStore:
         os.replace(tmp, path)
 
     def _with_lock(self):
-        return _DirectoryLock(self.root / ".lock")
+        return _FileLock(self.root / ".lock")
 
     def list(self, include_stale: bool = True) -> list[Lease]:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -146,6 +143,8 @@ class LeaseStore:
         repo_path: str | Path,
         worktree_path: str | Path | None = None,
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
+        workspace_id: str | None = None,
+        session_id: str | None = None,
     ) -> Lease:
         if ttl_seconds <= 0:
             raise LeaseError("ttl_seconds must be positive")
@@ -159,8 +158,9 @@ class LeaseStore:
             worktree_path=worktree,
             created_at=now,
             expires_at=now + ttl_seconds,
-            pid=os.getpid(),
             hostname=socket.gethostname(),
+            workspace_id=workspace_id,
+            session_id=session_id,
         )
         self.root.mkdir(parents=True, exist_ok=True)
         with self._with_lock():
@@ -176,36 +176,167 @@ class LeaseStore:
                         "Repository or worktree is already owned by "
                         f"{existing.owner} until {existing.expires_at}"
                     )
-            self._write_atomic(self._lease_path(repo, worktree), lease)
+            path = self._lease_path(repo, worktree)
+            self._write_atomic(path, lease)
+            if workspace_id:
+                self._write_workspace(workspace_id, lease.token)
         return lease
 
-    def release(self, token: str) -> Lease:
+    def renew(
+        self,
+        token: str,
+        ttl_seconds: int = DEFAULT_TTL_SECONDS,
+        owner: str | None = None,
+        workspace_id: str | None = None,
+    ) -> Lease:
+        if ttl_seconds <= 0:
+            raise LeaseError("ttl_seconds must be positive")
         self.root.mkdir(parents=True, exist_ok=True)
         with self._with_lock():
             for path in sorted(self.root.glob("*.json")):
                 lease = self._read(path)
                 if lease and lease.token == token:
-                    path.unlink(missing_ok=True)
-                    return lease
+                    self._check_owner(lease, owner, workspace_id)
+                    renewed = Lease(
+                        token=lease.token,
+                        owner=lease.owner,
+                        repo_path=lease.repo_path,
+                        worktree_path=lease.worktree_path,
+                        created_at=lease.created_at,
+                        expires_at=_now() + ttl_seconds,
+                        hostname=lease.hostname,
+                        workspace_id=lease.workspace_id,
+                        session_id=lease.session_id,
+                    )
+                    self._write_atomic(path, renewed)
+                    return renewed
         raise LeaseError("No lease found for token")
 
+    def attach_workspace(
+        self, token: str, workspace_id: str, session_id: str | None = None
+    ) -> Lease:
+        self.root.mkdir(parents=True, exist_ok=True)
+        with self._with_lock():
+            for path in sorted(self.root.glob("*.json")):
+                lease = self._read(path)
+                if lease and lease.token == token:
+                    attached = Lease(
+                        token=lease.token,
+                        owner=lease.owner,
+                        repo_path=lease.repo_path,
+                        worktree_path=lease.worktree_path,
+                        created_at=lease.created_at,
+                        expires_at=lease.expires_at,
+                        hostname=lease.hostname,
+                        workspace_id=workspace_id,
+                        session_id=session_id or lease.session_id,
+                    )
+                    self._write_atomic(path, attached)
+                    self._write_workspace(workspace_id, token)
+                    return attached
+        raise LeaseError("No lease found for token")
 
-class _DirectoryLock:
+    def release(
+        self, token: str, owner: str | None = None, workspace_id: str | None = None
+    ) -> Lease:
+        self.root.mkdir(parents=True, exist_ok=True)
+        with self._with_lock():
+            return self._release_locked(token, owner=owner, workspace_id=workspace_id)
+
+    def release_workspace(self, workspace_id: str) -> Lease:
+        self.root.mkdir(parents=True, exist_ok=True)
+        with self._with_lock():
+            token = self._read_workspace(workspace_id)
+            if not token:
+                raise LeaseError(f"No lease found for workspace {workspace_id}")
+            return self._release_locked(token, workspace_id=workspace_id)
+
+    def workspace_token(self, workspace_id: str) -> str | None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        with self._with_lock():
+            return self._read_workspace(workspace_id)
+
+    def assert_spawn_allowed(self, repo_path: str | Path, use_worktree: bool) -> None:
+        repo = _canonical(repo_path)
+        self.root.mkdir(parents=True, exist_ok=True)
+        with self._with_lock():
+            for path in sorted(self.root.glob("*.json")):
+                existing = self._read(path)
+                if not existing:
+                    continue
+                if not existing.live:
+                    path.unlink(missing_ok=True)
+                    continue
+                if existing.repo_path == repo and (not use_worktree or existing.worktree_path is None):
+                    raise LeaseError(
+                        "Repository is already owned by "
+                        f"{existing.owner} until {existing.expires_at}"
+                    )
+
+    def _release_locked(
+        self, token: str, owner: str | None = None, workspace_id: str | None = None
+    ) -> Lease:
+        for path in sorted(self.root.glob("*.json")):
+            lease = self._read(path)
+            if lease and lease.token == token:
+                self._check_owner(lease, owner, workspace_id)
+                path.unlink(missing_ok=True)
+                if lease.workspace_id:
+                    self._workspace_path(lease.workspace_id).unlink(missing_ok=True)
+                return lease
+        raise LeaseError("No lease found for token")
+
+    def _check_owner(
+        self, lease: Lease, owner: str | None = None, workspace_id: str | None = None
+    ) -> None:
+        if owner and lease.owner != owner:
+            raise LeaseError("Lease owner does not match")
+        if workspace_id and lease.workspace_id != workspace_id:
+            raise LeaseError("Lease workspace does not match")
+
+    def _write_workspace(self, workspace_id: str, token: str) -> None:
+        target = self._workspace_path(workspace_id)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+        tmp.write_text(json.dumps({"token": token}, sort_keys=True), encoding="utf-8")
+        os_replace_parent(tmp, target)
+
+    def _read_workspace(self, workspace_id: str) -> str | None:
+        try:
+            data = json.loads(self._workspace_path(workspace_id).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except json.JSONDecodeError as exc:
+            raise LeaseError(f"Invalid workspace lease mapping for {workspace_id}: {exc}") from exc
+        token = data.get("token")
+        return str(token) if token else None
+
+
+def os_replace_parent(tmp: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp.replace(target)
+
+
+class _FileLock:
     def __init__(self, path: Path, timeout: float = 10.0) -> None:
         self.path = path
         self.timeout = timeout
+        self._file: Any = None
 
-    def __enter__(self) -> "_DirectoryLock":
+    def __enter__(self) -> "_FileLock":
         deadline = time.monotonic() + self.timeout
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.path.open("a+")
         while True:
             try:
-                self.path.mkdir()
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return self
-            except FileExistsError:
+            except BlockingIOError:
                 if time.monotonic() >= deadline:
                     raise LeaseError(f"Timed out waiting for lease lock {self.path}")
                 time.sleep(0.05)
 
     def __exit__(self, *_exc: object) -> None:
-        self.path.rmdir()
+        if self._file:
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+            self._file.close()

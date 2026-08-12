@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -11,6 +10,7 @@ from typing import Any
 
 
 SECRET_WORDS = ("token", "secret", "password", "authorization", "cookie", "credential", "key")
+METADATA_SKIP_WORDS = SECRET_WORDS + ("prompt", "transcript", "message")
 SKIP_DIRS = {
     ".git",
     ".venv",
@@ -20,6 +20,7 @@ SKIP_DIRS = {
     "build",
     ".next",
     ".cache",
+    "workspaces",
 }
 
 
@@ -80,7 +81,7 @@ def safe_metadata_files(path: Path) -> list[str]:
         if not root.exists():
             continue
         for item in root.rglob("*"):
-            if item.is_file() and not any(word in item.name.lower() for word in SECRET_WORDS):
+            if item.is_file() and not any(word in item.name.lower() for word in METADATA_SKIP_WORDS):
                 files.append(str(item.relative_to(path)))
     return sorted(files)
 
@@ -195,10 +196,6 @@ def inventory(args: argparse.Namespace) -> dict[str, Any]:
         "workspace_count": len(workspace_paths),
         "workspaces": [inventory_workspace(path) for path in sorted(set(workspace_paths))],
         "sqlite": [sqlite_inventory(path) for path in sorted(set(sqlite_paths))],
-        "environment": {
-            "cwd": os.getcwd(),
-            "user": os.environ.get("USER"),
-        },
     }
 
 

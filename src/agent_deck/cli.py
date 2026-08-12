@@ -148,6 +148,35 @@ def cmd_configure(args: argparse.Namespace) -> int:
     return 0
 
 
+def _workspace_id(result: dict[str, Any]) -> str:
+    workspace = result.get("workspace") if isinstance(result, dict) else None
+    if isinstance(workspace, dict) and workspace.get("id"):
+        return str(workspace["id"])
+    if isinstance(result, dict) and result.get("workspace_id"):
+        return str(result["workspace_id"])
+    raise ValueError("cdesktop did not return a workspace id")
+
+
+def _primary_session_id(result: dict[str, Any]) -> str | None:
+    sessions = result.get("sessions") if isinstance(result, dict) else None
+    if isinstance(sessions, list) and sessions and isinstance(sessions[0], dict):
+        return str(sessions[0].get("id")) if sessions[0].get("id") else None
+    session = result.get("session") if isinstance(result, dict) else None
+    if isinstance(session, dict) and session.get("id"):
+        return str(session["id"])
+    return None
+
+
+def _workspace_container(result: dict[str, Any], client: CdesktopClient, workspace_id: str) -> Path:
+    workspace = result.get("workspace") if isinstance(result, dict) else None
+    container = workspace.get("container_ref") if isinstance(workspace, dict) else None
+    if not container:
+        container = client.workspace(workspace_id).get("container_ref")
+    if not container:
+        raise ValueError("cdesktop did not return a worktree container path")
+    return Path(str(container)).expanduser().resolve()
+
+
 def cmd_spawn(args: argparse.Namespace) -> int:
     prompt = _read_text(args.prompt, args.prompt_file, "prompt")
     if not prompt.strip():
@@ -156,20 +185,61 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     if not repo_path.is_dir():
         raise ValueError(f"Repository path does not exist: {repo_path}")
     client = CdesktopClient(args.url)
-    result = client.spawn_workspace(
-        name=args.name,
-        repo_path=repo_path,
-        target_branch=args.base,
-        executor=args.executor,
-        prompt=prompt,
-        use_worktree=args.worktree,
-        permission_policy=args.permission,
-        model=args.model,
-        reasoning=args.reasoning,
-        provider_id=args.provider,
-    )
+    lease_store = leases.LeaseStore()
+    lease_owner = f"cdesktop-spawn:{args.name}"
+    pending_lease: leases.Lease | None = None
+    if args.worktree:
+        lease_store.assert_spawn_allowed(repo_path, use_worktree=True)
+    else:
+        pending_lease = lease_store.acquire(
+            lease_owner,
+            repo_path,
+            ttl_seconds=args.lease_ttl_seconds,
+        )
+    try:
+        result = client.spawn_workspace(
+            name=args.name,
+            repo_path=repo_path,
+            target_branch=args.base,
+            executor=args.executor,
+            prompt=prompt,
+            use_worktree=args.worktree,
+            permission_policy=args.permission,
+            model=args.model,
+            reasoning=args.reasoning,
+            provider_id=args.provider,
+        )
+    except Exception:
+        if pending_lease:
+            lease_store.release(pending_lease.token)
+        raise
+    workspace_id = _workspace_id(result)
+    session_id = _primary_session_id(result)
+    try:
+        if args.worktree:
+            container = _workspace_container(result, client, workspace_id)
+            lease = lease_store.acquire(
+                lease_owner,
+                repo_path,
+                container / repo_path.name,
+                ttl_seconds=args.lease_ttl_seconds,
+                workspace_id=workspace_id,
+                session_id=session_id,
+            )
+        elif pending_lease:
+            lease = lease_store.attach_workspace(pending_lease.token, workspace_id, session_id)
+        else:
+            lease = None
+    except Exception:
+        if args.worktree:
+            client.stop_workspace(workspace_id)
+        elif pending_lease:
+            lease_store.release(pending_lease.token)
+        raise
     if not args.no_bridge:
-        routing.enable(result["workspace"]["id"])
+        routing.enable(workspace_id)
+    if lease:
+        result["lease"] = lease.to_dict()
     _emit(result, args.json)
     return 0
 
@@ -252,11 +322,17 @@ def cmd_close(args: argparse.Namespace) -> int:
         client.stop_workspace(args.workspace_id)
         archived = client.archive_workspace(args.workspace_id)
         routing.disable(args.workspace_id)
+        released_lease = None
+        try:
+            released_lease = leases.LeaseStore().release_workspace(args.workspace_id).to_dict()
+        except leases.LeaseError:
+            released_lease = None
         _emit(
             {
                 "workspace": archived,
                 "action": "stopped-and-archived",
                 "preserved_dirty": dirty,
+                "released_lease": released_lease,
             },
             args.json,
         )
@@ -353,12 +429,29 @@ def _lease_store(args: argparse.Namespace) -> leases.LeaseStore:
 def cmd_lease(args: argparse.Namespace) -> int:
     store = _lease_store(args)
     if args.lease_action == "acquire":
-        lease = store.acquire(args.owner, args.repo, args.worktree, args.ttl_seconds)
+        lease = store.acquire(
+            args.owner,
+            args.repo,
+            args.worktree,
+            args.ttl_seconds,
+            workspace_id=args.workspace_id,
+            session_id=args.session_id,
+        )
         _emit(lease.to_dict(), args.json)
     elif args.lease_action == "list":
         _emit([lease.to_dict() for lease in store.list(include_stale=args.include_stale)], args.json)
     elif args.lease_action == "release":
-        _emit(store.release(args.token).to_dict(), args.json)
+        _emit(store.release(args.token, owner=args.owner, workspace_id=args.workspace_id).to_dict(), args.json)
+    elif args.lease_action == "renew":
+        _emit(
+            store.renew(
+                args.token,
+                ttl_seconds=args.ttl_seconds,
+                owner=args.owner,
+                workspace_id=args.workspace_id,
+            ).to_dict(),
+            args.json,
+        )
     elif args.lease_action == "recover-stale":
         _emit([lease.to_dict() for lease in store.recover_stale()], args.json)
     else:
@@ -417,6 +510,7 @@ def parser() -> argparse.ArgumentParser:
     spawn.add_argument("--model")
     spawn.add_argument("--reasoning", choices=["low", "medium", "high", "max"])
     spawn.add_argument("--provider", help="Configured cdesktop provider UUID")
+    spawn.add_argument("--lease-ttl-seconds", type=int, default=leases.DEFAULT_TTL_SECONDS)
     spawn.add_argument("--no-bridge", action="store_true")
     spawn.set_defaults(func=cmd_spawn)
 
@@ -522,13 +616,23 @@ def parser() -> argparse.ArgumentParser:
     lease_acquire.add_argument("--repo", required=True)
     lease_acquire.add_argument("--worktree")
     lease_acquire.add_argument("--ttl-seconds", type=int, default=leases.DEFAULT_TTL_SECONDS)
+    lease_acquire.add_argument("--workspace-id")
+    lease_acquire.add_argument("--session-id")
     lease_acquire.set_defaults(func=cmd_lease)
     lease_list = lease_sub.add_parser("list", help="List local ownership leases")
     lease_list.add_argument("--include-stale", action=argparse.BooleanOptionalAction, default=True)
     lease_list.set_defaults(func=cmd_lease)
     lease_release = lease_sub.add_parser("release", help="Release an ownership lease by token")
     lease_release.add_argument("token")
+    lease_release.add_argument("--owner")
+    lease_release.add_argument("--workspace-id")
     lease_release.set_defaults(func=cmd_lease)
+    lease_renew = lease_sub.add_parser("renew", help="Renew an ownership lease by token")
+    lease_renew.add_argument("token")
+    lease_renew.add_argument("--ttl-seconds", type=int, default=leases.DEFAULT_TTL_SECONDS)
+    lease_renew.add_argument("--owner")
+    lease_renew.add_argument("--workspace-id")
+    lease_renew.set_defaults(func=cmd_lease)
     lease_recover = lease_sub.add_parser("recover-stale", help="Remove expired or dead-owner leases")
     lease_recover.set_defaults(func=cmd_lease)
 

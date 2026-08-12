@@ -1,9 +1,14 @@
 import argparse
+from pathlib import Path
 
+import pytest
+
+from agent_deck import cli
 from agent_deck import delivery
 from agent_deck.cli import _read_text
 from agent_deck.cli import parser
 from agent_deck.delivery import DeliveryStore, make_record
+from agent_deck.leases import LeaseStore
 
 
 def test_read_text_requires_one_source(tmp_path) -> None:
@@ -69,3 +74,214 @@ def test_delivery_retry_and_purge_require_exact_keys(monkeypatch, tmp_path, caps
     args = parser().parse_args(["--json", "delivery", "purge", record.idempotency_key])
     assert args.func(args) == 0
     assert '"deleted": 1' in capsys.readouterr().out
+
+
+class FakeSpawnClient:
+    def __init__(self, _url=None) -> None:
+        self.stopped = []
+        self.archived = []
+        self.dirty = []
+        self.workspace_data = {
+            "id": "workspace-a",
+            "container_ref": None,
+            "use_worktree": False,
+        }
+
+    def spawn_workspace(self, **_kwargs):
+        return {"workspace": dict(self.workspace_data), "sessions": [{"id": "session-a"}]}
+
+    def workspace(self, workspace_id):
+        assert workspace_id == "workspace-a"
+        return dict(self.workspace_data)
+
+    def stop_workspace(self, workspace_id):
+        self.stopped.append(workspace_id)
+
+    def archive_workspace(self, workspace_id):
+        self.archived.append(workspace_id)
+        return {"id": workspace_id, "archived": True}
+
+    def dirty_repositories(self, workspace_id):
+        assert workspace_id == "workspace-a"
+        return list(self.dirty)
+
+    def sessions(self, _workspace_id):
+        return [{"id": "session-a", "created_at": "2026-08-12T00:00:00Z"}]
+
+
+def test_spawn_direct_acquires_workspace_lease(monkeypatch, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lease_dir = tmp_path / "leases"
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
+    monkeypatch.setattr(cli, "CdesktopClient", FakeSpawnClient)
+    monkeypatch.setattr(cli.routing, "enable", lambda _workspace_id: None)
+
+    args = argparse.Namespace(
+        prompt="start",
+        prompt_file=None,
+        repo=str(repo),
+        url=None,
+        name="demo",
+        base="main",
+        executor="CODEX",
+        worktree=False,
+        permission="SUPERVISED",
+        model=None,
+        reasoning=None,
+        provider=None,
+        lease_ttl_seconds=60,
+        no_bridge=False,
+        json=True,
+    )
+
+    assert cli.cmd_spawn(args) == 0
+
+    leases = LeaseStore(lease_dir).list()
+    assert len(leases) == 1
+    assert leases[0].repo_path == str(repo.resolve())
+    assert leases[0].worktree_path is None
+    assert leases[0].workspace_id == "workspace-a"
+    assert leases[0].session_id == "session-a"
+
+
+def test_spawn_worktree_acquires_container_lease(monkeypatch, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    container = tmp_path / "container"
+    repo.mkdir()
+    (container / repo.name).mkdir(parents=True)
+    lease_dir = tmp_path / "leases"
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
+    monkeypatch.setattr(cli.routing, "enable", lambda _workspace_id: None)
+
+    class WorktreeClient(FakeSpawnClient):
+        def __init__(self, _url=None) -> None:
+            super().__init__(_url)
+            self.workspace_data = {
+                "id": "workspace-a",
+                "container_ref": str(container),
+                "use_worktree": True,
+            }
+
+    monkeypatch.setattr(cli, "CdesktopClient", WorktreeClient)
+    args = argparse.Namespace(
+        prompt="start",
+        prompt_file=None,
+        repo=str(repo),
+        url=None,
+        name="demo",
+        base="main",
+        executor="CODEX",
+        worktree=True,
+        permission="SUPERVISED",
+        model=None,
+        reasoning=None,
+        provider=None,
+        lease_ttl_seconds=60,
+        no_bridge=False,
+        json=True,
+    )
+
+    assert cli.cmd_spawn(args) == 0
+
+    lease = LeaseStore(lease_dir).list()[0]
+    assert lease.repo_path == str(repo.resolve())
+    assert lease.worktree_path == str((container / repo.name).resolve())
+    assert lease.workspace_id == "workspace-a"
+
+
+def test_close_archive_releases_only_workspace_lease(monkeypatch, tmp_path: Path) -> None:
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    repo_a.mkdir()
+    repo_b.mkdir()
+    lease_dir = tmp_path / "leases"
+    store = LeaseStore(lease_dir)
+    store.acquire("owner-a", repo_a, ttl_seconds=60, workspace_id="workspace-a")
+    other = store.acquire("owner-b", repo_b, ttl_seconds=60, workspace_id="workspace-b")
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
+    monkeypatch.setattr(cli, "CdesktopClient", FakeSpawnClient)
+    monkeypatch.setattr(cli.routing, "disable", lambda _workspace_id: None)
+
+    args = argparse.Namespace(
+        workspace_id="workspace-a",
+        url=None,
+        archive=True,
+        confirm_reconciled=True,
+        preserve_dirty=False,
+        json=True,
+        message=None,
+        message_file=None,
+        sender_session=None,
+    )
+
+    assert cli.cmd_close(args) == 0
+
+    remaining = LeaseStore(lease_dir).list()
+    assert [lease.token for lease in remaining] == [other.token]
+
+
+def test_spawn_direct_fails_closed_when_repo_leased(monkeypatch, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lease_dir = tmp_path / "leases"
+    LeaseStore(lease_dir).acquire("other", repo, ttl_seconds=60)
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
+
+    args = argparse.Namespace(
+        prompt="start",
+        prompt_file=None,
+        repo=str(repo),
+        url=None,
+        name="demo",
+        base="main",
+        executor="CODEX",
+        worktree=False,
+        permission="SUPERVISED",
+        model=None,
+        reasoning=None,
+        provider=None,
+        lease_ttl_seconds=60,
+        no_bridge=True,
+        json=True,
+    )
+
+    with pytest.raises(cli.leases.LeaseError):
+        cli.cmd_spawn(args)
+
+
+def test_spawn_direct_releases_pending_lease_when_cdesktop_start_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lease_dir = tmp_path / "leases"
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
+
+    class FailingClient(FakeSpawnClient):
+        def spawn_workspace(self, **_kwargs):
+            raise RuntimeError("start failed")
+
+    monkeypatch.setattr(cli, "CdesktopClient", FailingClient)
+    args = argparse.Namespace(
+        prompt="start",
+        prompt_file=None,
+        repo=str(repo),
+        url=None,
+        name="demo",
+        base="main",
+        executor="CODEX",
+        worktree=False,
+        permission="SUPERVISED",
+        model=None,
+        reasoning=None,
+        provider=None,
+        lease_ttl_seconds=60,
+        no_bridge=True,
+        json=True,
+    )
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        cli.cmd_spawn(args)
+
+    assert LeaseStore(lease_dir).list() == []

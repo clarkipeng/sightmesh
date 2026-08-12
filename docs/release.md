@@ -9,4 +9,6 @@ Before publishing:
 
 `scripts/package-smoke.sh` builds standard source and wheel artifacts with `python -m build`, installs the wheel into an isolated virtual environment, verifies the `agent-deck` entry point imports, and runs `twine check`.
 
+The compatibility workflow validates Python 3.11 through 3.13 and runs package smoke on each supported version. The package provenance job uses `actions/attest@v4` with `contents: read`, `id-token: write`, and `attestations: write`, and attests the built wheel and sdist subject paths under `dist/`.
+
 Public binary releases require signing with an available project-approved identity. This repository does not declare a signing identity, so unsigned public binary distribution is blocked until the maintainer supplies one and documents the signing command and verification step.
