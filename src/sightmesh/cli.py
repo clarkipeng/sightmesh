@@ -424,6 +424,7 @@ def cmd_failover(args: argparse.Namespace) -> int:
     )
     if not sessions:
         raise ValueError("Source workspace has no session to hand off")
+    lead_session_id = sessions[0]["id"]
     source_session_id = sessions[-1]["id"]
     if not args.new_worktree:
         prompt = (
@@ -436,7 +437,7 @@ def cmd_failover(args: argparse.Namespace) -> int:
             f"{checkpoint.rstrip()}\n"
         )
         replacement = client.spawn_teammate(
-            caller_session=source_session_id,
+            caller_session=lead_session_id,
             name=args.name or f"successor-{profile.name}",
             prompt=prompt,
             executor=profile.executor,
