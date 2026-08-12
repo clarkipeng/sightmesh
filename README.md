@@ -19,6 +19,8 @@ Prerequisites:
 For a fresh machine, run:
 
 ```sh
+git clone https://github.com/clarkipeng/agent-deck.git
+cd agent-deck
 ./scripts/bootstrap-local.sh
 ```
 
