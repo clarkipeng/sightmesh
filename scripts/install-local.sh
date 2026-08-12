@@ -3,6 +3,7 @@ set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
+uv tool uninstall agent-deck >/dev/null 2>&1 || true
 uv tool install --editable "$repo_root" --force
 
 link_skill() {
@@ -13,6 +14,14 @@ link_skill() {
     destination="$skill_root/$skill_name"
     if [ -L "$destination" ] && [ "$(readlink "$destination")" = "$source_path" ]; then
       continue
+    fi
+    if [ -L "$destination" ]; then
+      previous_source=$(readlink "$destination")
+      case "$previous_source" in
+        */agent-deck/skills/"$skill_name")
+          rm "$destination"
+          ;;
+      esac
     fi
     if [ -e "$destination" ] || [ -L "$destination" ]; then
       echo "Refusing to replace existing skill: $destination" >&2
@@ -25,4 +34,4 @@ link_skill() {
 link_skill orchestrate-visible-agents
 link_skill reconcile-agent-work
 
-echo "Installed agent-deck and linked shared Claude/Codex skills."
+echo "Installed SightMesh and linked shared Claude/Codex skills."

@@ -1,8 +1,8 @@
 import asyncio
 import json
 
-from agent_deck.bridge import BridgedSession, RepowireSessionBridge, _backend, _peer_name
-from agent_deck.delivery import DeliveryPolicy, DeliveryStore
+from sightmesh.bridge import BridgedSession, RepowireSessionBridge, _backend, _peer_name
+from sightmesh.delivery import DeliveryPolicy, DeliveryStore
 
 
 class FakeClient:
@@ -68,7 +68,7 @@ def test_plain_ask_becomes_visible_follow_up_and_ack_command(tmp_path) -> None:
     )
     assert client.sent[0][0] == "session-123456"
     assert "Repowire ask from @sender" in client.sent[0][1]
-    assert "agent-deck bridge-reply correlation-1" in client.sent[0][1]
+    assert "sightmesh bridge-reply correlation-1" in client.sent[0][1]
     assert "--question" not in client.sent[0][1]
     assert ws.frames == [
         {

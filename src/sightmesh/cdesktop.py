@@ -19,7 +19,7 @@ class CdesktopError(RuntimeError):
 
 class CdesktopClient:
     def __init__(self, base_url: str | None = None) -> None:
-        configured = base_url or os.environ.get("AGENT_DECK_CDESKTOP_URL")
+        configured = base_url or os.environ.get("SIGHTMESH_CDESKTOP_URL")
         self.base_url = (configured or self._discover_url()).rstrip("/")
 
     @staticmethod
@@ -32,7 +32,7 @@ class CdesktopClient:
         except OSError as exc:
             raise CdesktopError(
                 f"Cannot read {port_file}. Start cdesktop or set "
-                "AGENT_DECK_CDESKTOP_URL."
+                "SIGHTMESH_CDESKTOP_URL."
             ) from exc
 
         try:

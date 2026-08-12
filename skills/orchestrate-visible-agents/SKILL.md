@@ -25,7 +25,7 @@ Read [references/cdesktop-and-repowire.md](references/cdesktop-and-repowire.md) 
 Before spawning, write a bounded prompt containing:
 
 - objective and non-goals;
-- exact repository and base ref, including the 40-character SHA when correctness depends on it;
+- exact repository, an existing base branch, and the frozen 40-character SHA in the prompt when correctness depends on it;
 - owned paths and forbidden paths;
 - expected artifact, checks, branch, PR state, and completion marker;
 - handoff location;
@@ -39,20 +39,20 @@ Search cdesktop and Repowire inventories first. Do not spawn a duplicate worker 
 For isolated implementation:
 
 ```sh
-agent-deck spawn \
+sightmesh spawn \
   --name <name> \
   --repo <repository-root> \
-  --base <exact-ref> \
+  --base <existing-branch> \
   --executor <CLAUDE_CODE|CODEX> \
-  --permission SUPERVISED \
   --prompt-file <prompt-file> \
-  --worktree
+  --worktree \
+  --unattended
 ```
 
 For a read-only teammate in the current cdesktop workspace:
 
 ```sh
-agent-deck teammate-spawn --name <name> --prompt-file <prompt-file>
+sightmesh teammate-spawn --name <name> --prompt-file <prompt-file>
 ```
 
 To mix Claude and Codex in one workspace, pass `--executor`, `--model`, and `--provider` as required by cdesktop. Never synthesize or extract provider credentials.
@@ -62,15 +62,15 @@ To mix Claude and Codex in one workspace, pass `--executor`, `--model`, and `--p
 Within one workspace:
 
 ```sh
-agent-deck teammate-list
-agent-deck message <session-id> --message-file <message-file>
+sightmesh teammate-list
+sightmesh message <session-id> --message-file <message-file>
 ```
 
 Across workspaces, use the visible cdesktop session ID for immediate routing:
 
 ```sh
-agent-deck list
-agent-deck message <session-id> --message-file <message-file>
+sightmesh list
+sightmesh message <session-id> --message-file <message-file>
 ```
 
 Use Repowire for peer discovery, asks, and delivery tracing when the peer reports online:
@@ -80,7 +80,7 @@ repowire peer list -a
 repowire peer ask <peer-name> "<bounded request>"
 ```
 
-For cdesktop, target the online bridge peer whose repository path and backend match the intended session. Repowire chooses the displayed name. Do not target a stale offline identity created by an executor's short-lived app-server hook. If no matching bridge peer is online, use `agent-deck message` and report that Repowire delivery was unavailable.
+For cdesktop, target the online bridge peer whose repository path and backend match the intended session. Repowire chooses the displayed name. Do not target a stale offline identity created by an executor's short-lived app-server hook. If no matching bridge peer is online, use `sightmesh message` and report that Repowire delivery was unavailable.
 
 Use messages for decisions, exact SHAs, ownership transfers, and blockers. Keep durable evidence in the repository or its ignored handoff directory. Repowire is transport, not the sole record.
 

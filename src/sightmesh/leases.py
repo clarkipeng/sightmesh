@@ -20,7 +20,7 @@ class LeaseError(RuntimeError):
 
 
 def default_lease_dir() -> Path:
-    return Path.home() / ".local" / "state" / "agent-deck" / "leases"
+    return Path.home() / ".local" / "state" / "sightmesh" / "leases"
 
 
 def _now() -> float:
@@ -133,7 +133,7 @@ class LeaseStore:
             for path in sorted(self.root.glob("*.json")):
                 lease = self._read(path)
                 if lease and not lease.live:
-                    path.unlink(missing_ok=True)
+                    self._remove_locked(path, lease)
                     recovered.append(lease)
         return recovered
 
@@ -169,7 +169,7 @@ class LeaseStore:
                 if not existing:
                     continue
                 if not existing.live:
-                    path.unlink(missing_ok=True)
+                    self._remove_locked(path, existing)
                     continue
                 if existing.conflicts(repo, worktree):
                     raise LeaseError(
@@ -251,6 +251,43 @@ class LeaseStore:
                 raise LeaseError(f"No lease found for workspace {workspace_id}")
             return self._release_locked(token, workspace_id=workspace_id)
 
+    def release_workspace_if_present(self, workspace_id: str) -> Lease | None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        with self._with_lock():
+            token = self._read_workspace(workspace_id)
+            if not token:
+                return None
+            return self._release_locked(token, workspace_id=workspace_id)
+
+    def renew_workspace(
+        self, workspace_id: str, ttl_seconds: int = DEFAULT_TTL_SECONDS
+    ) -> Lease | None:
+        if ttl_seconds <= 0:
+            raise LeaseError("ttl_seconds must be positive")
+        self.root.mkdir(parents=True, exist_ok=True)
+        with self._with_lock():
+            token = self._read_workspace(workspace_id)
+            if not token:
+                return None
+            for path in sorted(self.root.glob("*.json")):
+                lease = self._read(path)
+                if lease and lease.token == token:
+                    self._check_owner(lease, workspace_id=workspace_id)
+                    renewed = Lease(
+                        token=lease.token,
+                        owner=lease.owner,
+                        repo_path=lease.repo_path,
+                        worktree_path=lease.worktree_path,
+                        created_at=lease.created_at,
+                        expires_at=_now() + ttl_seconds,
+                        hostname=lease.hostname,
+                        workspace_id=lease.workspace_id,
+                        session_id=lease.session_id,
+                    )
+                    self._write_atomic(path, renewed)
+                    return renewed
+            raise LeaseError(f"Workspace lease mapping has no lease record: {workspace_id}")
+
     def workspace_token(self, workspace_id: str) -> str | None:
         self.root.mkdir(parents=True, exist_ok=True)
         with self._with_lock():
@@ -265,7 +302,7 @@ class LeaseStore:
                 if not existing:
                     continue
                 if not existing.live:
-                    path.unlink(missing_ok=True)
+                    self._remove_locked(path, existing)
                     continue
                 if existing.repo_path == repo and (not use_worktree or existing.worktree_path is None):
                     raise LeaseError(
@@ -280,11 +317,14 @@ class LeaseStore:
             lease = self._read(path)
             if lease and lease.token == token:
                 self._check_owner(lease, owner, workspace_id)
-                path.unlink(missing_ok=True)
-                if lease.workspace_id:
-                    self._workspace_path(lease.workspace_id).unlink(missing_ok=True)
+                self._remove_locked(path, lease)
                 return lease
         raise LeaseError("No lease found for token")
+
+    def _remove_locked(self, path: Path, lease: Lease) -> None:
+        path.unlink(missing_ok=True)
+        if lease.workspace_id:
+            self._workspace_path(lease.workspace_id).unlink(missing_ok=True)
 
     def _check_owner(
         self, lease: Lease, owner: str | None = None, workspace_id: str | None = None
@@ -340,3 +380,45 @@ class _FileLock:
         if self._file:
             fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
             self._file.close()
+
+
+def sync_active_workspaces(client: Any, ttl_seconds: int = DEFAULT_TTL_SECONDS) -> list[Lease]:
+    """Renew or backfill leases for every active cdesktop workspace."""
+    store = LeaseStore()
+    synced: list[Lease] = []
+    for workspace in client.workspaces():
+        if workspace.get("archived"):
+            continue
+        workspace_id = str(workspace["id"])
+        renewed = store.renew_workspace(workspace_id, ttl_seconds)
+        if renewed:
+            synced.append(renewed)
+            continue
+        repos = client.workspace_repos(workspace_id)
+        if not repos:
+            raise LeaseError(f"Active workspace has no repository: {workspace_id}")
+        repo = repos[0]
+        repo_path = Path(str(repo["path"])).expanduser().resolve()
+        worktree_path = None
+        if workspace.get("use_worktree"):
+            container = workspace.get("container_ref")
+            if not container:
+                raise LeaseError(f"Active worktree workspace has no container: {workspace_id}")
+            worktree_path = Path(str(container)).expanduser().resolve() / str(repo["name"])
+        sessions = client.sessions(workspace_id)
+        session_id = str(sessions[0]["id"]) if sessions else None
+        try:
+            lease = store.acquire(
+                f"cdesktop-workspace:{workspace_id}",
+                repo_path,
+                worktree_path,
+                ttl_seconds,
+                workspace_id=workspace_id,
+                session_id=session_id,
+            )
+        except LeaseError:
+            lease = store.renew_workspace(workspace_id, ttl_seconds)
+            if not lease:
+                raise
+        synced.append(lease)
+    return synced

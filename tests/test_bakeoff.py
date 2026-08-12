@@ -23,7 +23,7 @@ def test_manifest_schema_contains_required_scenarios() -> None:
     manifest = json.loads(Path("benchmarks/bakeoff_manifest.json").read_text(encoding="utf-8"))
     validate_manifest(manifest)
     assert {item["id"] for item in manifest["competitors"]} == {
-        "local_agent_deck",
+        "local_sightmesh",
         "ashesh_agent_deck",
         "ccb",
     }

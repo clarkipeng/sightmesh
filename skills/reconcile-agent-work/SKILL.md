@@ -55,13 +55,13 @@ Classify every requested item as delivered, explicitly deferred with owner, bloc
 First request closeout from the lead session:
 
 ```sh
-agent-deck close <workspace-id> --message-file <closeout-prompt>
+sightmesh close <workspace-id> --message-file <closeout-prompt>
 ```
 
 After the response is complete and reconciliation passes:
 
 ```sh
-agent-deck close <workspace-id> --archive --confirm-reconciled
+sightmesh close <workspace-id> --archive --confirm-reconciled
 ```
 
 Archiving stops the workspace and hides it from the active list while preserving cdesktop's recorded history. Do not delete the worktree, branch, transcript, or handoff as part of ordinary retirement.

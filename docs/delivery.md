@@ -3,7 +3,7 @@
 The cdesktop to Repowire bridge keeps a local SQLite delivery store at:
 
 ```text
-~/.local/state/agent-deck/delivery.sqlite3
+~/.local/state/sightmesh/delivery.sqlite3
 ```
 
 The store uses SQLite WAL mode and short process-safe transactions so bridge restarts and concurrent local inspectors see a consistent queue. Due records are atomically claimed before any cdesktop send, so competing local bridge workers cannot intentionally inject the same row at the same time.
@@ -52,17 +52,17 @@ Claims expire after 120 seconds by default. Expired `inflight` records return to
 Read-only inspection:
 
 ```sh
-agent-deck delivery status
-agent-deck delivery list --status pending
-agent-deck delivery list --status inflight
-agent-deck delivery list --status dead --session-id <cdesktop-session-id>
+sightmesh delivery status
+sightmesh delivery list --status pending
+sightmesh delivery list --status inflight
+sightmesh delivery list --status dead --session-id <cdesktop-session-id>
 ```
 
 Explicit operations require exact idempotency keys:
 
 ```sh
-agent-deck delivery retry <idempotency-key>
-agent-deck delivery purge <idempotency-key>
+sightmesh delivery retry <idempotency-key>
+sightmesh delivery purge <idempotency-key>
 ```
 
 `retry` moves a retryable non-injected record back to `pending` and resets its retry counter. `purge` deletes only the exact keys provided.

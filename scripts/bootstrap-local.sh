@@ -9,6 +9,6 @@ uv pip install --python "$HOME/.local/share/uv/tools/repowire/bin/python" "mcp<2
 repowire setup --non-interactive --no-update-checks
 
 "$repo_root/scripts/install-local.sh"
-agent-deck service install --no-start
+sightmesh service install --no-start
 
-echo "Bootstrap complete. Review 'agent-deck doctor' before starting the service."
+echo "Bootstrap complete. Review 'sightmesh doctor' before starting the service."

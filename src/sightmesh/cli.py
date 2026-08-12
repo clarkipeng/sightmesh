@@ -177,6 +177,23 @@ def _workspace_container(result: dict[str, Any], client: CdesktopClient, workspa
     return Path(str(container)).expanduser().resolve()
 
 
+def _validate_base_branch(repo_path: Path, base: str) -> None:
+    candidates = [f"refs/heads/{base}", f"refs/remotes/{base}"]
+    for candidate in candidates:
+        result = subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", candidate],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+    raise ValueError(
+        f"--base must name an existing local or remote branch, not a raw commit: {base}"
+    )
+
+
 def cmd_spawn(args: argparse.Namespace) -> int:
     prompt = _read_text(args.prompt, args.prompt_file, "prompt")
     if not prompt.strip():
@@ -184,7 +201,19 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     repo_path = Path(args.repo).expanduser().resolve()
     if not repo_path.is_dir():
         raise ValueError(f"Repository path does not exist: {repo_path}")
+    _validate_base_branch(repo_path, args.base)
+    if args.unattended and not args.worktree:
+        raise ValueError("--unattended requires --worktree")
+    if args.unattended:
+        if args.permission not in {None, "BYPASS_PERMISSIONS"}:
+            raise ValueError("--unattended cannot be combined with a supervised permission policy")
+        permission_policy = "BYPASS_PERMISSIONS"
+    else:
+        permission_policy = args.permission or "SUPERVISED"
+        if permission_policy == "BYPASS_PERMISSIONS":
+            raise ValueError("BYPASS_PERMISSIONS requires explicit --unattended")
     client = CdesktopClient(args.url)
+    leases.sync_active_workspaces(client)
     lease_store = leases.LeaseStore()
     lease_owner = f"cdesktop-spawn:{args.name}"
     pending_lease: leases.Lease | None = None
@@ -204,7 +233,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
             executor=args.executor,
             prompt=prompt,
             use_worktree=args.worktree,
-            permission_policy=args.permission,
+            permission_policy=permission_policy,
             model=args.model,
             reasoning=args.reasoning,
             provider_id=args.provider,
@@ -298,6 +327,8 @@ def cmd_service(args: argparse.Namespace) -> int:
     elif args.action == "open":
         service.open_ui(args.port)
         result = service.status(args.port)
+    elif args.action == "cutover":
+        result = service.cutover(args.port)
     elif args.action == "uninstall":
         service.uninstall()
         result = service.status(args.port)
@@ -322,11 +353,8 @@ def cmd_close(args: argparse.Namespace) -> int:
         client.stop_workspace(args.workspace_id)
         archived = client.archive_workspace(args.workspace_id)
         routing.disable(args.workspace_id)
-        released_lease = None
-        try:
-            released_lease = leases.LeaseStore().release_workspace(args.workspace_id).to_dict()
-        except leases.LeaseError:
-            released_lease = None
+        released = leases.LeaseStore().release_workspace_if_present(args.workspace_id)
+        released_lease = released.to_dict() if released else None
         _emit(
             {
                 "workspace": archived,
@@ -460,10 +488,7 @@ def cmd_lease(args: argparse.Namespace) -> int:
 
 
 def cmd_migration_dry_run(args: argparse.Namespace) -> int:
-    script = Path(__file__).resolve().parents[2] / "scripts" / "migration-dry-run.py"
-    if not script.exists():
-        raise ValueError(f"Migration dry-run script not found: {script}")
-    command = [sys.executable, str(script)]
+    command = [sys.executable, "-m", "sightmesh.migration"]
     for root in args.conductor_root:
         command.extend(["--conductor-root", root])
     if args.json:
@@ -473,7 +498,7 @@ def cmd_migration_dry_run(args: argparse.Namespace) -> int:
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(prog="agent-deck")
+    root = argparse.ArgumentParser(prog="sightmesh")
     root.add_argument("--url", help="Exact local cdesktop backend URL")
     root.add_argument("--json", action="store_true", help="Emit JSON")
     sub = root.add_subparsers(dest="command", required=True)
@@ -487,14 +512,14 @@ def parser() -> argparse.ArgumentParser:
     configure = sub.add_parser("configure", help="Enforce local-only cdesktop settings")
     configure.add_argument(
         "--workspace-root",
-        default=str(Path.home() / ".local" / "share" / "agent-deck"),
+        default=str(Path.home() / ".local" / "share" / "sightmesh"),
     )
     configure.set_defaults(func=cmd_configure)
 
     spawn = sub.add_parser("spawn", help="Launch a full visible cdesktop workspace")
     spawn.add_argument("--name", required=True)
     spawn.add_argument("--repo", required=True)
-    spawn.add_argument("--base", required=True, help="Git branch or ref used as the target base")
+    spawn.add_argument("--base", required=True, help="Existing local or remote Git branch")
     spawn.add_argument("--executor", choices=["CLAUDE_CODE", "CODEX"], required=True)
     prompt_group = spawn.add_mutually_exclusive_group(required=True)
     prompt_group.add_argument("--prompt")
@@ -505,7 +530,12 @@ def parser() -> argparse.ArgumentParser:
     spawn.add_argument(
         "--permission",
         choices=["SUPERVISED", "PLAN", "ACCEPT_EDITS", "BYPASS_PERMISSIONS"],
-        default="SUPERVISED",
+        default=None,
+    )
+    spawn.add_argument(
+        "--unattended",
+        action="store_true",
+        help="Run a worktree-isolated worker without approval prompts",
     )
     spawn.add_argument("--model")
     spawn.add_argument("--reasoning", choices=["low", "medium", "high", "max"])
@@ -531,7 +561,7 @@ def parser() -> argparse.ArgumentParser:
     teammate_spawn.add_argument("--executor", choices=["CLAUDE_CODE", "CODEX"])
     teammate_spawn.add_argument(
         "--permission",
-        choices=["SUPERVISED", "PLAN", "ACCEPT_EDITS", "BYPASS_PERMISSIONS"],
+        choices=["SUPERVISED", "PLAN", "ACCEPT_EDITS"],
     )
     teammate_spawn.add_argument("--model")
     teammate_spawn.add_argument("--reasoning", choices=["low", "medium", "high", "max"])
@@ -559,7 +589,8 @@ def parser() -> argparse.ArgumentParser:
 
     managed = sub.add_parser("service", help="Manage the local cdesktop service")
     managed.add_argument(
-        "action", choices=["install", "start", "stop", "status", "open", "uninstall"]
+        "action",
+        choices=["install", "start", "stop", "status", "open", "cutover", "uninstall"],
     )
     managed.add_argument("--port", type=int, default=service.DEFAULT_PORT)
     managed.add_argument("--no-start", action="store_true")
@@ -648,8 +679,15 @@ def main() -> None:
     args = parser().parse_args()
     try:
         code = args.func(args)
-    except (CdesktopError, DeliveryStoreError, RepowireError, OSError, ValueError) as exc:
-        print(f"agent-deck: {exc}", file=sys.stderr)
+    except (
+        CdesktopError,
+        DeliveryStoreError,
+        leases.LeaseError,
+        RepowireError,
+        OSError,
+        ValueError,
+    ) as exc:
+        print(f"sightmesh: {exc}", file=sys.stderr)
         code = 2
     raise SystemExit(code)
 

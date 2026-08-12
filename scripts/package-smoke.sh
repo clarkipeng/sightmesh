@@ -10,8 +10,15 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   exit 0
 fi
 
+case "${DIST_DIR}" in
+  ""|"."|".."|/*|*/*)
+    echo "package-smoke: DIST_DIR must be one safe relative directory name" >&2
+    exit 2
+    ;;
+esac
+
 rm -rf "${DIST_DIR}"
-"${PYTHON_BIN}" -m build
+"${PYTHON_BIN}" -m build --outdir "${DIST_DIR}"
 venv="$(mktemp -d)"
 cleanup() {
   rm -rf "${venv}"
@@ -19,9 +26,12 @@ cleanup() {
 trap cleanup EXIT
 
 "${PYTHON_BIN}" -m venv "${venv}"
+mkdir -p "${venv}/empty-conductor-root"
 "${venv}/bin/python" -m pip install --upgrade pip >/dev/null
 "${venv}/bin/python" -m pip install "${DIST_DIR}"/*.whl >/dev/null
-"${venv}/bin/agent-deck" --help >/dev/null
-"${venv}/bin/python" -c "import agent_deck, agent_deck.cli, agent_deck.leases"
+"${venv}/bin/sightmesh" --help >/dev/null
+"${venv}/bin/sightmesh" --json migration-dry-run \
+  --conductor-root "${venv}/empty-conductor-root" >/dev/null
+"${venv}/bin/python" -c "import sightmesh, sightmesh.cli, sightmesh.leases"
 "${PYTHON_BIN}" -m twine check "${DIST_DIR}"/*
 echo "package-smoke: artifacts install and metadata validation passed"

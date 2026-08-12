@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 from pathlib import Path
 
 import pytest
 
-from agent_deck.leases import LeaseError, LeaseStore
+from sightmesh.leases import LeaseError, LeaseStore, sync_active_workspaces
+from sightmesh import migration
 
 
 def test_acquire_fails_closed_for_live_repo_owner(tmp_path: Path) -> None:
@@ -152,15 +152,56 @@ def test_recover_stale_removes_expired_leases(tmp_path: Path) -> None:
     assert store.list() == []
 
 
-def test_migration_git_status_parsing() -> None:
-    script = Path(__file__).resolve().parents[1] / "scripts" / "migration-dry-run.py"
-    spec = importlib.util.spec_from_file_location("migration_dry_run", script)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+def test_recover_stale_removes_workspace_mapping(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = LeaseStore(tmp_path / "leases")
+    store.acquire("old", repo, ttl_seconds=1, workspace_id="workspace-a")
+    for path in (tmp_path / "leases").glob("*.json"):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["expires_at"] = 1
+        path.write_text(json.dumps(data), encoding="utf-8")
+    store.recover_stale()
+    assert store.workspace_token("workspace-a") is None
 
-    assert module.parse_porcelain_paths(" M a.txt\nR  old.txt -> new.txt\n?? scratch\n") == [
+
+def test_sync_active_workspaces_backfills_and_renews(monkeypatch, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lease_dir = tmp_path / "leases"
+    monkeypatch.setattr("sightmesh.leases.default_lease_dir", lambda: lease_dir)
+
+    class Client:
+        def workspaces(self):
+            return [{"id": "workspace-a", "archived": False, "use_worktree": False}]
+
+        def workspace_repos(self, workspace_id):
+            assert workspace_id == "workspace-a"
+            return [{"path": str(repo), "name": repo.name}]
+
+        def sessions(self, workspace_id):
+            assert workspace_id == "workspace-a"
+            return [{"id": "session-a"}]
+
+    first = sync_active_workspaces(Client(), ttl_seconds=60)[0]
+    second = sync_active_workspaces(Client(), ttl_seconds=120)[0]
+    assert second.token == first.token
+    assert second.expires_at > first.expires_at
+    assert second.workspace_id == "workspace-a"
+
+
+def test_migration_git_status_parsing() -> None:
+    assert migration.parse_porcelain_paths(" M a.txt\nR  old.txt -> new.txt\n?? scratch\n") == [
         "a.txt",
         "new.txt",
         "scratch",
     ]
+
+
+def test_explicit_migration_root_does_not_add_defaults(monkeypatch, tmp_path: Path) -> None:
+    default_root = tmp_path / "conductor"
+    explicit_root = tmp_path / "explicit"
+    default_root.mkdir()
+    explicit_root.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert migration.conductor_roots([str(explicit_root)]) == [explicit_root.resolve()]

@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 def routing_path() -> Path:
-    return Path.home() / ".config" / "agent-deck" / "bridge.json"
+    return Path.home() / ".config" / "sightmesh" / "bridge.json"
 
 
 def enabled_workspaces() -> set[str]:

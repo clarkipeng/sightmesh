@@ -1,6 +1,6 @@
 import json
 
-from agent_deck import repowire
+from sightmesh import repowire
 
 
 class FakeResponse:

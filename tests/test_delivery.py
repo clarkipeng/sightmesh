@@ -1,6 +1,6 @@
 import pytest
 
-from agent_deck.delivery import (
+from sightmesh.delivery import (
     DeliveryCapacityError,
     DeliveryPolicy,
     DeliveryStore,

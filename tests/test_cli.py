@@ -1,14 +1,15 @@
 import argparse
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from agent_deck import cli
-from agent_deck import delivery
-from agent_deck.cli import _read_text
-from agent_deck.cli import parser
-from agent_deck.delivery import DeliveryStore, make_record
-from agent_deck.leases import LeaseStore
+from sightmesh import cli
+from sightmesh import delivery
+from sightmesh.cli import _read_text
+from sightmesh.cli import parser
+from sightmesh.delivery import DeliveryStore, make_record
+from sightmesh.leases import LeaseStore
 
 
 def test_read_text_requires_one_source(tmp_path) -> None:
@@ -86,9 +87,14 @@ class FakeSpawnClient:
             "container_ref": None,
             "use_worktree": False,
         }
+        self.last_spawn = None
 
-    def spawn_workspace(self, **_kwargs):
+    def spawn_workspace(self, **kwargs):
+        self.last_spawn = kwargs
         return {"workspace": dict(self.workspace_data), "sessions": [{"id": "session-a"}]}
+
+    def workspaces(self):
+        return []
 
     def workspace(self, workspace_id):
         assert workspace_id == "workspace-a"
@@ -115,6 +121,7 @@ def test_spawn_direct_acquires_workspace_lease(monkeypatch, tmp_path: Path) -> N
     lease_dir = tmp_path / "leases"
     monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
     monkeypatch.setattr(cli, "CdesktopClient", FakeSpawnClient)
+    monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
     monkeypatch.setattr(cli.routing, "enable", lambda _workspace_id: None)
 
     args = argparse.Namespace(
@@ -127,6 +134,7 @@ def test_spawn_direct_acquires_workspace_lease(monkeypatch, tmp_path: Path) -> N
         executor="CODEX",
         worktree=False,
         permission="SUPERVISED",
+        unattended=False,
         model=None,
         reasoning=None,
         provider=None,
@@ -153,6 +161,7 @@ def test_spawn_worktree_acquires_container_lease(monkeypatch, tmp_path: Path) ->
     lease_dir = tmp_path / "leases"
     monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
     monkeypatch.setattr(cli.routing, "enable", lambda _workspace_id: None)
+    monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
 
     class WorktreeClient(FakeSpawnClient):
         def __init__(self, _url=None) -> None:
@@ -174,6 +183,7 @@ def test_spawn_worktree_acquires_container_lease(monkeypatch, tmp_path: Path) ->
         executor="CODEX",
         worktree=True,
         permission="SUPERVISED",
+        unattended=False,
         model=None,
         reasoning=None,
         provider=None,
@@ -227,6 +237,7 @@ def test_spawn_direct_fails_closed_when_repo_leased(monkeypatch, tmp_path: Path)
     lease_dir = tmp_path / "leases"
     LeaseStore(lease_dir).acquire("other", repo, ttl_seconds=60)
     monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
+    monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
 
     args = argparse.Namespace(
         prompt="start",
@@ -238,6 +249,7 @@ def test_spawn_direct_fails_closed_when_repo_leased(monkeypatch, tmp_path: Path)
         executor="CODEX",
         worktree=False,
         permission="SUPERVISED",
+        unattended=False,
         model=None,
         reasoning=None,
         provider=None,
@@ -257,6 +269,7 @@ def test_spawn_direct_releases_pending_lease_when_cdesktop_start_fails(
     repo.mkdir()
     lease_dir = tmp_path / "leases"
     monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
+    monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
 
     class FailingClient(FakeSpawnClient):
         def spawn_workspace(self, **_kwargs):
@@ -273,6 +286,7 @@ def test_spawn_direct_releases_pending_lease_when_cdesktop_start_fails(
         executor="CODEX",
         worktree=False,
         permission="SUPERVISED",
+        unattended=False,
         model=None,
         reasoning=None,
         provider=None,
@@ -285,3 +299,97 @@ def test_spawn_direct_releases_pending_lease_when_cdesktop_start_fails(
         cli.cmd_spawn(args)
 
     assert LeaseStore(lease_dir).list() == []
+
+
+def test_validate_base_branch_rejects_raw_commit(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "base",
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    cli._validate_base_branch(repo, "main")
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    with pytest.raises(ValueError, match="raw commit"):
+        cli._validate_base_branch(repo, head)
+
+
+def test_unattended_requires_worktree(monkeypatch, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
+    args = argparse.Namespace(
+        prompt="start",
+        prompt_file=None,
+        repo=str(repo),
+        url=None,
+        name="demo",
+        base="main",
+        executor="CODEX",
+        worktree=False,
+        permission=None,
+        unattended=True,
+        model=None,
+        reasoning=None,
+        provider=None,
+        lease_ttl_seconds=60,
+        no_bridge=True,
+        json=True,
+    )
+    with pytest.raises(ValueError, match="requires --worktree"):
+        cli.cmd_spawn(args)
+
+
+def test_unattended_worktree_selects_bypass(monkeypatch, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    container = tmp_path / "container"
+    repo.mkdir()
+    (container / repo.name).mkdir(parents=True)
+    lease_dir = tmp_path / "leases"
+    instances = []
+
+    class WorktreeClient(FakeSpawnClient):
+        def __init__(self, _url=None) -> None:
+            super().__init__(_url)
+            self.workspace_data["container_ref"] = str(container)
+            self.workspace_data["use_worktree"] = True
+            instances.append(self)
+
+    monkeypatch.setattr(cli, "CdesktopClient", WorktreeClient)
+    monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
+    args = argparse.Namespace(
+        prompt="start",
+        prompt_file=None,
+        repo=str(repo),
+        url=None,
+        name="demo",
+        base="main",
+        executor="CODEX",
+        worktree=True,
+        permission=None,
+        unattended=True,
+        model=None,
+        reasoning=None,
+        provider=None,
+        lease_ttl_seconds=60,
+        no_bridge=True,
+        json=True,
+    )
+    assert cli.cmd_spawn(args) == 0
+    assert instances[0].last_spawn["permission_policy"] == "BYPASS_PERMISSIONS"

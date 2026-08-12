@@ -7,8 +7,8 @@ Before publishing:
 3. Run `scripts/package-smoke.sh`.
 4. Inspect the generated `dist/` artifacts and keep the exact commit SHA in the release notes.
 
-`scripts/package-smoke.sh` builds standard source and wheel artifacts with `python -m build`, installs the wheel into an isolated virtual environment, verifies the `agent-deck` entry point imports, and runs `twine check`.
+`scripts/package-smoke.sh` builds standard source and wheel artifacts with `python -m build`, installs the wheel into an isolated virtual environment, verifies the `sightmesh` entry point and packaged migration command, and runs `twine check`.
 
-The compatibility workflow validates Python 3.11 through 3.13 and runs package smoke on each supported version. The package provenance job uses `actions/attest@v4` with `contents: read`, `id-token: write`, and `attestations: write`, and attests the built wheel and sdist subject paths under `dist/`.
+The compatibility workflow validates Python 3.11 through 3.13 and runs package smoke on each supported version. Tag releases build wheel and sdist artifacts, write SHA-256 checksums, use `actions/attest@v4` with GitHub OIDC provenance, and upload all artifacts to the matching GitHub release.
 
-Public binary releases require signing with an available project-approved identity. This repository does not declare a signing identity, so unsigned public binary distribution is blocked until the maintainer supplies one and documents the signing command and verification step.
+GitHub artifact attestations provide signed Sigstore provenance for the published release assets. Publishing to PyPI or another package index remains a separate maintainer decision and is not performed by the release workflow.

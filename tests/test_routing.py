@@ -1,6 +1,6 @@
 import json
 
-from agent_deck import routing
+from sightmesh import routing
 
 
 def test_routing_preserves_enabled_workspaces_and_peer_identities(monkeypatch, tmp_path) -> None:

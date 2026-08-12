@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from agent_deck.cdesktop import CdesktopClient
+from sightmesh.cdesktop import CdesktopClient
 
 
 class FakeClient(CdesktopClient):
@@ -63,7 +63,7 @@ def test_dirty_repositories_reports_direct_checkout(monkeypatch, tmp_path) -> No
         stdout = "?? pending.txt\n"
         stderr = ""
 
-    monkeypatch.setattr("agent_deck.cdesktop.subprocess.run", lambda *args, **kwargs: Result())
+    monkeypatch.setattr("sightmesh.cdesktop.subprocess.run", lambda *args, **kwargs: Result())
     assert client.dirty_repositories("workspace") == [
         {"path": str(tmp_path), "status": "?? pending.txt"}
     ]

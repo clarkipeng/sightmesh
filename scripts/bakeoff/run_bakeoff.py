@@ -45,7 +45,7 @@ def isolated_env(root: Path) -> dict[str, str]:
             "XDG_DATA_HOME": str(home / ".local" / "share"),
             "XDG_CACHE_HOME": str(home / ".cache"),
             "TMUX_TMPDIR": str(tmux),
-            "AGENT_DECK_BAKEOFF": "1",
+            "SIGHTMESH_BAKEOFF": "1",
         }
     )
     env.pop("TMUX", None)
@@ -133,10 +133,10 @@ def read_texts(root: Path) -> dict[str, str]:
         "cmd/agent-deck/main.go",
         "cmd/agent-deck/session_cmd.go",
         "cmd/agent-deck/hook_children_context.go",
-        "src/agent_deck/cli.py",
-        "src/agent_deck/cdesktop.py",
-        "src/agent_deck/service.py",
-        "src/agent_deck/bridge.py",
+        "src/sightmesh/cli.py",
+        "src/sightmesh/cdesktop.py",
+        "src/sightmesh/service.py",
+        "src/sightmesh/bridge.py",
         "docs/compatibility.md",
         "docs/conductor/README.md",
         "docs/SESSION-PERSISTENCE-SPEC.md",
@@ -241,15 +241,15 @@ def evaluate_local(texts: dict[str, str], commands: list[dict[str, Any]]) -> dic
             texts,
             "pass",
             "Static launch surface supports full visible cdesktop Claude Code workspaces; no fresh provider runtime launch was executed.",
-            [("src/agent_deck/cli.py", r'choices=\["CLAUDE_CODE", "CODEX"\]'), ("src/agent_deck/cdesktop.py", r'"/workspaces/start"')],
+            [("src/sightmesh/cli.py", r'choices=\["CLAUDE_CODE", "CODEX"\]'), ("src/sightmesh/cdesktop.py", r'"/workspaces/start"')],
         ),
         "launch_codex_worker": static_result(
             texts,
             "partial",
             "Static launch surface supports Codex workspaces, but current local compatibility is qualified by the recorded supervised-approval/MCP-elicitation stall.",
             [
-                ("src/agent_deck/cli.py", r'choices=\["CLAUDE_CODE", "CODEX"\]'),
-                ("src/agent_deck/cdesktop.py", r'"/workspaces/start"'),
+                ("src/sightmesh/cli.py", r'choices=\["CLAUDE_CODE", "CODEX"\]'),
+                ("src/sightmesh/cdesktop.py", r'"/workspaces/start"'),
                 ("docs/compatibility.md", r"cdesktop 0\.2\.3"),
                 ("docs/compatibility.md", r"Codex CLI 0\.147\.0"),
             ],
@@ -259,44 +259,44 @@ def evaluate_local(texts: dict[str, str], commands: list[dict[str, Any]]) -> dic
             texts,
             "pass",
             "cdesktop workspace/session APIs and visible follow-up commands provide human-visible worker control surfaces.",
-            [("src/agent_deck/cli.py", r"Send a visible cdesktop follow-up"), ("src/agent_deck/cdesktop.py", r'"/sessions/\{session_id\}/follow-up"')],
+            [("src/sightmesh/cli.py", r"Send a visible cdesktop follow-up"), ("src/sightmesh/cdesktop.py", r'"/sessions/\{session_id\}/follow-up"')],
         ),
         "cross_agent_request_reply": static_result(
             texts,
             "pass",
             "Repowire asks are injected as cdesktop follow-ups and closed through bridge-reply.",
-            [("src/agent_deck/bridge.py", r'Repowire ask from @\{from_peer\}'), ("src/agent_deck/cli.py", r"bridge-reply")],
+            [("src/sightmesh/bridge.py", r'Repowire ask from @\{from_peer\}'), ("src/sightmesh/cli.py", r"bridge-reply")],
         ),
         "isolated_worktrees": static_result(
             texts,
             "pass",
             "spawn requires an explicit worktree/direct choice and passes use_worktree into cdesktop.",
-            [("src/agent_deck/cli.py", r"--worktree"), ("src/agent_deck/cdesktop.py", r'"use_worktree": use_worktree')],
+            [("src/sightmesh/cli.py", r"--worktree"), ("src/sightmesh/cdesktop.py", r'"use_worktree": use_worktree')],
         ),
         "dirty_work_refusal": static_result(
             texts,
             "pass",
             "close --archive refuses dirty git repositories unless --preserve-dirty is explicit.",
-            [("src/agent_deck/cli.py", r"Refusing to archive dirty repositories"), ("src/agent_deck/cdesktop.py", r'"git", "status", "--porcelain=v1"')],
+            [("src/sightmesh/cli.py", r"Refusing to archive dirty repositories"), ("src/sightmesh/cdesktop.py", r'"git", "status", "--porcelain=v1"')],
         ),
         "crash_restart_recovery": static_result(
             texts,
             "partial",
             "launchd KeepAlive covers local cdesktop/bridge services; provider-level crash recovery remains qualified by cdesktop/Codex stall evidence.",
-            [("src/agent_deck/service.py", r'"KeepAlive": True'), ("src/agent_deck/bridge.py", r"Bridge .* disconnected")],
+            [("src/sightmesh/service.py", r'"KeepAlive": True'), ("src/sightmesh/bridge.py", r"Bridge .* disconnected")],
             limitations=[codex_stall],
         ),
         "local_only_operation": static_result(
             texts,
             "pass",
             "Local configuration disables analytics/relay and binds the managed service to loopback.",
-            [("src/agent_deck/cdesktop.py", r'"analytics_enabled": False'), ("src/agent_deck/cdesktop.py", r'"relay_enabled": False'), ("src/agent_deck/service.py", r"http://127\.0\.0\.1:\{port\}")],
+            [("src/sightmesh/cdesktop.py", r'"analytics_enabled": False'), ("src/sightmesh/cdesktop.py", r'"relay_enabled": False'), ("src/sightmesh/service.py", r"http://127\.0\.0\.1:\{port\}")],
         ),
         "install_uninstall_containment": static_result(
             texts,
             "partial",
             "service install/uninstall is scoped to user LaunchAgents and local state paths, but actual install mutates user launchd state so it is not executed by the bake-off.",
-            [("src/agent_deck/service.py", r'Library.*LaunchAgents'), ("src/agent_deck/service.py", r'\.local.*state.*agent-deck'), ("src/agent_deck/service.py", r"def uninstall")],
+            [("src/sightmesh/service.py", r'Library.*LaunchAgents'), ("src/sightmesh/service.py", r'\.local.*state.*sightmesh'), ("src/sightmesh/service.py", r"def uninstall")],
         ),
     }
 
@@ -469,21 +469,21 @@ def score(scenarios: dict[str, Any]) -> dict[str, Any]:
 def run_bakeoff(manifest_path: Path, repo_root: Path, out_path: Path) -> dict[str, Any]:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     validate_manifest(manifest)
-    with tempfile.TemporaryDirectory(prefix="agent-deck-bakeoff.") as temp:
+    with tempfile.TemporaryDirectory(prefix="sightmesh-bakeoff.") as temp:
         work_root = Path(temp)
         env = isolated_env(work_root)
         competitors = []
         for competitor in manifest["competitors"]:
             source_path, pin = clone_or_locate(competitor, repo_root=repo_root, work_root=work_root, env=env)
             commands: list[dict[str, Any]] = []
-            if competitor["id"] == "local_agent_deck":
-                commands.append(run([sys.executable, "-m", "agent_deck.cli", "--help"], cwd=repo_root, env={**env, "PYTHONPATH": str(repo_root / "src")}, timeout=20))
+            if competitor["id"] == "local_sightmesh":
+                commands.append(run([sys.executable, "-m", "sightmesh.cli", "--help"], cwd=repo_root, env={**env, "PYTHONPATH": str(repo_root / "src")}, timeout=20))
             elif competitor["id"] == "ccb":
                 commands.append(run([sys.executable, "ccb.py", "--print-version"], cwd=source_path, env=env, timeout=20))
             else:
                 commands.append(run(["git", "status", "--short"], cwd=source_path, env=env, timeout=20))
             texts = read_texts(source_path)
-            if competitor["id"] == "local_agent_deck":
+            if competitor["id"] == "local_sightmesh":
                 scenarios = evaluate_local(texts, commands)
             elif competitor["id"] == "ashesh_agent_deck":
                 scenarios = evaluate_ash(texts)
@@ -530,7 +530,7 @@ def run_bakeoff(manifest_path: Path, repo_root: Path, out_path: Path) -> dict[st
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run the isolated agent-deck competitor bake-off.")
+    parser = argparse.ArgumentParser(description="Run the isolated SightMesh competitor bake-off.")
     parser.add_argument("--manifest", type=Path, default=Path("benchmarks/bakeoff_manifest.json"))
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--out", type=Path, default=Path("benchmarks/bakeoff_results.json"))

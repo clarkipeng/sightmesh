@@ -11,6 +11,7 @@ from typing import Any
 
 import websockets
 
+from . import leases
 from .cdesktop import CdesktopClient, CdesktopError
 from .delivery import (
     DeliveryCapacityError,
@@ -22,7 +23,7 @@ from .delivery import (
 from .routing import clear_peer_identity, enabled_workspaces, peer_identity, set_peer_identity
 
 
-LOGGER = logging.getLogger("agent-deck.bridge")
+LOGGER = logging.getLogger("sightmesh.bridge")
 
 
 def _peer_name(workspace: dict[str, Any], session: dict[str, Any]) -> str:
@@ -155,7 +156,7 @@ class RepowireSessionBridge:
                 "Do not use native subagents. Complete the bounded request, then acknowledge the "
                 "Repowire ask before ending your response with this command, replacing REPLY with "
                 "a concise answer:\n\n"
-                f"agent-deck bridge-reply {correlation_id} --from-peer {self.assigned_name}"
+                f"sightmesh bridge-reply {correlation_id} --from-peer {self.assigned_name}"
                 f"{question_flag} --message 'REPLY'"
             )
         else:
@@ -313,6 +314,7 @@ class BridgeSupervisor:
         enabled = enabled_workspaces()
         desired: dict[str, BridgedSession] = {}
         try:
+            await asyncio.to_thread(leases.sync_active_workspaces, self.client)
             workspaces = await asyncio.to_thread(self.client.workspaces)
             for workspace in workspaces:
                 if workspace["id"] not in enabled or workspace.get("archived"):
@@ -325,8 +327,8 @@ class BridgeSupervisor:
                     continue
                 for session in sessions:
                     desired[session["id"]] = BridgedSession(workspace, session, path)
-        except CdesktopError as exc:
-            LOGGER.warning("Cannot inventory cdesktop: %s", exc)
+        except (CdesktopError, leases.LeaseError) as exc:
+            LOGGER.warning("Cannot reconcile cdesktop ownership: %s", exc)
             return
 
         for session_id in set(self.tasks) - set(desired):
