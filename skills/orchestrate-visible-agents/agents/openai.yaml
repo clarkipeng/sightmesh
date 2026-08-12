@@ -1,0 +1,4 @@
+interface:
+  display_name: "Orchestrate Visible Agents"
+  short_description: "Launch and coordinate visible local agent workers"
+  default_prompt: "Use $orchestrate-visible-agents to delegate this work through visible cdesktop sessions."

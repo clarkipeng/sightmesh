@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reconcile Agent Work"
+  short_description: "Checkpoint, hand off, and retire agent work safely"
+  default_prompt: "Use $reconcile-agent-work to checkpoint and close this agent assignment safely."
