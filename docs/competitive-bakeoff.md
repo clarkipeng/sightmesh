@@ -1,6 +1,6 @@
 # Competitive Bake-Off
 
-Generated for base `6f17700d931449ac576fae17de9b6e54cfda1b90` on `2026-08-12`.
+Generated for SightMesh base `b570bcf6db8bb287c45d63c427659d9b0f4ba9ea` on `2026-08-12`.
 
 ## Reproduce
 

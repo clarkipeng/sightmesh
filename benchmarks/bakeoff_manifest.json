@@ -1,6 +1,6 @@
 {
   "schema_version": "2026-08-12.bakeoff.v1",
-  "base_commit": "6f17700d931449ac576fae17de9b6e54cfda1b90",
+  "base_commit": "b570bcf6db8bb287c45d63c427659d9b0f4ba9ea",
   "generated_for": "SightMesh visible competitor bake-off",
   "competitors": [
     {

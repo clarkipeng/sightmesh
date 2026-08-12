@@ -54,6 +54,7 @@ def isolated_env(root: Path) -> dict[str, str]:
 
 def run(cmd: list[str], *, cwd: Path, env: dict[str, str], timeout: int = 60) -> dict[str, Any]:
     started = datetime.now(timezone.utc).isoformat()
+    public_cmd = [Path(value).name if Path(value).is_absolute() else value for value in cmd]
     try:
         completed = subprocess.run(
             cmd,
@@ -65,8 +66,8 @@ def run(cmd: list[str], *, cwd: Path, env: dict[str, str], timeout: int = 60) ->
             check=False,
         )
         return {
-            "cmd": cmd,
-            "cwd": str(cwd),
+            "cmd": public_cmd,
+            "cwd": "<isolated-checkout>",
             "started_at": started,
             "returncode": completed.returncode,
             "stdout": completed.stdout[-4000:],
@@ -74,8 +75,8 @@ def run(cmd: list[str], *, cwd: Path, env: dict[str, str], timeout: int = 60) ->
         }
     except subprocess.TimeoutExpired as exc:
         return {
-            "cmd": cmd,
-            "cwd": str(cwd),
+            "cmd": public_cmd,
+            "cwd": "<isolated-checkout>",
             "started_at": started,
             "returncode": None,
             "timed_out": True,
@@ -478,6 +479,7 @@ def run_bakeoff(manifest_path: Path, repo_root: Path, out_path: Path) -> dict[st
             commands: list[dict[str, Any]] = []
             if competitor["id"] == "local_sightmesh":
                 commands.append(run([sys.executable, "-m", "sightmesh.cli", "--help"], cwd=repo_root, env={**env, "PYTHONPATH": str(repo_root / "src")}, timeout=20))
+                commands[-1]["cwd"] = "<workspace>"
             elif competitor["id"] == "ccb":
                 commands.append(run([sys.executable, "ccb.py", "--print-version"], cwd=source_path, env=env, timeout=20))
             else:
@@ -501,14 +503,18 @@ def run_bakeoff(manifest_path: Path, repo_root: Path, out_path: Path) -> dict[st
                 {
                     "id": competitor["id"],
                     "name": competitor["name"],
-                    "source": {**pin, "path": str(source_path), "version_ref": competitor["version_ref"]},
+                    "source": {
+                        **pin,
+                        "path": "." if competitor["kind"] == "local" else f"<isolated-checkout>/{competitor['id']}",
+                        "version_ref": competitor["version_ref"],
+                    },
                     "release": release,
                     "npm": npm,
                     "introspection_commands": commands,
                     "safe_runtime_scope": {
-                        "home": env["HOME"],
-                        "xdg_config_home": env["XDG_CONFIG_HOME"],
-                        "tmux_tmpdir": env["TMUX_TMPDIR"],
+                        "home": "<isolated-home>",
+                        "xdg_config_home": "<isolated-home>/.config",
+                        "tmux_tmpdir": "<isolated-tmux>",
                         "provider_sessions_started": False,
                         "global_install_ran": False,
                     },
@@ -519,7 +525,7 @@ def run_bakeoff(manifest_path: Path, repo_root: Path, out_path: Path) -> dict[st
         results = {
             "schema_version": SCHEMA_VERSION,
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "manifest": str(manifest_path),
+            "manifest": "benchmarks/bakeoff_manifest.json",
             "base_commit": manifest["base_commit"],
             "competitors": competitors,
         }

@@ -1,32 +1,32 @@
 {
-  "base_commit": "6f17700d931449ac576fae17de9b6e54cfda1b90",
+  "base_commit": "b570bcf6db8bb287c45d63c427659d9b0f4ba9ea",
   "competitors": [
     {
-      "id": "local_agent_deck",
+      "id": "local_sightmesh",
       "introspection_commands": [
         {
           "cmd": [
-            "/Users/clarkpeng/.cache/uv/builds-v0/.tmpKFRUEL/bin/python",
+            "python",
             "-m",
-            "agent_deck.cli",
+            "sightmesh.cli",
             "--help"
           ],
-          "cwd": "/Users/clarkpeng/.local/share/agent-deck/.cdesktop-workspaces/6897-witnessmesh-bake/agent-deck",
+          "cwd": "<workspace>",
           "returncode": 0,
-          "started_at": "2026-08-12T22:33:07.068860+00:00",
+          "started_at": "2026-08-12T23:00:35.894678+00:00",
           "stderr": "",
-          "stdout": "usage: agent-deck [-h] [--url URL] [--json]\n                  {doctor,list,configure,spawn,message,teammate-spawn,teammate-list,close,service,bridge,bridge-route,bridge-reply} ...\n\npositional arguments:\n  {doctor,list,configure,spawn,message,teammate-spawn,teammate-list,close,service,bridge,bridge-route,bridge-reply}\n    doctor              Verify local orchestration dependencies\n    list                List cdesktop workspaces and sessions\n    configure           Enforce local-only cdesktop settings\n    spawn               Launch a full visible cdesktop workspace\n    message             Send a visible cdesktop follow-up\n    teammate-spawn      Launch a visible same-workspace teammate\n    teammate-list       List the caller's cdesktop team\n    close               Request closeout or archive reconciled work\n    service             Manage the local cdesktop service\n    bridge              Bridge enabled cdesktop sessions into Repowire\n    bridge-route        Enable or disable Repowire routing\n    bridge-reply        Reply to a bridged Repowire ask\n\noptions:\n  -h, --help            show this help message and exit\n  --url URL             Exact local cdesktop backend URL\n  --json                Emit JSON\n"
+          "stdout": "usage: sightmesh [-h] [--url URL] [--json]\n                 {doctor,list,configure,spawn,message,teammate-spawn,teammate-list,close,service,bridge,bridge-route,bridge-reply,delivery,lease,migration-dry-run} ...\n\npositional arguments:\n  {doctor,list,configure,spawn,message,teammate-spawn,teammate-list,close,service,bridge,bridge-route,bridge-reply,delivery,lease,migration-dry-run}\n    doctor              Verify local orchestration dependencies\n    list                List cdesktop workspaces and sessions\n    configure           Enforce local-only cdesktop settings\n    spawn               Launch a full visible cdesktop workspace\n    message             Send a visible cdesktop follow-up\n    teammate-spawn      Launch a visible same-workspace teammate\n    teammate-list       List the caller's cdesktop team\n    close               Request closeout or archive reconciled work\n    service             Manage the local cdesktop service\n    bridge              Bridge enabled cdesktop sessions into Repowire\n    bridge-route        Enable or disable Repowire routing\n    bridge-reply        Reply to a bridged Repowire ask\n    delivery            Inspect and operate bridge delivery records\n    lease               Inspect and manage local workspace ownership leases\n    migration-dry-run   Read-only Conductor to cdesktop migration inventory\n\noptions:\n  -h, --help            show this help message and exit\n  --url URL             Exact local cdesktop backend URL\n  --json                Emit JSON\n"
         }
       ],
-      "name": "agent-deck (local cdesktop/Repowire bridge)",
+      "name": "SightMesh (local cdesktop/Repowire bridge)",
       "npm": null,
       "release": null,
       "safe_runtime_scope": {
         "global_install_ran": false,
-        "home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/home",
+        "home": "<isolated-home>",
         "provider_sessions_started": false,
-        "tmux_tmpdir": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/tmux",
-        "xdg_config_home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/home/.config"
+        "tmux_tmpdir": "<isolated-tmux>",
+        "xdg_config_home": "<isolated-home>/.config"
       },
       "scenarios": {
         "crash_restart_recovery": {
@@ -39,14 +39,14 @@
           "source_evidence": [
             {
               "excerpt": "\"KeepAlive\": True,",
-              "file": "src/agent_deck/service.py",
-              "line": 62,
+              "file": "src/sightmesh/service.py",
+              "line": 74,
               "pattern": "\"KeepAlive\": True"
             },
             {
               "excerpt": "LOGGER.warning(\"Bridge %s disconnected: %s\", self.assigned_name, exc)",
-              "file": "src/agent_deck/bridge.py",
-              "line": 73,
+              "file": "src/sightmesh/bridge.py",
+              "line": 83,
               "pattern": "Bridge .* disconnected"
             }
           ],
@@ -60,14 +60,14 @@
           "source_evidence": [
             {
               "excerpt": "f\"Repowire ask from @{from_peer}, correlation ID {correlation_id}:\\n\\n{text}\\n\\n\"",
-              "file": "src/agent_deck/bridge.py",
-              "line": 137,
+              "file": "src/sightmesh/bridge.py",
+              "line": 155,
               "pattern": "Repowire ask from @\\{from_peer\\}"
             },
             {
               "excerpt": "bridge_reply = sub.add_parser(\"bridge-reply\", help=\"Reply to a bridged Repowire ask\")",
-              "file": "src/agent_deck/cli.py",
-              "line": 422,
+              "file": "src/sightmesh/cli.py",
+              "line": 609,
               "pattern": "bridge-reply"
             }
           ],
@@ -81,13 +81,13 @@
           "source_evidence": [
             {
               "excerpt": "\"Refusing to archive dirty repositories. Reconcile them or pass \"",
-              "file": "src/agent_deck/cli.py",
-              "line": 247,
+              "file": "src/sightmesh/cli.py",
+              "line": 350,
               "pattern": "Refusing to archive dirty repositories"
             },
             {
               "excerpt": "[\"git\", \"status\", \"--porcelain=v1\", \"--untracked-files=all\"],",
-              "file": "src/agent_deck/cdesktop.py",
+              "file": "src/sightmesh/cdesktop.py",
               "line": 136,
               "pattern": "\"git\", \"status\", \"--porcelain=v1\""
             }
@@ -102,13 +102,13 @@
           "source_evidence": [
             {
               "excerpt": "message = sub.add_parser(\"message\", help=\"Send a visible cdesktop follow-up\")",
-              "file": "src/agent_deck/cli.py",
-              "line": 361,
+              "file": "src/sightmesh/cli.py",
+              "line": 547,
               "pattern": "Send a visible cdesktop follow-up"
             },
             {
               "excerpt": "f\"/sessions/{session_id}/follow-up\",",
-              "file": "src/agent_deck/cdesktop.py",
+              "file": "src/sightmesh/cdesktop.py",
               "line": 193,
               "pattern": "\"/sessions/\\{session_id\\}/follow-up\""
             }
@@ -123,20 +123,20 @@
           "source_evidence": [
             {
               "excerpt": "return Path.home() / \"Library\" / \"LaunchAgents\" / f\"{LABEL}.plist\"",
-              "file": "src/agent_deck/service.py",
-              "line": 25,
+              "file": "src/sightmesh/service.py",
+              "line": 29,
               "pattern": "Library.*LaunchAgents"
             },
             {
-              "excerpt": "return Path.home() / \".local\" / \"state\" / \"agent-deck\"",
-              "file": "src/agent_deck/service.py",
-              "line": 33,
-              "pattern": "\\.local.*state.*agent-deck"
+              "excerpt": "return Path.home() / \".local\" / \"state\" / \"sightmesh\"",
+              "file": "src/sightmesh/service.py",
+              "line": 37,
+              "pattern": "\\.local.*state.*sightmesh"
             },
             {
               "excerpt": "def uninstall() -> None:",
-              "file": "src/agent_deck/service.py",
-              "line": 160,
+              "file": "src/sightmesh/service.py",
+              "line": 291,
               "pattern": "def uninstall"
             }
           ],
@@ -149,14 +149,14 @@
           "score": 1.0,
           "source_evidence": [
             {
-              "excerpt": "topology.add_argument(\"--worktree\", action=\"store_true\")",
-              "file": "src/agent_deck/cli.py",
-              "line": 348,
+              "excerpt": "raise ValueError(\"--unattended requires --worktree\")",
+              "file": "src/sightmesh/cli.py",
+              "line": 206,
               "pattern": "--worktree"
             },
             {
               "excerpt": "\"use_worktree\": use_worktree,",
-              "file": "src/agent_deck/cdesktop.py",
+              "file": "src/sightmesh/cdesktop.py",
               "line": 182,
               "pattern": "\"use_worktree\": use_worktree"
             }
@@ -171,13 +171,13 @@
           "source_evidence": [
             {
               "excerpt": "spawn.add_argument(\"--executor\", choices=[\"CLAUDE_CODE\", \"CODEX\"], required=True)",
-              "file": "src/agent_deck/cli.py",
-              "line": 343,
+              "file": "src/sightmesh/cli.py",
+              "line": 523,
               "pattern": "choices=\\[\"CLAUDE_CODE\", \"CODEX\"\\]"
             },
             {
               "excerpt": "\"/workspaces/start\",",
-              "file": "src/agent_deck/cdesktop.py",
+              "file": "src/sightmesh/cdesktop.py",
               "line": 174,
               "pattern": "\"/workspaces/start\""
             }
@@ -195,13 +195,13 @@
           "source_evidence": [
             {
               "excerpt": "spawn.add_argument(\"--executor\", choices=[\"CLAUDE_CODE\", \"CODEX\"], required=True)",
-              "file": "src/agent_deck/cli.py",
-              "line": 343,
+              "file": "src/sightmesh/cli.py",
+              "line": 523,
               "pattern": "choices=\\[\"CLAUDE_CODE\", \"CODEX\"\\]"
             },
             {
               "excerpt": "\"/workspaces/start\",",
-              "file": "src/agent_deck/cdesktop.py",
+              "file": "src/sightmesh/cdesktop.py",
               "line": 174,
               "pattern": "\"/workspaces/start\""
             },
@@ -228,20 +228,20 @@
           "source_evidence": [
             {
               "excerpt": "\"analytics_enabled\": False,",
-              "file": "src/agent_deck/cdesktop.py",
+              "file": "src/sightmesh/cdesktop.py",
               "line": 86,
               "pattern": "\"analytics_enabled\": False"
             },
             {
               "excerpt": "\"relay_enabled\": False,",
-              "file": "src/agent_deck/cdesktop.py",
+              "file": "src/sightmesh/cdesktop.py",
               "line": 87,
               "pattern": "\"relay_enabled\": False"
             },
             {
               "excerpt": "return f\"http://127.0.0.1:{port}\"",
-              "file": "src/agent_deck/service.py",
-              "line": 21,
+              "file": "src/sightmesh/service.py",
+              "line": 25,
               "pattern": "http://127\\.0\\.0\\.1:\\{port\\}"
             }
           ],
@@ -250,8 +250,8 @@
         }
       },
       "source": {
-        "commit": "7cb660e34adc0f9cfb5b25fe171d449f9104c20f",
-        "path": "/Users/clarkpeng/.local/share/agent-deck/.cdesktop-workspaces/6897-witnessmesh-bake/agent-deck",
+        "commit": "b570bcfd3075b2c12cbd886de9b2f6b93a33f5f6",
+        "path": ".",
         "source_mode": "local",
         "version_ref": "6f17700d931449ac576fae17de9b6e54cfda1b90"
       },
@@ -270,16 +270,16 @@
             "status",
             "--short"
           ],
-          "cwd": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ashesh_agent_deck",
+          "cwd": "<isolated-checkout>",
           "returncode": 0,
-          "started_at": "2026-08-12T22:33:11.743781+00:00",
+          "started_at": "2026-08-12T23:00:40.478037+00:00",
           "stderr": "",
           "stdout": ""
         }
       ],
       "name": "asheshgoplani/agent-deck",
       "npm": {
-        "error": "npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/agent-deck - Not found\nnpm error 404\nnpm error 404  'agent-deck@*' is not in this registry.\nnpm error 404\nnpm error 404 Note that you can also install from a\nnpm error 404 tarball, folder, http url, or git url.\nnpm error A complete log of this run can be found in: /var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/home/.npm/_logs/2026-08-12T22_33_12_429Z-debug-0.log"
+        "error": "npm error code E404\nnpm error 404 Not Found - GET https://registry.npmjs.org/agent-deck - Not found\nnpm error 404\nnpm error 404  'agent-deck@*' is not in this registry.\nnpm error 404\nnpm error 404 Note that you can also install from a\nnpm error 404 tarball, folder, http url, or git url.\nnpm error A complete log of this run can be found in: /var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/sightmesh-bakeoff.b54r5xwx/home/.npm/_logs/2026-08-12T23_00_41_207Z-debug-0.log"
       },
       "release": {
         "assets": [
@@ -315,10 +315,10 @@
       },
       "safe_runtime_scope": {
         "global_install_ran": false,
-        "home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/home",
+        "home": "<isolated-home>",
         "provider_sessions_started": false,
-        "tmux_tmpdir": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/tmux",
-        "xdg_config_home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/home/.config"
+        "tmux_tmpdir": "<isolated-tmux>",
+        "xdg_config_home": "<isolated-home>/.config"
       },
       "scenarios": {
         "crash_restart_recovery": {
@@ -505,7 +505,7 @@
       },
       "source": {
         "commit": "2f586c5ca97d0e783bb16213d388bcce9e675e67",
-        "path": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ashesh_agent_deck",
+        "path": "<isolated-checkout>/ashesh_agent_deck",
         "source_mode": "git-clone",
         "tag_object": "7262d500c01872fc594e482f2607ecc892572e40",
         "version_ref": "refs/tags/v1.11.0"
@@ -521,14 +521,14 @@
       "introspection_commands": [
         {
           "cmd": [
-            "/Users/clarkpeng/.cache/uv/builds-v0/.tmpKFRUEL/bin/python",
+            "python",
             "ccb.py",
             "--print-version"
           ],
-          "cwd": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb",
+          "cwd": "<isolated-checkout>",
           "returncode": 1,
-          "started_at": "2026-08-12T22:33:15.649508+00:00",
-          "stderr": "Traceback (most recent call last):\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/ccb.py\", line 31, in <module>\n    from cli.entrypoint import run_cli_entrypoint\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/cli/entrypoint.py\", line 3, in <module>\n    from .entrypoint_runtime import run_cli_entrypoint\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/cli/entrypoint_runtime.py\", line 9, in <module>\n    from cli.management import cmd_install, cmd_reinstall, cmd_uninstall, cmd_update, cmd_version\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/cli/management.py\", line 3, in <module>\n    from .management_runtime import (\n    ...<18 lines>...\n    )\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/cli/management_runtime/__init__.py\", line 2, in <module>\n    from .commands import cmd_install, cmd_reinstall, cmd_uninstall, cmd_update, cmd_version, find_matching_version, is_newer_version, latest_version\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/cli/management_runtime/commands.py\", line 5, in <module>\n    from .commands_runtime import cmd_install, cmd_reinstall, cmd_uninstall, cmd_update, cmd_version, find_matching_version, is_newer_version, latest_version\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/cli/management_runtime/commands_runtime/__init__.py\", line 3, in <module>\n    from .install import cmd_install, cmd_reinstall, cmd_uninstall\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/cli/management_runtime/commands_runtime/install.py\", line 6, in <module>\n    from cli.services.mobile import prepare_server_mobile_gateway\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/cli/services/mobile.py\", line 11, in <module>\n    from mobile_gateway import (\n    ...<9 lines>...\n    )\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/mobile_gateway/__init__.py\", line 10, in <module>\n    from .relay_admission import RelayAdmissionError, RelayAdmissionSecrets, RelayAdmissionStore\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb/lib/mobile_gateway/relay_admission.py\", line 16, in <module>\n    from cryptography.hazmat.primitives import serialization\nModuleNotFoundError: No module named 'cryptography'\n",
+          "started_at": "2026-08-12T23:00:43.899761+00:00",
+          "stderr": "Traceback (most recent call last):\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/sightmesh-bakeoff.b54r5xwx/ccb/ccb.py\", line 31, in <module>\n    from cli.entrypoint import run_cli_entrypoint\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/sightmesh-bakeoff.b54r5xwx/ccb/lib/cli/entrypoint.py\", line 3, in <module>\n    from .entrypoint_runtime import run_cli_entrypoint\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/sightmesh-bakeoff.b54r5xwx/ccb/lib/cli/entrypoint_runtime.py\", line 9, in <module>\n    from cli.management import cmd_install, cmd_reinstall, cmd_uninstall, cmd_update, cmd_version\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/sightmesh-bakeoff.b54r5xwx/ccb/lib/cli/management.py\", line 3, in <module>\n    from .management_runtime import (\n    ...<18 lines>...\n    )\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/sightmesh-bakeoff.b54r5xwx/ccb/lib/cli/management_runtime/__init__.py\", line 2, in <module>\n    from .commands import cmd_install, cmd_reinstall, cmd_uninstall, cmd_update, cmd_version, find_matching_version, is_newer_version, latest_version\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/sightmesh-bakeoff.b54r5xwx/ccb/lib/cli/management_runtime/commands.py\", line 5, in <module>\n    from .commands_runtime import cmd_install, cmd_reinstall, cmd_uninstall, cmd_update, cmd_version, find_matching_version, is_newer_version, latest_version\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/sightmesh-bakeoff.b54r5xwx/ccb/lib/cli/management_runtime/commands_runtime/__init__.py\", line 3, in <module>\n    from .install import cmd_install, cmd_reinstall, cmd_uninstall\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/sightmesh-bakeoff.b54r5xwx/ccb/lib/cli/management_runtime/commands_runtime/install.py\", line 6, in <module>\n    from cli.services.mobile import prepare_server_mobile_gateway\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/sightmesh-bakeoff.b54r5xwx/ccb/lib/cli/services/mobile.py\", line 11, in <module>\n    from mobile_gateway import (\n    ...<9 lines>...\n    )\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/sightmesh-bakeoff.b54r5xwx/ccb/lib/mobile_gateway/__init__.py\", line 10, in <module>\n    from .relay_admission import RelayAdmissionError, RelayAdmissionSecrets, RelayAdmissionStore\n  File \"/private/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/sightmesh-bakeoff.b54r5xwx/ccb/lib/mobile_gateway/relay_admission.py\", line 16, in <module>\n    from cryptography.hazmat.primitives import serialization\nModuleNotFoundError: No module named 'cryptography'\n",
           "stdout": ""
         }
       ],
@@ -597,10 +597,10 @@
       },
       "safe_runtime_scope": {
         "global_install_ran": false,
-        "home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/home",
+        "home": "<isolated-home>",
         "provider_sessions_started": false,
-        "tmux_tmpdir": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/tmux",
-        "xdg_config_home": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/home/.config"
+        "tmux_tmpdir": "<isolated-tmux>",
+        "xdg_config_home": "<isolated-home>/.config"
       },
       "scenarios": {
         "crash_restart_recovery": {
@@ -805,7 +805,7 @@
       },
       "source": {
         "commit": "17bca73f2b1f26debe14a46bb9e166581341c1a3",
-        "path": "/var/folders/bb/q9_4j2pn5w53238kcp71jh8m0000gn/T/agent-deck-bakeoff.4ozmi595/ccb",
+        "path": "<isolated-checkout>/ccb",
         "source_mode": "git-clone",
         "tag_object": "8e24ec25921ed1d62fd31d18f7fc84c4e9537e9a",
         "version_ref": "refs/tags/v8.6.1"
@@ -817,7 +817,7 @@
       }
     }
   ],
-  "generated_at": "2026-08-12T22:33:17.104738+00:00",
-  "manifest": "/Users/clarkpeng/.local/share/agent-deck/.cdesktop-workspaces/6897-witnessmesh-bake/agent-deck/benchmarks/bakeoff_manifest.json",
+  "generated_at": "2026-08-12T23:00:45.039865+00:00",
+  "manifest": "benchmarks/bakeoff_manifest.json",
   "schema_version": "2026-08-12.bakeoff-results.v1"
 }
