@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from . import leases
 from .cdesktop import CdesktopClient, CdesktopError
 from . import service
 from .bridge import run_bridge
@@ -345,6 +346,39 @@ def cmd_delivery(args: argparse.Namespace) -> int:
     raise ValueError(f"Unknown delivery action: {args.delivery_action}")
 
 
+def _lease_store(args: argparse.Namespace) -> leases.LeaseStore:
+    return leases.LeaseStore(Path(args.lease_dir).expanduser() if args.lease_dir else None)
+
+
+def cmd_lease(args: argparse.Namespace) -> int:
+    store = _lease_store(args)
+    if args.lease_action == "acquire":
+        lease = store.acquire(args.owner, args.repo, args.worktree, args.ttl_seconds)
+        _emit(lease.to_dict(), args.json)
+    elif args.lease_action == "list":
+        _emit([lease.to_dict() for lease in store.list(include_stale=args.include_stale)], args.json)
+    elif args.lease_action == "release":
+        _emit(store.release(args.token).to_dict(), args.json)
+    elif args.lease_action == "recover-stale":
+        _emit([lease.to_dict() for lease in store.recover_stale()], args.json)
+    else:
+        raise ValueError(f"Unknown lease action: {args.lease_action}")
+    return 0
+
+
+def cmd_migration_dry_run(args: argparse.Namespace) -> int:
+    script = Path(__file__).resolve().parents[2] / "scripts" / "migration-dry-run.py"
+    if not script.exists():
+        raise ValueError(f"Migration dry-run script not found: {script}")
+    command = [sys.executable, str(script)]
+    for root in args.conductor_root:
+        command.extend(["--conductor-root", root])
+    if args.json:
+        command.append("--json")
+    result = subprocess.run(command, check=False)
+    return result.returncode
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="agent-deck")
     root.add_argument("--url", help="Exact local cdesktop backend URL")
@@ -479,6 +513,30 @@ def parser() -> argparse.ArgumentParser:
     delivery_purge = delivery_sub.add_parser("purge", help="Purge exact delivery keys")
     delivery_purge.add_argument("idempotency_key", nargs="+")
     delivery_purge.set_defaults(func=cmd_delivery)
+
+    lease = sub.add_parser("lease", help="Inspect and manage local workspace ownership leases")
+    lease.add_argument("--lease-dir", help="Override lease state directory")
+    lease_sub = lease.add_subparsers(dest="lease_action", required=True)
+    lease_acquire = lease_sub.add_parser("acquire", help="Acquire an expiring ownership lease")
+    lease_acquire.add_argument("--owner", required=True)
+    lease_acquire.add_argument("--repo", required=True)
+    lease_acquire.add_argument("--worktree")
+    lease_acquire.add_argument("--ttl-seconds", type=int, default=leases.DEFAULT_TTL_SECONDS)
+    lease_acquire.set_defaults(func=cmd_lease)
+    lease_list = lease_sub.add_parser("list", help="List local ownership leases")
+    lease_list.add_argument("--include-stale", action=argparse.BooleanOptionalAction, default=True)
+    lease_list.set_defaults(func=cmd_lease)
+    lease_release = lease_sub.add_parser("release", help="Release an ownership lease by token")
+    lease_release.add_argument("token")
+    lease_release.set_defaults(func=cmd_lease)
+    lease_recover = lease_sub.add_parser("recover-stale", help="Remove expired or dead-owner leases")
+    lease_recover.set_defaults(func=cmd_lease)
+
+    migration = sub.add_parser(
+        "migration-dry-run", help="Read-only Conductor to cdesktop migration inventory"
+    )
+    migration.add_argument("--conductor-root", action="append", default=[])
+    migration.set_defaults(func=cmd_migration_dry_run)
     return root
 
 
