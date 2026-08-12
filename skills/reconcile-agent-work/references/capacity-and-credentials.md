@@ -5,6 +5,8 @@
 - Detect provider rate limits, context exhaustion, authentication expiry, and unavailable models.
 - Pause new requests and preserve exact work state.
 - Resume through another provider profile or API key that the user explicitly configured through the provider's supported interface.
+- Map supported cdesktop providers to secret-free SightMesh profile names and mark automatic failover only on API or enterprise profiles.
+- Start the replacement as a visible cdesktop successor with `sightmesh failover`; keep the prior session and transcript until reconciliation is complete.
 - Keep each provider profile isolated and label the transition in the handoff.
 - Respect each provider's rate limits, subscription terms, organization policy, and billing controls.
 

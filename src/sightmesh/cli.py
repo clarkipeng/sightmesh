@@ -3,20 +3,26 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import shutil
 import subprocess
 import sys
-import os
 from pathlib import Path
 from typing import Any
 
-from . import leases
-from .cdesktop import CdesktopClient, CdesktopError
-from . import service
+from . import leases, routing, service
 from .bridge import run_bridge
+from .cdesktop import CdesktopClient, CdesktopError
 from .delivery import DeliveryStore, DeliveryStoreError, to_dict
-from . import routing
-from .repowire import RepowireError, reply as repowire_reply
+from .profiles import (
+    Profile,
+    ProfileError,
+    ProfileStore,
+    provider_summary,
+    validate_provider,
+)
+from .repowire import RepowireError
+from .repowire import reply as repowire_reply
 
 
 def _read_text(value: str | None, path: str | None, label: str) -> str:
@@ -43,7 +49,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         client = CdesktopClient(args.url)
         info = client.info()
         config = info["config"]
-        local_ok = config.get("analytics_enabled") is False and config.get("relay_enabled") is False
+        local_ok = (
+            config.get("analytics_enabled") is False
+            and config.get("relay_enabled") is False
+        )
         checks.append(
             {
                 "check": "cdesktop-local-only",
@@ -63,12 +72,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     for command in ("repowire", "codex", "claude", "cdesktop"):
         found = shutil.which(command)
-        checks.append({"check": f"command:{command}", "ok": bool(found), "detail": found})
+        checks.append(
+            {"check": f"command:{command}", "ok": bool(found), "detail": found}
+        )
         failures += int(not bool(found) and command in {"repowire", "cdesktop"})
 
     if shutil.which("repowire"):
         result = subprocess.run(
-            ["repowire", "status"], capture_output=True, text=True, timeout=20, check=False
+            ["repowire", "status"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
         )
         checks.append(
             {
@@ -81,7 +96,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     if shutil.which("claude"):
         result = subprocess.run(
-            ["claude", "auth", "status"], capture_output=True, text=True, timeout=20, check=False
+            ["claude", "auth", "status"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
         )
         try:
             raw_auth = json.loads(result.stdout)
@@ -108,9 +127,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def cmd_list(args: argparse.Namespace) -> int:
     client = CdesktopClient(args.url)
+    summaries = {
+        item["workspace_id"]: item
+        for archived in (False, True)
+        for item in client.workspace_summaries(archived)
+    }
     rows: list[dict[str, Any]] = []
     for workspace in client.workspaces():
         sessions = client.sessions(workspace["id"])
+        summary = summaries.get(workspace["id"], {})
         rows.append(
             {
                 "workspace_id": workspace["id"],
@@ -118,6 +143,13 @@ def cmd_list(args: argparse.Namespace) -> int:
                 "branch": workspace.get("branch"),
                 "archived": workspace.get("archived"),
                 "use_worktree": workspace.get("use_worktree"),
+                "latest_process_status": summary.get("latest_process_status"),
+                "latest_process_completed_at": summary.get(
+                    "latest_process_completed_at"
+                ),
+                "has_pending_approval": bool(summary.get("has_pending_approval")),
+                "has_unseen_turns": bool(summary.get("has_unseen_turns")),
+                "bridge_enabled": workspace["id"] in routing.enabled_workspaces(),
                 "sessions": [
                     {
                         "id": session["id"],
@@ -131,6 +163,39 @@ def cmd_list(args: argparse.Namespace) -> int:
         )
     _emit(rows, args.json)
     return 0
+
+
+def _profile_selection(
+    args: argparse.Namespace, client: CdesktopClient
+) -> tuple[str, str | None, str | None, str | None, str | None]:
+    profile_name = getattr(args, "profile_name", None)
+    if not profile_name:
+        executor = getattr(args, "executor", None)
+        if not executor:
+            raise ValueError("Provide --executor or --profile")
+        return (
+            executor,
+            getattr(args, "provider", None),
+            getattr(args, "model", None),
+            getattr(args, "reasoning", None),
+            None,
+        )
+
+    profile = ProfileStore().get(profile_name)
+    validate_provider(profile, client.providers())
+    executor_override = getattr(args, "executor", None)
+    provider_override = getattr(args, "provider", None)
+    if executor_override and executor_override != profile.executor:
+        raise ValueError("--executor cannot override a profile's executor")
+    if provider_override and provider_override != profile.provider_id:
+        raise ValueError("--provider cannot override a profile's provider")
+    return (
+        profile.executor,
+        profile.provider_id,
+        getattr(args, "model", None) or profile.model,
+        getattr(args, "reasoning", None) or profile.reasoning,
+        profile.name,
+    )
 
 
 def cmd_configure(args: argparse.Namespace) -> int:
@@ -170,7 +235,9 @@ def _primary_session_id(result: dict[str, Any]) -> str | None:
     return None
 
 
-def _workspace_container(result: dict[str, Any], client: CdesktopClient, workspace_id: str) -> Path:
+def _workspace_container(
+    result: dict[str, Any], client: CdesktopClient, workspace_id: str
+) -> Path:
     workspace = result.get("workspace") if isinstance(result, dict) else None
     container = workspace.get("container_ref") if isinstance(workspace, dict) else None
     if not container:
@@ -197,7 +264,7 @@ def _validate_base_branch(repo_path: Path, base: str) -> None:
     )
 
 
-def cmd_spawn(args: argparse.Namespace) -> int:
+def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
     prompt = _read_text(args.prompt, args.prompt_file, "prompt")
     if not prompt.strip():
         raise ValueError("Prompt must not be empty")
@@ -209,7 +276,9 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         raise ValueError("--unattended requires --worktree")
     if args.unattended:
         if args.permission not in {None, "BYPASS_PERMISSIONS"}:
-            raise ValueError("--unattended cannot be combined with a supervised permission policy")
+            raise ValueError(
+                "--unattended cannot be combined with a supervised permission policy"
+            )
         permission_policy = "BYPASS_PERMISSIONS"
     else:
         permission_policy = args.permission or "SUPERVISED"
@@ -219,6 +288,9 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     lease_store.assert_spawn_allowed(repo_path, use_worktree=args.worktree)
     client = CdesktopClient(args.url)
     leases.sync_active_workspaces(client)
+    executor, provider_id, model, reasoning, profile_name = _profile_selection(
+        args, client
+    )
     lease_owner = f"cdesktop-spawn:{args.name}"
     pending_lease: leases.Lease | None = None
     if args.worktree:
@@ -234,13 +306,13 @@ def cmd_spawn(args: argparse.Namespace) -> int:
             name=args.name,
             repo_path=repo_path,
             target_branch=args.base,
-            executor=args.executor,
+            executor=executor,
             prompt=prompt,
             use_worktree=args.worktree,
             permission_policy=permission_policy,
-            model=args.model,
-            reasoning=args.reasoning,
-            provider_id=args.provider,
+            model=model,
+            reasoning=reasoning,
+            provider_id=provider_id,
         )
     except Exception:
         if pending_lease:
@@ -260,7 +332,9 @@ def cmd_spawn(args: argparse.Namespace) -> int:
                 session_id=session_id,
             )
         elif pending_lease:
-            lease = lease_store.attach_workspace(pending_lease.token, workspace_id, session_id)
+            lease = lease_store.attach_workspace(
+                pending_lease.token, workspace_id, session_id
+            )
         else:
             lease = None
     except Exception:
@@ -273,13 +347,181 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         routing.enable(workspace_id)
     if lease:
         result["lease"] = lease.to_dict()
+    if profile_name:
+        result["profile"] = profile_name
+    return result
+
+
+def cmd_spawn(args: argparse.Namespace) -> int:
+    result = _spawn_workspace(args)
     _emit(result, args.json)
     return 0
 
 
 def cmd_message(args: argparse.Namespace) -> int:
     message = _read_text(args.message, args.message_file, "message")
-    result = CdesktopClient(args.url).send(args.session_id, message, args.sender_session)
+    result = CdesktopClient(args.url).send(
+        args.session_id, message, args.sender_session
+    )
+    _emit(result, args.json)
+    return 0
+
+
+def cmd_prompt_idle(args: argparse.Namespace) -> int:
+    message = _read_text(args.message, args.message_file, "message")
+    client = CdesktopClient(args.url)
+    session = client.session(args.session_id)
+    workspace_id = session["workspace_id"]
+    summary = next(
+        (
+            item
+            for item in client.workspace_summaries(False)
+            if item.get("workspace_id") == workspace_id
+        ),
+        None,
+    )
+    if not summary:
+        raise ValueError("Target session is not in an active cdesktop workspace")
+    if summary.get("latest_process_status") == "running":
+        raise ValueError("Target workspace is running; refusing idle-only prompt")
+    if summary.get("has_pending_approval"):
+        raise ValueError(
+            "Target workspace has a pending approval; refusing idle-only prompt"
+        )
+    result = client.send(args.session_id, message, args.sender_session)
+    _emit(
+        {
+            "workspace_id": workspace_id,
+            "session_id": args.session_id,
+            "verified_idle": True,
+            "follow_up": result,
+        },
+        args.json,
+    )
+    return 0
+
+
+def cmd_failover(args: argparse.Namespace) -> int:
+    checkpoint = _read_text(args.checkpoint, args.checkpoint_file, "checkpoint")
+    if not checkpoint.strip():
+        raise ValueError("Checkpoint must not be empty")
+    if args.archive_source and not args.confirm_reconciled:
+        raise ValueError("--archive-source requires --confirm-reconciled")
+    if args.archive_source and not args.new_worktree:
+        raise ValueError("--archive-source requires --new-worktree")
+    client = CdesktopClient(args.url)
+    source = client.workspace(args.workspace_id)
+    if source.get("archived"):
+        raise ValueError("Cannot fail over an archived workspace")
+    profile = ProfileStore().get(args.profile_name)
+    if not profile.automatic_failover:
+        raise ValueError(
+            f"Profile {profile.name} is not approved for automatic failover"
+        )
+    validate_provider(profile, client.providers())
+    sessions = sorted(
+        client.sessions(args.workspace_id), key=lambda item: item["created_at"]
+    )
+    if not sessions:
+        raise ValueError("Source workspace has no session to hand off")
+    source_session_id = sessions[-1]["id"]
+    if not args.new_worktree:
+        prompt = (
+            "Take over this visible workspace after a checkpointed capacity or provider "
+            "handoff. The prior session remains in the cdesktop transcript. First inspect "
+            "the branch, HEAD, working tree, and remaining scope before writing.\n\n"
+            f"Source cdesktop session: {source_session_id}\n"
+            f"Destination profile: {profile.name}\n\n"
+            "Checkpoint:\n"
+            f"{checkpoint.rstrip()}\n"
+        )
+        replacement = client.spawn_teammate(
+            caller_session=source_session_id,
+            name=args.name or f"successor-{profile.name}",
+            prompt=prompt,
+            executor=profile.executor,
+            permission_policy="BYPASS_PERMISSIONS" if args.unattended else "SUPERVISED",
+            model=profile.model,
+            reasoning=profile.reasoning,
+            provider_id=profile.provider_id,
+        )
+        _emit(
+            {
+                "action": "visible-successor-started",
+                "workspace_id": args.workspace_id,
+                "source_session_id": source_session_id,
+                "source_preserved": True,
+                "profile": profile.name,
+                "replacement": replacement,
+            },
+            args.json,
+        )
+        return 0
+
+    repos = client.workspace_repos(args.workspace_id)
+    if len(repos) != 1:
+        raise ValueError(
+            "New-worktree failover currently requires exactly one repository"
+        )
+    dirty = client.dirty_repositories(args.workspace_id)
+    if dirty:
+        raise ValueError(
+            "New-worktree failover requires a clean checkpointed source workspace. "
+            f"Dirty state: {json.dumps(dirty)}"
+        )
+    repo = repos[0]
+    source_branch = source.get("branch") or repo.get("target_branch")
+    if not source_branch:
+        raise ValueError("Source workspace has no branch for failover")
+    prompt = (
+        "Resume a checkpointed visible-agent handoff. First verify the branch, HEAD, "
+        "working tree, and remaining scope before writing.\n\n"
+        f"Source cdesktop workspace: {args.workspace_id}\n"
+        f"Source branch: {source_branch}\n"
+        f"Destination profile: {profile.name}\n\n"
+        "Checkpoint:\n"
+        f"{checkpoint.rstrip()}\n"
+    )
+    spawn_args = argparse.Namespace(
+        prompt=prompt,
+        prompt_file=None,
+        repo=repo["path"],
+        url=args.url,
+        name=args.name or f"{source.get('name') or 'worker'}-{profile.name}",
+        base=source_branch,
+        executor=None,
+        profile_name=profile.name,
+        worktree=True,
+        permission=None,
+        unattended=args.unattended,
+        model=None,
+        reasoning=None,
+        provider=None,
+        lease_ttl_seconds=args.lease_ttl_seconds,
+        no_bridge=args.no_bridge,
+        json=args.json,
+    )
+    replacement = _spawn_workspace(spawn_args)
+    result: dict[str, Any] = {
+        "action": "replacement-started",
+        "source_workspace_id": args.workspace_id,
+        "source_archived": False,
+        "profile": profile.name,
+        "replacement": replacement,
+    }
+    if args.archive_source:
+        client.stop_workspace(args.workspace_id)
+        archived = client.archive_workspace(args.workspace_id)
+        routing.disable(args.workspace_id)
+        released = leases.LeaseStore().release_workspace_if_present(args.workspace_id)
+        result.update(
+            {
+                "action": "replacement-started-source-archived",
+                "source_archived": True,
+                "source_workspace": archived,
+                "released_source_lease": released.to_dict() if released else None,
+            }
+        )
     _emit(result, args.json)
     return 0
 
@@ -293,16 +535,22 @@ def _caller_session(explicit: str | None) -> str:
 
 def cmd_teammate_spawn(args: argparse.Namespace) -> int:
     prompt = _read_text(args.prompt, args.prompt_file, "prompt")
-    result = CdesktopClient(args.url).spawn_teammate(
+    client = CdesktopClient(args.url)
+    executor, provider_id, model, reasoning, profile_name = _profile_selection(
+        args, client
+    )
+    result = client.spawn_teammate(
         caller_session=_caller_session(args.caller),
         name=args.name,
         prompt=prompt,
-        executor=args.executor,
+        executor=executor,
         permission_policy=args.permission,
-        model=args.model,
-        reasoning=args.reasoning,
-        provider_id=args.provider,
+        model=model,
+        reasoning=reasoning,
+        provider_id=provider_id,
     )
+    if profile_name and isinstance(result, dict):
+        result["profile"] = profile_name
     _emit(result, args.json)
     return 0
 
@@ -371,7 +619,9 @@ def cmd_close(args: argparse.Namespace) -> int:
         return 0
 
     message = _read_text(args.message, args.message_file, "message")
-    sessions = sorted(client.sessions(args.workspace_id), key=lambda item: item["created_at"])
+    sessions = sorted(
+        client.sessions(args.workspace_id), key=lambda item: item["created_at"]
+    )
     if not sessions:
         raise ValueError("Workspace has no session to receive a closeout request")
     result = client.send(sessions[0]["id"], message, args.sender_session)
@@ -454,8 +704,111 @@ def cmd_delivery(args: argparse.Namespace) -> int:
     raise ValueError(f"Unknown delivery action: {args.delivery_action}")
 
 
+def cmd_profile(args: argparse.Namespace) -> int:
+    store = ProfileStore()
+    if args.profile_action == "list":
+        _emit([profile.to_dict() for profile in store.list()], args.json)
+        return 0
+    if args.profile_action == "providers":
+        providers = [
+            provider_summary(item) for item in CdesktopClient(args.url).providers()
+        ]
+        _emit(providers, args.json)
+        return 0
+    if args.profile_action == "set":
+        profile = Profile(
+            name=args.name,
+            executor=args.executor,
+            provider_id=args.provider,
+            credential_kind=args.credential_kind,
+            model=args.model,
+            reasoning=args.reasoning,
+            automatic_failover=args.automatic_failover,
+        )
+        validate_provider(profile, CdesktopClient(args.url).providers())
+        _emit(store.set(profile).to_dict(), args.json)
+        return 0
+    if args.profile_action == "remove":
+        _emit(store.remove(args.name).to_dict(), args.json)
+        return 0
+    raise ValueError(f"Unknown profile action: {args.profile_action}")
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    client = CdesktopClient(args.url)
+    services = service.status(args.port)
+    workspaces: list[dict[str, Any]] = []
+    summaries = {
+        item["workspace_id"]: item
+        for archived in (False, True)
+        for item in client.workspace_summaries(archived)
+    }
+    for workspace in client.workspaces():
+        if workspace.get("archived") and not args.include_archived:
+            continue
+        summary = summaries.get(workspace["id"], {})
+        workspaces.append(
+            {
+                "workspace_id": workspace["id"],
+                "name": workspace.get("name"),
+                "branch": workspace.get("branch"),
+                "archived": bool(workspace.get("archived")),
+                "worktree": bool(workspace.get("use_worktree")),
+                "latest_process_status": summary.get("latest_process_status"),
+                "latest_process_completed_at": summary.get(
+                    "latest_process_completed_at"
+                ),
+                "has_pending_approval": bool(summary.get("has_pending_approval")),
+                "has_unseen_turns": bool(summary.get("has_unseen_turns")),
+                "bridge_enabled": workspace["id"] in routing.enabled_workspaces(),
+                "sessions": [
+                    {
+                        "id": session["id"],
+                        "executor": session.get("executor"),
+                        "name": session.get("name"),
+                    }
+                    for session in client.sessions(workspace["id"])
+                ],
+            }
+        )
+    profile_rows: list[dict[str, Any]] = []
+    providers = client.providers()
+    for profile in ProfileStore().list():
+        try:
+            validate_provider(profile, providers)
+            valid = True
+            error = None
+        except ProfileError as exc:
+            valid = False
+            error = str(exc)
+        profile_rows.append({**profile.to_dict(), "valid": valid, "error": error})
+    _emit(
+        {
+            "service": services,
+            "workspaces": workspaces,
+            "workspace_counts": {
+                "active": sum(not item["archived"] for item in workspaces),
+                "running": sum(
+                    item["latest_process_status"] == "running" for item in workspaces
+                ),
+                "awaiting_approval": sum(
+                    item["has_pending_approval"] for item in workspaces
+                ),
+            },
+            "delivery": DeliveryStore().status(),
+            "leases": [lease.to_dict() for lease in leases.LeaseStore().list()],
+            "profiles": profile_rows,
+            "providers": [provider_summary(provider) for provider in providers],
+        },
+        args.json,
+    )
+    return 0
+
+
 def _lease_store(args: argparse.Namespace) -> leases.LeaseStore:
-    return leases.LeaseStore(Path(args.lease_dir).expanduser() if args.lease_dir else None)
+    return leases.LeaseStore(
+        Path(args.lease_dir).expanduser() if args.lease_dir else None
+    )
 
 
 def cmd_lease(args: argparse.Namespace) -> int:
@@ -471,9 +824,17 @@ def cmd_lease(args: argparse.Namespace) -> int:
         )
         _emit(lease.to_dict(), args.json)
     elif args.lease_action == "list":
-        _emit([lease.to_dict() for lease in store.list(include_stale=args.include_stale)], args.json)
+        _emit(
+            [lease.to_dict() for lease in store.list(include_stale=args.include_stale)],
+            args.json,
+        )
     elif args.lease_action == "release":
-        _emit(store.release(args.token, owner=args.owner, workspace_id=args.workspace_id).to_dict(), args.json)
+        _emit(
+            store.release(
+                args.token, owner=args.owner, workspace_id=args.workspace_id
+            ).to_dict(),
+            args.json,
+        )
     elif args.lease_action == "renew":
         _emit(
             store.renew(
@@ -513,6 +874,13 @@ def parser() -> argparse.ArgumentParser:
     listing = sub.add_parser("list", help="List cdesktop workspaces and sessions")
     listing.set_defaults(func=cmd_list)
 
+    fleet_status = sub.add_parser(
+        "status", help="Show joined local fleet and reliability status"
+    )
+    fleet_status.add_argument("--port", type=int, default=service.DEFAULT_PORT)
+    fleet_status.add_argument("--include-archived", action="store_true")
+    fleet_status.set_defaults(func=cmd_status)
+
     configure = sub.add_parser("configure", help="Enforce local-only cdesktop settings")
     configure.add_argument(
         "--workspace-root",
@@ -523,8 +891,13 @@ def parser() -> argparse.ArgumentParser:
     spawn = sub.add_parser("spawn", help="Launch a full visible cdesktop workspace")
     spawn.add_argument("--name", required=True)
     spawn.add_argument("--repo", required=True)
-    spawn.add_argument("--base", required=True, help="Existing local or remote Git branch")
-    spawn.add_argument("--executor", choices=["CLAUDE_CODE", "CODEX"], required=True)
+    spawn.add_argument(
+        "--base", required=True, help="Existing local or remote Git branch"
+    )
+    spawn.add_argument("--executor", choices=["CLAUDE_CODE", "CODEX"])
+    spawn.add_argument(
+        "--profile", dest="profile_name", help="Named SightMesh provider profile"
+    )
     prompt_group = spawn.add_mutually_exclusive_group(required=True)
     prompt_group.add_argument("--prompt")
     prompt_group.add_argument("--prompt-file")
@@ -544,7 +917,9 @@ def parser() -> argparse.ArgumentParser:
     spawn.add_argument("--model")
     spawn.add_argument("--reasoning", choices=["low", "medium", "high", "max"])
     spawn.add_argument("--provider", help="Configured cdesktop provider UUID")
-    spawn.add_argument("--lease-ttl-seconds", type=int, default=leases.DEFAULT_TTL_SECONDS)
+    spawn.add_argument(
+        "--lease-ttl-seconds", type=int, default=leases.DEFAULT_TTL_SECONDS
+    )
     spawn.add_argument("--no-bridge", action="store_true")
     spawn.set_defaults(func=cmd_spawn)
 
@@ -556,13 +931,50 @@ def parser() -> argparse.ArgumentParser:
     message.add_argument("--sender-session")
     message.set_defaults(func=cmd_message)
 
-    teammate_spawn = sub.add_parser("teammate-spawn", help="Launch a visible same-workspace teammate")
+    prompt_idle = sub.add_parser(
+        "prompt-idle", help="Prompt a session only when cdesktop reports it idle"
+    )
+    prompt_idle.add_argument("session_id")
+    idle_group = prompt_idle.add_mutually_exclusive_group(required=True)
+    idle_group.add_argument("--message")
+    idle_group.add_argument("--message-file")
+    prompt_idle.add_argument("--sender-session")
+    prompt_idle.set_defaults(func=cmd_prompt_idle)
+
+    failover = sub.add_parser(
+        "failover",
+        help="Start a visible checkpointed replacement on an approved API or enterprise profile",
+    )
+    failover.add_argument("workspace_id")
+    failover.add_argument("--profile", dest="profile_name", required=True)
+    checkpoint_group = failover.add_mutually_exclusive_group(required=True)
+    checkpoint_group.add_argument("--checkpoint")
+    checkpoint_group.add_argument("--checkpoint-file")
+    failover.add_argument("--name")
+    failover.add_argument("--unattended", action="store_true")
+    failover.add_argument(
+        "--new-worktree",
+        action="store_true",
+        help="Start the successor in a new isolated workspace instead of this workspace",
+    )
+    failover.add_argument("--archive-source", action="store_true")
+    failover.add_argument("--confirm-reconciled", action="store_true")
+    failover.add_argument("--no-bridge", action="store_true")
+    failover.add_argument(
+        "--lease-ttl-seconds", type=int, default=leases.DEFAULT_TTL_SECONDS
+    )
+    failover.set_defaults(func=cmd_failover)
+
+    teammate_spawn = sub.add_parser(
+        "teammate-spawn", help="Launch a visible same-workspace teammate"
+    )
     teammate_spawn.add_argument("--caller")
     teammate_spawn.add_argument("--name", required=True)
     teammate_prompt = teammate_spawn.add_mutually_exclusive_group(required=True)
     teammate_prompt.add_argument("--prompt")
     teammate_prompt.add_argument("--prompt-file")
     teammate_spawn.add_argument("--executor", choices=["CLAUDE_CODE", "CODEX"])
+    teammate_spawn.add_argument("--profile", dest="profile_name")
     teammate_spawn.add_argument(
         "--permission",
         choices=["SUPERVISED", "PLAN", "ACCEPT_EDITS"],
@@ -572,9 +984,44 @@ def parser() -> argparse.ArgumentParser:
     teammate_spawn.add_argument("--provider")
     teammate_spawn.set_defaults(func=cmd_teammate_spawn)
 
-    teammate_list = sub.add_parser("teammate-list", help="List the caller's cdesktop team")
+    teammate_list = sub.add_parser(
+        "teammate-list", help="List the caller's cdesktop team"
+    )
     teammate_list.add_argument("--caller")
     teammate_list.set_defaults(func=cmd_teammate_list)
+
+    profile = sub.add_parser(
+        "profile", help="Manage safe named mappings to configured cdesktop providers"
+    )
+    profile_sub = profile.add_subparsers(dest="profile_action", required=True)
+    profile_list = profile_sub.add_parser("list", help="List SightMesh profiles")
+    profile_list.set_defaults(func=cmd_profile)
+    profile_providers = profile_sub.add_parser(
+        "providers", help="List redacted cdesktop provider metadata"
+    )
+    profile_providers.set_defaults(func=cmd_profile)
+    profile_set = profile_sub.add_parser("set", help="Create or update a named profile")
+    profile_set.add_argument("name")
+    profile_set.add_argument(
+        "--executor", choices=["CLAUDE_CODE", "CODEX"], required=True
+    )
+    profile_set.add_argument(
+        "--provider", required=True, help="Configured cdesktop provider UUID"
+    )
+    profile_set.add_argument(
+        "--credential-kind", choices=["ambient", "api", "enterprise"], default="ambient"
+    )
+    profile_set.add_argument("--model")
+    profile_set.add_argument("--reasoning", choices=["low", "medium", "high", "max"])
+    profile_set.add_argument(
+        "--automatic-failover",
+        action="store_true",
+        help="Allow checkpointed failover to this API or enterprise profile",
+    )
+    profile_set.set_defaults(func=cmd_profile)
+    profile_remove = profile_sub.add_parser("remove", help="Remove a named profile")
+    profile_remove.add_argument("name")
+    profile_remove.set_defaults(func=cmd_profile)
 
     close = sub.add_parser("close", help="Request closeout or archive reconciled work")
     close.add_argument("workspace_id")
@@ -600,17 +1047,25 @@ def parser() -> argparse.ArgumentParser:
     managed.add_argument("--no-start", action="store_true")
     managed.set_defaults(func=cmd_service)
 
-    bridge = sub.add_parser("bridge", help="Bridge enabled cdesktop sessions into Repowire")
+    bridge = sub.add_parser(
+        "bridge", help="Bridge enabled cdesktop sessions into Repowire"
+    )
     bridge.add_argument("--repowire-url", default="ws://127.0.0.1:8377/ws")
     bridge.add_argument("--verbose", action="store_true")
     bridge.set_defaults(func=cmd_bridge)
 
-    bridge_route = sub.add_parser("bridge-route", help="Enable or disable Repowire routing")
+    bridge_route = sub.add_parser(
+        "bridge-route", help="Enable or disable Repowire routing"
+    )
     bridge_route.add_argument("workspace_id")
-    bridge_route.add_argument("--enabled", action=argparse.BooleanOptionalAction, default=True)
+    bridge_route.add_argument(
+        "--enabled", action=argparse.BooleanOptionalAction, default=True
+    )
     bridge_route.set_defaults(func=cmd_bridge_route)
 
-    bridge_reply = sub.add_parser("bridge-reply", help="Reply to a bridged Repowire ask")
+    bridge_reply = sub.add_parser(
+        "bridge-reply", help="Reply to a bridged Repowire ask"
+    )
     bridge_reply.add_argument("correlation_id")
     bridge_reply.add_argument("--from-peer", required=True)
     reply_group = bridge_reply.add_mutually_exclusive_group(required=True)
@@ -623,14 +1078,20 @@ def parser() -> argparse.ArgumentParser:
     )
     bridge_reply.set_defaults(func=cmd_bridge_reply)
 
-    delivery = sub.add_parser("delivery", help="Inspect and operate bridge delivery records")
+    delivery = sub.add_parser(
+        "delivery", help="Inspect and operate bridge delivery records"
+    )
     delivery_sub = delivery.add_subparsers(dest="delivery_action", required=True)
 
-    delivery_status = delivery_sub.add_parser("status", help="Show delivery store status")
+    delivery_status = delivery_sub.add_parser(
+        "status", help="Show delivery store status"
+    )
     delivery_status.set_defaults(func=cmd_delivery)
 
     delivery_list = delivery_sub.add_parser("list", help="List delivery records")
-    delivery_list.add_argument("--status", choices=["pending", "inflight", "injected", "dead"])
+    delivery_list.add_argument(
+        "--status", choices=["pending", "inflight", "injected", "dead"]
+    )
     delivery_list.add_argument("--session-id")
     delivery_list.add_argument("--limit", type=int, default=50)
     delivery_list.set_defaults(func=cmd_delivery)
@@ -643,32 +1104,48 @@ def parser() -> argparse.ArgumentParser:
     delivery_purge.add_argument("idempotency_key", nargs="+")
     delivery_purge.set_defaults(func=cmd_delivery)
 
-    lease = sub.add_parser("lease", help="Inspect and manage local workspace ownership leases")
+    lease = sub.add_parser(
+        "lease", help="Inspect and manage local workspace ownership leases"
+    )
     lease.add_argument("--lease-dir", help="Override lease state directory")
     lease_sub = lease.add_subparsers(dest="lease_action", required=True)
-    lease_acquire = lease_sub.add_parser("acquire", help="Acquire an expiring ownership lease")
+    lease_acquire = lease_sub.add_parser(
+        "acquire", help="Acquire an expiring ownership lease"
+    )
     lease_acquire.add_argument("--owner", required=True)
     lease_acquire.add_argument("--repo", required=True)
     lease_acquire.add_argument("--worktree")
-    lease_acquire.add_argument("--ttl-seconds", type=int, default=leases.DEFAULT_TTL_SECONDS)
+    lease_acquire.add_argument(
+        "--ttl-seconds", type=int, default=leases.DEFAULT_TTL_SECONDS
+    )
     lease_acquire.add_argument("--workspace-id")
     lease_acquire.add_argument("--session-id")
     lease_acquire.set_defaults(func=cmd_lease)
     lease_list = lease_sub.add_parser("list", help="List local ownership leases")
-    lease_list.add_argument("--include-stale", action=argparse.BooleanOptionalAction, default=True)
+    lease_list.add_argument(
+        "--include-stale", action=argparse.BooleanOptionalAction, default=True
+    )
     lease_list.set_defaults(func=cmd_lease)
-    lease_release = lease_sub.add_parser("release", help="Release an ownership lease by token")
+    lease_release = lease_sub.add_parser(
+        "release", help="Release an ownership lease by token"
+    )
     lease_release.add_argument("token")
     lease_release.add_argument("--owner")
     lease_release.add_argument("--workspace-id")
     lease_release.set_defaults(func=cmd_lease)
-    lease_renew = lease_sub.add_parser("renew", help="Renew an ownership lease by token")
+    lease_renew = lease_sub.add_parser(
+        "renew", help="Renew an ownership lease by token"
+    )
     lease_renew.add_argument("token")
-    lease_renew.add_argument("--ttl-seconds", type=int, default=leases.DEFAULT_TTL_SECONDS)
+    lease_renew.add_argument(
+        "--ttl-seconds", type=int, default=leases.DEFAULT_TTL_SECONDS
+    )
     lease_renew.add_argument("--owner")
     lease_renew.add_argument("--workspace-id")
     lease_renew.set_defaults(func=cmd_lease)
-    lease_recover = lease_sub.add_parser("recover-stale", help="Remove expired or dead-owner leases")
+    lease_recover = lease_sub.add_parser(
+        "recover-stale", help="Remove expired or dead-owner leases"
+    )
     lease_recover.set_defaults(func=cmd_lease)
 
     migration = sub.add_parser(
@@ -688,6 +1165,7 @@ def main() -> None:
         DeliveryStoreError,
         leases.LeaseError,
         RepowireError,
+        ProfileError,
         OSError,
         ValueError,
     ) as exc:

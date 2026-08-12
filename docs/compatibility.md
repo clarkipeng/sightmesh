@@ -35,7 +35,7 @@ cdesktop 0.2.3 uses Codex app-server protocol types from Codex 0.121. An explici
 
 ### Claude capacity
 
-Claude Code launches through cdesktop, but the live end-to-end run on 2026-08-12 encountered the account's weekly Max limit. SightMesh treats this as a checkpoint and supported-profile failover event. It does not bypass the limit or manipulate subscription credentials.
+An initial live run on 2026-08-12 encountered the account's weekly Max limit. After the provider's stated reset, a fresh visible Claude Code workspace completed successfully with `CLAUDE_SIGHTMESH_OK`, and a blocking Repowire request returned `CLAUDE_REPOWIRE_OK`. SightMesh treats future capacity boundaries as checkpointed supported-profile failover events. It does not bypass limits or manipulate subscription credentials.
 
 ### Repowire app-server hook replacement
 

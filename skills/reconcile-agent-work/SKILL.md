@@ -32,8 +32,9 @@ On a rate or context limit:
 2. Request or reconstruct a checkpoint from Git, cdesktop, Repowire, and the PR host.
 3. Mark the exact last completed action and any command with unknown outcome.
 4. Select only a provider profile or API credential the user explicitly configured through supported vendor mechanisms.
-5. Launch or resume a visible cdesktop session and give it the checkpoint.
-6. Record the ownership transition and validate the first read-only inventory before authorizing writes.
+5. When the destination is an approved SightMesh API or enterprise profile, run `sightmesh failover WORKSPACE_ID --profile NAME --checkpoint-file FILE`. This starts a visible successor in the same workspace by default, preserving dirty files and transcript context. Use `--new-worktree` only for a clean committed handoff.
+6. Otherwise launch or resume a visible cdesktop session and give it the checkpoint.
+7. Record the ownership transition and validate the first read-only inventory before authorizing writes.
 
 Never extract, replay, share, or rotate browser cookies, auth headers, refresh tokens, session tokens, keychain records, or consumer-subscription credentials. Never cycle accounts to evade vendor rate limits or usage controls.
 

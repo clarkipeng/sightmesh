@@ -1,5 +1,36 @@
 # Operations gates
 
+## Fleet status and idle prompting
+
+`sightmesh status` joins managed service state, active cdesktop workspaces, latest process state, pending approvals, unseen turns, Repowire route policy, delivery counts, ownership leases, redacted cdesktop providers, and named SightMesh profiles. Add `--include-archived` only when historical workspaces are relevant.
+
+Use `sightmesh prompt-idle SESSION_ID --message-file FILE` for automation that must not append work behind an active turn or bypass a pending approval. It reads cdesktop's active workspace summary immediately before sending and fails closed unless the target is active and idle.
+
+## Provider profiles and failover
+
+Configure provider credentials in cdesktop through its supported provider UI. SightMesh stores only a provider UUID and non-secret defaults:
+
+```sh
+sightmesh --json profile providers
+sightmesh profile set codex-work-api \
+  --executor CODEX \
+  --provider CDESKTOP_PROVIDER_UUID \
+  --credential-kind api \
+  --automatic-failover
+```
+
+`credential-kind=ambient` is appropriate for a normal CLI login or consumer subscription, but SightMesh rejects `--automatic-failover` for that kind. API and enterprise profiles may opt in.
+
+On a capacity or authentication boundary, create a durable checkpoint and run:
+
+```sh
+sightmesh failover WORKSPACE_ID \
+  --profile codex-work-api \
+  --checkpoint-file handoff.md
+```
+
+The default starts a visible successor session in the same cdesktop workspace. This preserves dirty files and the human-visible transcript while changing the explicitly selected provider. `--new-worktree` requires a clean source and starts a separate workspace. The source remains active unless archival is explicitly confirmed.
+
 ## Workspace ownership leases
 
 Use `sightmesh lease acquire --owner <name> --repo <path>` before taking recovery or migration ownership of a repository. Add `--worktree <path>` when the active checkout is a worktree. Leases are local JSON records under `~/.local/state/sightmesh/leases`, written under an interprocess `fcntl.flock`.

@@ -55,8 +55,10 @@ sightmesh spawn --name worker-name --repo /path/to/repo \
 Other lifecycle commands:
 
 ```sh
+sightmesh status
 sightmesh list
 sightmesh message SESSION_ID --message-file follow-up.txt
+sightmesh prompt-idle SESSION_ID --message-file follow-up.txt
 sightmesh bridge-route WORKSPACE_ID --enabled
 sightmesh close WORKSPACE_ID --message-file closeout.txt
 sightmesh close WORKSPACE_ID --archive --confirm-reconciled
@@ -85,7 +87,36 @@ Set `SIGHTMESH_CDESKTOP_URL` when more than one cdesktop process is running. Oth
 
 ## Capacity and credentials
 
-SightMesh supports checkpointed failover between provider profiles explicitly configured through supported vendor mechanisms. It does not extract auth headers, copy cookies or tokens, rotate consumer subscriptions, or evade rate limits. On exhaustion, checkpoint the worker, stop new requests, and resume through an explicitly authorized profile with the handoff recorded.
+SightMesh uses the Claude Code and Codex authentication already available to their CLIs, or a cdesktop provider configured by the user. It never stores provider secrets in its profile registry. Inspect cdesktop providers through a redacted view and create a named mapping:
+
+```sh
+sightmesh --json profile providers
+sightmesh profile set work-claude-api \
+  --executor CLAUDE_CODE \
+  --provider CDESKTOP_PROVIDER_UUID \
+  --credential-kind api \
+  --model sonnet \
+  --automatic-failover
+```
+
+Use a profile at launch with `sightmesh spawn ... --profile work-claude-api`. When a worker reaches a capacity or authentication boundary, a manager can automatically start a visible successor in the same cdesktop workspace, preserving the existing files and transcript:
+
+```sh
+sightmesh failover WORKSPACE_ID \
+  --profile work-claude-api \
+  --checkpoint-file handoff.md \
+  --unattended
+```
+
+Use `--new-worktree` only for a clean committed handoff that needs a separate workspace. The source is preserved unless `--archive-source --confirm-reconciled` is explicit.
+
+Automatic failover is allowed only for API or enterprise profiles explicitly configured through cdesktop. Ambient Claude Max, ChatGPT, or Codex consumer subscriptions can be selected for normal launches but cannot enter an automatic failover chain. SightMesh does not extract auth headers, copy cookies or tokens, silently switch logins, rotate consumer subscriptions, or evade rate limits.
+
+## Conductor comparison
+
+SightMesh is not better than Conductor in every dimension. Conductor currently has a more polished native Mac experience, integrated review and merge flows, repository setup and run scripts, file copying, managed settings, cloud workspaces, iOS control, and a hosted API.
+
+SightMesh is the stronger fit when the requirements are local-only execution, a browser-visible fleet of full Claude and Codex sessions, agent-to-agent messaging across independent workspaces, scriptable idle-session prompting, durable message delivery, explicit ownership leases, provider-neutral failover, and open-source control over lifecycle policy. See `docs/conductor-parity.md` for the exact support matrix and remaining gaps.
 
 ## Scope
 

@@ -17,6 +17,7 @@ Do not use the host agent's native subagent, Task, delegate, fork, or team mecha
 2. Use `cdesktop team spawn` only for read-only review, research, or disjoint paths in the same workspace.
 3. Keep one lead session per cdesktop workspace. Only the lead spawns teammates.
 4. Use Repowire for communication between different cdesktop workspaces.
+5. Use `sightmesh prompt-idle` when a script or manager must prompt only an idle session. A normal `sightmesh message` is allowed when delivery must queue behind an active turn.
 
 Read [references/cdesktop-and-repowire.md](references/cdesktop-and-repowire.md) before the first spawn in a new environment.
 
@@ -56,6 +57,8 @@ sightmesh teammate-spawn --name <name> --prompt-file <prompt-file>
 ```
 
 To mix Claude and Codex in one workspace, pass `--executor`, `--model`, and `--provider` as required by cdesktop. Never synthesize or extract provider credentials.
+
+Prefer named SightMesh profiles over raw provider IDs when repeatability matters. Inspect only redacted provider metadata with `sightmesh --json profile providers`. Profiles contain identifiers and policy, never keys or tokens.
 
 ## Communicate
 

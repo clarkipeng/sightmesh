@@ -64,9 +64,13 @@ class CdesktopClient:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise CdesktopError(f"{method} {path} failed: HTTP {exc.code}: {detail}") from exc
+            raise CdesktopError(
+                f"{method} {path} failed: HTTP {exc.code}: {detail}"
+            ) from exc
         except URLError as exc:
-            raise CdesktopError(f"Cannot reach cdesktop at {self.base_url}: {exc}") from exc
+            raise CdesktopError(
+                f"Cannot reach cdesktop at {self.base_url}: {exc}"
+            ) from exc
 
         data = json.loads(raw) if raw else None
         if isinstance(data, dict) and data.get("success") is False:
@@ -95,7 +99,12 @@ class CdesktopClient:
     def repos(self) -> list[dict[str, Any]]:
         return self.request("GET", "/repos")
 
-    def register_repo(self, path: Path, display_name: str | None = None) -> dict[str, Any]:
+    def providers(self) -> list[dict[str, Any]]:
+        return self.request("GET", "/providers")
+
+    def register_repo(
+        self, path: Path, display_name: str | None = None
+    ) -> dict[str, Any]:
         resolved = path.expanduser().resolve()
         for repo in self.repos():
             if Path(repo["path"]).expanduser().resolve() == resolved:
@@ -114,6 +123,14 @@ class CdesktopClient:
 
     def sessions(self, workspace_id: str) -> list[dict[str, Any]]:
         return self.request("GET", "/sessions", query={"workspace_id": workspace_id})
+
+    def session(self, session_id: str) -> dict[str, Any]:
+        return self.request("GET", f"/sessions/{session_id}")
+
+    def workspace_summaries(self, archived: bool = False) -> list[dict[str, Any]]:
+        result = self.request("POST", "/workspaces/summaries", {"archived": archived})
+        summaries = result.get("summaries") if isinstance(result, dict) else None
+        return summaries if isinstance(summaries, list) else []
 
     def workspace_repos(self, workspace_id: str) -> list[dict[str, Any]]:
         return self.request("GET", f"/workspaces/{workspace_id}/repos")
@@ -184,7 +201,9 @@ class CdesktopClient:
             },
         )
 
-    def send(self, session_id: str, prompt: str, sender_session: str | None = None) -> Any:
+    def send(
+        self, session_id: str, prompt: str, sender_session: str | None = None
+    ) -> Any:
         headers = {}
         if sender_session:
             headers["x-cdesktop-from-session"] = sender_session
