@@ -467,7 +467,7 @@ def parser() -> argparse.ArgumentParser:
     delivery_status.set_defaults(func=cmd_delivery)
 
     delivery_list = delivery_sub.add_parser("list", help="List delivery records")
-    delivery_list.add_argument("--status", choices=["pending", "injected", "dead"])
+    delivery_list.add_argument("--status", choices=["pending", "inflight", "injected", "dead"])
     delivery_list.add_argument("--session-id")
     delivery_list.add_argument("--limit", type=int, default=50)
     delivery_list.set_defaults(func=cmd_delivery)

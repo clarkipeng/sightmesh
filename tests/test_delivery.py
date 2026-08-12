@@ -48,14 +48,26 @@ def test_retry_timing_uses_capped_exponential_backoff(tmp_path) -> None:
         DeliveryPolicy(base_backoff_seconds=2, max_backoff_seconds=5),
     )
     record = store.enqueue(_record())
-    failed_once = store.mark_failed(record.idempotency_key, "offline", now=10.0)
-    failed_twice = store.mark_failed(record.idempotency_key, "offline", now=20.0)
-    failed_third = store.mark_failed(record.idempotency_key, "offline", now=30.0)
+    claimed = store.claim(record.idempotency_key, now=9.0)
+    assert claimed and claimed.claim_token
+    failed_once = store.mark_failed(
+        record.idempotency_key, claimed.claim_token, "offline", now=10.0
+    )
+    claimed = store.claim(record.idempotency_key, now=20.0)
+    assert claimed and claimed.claim_token
+    failed_twice = store.mark_failed(
+        record.idempotency_key, claimed.claim_token, "offline", now=20.0
+    )
+    claimed = store.claim(record.idempotency_key, now=30.0)
+    assert claimed and claimed.claim_token
+    failed_third = store.mark_failed(
+        record.idempotency_key, claimed.claim_token, "offline", now=30.0
+    )
     assert failed_once.next_attempt_at == 12.0
     assert failed_twice.next_attempt_at == 24.0
     assert failed_third.next_attempt_at == 35.0
-    assert store.due(now=34.9) == []
-    assert store.due(now=35.0)[0].idempotency_key == record.idempotency_key
+    assert store.claim_due(now=34.9) is None
+    assert store.claim_due(now=35.0).idempotency_key == record.idempotency_key
 
 
 def test_capacity_limits_pending_count_and_bytes(tmp_path) -> None:
@@ -81,8 +93,14 @@ def test_dead_lettering_is_inspectable_and_retryable(tmp_path) -> None:
         DeliveryPolicy(max_attempts=2, base_backoff_seconds=0),
     )
     record = store.enqueue(_record())
-    store.mark_failed(record.idempotency_key, "offline", now=10.0)
-    dead = store.mark_failed(record.idempotency_key, "offline again", now=11.0)
+    claimed = store.claim(record.idempotency_key, now=9.0)
+    assert claimed and claimed.claim_token
+    store.mark_failed(record.idempotency_key, claimed.claim_token, "offline", now=10.0)
+    claimed = store.claim(record.idempotency_key, now=11.0)
+    assert claimed and claimed.claim_token
+    dead = store.mark_failed(
+        record.idempotency_key, claimed.claim_token, "offline again", now=11.0
+    )
     assert dead.status == "dead"
     assert dead.last_error == "offline again"
     assert dead.prompt == "visible follow-up"
@@ -96,10 +114,59 @@ def test_dead_lettering_is_inspectable_and_retryable(tmp_path) -> None:
 def test_successful_closeout_clears_retained_prompt(tmp_path) -> None:
     store = DeliveryStore(tmp_path / "delivery.sqlite3")
     record = store.enqueue(_record())
-    injected = store.mark_injected(record.idempotency_key, now=20.0)
+    claimed = store.claim(record.idempotency_key, now=19.0)
+    assert claimed and claimed.claim_token
+    injected = store.mark_injected(record.idempotency_key, claimed.claim_token, now=20.0)
     assert injected.status == "injected"
     assert injected.prompt is None
     assert injected.prompt_bytes == 0
+
+
+def test_competing_processors_cannot_claim_the_same_record(tmp_path) -> None:
+    store = DeliveryStore(tmp_path / "delivery.sqlite3")
+    record = store.enqueue(_record())
+    first = store.claim_due(now=10.0, session_id="session-1")
+    second = store.claim_due(now=10.0, session_id="session-1")
+    assert first is not None
+    assert first.idempotency_key == record.idempotency_key
+    assert first.status == "inflight"
+    assert first.claim_token
+    assert second is None
+
+
+def test_stale_claim_recovers_without_incrementing_attempts(tmp_path) -> None:
+    store = DeliveryStore(
+        tmp_path / "delivery.sqlite3",
+        DeliveryPolicy(claim_timeout_seconds=10),
+    )
+    record = store.enqueue(_record())
+    first = store.claim(record.idempotency_key, now=100.0)
+    assert first and first.claim_token
+    assert store.claim(record.idempotency_key, now=105.0) is None
+
+    recovered = store.claim(record.idempotency_key, now=111.0)
+    assert recovered is not None
+    assert recovered.status == "inflight"
+    assert recovered.claim_token and recovered.claim_token != first.claim_token
+    assert recovered.attempt_count == 0
+
+
+def test_wrong_claim_token_is_rejected(tmp_path) -> None:
+    store = DeliveryStore(tmp_path / "delivery.sqlite3")
+    record = store.enqueue(_record())
+    claimed = store.claim(record.idempotency_key, now=10.0)
+    assert claimed and claimed.claim_token
+
+    with pytest.raises(DeliveryStoreError):
+        store.mark_injected(record.idempotency_key, "wrong-token", now=11.0)
+    with pytest.raises(DeliveryStoreError):
+        store.mark_failed(record.idempotency_key, "wrong-token", "offline", now=12.0)
+
+    current = store.get(record.idempotency_key)
+    assert current is not None
+    assert current.status == "inflight"
+    assert current.claim_token == claimed.claim_token
+    assert current.attempt_count == 0
 
 
 def test_corruption_fails_closed(tmp_path) -> None:

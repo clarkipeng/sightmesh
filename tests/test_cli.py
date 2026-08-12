@@ -58,7 +58,9 @@ def test_delivery_retry_and_purge_require_exact_keys(monkeypatch, tmp_path, caps
             text="text",
         )
     )
-    store.mark_failed(record.idempotency_key, "offline")
+    claimed = store.claim(record.idempotency_key)
+    assert claimed and claimed.claim_token
+    store.mark_failed(record.idempotency_key, claimed.claim_token, "offline")
 
     args = parser().parse_args(["--json", "delivery", "retry", record.idempotency_key])
     assert args.func(args) == 0

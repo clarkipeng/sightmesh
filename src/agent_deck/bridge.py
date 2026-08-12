@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import re
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -179,14 +178,20 @@ class RepowireSessionBridge:
         if stored.status == "injected":
             await self._send_delivery_ack(ws, stored, "injected")
             return
+        if stored.status == "inflight":
+            return
         if stored.status == "dead":
             await self._send_delivery_ack(ws, stored, "dead")
             if stored.correlation_id:
                 await self._send_error(ws, stored.correlation_id, stored.last_error or "dead-lettered")
             return
-        if stored.next_attempt_at > time.time():
+        claimed = await asyncio.to_thread(
+            self.delivery_store.claim,
+            stored.idempotency_key,
+        )
+        if not claimed:
             return
-        await self._process_record(ws, stored)
+        await self._process_record(ws, claimed)
 
     async def _retry_loop(self, ws: Any) -> None:
         while True:
@@ -195,26 +200,31 @@ class RepowireSessionBridge:
 
     async def _process_due(self, ws: Any) -> None:
         try:
-            records = await asyncio.to_thread(
-                self.delivery_store.due,
+            record = await asyncio.to_thread(
+                self.delivery_store.claim_due,
                 None,
-                25,
                 self.bridged.session["id"],
             )
         except DeliveryStoreError as exc:
             LOGGER.error("Cannot read delivery retry queue: %s", exc)
             return
-        for record in records:
+        if record:
             await self._process_record(ws, record)
 
     async def _process_record(self, ws: Any, record: DeliveryRecord) -> None:
-        if record.status != "pending":
+        if record.status != "inflight":
             await self._send_delivery_ack(ws, record, record.status)
+            return
+        if not record.claim_token:
+            await self._send_delivery_ack(ws, record, "failed")
+            if record.correlation_id:
+                await self._send_error(ws, record.correlation_id, "Inflight delivery has no claim token")
             return
         if record.prompt is None:
             failed = await asyncio.to_thread(
                 self.delivery_store.mark_failed,
                 record.idempotency_key,
+                record.claim_token,
                 "Pending delivery has no retained prompt",
             )
             await self._send_delivery_ack(ws, failed, failed.status)
@@ -229,12 +239,14 @@ class RepowireSessionBridge:
             injected = await asyncio.to_thread(
                 self.delivery_store.mark_injected,
                 record.idempotency_key,
+                record.claim_token,
             )
             await self._send_delivery_ack(ws, injected, "injected")
         except Exception as exc:
             failed = await asyncio.to_thread(
                 self.delivery_store.mark_failed,
                 record.idempotency_key,
+                record.claim_token,
                 str(exc),
             )
             await self._send_delivery_ack(ws, failed, failed.status)

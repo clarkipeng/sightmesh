@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ DEFAULT_MAX_PROMPT_BYTES = 128 * 1024
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_BASE_BACKOFF_SECONDS = 1.0
 DEFAULT_MAX_BACKOFF_SECONDS = 60.0
+DEFAULT_CLAIM_TIMEOUT_SECONDS = 120.0
 
 
 class DeliveryStoreError(RuntimeError):
@@ -35,6 +37,7 @@ class DeliveryPolicy:
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     base_backoff_seconds: float = DEFAULT_BASE_BACKOFF_SECONDS
     max_backoff_seconds: float = DEFAULT_MAX_BACKOFF_SECONDS
+    claim_timeout_seconds: float = DEFAULT_CLAIM_TIMEOUT_SECONDS
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,8 @@ class DeliveryRecord:
     injected_at: float | None
     dead_lettered_at: float | None
     prompt_bytes: int
+    claim_token: str | None = None
+    claimed_at: float | None = None
 
 
 def delivery_db_path() -> Path:
@@ -110,36 +115,55 @@ class DeliveryStore:
     def _initialize(self) -> None:
         try:
             with self._connect() as conn:
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS deliveries (
-                        idempotency_key TEXT PRIMARY KEY,
-                        session_id TEXT NOT NULL,
-                        message_type TEXT NOT NULL,
-                        status TEXT NOT NULL CHECK (
-                            status IN ('pending', 'injected', 'dead')
-                        ),
-                        prompt TEXT,
-                        delivery_id TEXT,
-                        correlation_id TEXT,
-                        from_peer TEXT,
-                        attempt_count INTEGER NOT NULL DEFAULT 0,
-                        next_attempt_at REAL NOT NULL DEFAULT 0,
-                        last_error TEXT,
-                        created_at REAL NOT NULL,
-                        updated_at REAL NOT NULL,
-                        injected_at REAL,
-                        dead_lettered_at REAL,
-                        prompt_bytes INTEGER NOT NULL DEFAULT 0
-                    )
-                    """
-                )
+                self._ensure_schema(conn)
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_deliveries_status_next "
                     "ON deliveries(status, next_attempt_at, created_at)"
                 )
         except sqlite3.DatabaseError as exc:
             raise DeliveryStoreError(f"Cannot initialize delivery store {self.path}: {exc}") from exc
+
+    def _ensure_schema(self, conn: sqlite3.Connection) -> None:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'deliveries'"
+        ).fetchone()
+        if not row:
+            conn.execute(_CREATE_DELIVERIES_SQL)
+            return
+
+        sql = str(row["sql"])
+        columns = {
+            column["name"]
+            for column in conn.execute("PRAGMA table_info(deliveries)").fetchall()
+        }
+        if (
+            "'inflight'" in sql
+            and "claim_token" in columns
+            and "claimed_at" in columns
+        ):
+            return
+
+        conn.execute("DROP INDEX IF EXISTS idx_deliveries_status_next")
+        conn.execute("ALTER TABLE deliveries RENAME TO deliveries_old")
+        conn.execute(_CREATE_DELIVERIES_SQL)
+        conn.execute(
+            """
+            INSERT INTO deliveries (
+                idempotency_key, session_id, message_type, status, prompt,
+                delivery_id, correlation_id, from_peer, attempt_count,
+                next_attempt_at, last_error, created_at, updated_at,
+                injected_at, dead_lettered_at, prompt_bytes
+            )
+            SELECT
+                idempotency_key, session_id, message_type,
+                CASE WHEN status = 'inflight' THEN 'pending' ELSE status END,
+                prompt, delivery_id, correlation_id, from_peer, attempt_count,
+                next_attempt_at, last_error, created_at, updated_at,
+                injected_at, dead_lettered_at, prompt_bytes
+            FROM deliveries_old
+            """
+        )
+        conn.execute("DROP TABLE deliveries_old")
 
     def enqueue(self, record: DeliveryRecord) -> DeliveryRecord:
         prompt_bytes = len((record.prompt or "").encode("utf-8"))
@@ -151,6 +175,7 @@ class DeliveryStore:
         try:
             with self._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
+                self._release_expired_claims(conn, record.created_at)
                 existing = self._get(conn, record.idempotency_key)
                 if existing:
                     conn.execute("COMMIT")
@@ -162,9 +187,13 @@ class DeliveryStore:
                         idempotency_key, session_id, message_type, status, prompt,
                         delivery_id, correlation_id, from_peer, attempt_count,
                         next_attempt_at, last_error, created_at, updated_at,
-                        injected_at, dead_lettered_at, prompt_bytes
+                        injected_at, dead_lettered_at, prompt_bytes,
+                        claim_token, claimed_at
                     )
-                    VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, 0, 0, NULL, ?, ?, NULL, NULL, ?)
+                    VALUES (
+                        ?, ?, ?, 'pending', ?, ?, ?, ?, 0, 0, NULL, ?, ?,
+                        NULL, NULL, ?, NULL, NULL
+                    )
                     """,
                     (
                         record.idempotency_key,
@@ -179,8 +208,9 @@ class DeliveryStore:
                         prompt_bytes,
                     ),
                 )
+                stored = self._get(conn, record.idempotency_key)
                 conn.execute("COMMIT")
-                return self.get(record.idempotency_key) or record
+                return stored or record
         except sqlite3.DatabaseError as exc:
             raise DeliveryStoreError(f"Cannot enqueue delivery: {exc}") from exc
 
@@ -188,7 +218,7 @@ class DeliveryStore:
         row = conn.execute(
             """
             SELECT COUNT(*) AS count, COALESCE(SUM(prompt_bytes), 0) AS bytes
-            FROM deliveries WHERE status = 'pending'
+            FROM deliveries WHERE status IN ('pending', 'inflight')
             """
         ).fetchone()
         pending_count = int(row["count"])
@@ -235,6 +265,7 @@ class DeliveryStore:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         try:
             with self._connect() as conn:
+                self._release_expired_claims(conn, time.time())
                 rows = conn.execute(
                     f"""
                     SELECT * FROM deliveries
@@ -251,13 +282,14 @@ class DeliveryStore:
     def status(self) -> dict[str, Any]:
         try:
             with self._connect() as conn:
+                self._release_expired_claims(conn, time.time())
                 rows = conn.execute(
                     "SELECT status, COUNT(*) AS count FROM deliveries GROUP BY status"
                 ).fetchall()
                 pending = conn.execute(
                     """
                     SELECT COUNT(*) AS count, COALESCE(SUM(prompt_bytes), 0) AS bytes
-                    FROM deliveries WHERE status = 'pending'
+                    FROM deliveries WHERE status IN ('pending', 'inflight')
                     """
                 ).fetchone()
         except sqlite3.DatabaseError as exc:
@@ -267,6 +299,7 @@ class DeliveryStore:
             "path": str(self.path),
             "counts": {
                 "pending": counts.get("pending", 0),
+                "inflight": counts.get("inflight", 0),
                 "injected": counts.get("injected", 0),
                 "dead": counts.get("dead", 0),
             },
@@ -278,47 +311,116 @@ class DeliveryStore:
             },
             "max_prompt_bytes": self.policy.max_prompt_bytes,
             "max_attempts": self.policy.max_attempts,
+            "claim_timeout_seconds": self.policy.claim_timeout_seconds,
         }
 
-    def due(
+    def claim(self, idempotency_key: str, now: float | None = None) -> DeliveryRecord | None:
+        current = time.time() if now is None else now
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self._release_expired_claims(conn, current)
+                row = conn.execute(
+                    """
+                    SELECT idempotency_key FROM deliveries
+                    WHERE idempotency_key = ? AND status = 'pending'
+                        AND next_attempt_at <= ?
+                    """,
+                    (idempotency_key, current),
+                ).fetchone()
+                if not row:
+                    conn.execute("COMMIT")
+                    return None
+                claimed = self._claim_locked(conn, idempotency_key, current)
+                conn.execute("COMMIT")
+                return claimed
+        except sqlite3.DatabaseError as exc:
+            raise DeliveryStoreError(f"Cannot claim delivery: {exc}") from exc
+
+    def claim_due(
         self,
         now: float | None = None,
-        limit: int = 25,
         session_id: str | None = None,
-    ) -> list[DeliveryRecord]:
+    ) -> DeliveryRecord | None:
         current = time.time() if now is None else now
         session_clause = "AND session_id = ?" if session_id else ""
         params: tuple[Any, ...] = (
-            (current, session_id, limit) if session_id else (current, limit)
+            (current, session_id) if session_id else (current,)
         )
         try:
             with self._connect() as conn:
-                rows = conn.execute(
+                conn.execute("BEGIN IMMEDIATE")
+                self._release_expired_claims(conn, current)
+                row = conn.execute(
                     f"""
-                    SELECT * FROM deliveries
+                    SELECT idempotency_key FROM deliveries
                     WHERE status = 'pending' AND next_attempt_at <= ? {session_clause}
                     ORDER BY created_at ASC
-                    LIMIT ?
+                    LIMIT 1
                     """,
                     params,
-                ).fetchall()
-                return [_record(row) for row in rows]
+                ).fetchone()
+                if not row:
+                    conn.execute("COMMIT")
+                    return None
+                claimed = self._claim_locked(conn, row["idempotency_key"], current)
+                conn.execute("COMMIT")
+                return claimed
         except sqlite3.DatabaseError as exc:
-            raise DeliveryStoreError(f"Cannot read due deliveries: {exc}") from exc
+            raise DeliveryStoreError(f"Cannot claim due delivery: {exc}") from exc
 
-    def mark_injected(self, idempotency_key: str, now: float | None = None) -> DeliveryRecord:
+    def _claim_locked(
+        self, conn: sqlite3.Connection, idempotency_key: str, current: float
+    ) -> DeliveryRecord:
+        token = secrets.token_urlsafe(24)
+        cursor = conn.execute(
+            """
+            UPDATE deliveries
+            SET status = 'inflight', claim_token = ?, claimed_at = ?, updated_at = ?
+            WHERE idempotency_key = ? AND status = 'pending'
+            """,
+            (token, current, current, idempotency_key),
+        )
+        if cursor.rowcount != 1:
+            raise DeliveryStoreError(f"Delivery claim lost: {idempotency_key}")
+        record = self._get(conn, idempotency_key)
+        if not record:
+            raise DeliveryStoreError(f"Delivery not found: {idempotency_key}")
+        return record
+
+    def _release_expired_claims(self, conn: sqlite3.Connection, current: float) -> None:
+        expired_before = current - self.policy.claim_timeout_seconds
+        conn.execute(
+            """
+            UPDATE deliveries
+            SET status = 'pending', claim_token = NULL, claimed_at = NULL,
+                updated_at = ?
+            WHERE status = 'inflight' AND claimed_at <= ?
+            """,
+            (current, expired_before),
+        )
+
+    def mark_injected(
+        self, idempotency_key: str, claim_token: str, now: float | None = None
+    ) -> DeliveryRecord:
         current = time.time() if now is None else now
         try:
             with self._connect() as conn:
-                conn.execute(
+                cursor = conn.execute(
                     """
                     UPDATE deliveries
                     SET status = 'injected', prompt = NULL, prompt_bytes = 0,
-                        updated_at = ?, injected_at = ?, last_error = NULL
-                    WHERE idempotency_key = ?
+                        updated_at = ?, injected_at = ?, last_error = NULL,
+                        claim_token = NULL, claimed_at = NULL
+                    WHERE idempotency_key = ? AND status = 'inflight'
+                        AND claim_token = ?
                     """,
-                    (current, current, idempotency_key),
+                    (current, current, idempotency_key, claim_token),
                 )
+                if cursor.rowcount != 1:
+                    raise DeliveryStoreError(
+                        f"Delivery claim token rejected: {idempotency_key}"
+                    )
                 record = self._get(conn, idempotency_key)
         except sqlite3.DatabaseError as exc:
             raise DeliveryStoreError(f"Cannot mark delivery injected: {exc}") from exc
@@ -327,7 +429,11 @@ class DeliveryStore:
         return record
 
     def mark_failed(
-        self, idempotency_key: str, error: str, now: float | None = None
+        self,
+        idempotency_key: str,
+        claim_token: str,
+        error: str,
+        now: float | None = None,
     ) -> DeliveryRecord:
         current = time.time() if now is None else now
         try:
@@ -336,13 +442,18 @@ class DeliveryStore:
                 record = self._get(conn, idempotency_key)
                 if not record:
                     raise DeliveryStoreError(f"Delivery not found: {idempotency_key}")
+                if record.status != "inflight" or record.claim_token != claim_token:
+                    raise DeliveryStoreError(
+                        f"Delivery claim token rejected: {idempotency_key}"
+                    )
                 attempts = record.attempt_count + 1
                 if attempts >= self.policy.max_attempts:
                     conn.execute(
                         """
                         UPDATE deliveries
                         SET status = 'dead', attempt_count = ?, updated_at = ?,
-                            dead_lettered_at = ?, last_error = ?
+                            dead_lettered_at = ?, last_error = ?,
+                            claim_token = NULL, claimed_at = NULL
                         WHERE idempotency_key = ?
                         """,
                         (attempts, current, current, _trim_error(error), idempotency_key),
@@ -351,8 +462,9 @@ class DeliveryStore:
                     conn.execute(
                         """
                         UPDATE deliveries
-                        SET attempt_count = ?, updated_at = ?, next_attempt_at = ?,
-                            last_error = ?
+                        SET status = 'pending', attempt_count = ?, updated_at = ?,
+                            next_attempt_at = ?, last_error = ?,
+                            claim_token = NULL, claimed_at = NULL
                         WHERE idempotency_key = ?
                         """,
                         (
@@ -394,7 +506,8 @@ class DeliveryStore:
                     """
                     UPDATE deliveries
                     SET status = 'pending', attempt_count = 0, next_attempt_at = ?,
-                        updated_at = ?, dead_lettered_at = NULL, last_error = NULL
+                        updated_at = ?, dead_lettered_at = NULL, last_error = NULL,
+                        claim_token = NULL, claimed_at = NULL
                     WHERE idempotency_key = ?
                     """,
                     (current, current, idempotency_key),
@@ -480,6 +593,8 @@ def to_dict(record: DeliveryRecord, *, include_prompt: bool = False) -> dict[str
         "dead_lettered_at": record.dead_lettered_at,
         "prompt_bytes": record.prompt_bytes,
         "has_prompt": record.prompt is not None,
+        "claimed_at": record.claimed_at,
+        "has_claim": record.claim_token is not None,
     }
     if include_prompt:
         data["prompt"] = record.prompt
@@ -506,8 +621,36 @@ def _record(row: sqlite3.Row) -> DeliveryRecord:
             float(row["dead_lettered_at"]) if row["dead_lettered_at"] is not None else None
         ),
         prompt_bytes=int(row["prompt_bytes"]),
+        claim_token=row["claim_token"],
+        claimed_at=float(row["claimed_at"]) if row["claimed_at"] is not None else None,
     )
 
 
 def _trim_error(error: str) -> str:
     return error[:2000]
+
+
+_CREATE_DELIVERIES_SQL = """
+CREATE TABLE deliveries (
+    idempotency_key TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    message_type TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('pending', 'inflight', 'injected', 'dead')
+    ),
+    prompt TEXT,
+    delivery_id TEXT,
+    correlation_id TEXT,
+    from_peer TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    injected_at REAL,
+    dead_lettered_at REAL,
+    prompt_bytes INTEGER NOT NULL DEFAULT 0,
+    claim_token TEXT,
+    claimed_at REAL
+)
+"""

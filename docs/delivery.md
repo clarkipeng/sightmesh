@@ -6,7 +6,7 @@ The cdesktop to Repowire bridge keeps a local SQLite delivery store at:
 ~/.local/state/agent-deck/delivery.sqlite3
 ```
 
-The store uses SQLite WAL mode and short process-safe transactions so bridge restarts and concurrent local inspectors see a consistent queue.
+The store uses SQLite WAL mode and short process-safe transactions so bridge restarts and concurrent local inspectors see a consistent queue. Due records are atomically claimed before any cdesktop send, so competing local bridge workers cannot intentionally inject the same row at the same time.
 
 ## Record Format
 
@@ -21,8 +21,11 @@ If Repowire did not provide either identifier, the bridge uses a SHA-256 digest 
 Statuses:
 
 - `pending`: the bridge has not yet received a successful cdesktop follow-up acknowledgement.
+- `inflight`: a local bridge worker owns a bounded send attempt using a private claim token.
 - `injected`: cdesktop accepted the follow-up. Duplicate inbound deliveries acknowledge Repowire but are not injected again.
 - `dead`: retry attempts were exhausted and the item needs operator inspection.
+
+Delivery is locally deduplicated and at-least-once. It is not exactly-once: if the bridge crashes after cdesktop accepts a follow-up but before the SQLite `injected` commit, the claim eventually expires and the record can be retried.
 
 ## Retention
 
@@ -42,6 +45,8 @@ Pending records are bounded by count, aggregate prompt bytes, and individual pro
 
 Transient cdesktop send failures are retried with capped exponential backoff. Exhausted records move to `dead` and remain inspectable.
 
+Claims expire after 120 seconds by default. Expired `inflight` records return to `pending` without increasing `attempt_count`; attempts increase only after a claimed send returns an actual cdesktop failure. Only the holder of the current claim token may mark a record `injected` or failed.
+
 ## Commands
 
 Read-only inspection:
@@ -49,6 +54,7 @@ Read-only inspection:
 ```sh
 agent-deck delivery status
 agent-deck delivery list --status pending
+agent-deck delivery list --status inflight
 agent-deck delivery list --status dead --session-id <cdesktop-session-id>
 ```
 
