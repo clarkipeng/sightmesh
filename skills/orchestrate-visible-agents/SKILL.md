@@ -79,6 +79,8 @@ To mix Claude and Codex in one workspace, pass `--executor`, `--model`, and `--p
 
 Prefer named SightMesh profiles over raw provider IDs when repeatability matters. Inspect only redacted provider metadata with `sightmesh --json profile providers`. Profiles contain identifiers and policy, never keys or tokens.
 
+Match the model family to the executor before creating or using a profile. Fable, Opus, Sonnet, and Haiku require `CLAUDE_CODE`; GPT and Codex model IDs require `CODEX`. A provider listing a model does not prove every executor can run it. After launch, require at least one assistant message or tool call; a session that completes with neither is a failed launch, not completed work.
+
 ## Communicate
 
 Start with the compact local fleet surface:
