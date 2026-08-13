@@ -26,9 +26,8 @@ Keep the workflow native and unsurprising:
 1. Use a separate cdesktop workspace with an isolated worktree for implementation, independently shippable changes, or overlapping repository access.
 2. Use `cdesktop team spawn` only for read-only review, research, or disjoint paths in the same workspace.
 3. Keep one lead session per cdesktop workspace. Only the lead spawns teammates.
-4. Use `sightmesh steer @agent --message "..."` for agent-to-agent contact. It interrupts only that selected session and makes the message the next turn instead of appending behind current work.
-5. Do not use `sightmesh message`, `sightmesh prompt-idle`, or Repowire as the normal peer-contact path. They remain compatibility and durable-delivery surfaces for explicitly non-interrupting workflows.
-6. Every child must contact its launcher when it needs a decision, feedback, or help with a blocker, and when it completes. Use `sightmesh parent --message "STATUS: concise details"`; the per-spawn edge resolves the exact parent session automatically. Same-workspace teammates may use `cdesktop team manager` as the native lead alias.
+4. Any visible agent may contact any other. Use `sightmesh message @agent --message "..."` to queue information without interrupting valid work; use `sightmesh steer @agent --message "..."` when delay would cause invalid output, unsafe mutation, or avoidable rework. Use Repowire when the ask needs durable cross-workspace delivery.
+5. Every child must use `sightmesh parent --message "..."` for a blocker, decision, or completion that must wake its launcher. Same-workspace teammates may use `cdesktop team manager` as the native lead alias.
 7. Before asking for input, collect all currently known independent questions and send one multi-question request. Before tool use, batch independent read-only inspections. Keep dependent operations, mutations, approvals, and destructive actions sequential.
 8. A lead reviewing multiple workers should call `sightmesh inbox` once and answer independent pending requests with one prevalidated `sightmesh respond --responses '<json>'` call.
 
@@ -92,6 +91,7 @@ Start with the compact local fleet surface:
 ```sh
 sightmesh peers
 sightmesh peek @<agent>
+sightmesh message @<agent> --message "<non-interrupting information>"
 sightmesh steer @<agent> --message "<immediate correction or blocker>"
 sightmesh parent --message "<status, decision request, or blocker>"
 sightmesh inbox
@@ -108,7 +108,7 @@ repowire peer ask <peer-name> "<bounded request>"
 
 For cdesktop, target the online bridge peer whose repository path and backend match the intended session. Repowire chooses the displayed name. Do not target a stale offline identity created by an executor's short-lived app-server hook. If no matching bridge peer is online, use `sightmesh steer` for direct agent contact and report that Repowire delivery was unavailable.
 
-Make queued and steering messages bounded and self-contained: state the authority, exact SHA when relevant, owner, required action, exclusions, and stop condition. Keep durable evidence in the repository or its ignored handoff directory. Files under an ignored handoff directory are local coordination evidence, not PR content. Repowire is transport, not the sole record.
+Send a peer message only when it changes the recipient's action or resolves a decision. Keep it to the minimum actionable delta, usually `DONE head=<sha> checks=<result> handoff=<path>`, `BLOCKED cause=<cause> need=<decision>`, or one direct instruction. Put narrative context and evidence in the ignored handoff. Repowire is transport, not the sole record.
 
 Before a worker completes, require every finding, blocker, exact SHA, validation result, and next action needed by another workspace to appear in the ignored handoff itself. A terminal response or transcript may summarize or link to that handoff, but must not be the only place containing actionable detail.
 
@@ -130,3 +130,5 @@ An agent must never approve its own request. When invoked from cdesktop, only th
 Inspect cdesktop transcripts and derived git state. Intervene only on state change, a blocker, scope drift, duplicate ownership, or failed validation. Before retirement, invoke `$reconcile-agent-work`. Archive only after the branch, PR, dirty state, handoff, and remaining scope are reconciled.
 
 Keep one writer for each conflict hotspot such as a migration or shared composition file. Parallelize disjoint fixtures, adapters, new test files, docs, and exact-head review. Prefer short pushed checkpoints with explicit remaining scope, and replace a worker from the exact pushed branch before context pressure degrades judgment.
+
+Do not rotate an agent at a fixed context percentage. Rotate when behavior shows degraded state tracking or instruction quality, or when the remaining context is plainly insufficient for the next bounded phase. Otherwise preserve continuity.

@@ -42,6 +42,8 @@ Never extract, replay, share, or rotate browser cookies, auth headers, refresh t
 
 ## Reconcile before retirement
 
+A completed execution process means one agent turn ended, not that its assignment or program is complete. If owned work remains, the launcher must choose and trigger the next action. Recover or replace a killed or failed child unless the handoff proves its scope was already delivered or explicitly deferred.
+
 Compare:
 
 - original assignment and later follow-ups;
