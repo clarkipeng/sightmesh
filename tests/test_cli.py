@@ -820,6 +820,128 @@ def test_spawn_worktree_acquires_container_lease(monkeypatch, tmp_path: Path) ->
     assert lease.workspace_id == "workspace-a"
 
 
+def _worktree_spawn_args(repo: Path) -> argparse.Namespace:
+    return argparse.Namespace(
+        prompt="start",
+        prompt_file=None,
+        repo=str(repo),
+        url=None,
+        name="demo",
+        base="main",
+        executor="CODEX",
+        worktree=True,
+        permission="SUPERVISED",
+        unattended=False,
+        model=None,
+        reasoning=None,
+        provider=None,
+        lease_ttl_seconds=60,
+        no_bridge=False,
+        json=True,
+    )
+
+
+def _commit_worktree_fixture(repo: Path) -> None:
+    subprocess.run(
+        ["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True
+    )
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "base",
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_worktree_spawn_configures_repository_setup_hook(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    settings = repo / ".conductor" / "settings.toml"
+    settings.parent.mkdir(parents=True)
+    settings.write_text('[scripts]\nsetup = "bun install --frozen-lockfile"\n')
+    _commit_worktree_fixture(repo)
+    container = tmp_path / "container"
+    (container / repo.name).mkdir(parents=True)
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: tmp_path / "leases")
+    monkeypatch.setattr(cli.routing, "enable", lambda _workspace_id: None)
+    monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
+    monkeypatch.delenv("CDESKTOP_SESSION_ID", raising=False)
+
+    class Client(FakeSpawnClient):
+        instance = None
+
+        def __init__(self, _url=None) -> None:
+            super().__init__(_url)
+            type(self).instance = self
+            self.workspace_data.update(container_ref=str(container), use_worktree=True)
+
+    monkeypatch.setattr(cli, "CdesktopClient", Client)
+    assert cli.cmd_spawn(_worktree_spawn_args(repo)) == 0
+    assert Client.instance.last_spawn["setup_script"] == "bun install --frozen-lockfile"
+
+
+def test_worktree_spawn_without_setup_hook_is_a_noop(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _commit_worktree_fixture(repo)
+    container = tmp_path / "container"
+    (container / repo.name).mkdir(parents=True)
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: tmp_path / "leases")
+    monkeypatch.setattr(cli.routing, "enable", lambda _workspace_id: None)
+    monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
+    monkeypatch.delenv("CDESKTOP_SESSION_ID", raising=False)
+
+    class Client(FakeSpawnClient):
+        instance = None
+
+        def __init__(self, _url=None) -> None:
+            super().__init__(_url)
+            type(self).instance = self
+            self.workspace_data.update(container_ref=str(container), use_worktree=True)
+
+    monkeypatch.setattr(cli, "CdesktopClient", Client)
+    assert cli.cmd_spawn(_worktree_spawn_args(repo)) == 0
+    assert Client.instance.last_spawn["setup_script"] is None
+
+
+def test_worktree_setup_failure_propagates_without_a_lease(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    settings = repo / ".conductor" / "settings.toml"
+    settings.parent.mkdir(parents=True)
+    settings.write_text('[scripts]\nsetup = "false"\n')
+    _commit_worktree_fixture(repo)
+    lease_dir = tmp_path / "leases"
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
+    monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
+    monkeypatch.delenv("CDESKTOP_SESSION_ID", raising=False)
+
+    class Client(FakeSpawnClient):
+        def spawn_workspace(self, **kwargs):
+            assert kwargs["setup_script"] == "false"
+            raise RuntimeError("setup script failed")
+
+    monkeypatch.setattr(cli, "CdesktopClient", Client)
+    with pytest.raises(RuntimeError, match="setup script failed"):
+        cli.cmd_spawn(_worktree_spawn_args(repo))
+    assert LeaseStore(lease_dir).list() == []
+
+
 def test_close_archive_releases_only_workspace_lease(
     monkeypatch, tmp_path: Path
 ) -> None:

@@ -119,16 +119,41 @@ class CdesktopClient:
         return self.request("GET", "/providers")
 
     def register_repo(
-        self, path: Path, display_name: str | None = None
+        self,
+        path: Path,
+        display_name: str | None = None,
+        *,
+        setup_script: str | None = None,
+        configure_setup: bool = False,
     ) -> dict[str, Any]:
         resolved = path.expanduser().resolve()
         for repo in self.repos():
             if Path(repo["path"]).expanduser().resolve() == resolved:
+                if configure_setup:
+                    return self.request(
+                        "PUT",
+                        f"/repos/{repo['id']}",
+                        {
+                            "setup_script": setup_script,
+                            "parallel_setup_script": False,
+                        },
+                    )
                 return repo
+        payload: dict[str, Any] = {
+            "path": str(resolved),
+            "display_name": display_name or resolved.name,
+        }
+        if configure_setup:
+            payload.update(
+                {
+                    "setup_script": setup_script,
+                    "parallel_setup_script": False,
+                }
+            )
         return self.request(
             "POST",
             "/repos",
-            {"path": str(resolved), "display_name": display_name or resolved.name},
+            payload,
         )
 
     def create_workspace_record(
@@ -395,8 +420,13 @@ class CdesktopClient:
         model: str | None,
         reasoning: str | None,
         provider_id: str | None,
+        setup_script: str | None = None,
     ) -> dict[str, Any]:
-        repo = self.register_repo(repo_path)
+        repo = self.register_repo(
+            repo_path,
+            setup_script=setup_script,
+            configure_setup=use_worktree and setup_script is not None,
+        )
         executor_config: dict[str, Any] = {
             "executor": executor,
             "permission_policy": permission_policy,

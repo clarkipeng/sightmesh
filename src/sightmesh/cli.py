@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -600,6 +601,27 @@ def _validate_base_branch(repo_path: Path, base: str) -> None:
     )
 
 
+def _repository_setup_script(repo_path: Path, base: str) -> str | None:
+    settings = ".conductor/settings.toml"
+    result = subprocess.run(
+        ["git", "show", f"{base}:{settings}"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        return None
+    data = tomllib.loads(result.stdout)
+    scripts = data.get("scripts")
+    setup = scripts.get("setup") if isinstance(scripts, dict) else None
+    if setup is None:
+        return None
+    if not isinstance(setup, str):
+        raise ValueError(f"{settings}: scripts.setup must be a string")  # noqa: TRY004
+    return setup.strip() or None
+
+
 def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
     prompt = _with_coordination_contract(
         _read_text(args.prompt, args.prompt_file, "prompt")
@@ -610,6 +632,9 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
     if not repo_path.is_dir():
         raise ValueError(f"Repository path does not exist: {repo_path}")
     _validate_base_branch(repo_path, args.base)
+    setup_script = (
+        _repository_setup_script(repo_path, args.base) if args.worktree else None
+    )
     if args.unattended and not args.worktree:
         raise ValueError("--unattended requires --worktree")
     if args.unattended:
@@ -651,6 +676,7 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
             model=model,
             reasoning=reasoning,
             provider_id=provider_id,
+            setup_script=setup_script,
         )
     except Exception:
         if pending_lease:
