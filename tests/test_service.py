@@ -8,11 +8,14 @@ def test_service_definition_is_local_and_uses_native_cleanup(
 ) -> None:
     monkeypatch.setattr(service.shutil, "which", lambda _: "/tmp/cdesktop")
     monkeypatch.setattr(service, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(service, "command_path", lambda: "/user/bin:/usr/bin")
     definition = service.definition(4321)
     assert definition["ProgramArguments"] == ["/tmp/cdesktop"]
     assert definition["EnvironmentVariables"]["CDESKTOP_NO_BROWSER"] == "1"
     assert definition["EnvironmentVariables"]["HOST"] == "127.0.0.1"
     assert definition["EnvironmentVariables"]["PORT"] == "4321"
+    assert definition["EnvironmentVariables"]["PATH"] == "/user/bin:/usr/bin"
+    assert definition["WorkingDirectory"] == str(service.Path.home())
     assert "DISABLE_WORKTREE_CLEANUP" not in definition["EnvironmentVariables"]
     assert definition["Umask"] == 0o077
     assert definition["Label"] == "io.sightmesh.cdesktop"
@@ -23,6 +26,7 @@ def test_bridge_definition_targets_managed_local_cdesktop(
 ) -> None:
     monkeypatch.setattr(service.shutil, "which", lambda _: "/tmp/sightmesh")
     monkeypatch.setattr(service, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(service, "command_path", lambda: "/user/bin:/usr/bin")
     definition = service.bridge_definition(4321)
     assert definition["ProgramArguments"] == [
         "/tmp/sightmesh",
@@ -31,6 +35,25 @@ def test_bridge_definition_targets_managed_local_cdesktop(
         "bridge",
     ]
     assert definition["Label"] == "io.sightmesh.bridge"
+
+
+def test_command_path_uses_login_shell_instead_of_launcher_path(monkeypatch) -> None:
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+    monkeypatch.setenv("PATH", "/restricted/bin")
+
+    class Result:
+        returncode = 0
+        stdout = "/normal/user/bin:/usr/bin"
+
+    calls = []
+    monkeypatch.setattr(
+        service.subprocess,
+        "run",
+        lambda command, **_kwargs: calls.append(command) or Result(),
+    )
+
+    assert service.command_path() == "/normal/user/bin:/usr/bin"
+    assert calls == [["/bin/zsh", "-ilc", 'printf "%s" "$PATH"']]
 
 
 def test_service_paths_are_scoped_to_sightmesh() -> None:

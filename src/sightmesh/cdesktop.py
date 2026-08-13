@@ -435,20 +435,51 @@ class CdesktopClient:
             executor_config["model_id"] = model
         if reasoning:
             executor_config["reasoning_id"] = reasoning
-        return self.request(
-            "POST",
-            "/workspaces/start",
-            {
-                "name": name,
-                "repos": [{"repo_id": repo["id"], "target_branch": target_branch}],
-                "linked_issue": None,
-                "executor_config": executor_config,
-                "prompt": prompt,
-                "attachment_ids": None,
-                "use_worktree": use_worktree,
-                "selected_provider_id": provider_id,
-            },
-        )
+        known_workspace_ids = {str(item.get("id")) for item in self.workspaces()}
+        try:
+            return self.request(
+                "POST",
+                "/workspaces/start",
+                {
+                    "name": name,
+                    "repos": [{"repo_id": repo["id"], "target_branch": target_branch}],
+                    "linked_issue": None,
+                    "executor_config": executor_config,
+                    "prompt": prompt,
+                    "attachment_ids": None,
+                    "use_worktree": use_worktree,
+                    "selected_provider_id": provider_id,
+                },
+            )
+        except CdesktopError as exc:
+            cleanup = self._cleanup_failed_workspace_start(name, known_workspace_ids)
+            if cleanup:
+                raise CdesktopError(f"{exc}; {cleanup}") from exc
+            raise
+
+    def _cleanup_failed_workspace_start(
+        self, name: str, known_workspace_ids: set[str]
+    ) -> str | None:
+        """Delete only the unambiguous native workspace left by a failed start."""
+        try:
+            candidates = [
+                item
+                for item in self.workspaces()
+                if str(item.get("id")) not in known_workspace_ids
+                and item.get("name") == name
+            ]
+        except CdesktopError as exc:
+            return f"could not inspect partial workspace for cleanup: {exc}"
+        if len(candidates) != 1:
+            if candidates:
+                return "left partial workspace untouched because cleanup was ambiguous"
+            return None
+        workspace_id = str(candidates[0]["id"])
+        try:
+            self.delete_workspace(workspace_id)
+        except CdesktopError as exc:
+            return f"partial workspace {workspace_id} was not cleaned up: {exc}"
+        return f"native cleanup deleted partial workspace {workspace_id}"
 
     def send(
         self,

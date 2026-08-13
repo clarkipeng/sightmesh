@@ -20,6 +20,24 @@ LEGACY_BRIDGE_LABEL = "io.agent-deck.bridge"
 DEFAULT_PORT = 3210
 
 
+def command_path() -> str:
+    """Return the PATH a user gets from their normal interactive login shell."""
+    shell = os.environ.get("SHELL", "/bin/sh")
+    try:
+        result = subprocess.run(
+            [shell, "-ilc", 'printf "%s" "$PATH"'],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        result = None
+    if result and result.returncode == 0 and result.stdout:
+        return result.stdout
+    return os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+
+
 def service_url(port: int = DEFAULT_PORT) -> str:
     return f"http://127.0.0.1:{port}"
 
@@ -115,12 +133,13 @@ def definition(
         "RunAtLoad": True,
         "KeepAlive": True,
         "ProcessType": "Interactive",
+        "WorkingDirectory": str(Path.home()),
         "Umask": 0o077,
         "EnvironmentVariables": {
             "CDESKTOP_NO_BROWSER": "1",
             "HOST": "127.0.0.1",
             "PORT": str(port),
-            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            "PATH": command_path(),
         },
         "StandardOutPath": str(logs / "cdesktop.stdout.log"),
         "StandardErrorPath": str(logs / "cdesktop.stderr.log"),
@@ -146,7 +165,7 @@ def bridge_definition(port: int = DEFAULT_PORT) -> dict[str, Any]:
         "ProcessType": "Background",
         "Umask": 0o077,
         "EnvironmentVariables": {
-            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+            "PATH": command_path(),
         },
         "StandardOutPath": str(logs / "bridge.stdout.log"),
         "StandardErrorPath": str(logs / "bridge.stderr.log"),
