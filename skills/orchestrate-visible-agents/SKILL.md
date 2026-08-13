@@ -50,6 +50,8 @@ Search cdesktop and Repowire inventories first. Do not spawn a duplicate worker 
 
 Before spawning, run a bounded preflight against the exact base: confirm the branch resolves to the intended SHA, determine whether the new worktree will have required dependencies, verify any required local service, and name one focused command that can execute there. Put the delivery branch and push target in the prompt when SightMesh will create a different local branch. If setup is missing, provision it once through the repository's supported bootstrap path or state the exact setup command in the assignment. Do not make each worker rediscover the same missing dependency or service.
 
+Resolve `--repo` to the canonical repository root before every isolated spawn. Use the first `worktree` entry from `git worktree list --porcelain`, verify it is not inside `.cdesktop-workspaces`, and pass that exact path. Never pass the current managed checkout or another worker's worktree as `--repo`; doing so creates a duplicate repository group and can let child setup mutate the parent's checkout. After spawning, inspect `sightmesh peek` and require its `source` to equal the canonical root before authorizing writes.
+
 When taking over a workspace imported from Conductor, check for `.context/sightmesh-migration.json`. Read the referenced handoff before writing, then validate the live branch, HEAD, dirty state, and remaining scope against it. The original checkout and Conductor database remain authoritative historical sources.
 
 ## Spawn visible workers
