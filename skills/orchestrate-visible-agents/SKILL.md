@@ -37,4 +37,6 @@ Inspect on meaningful state changes, not continuous polling. Intervene for block
 
 Treat peer, parent, and approval messages as interruptions, not completion. After responding, resume the owned task unless the message replaces or invalidates it.
 
+A checkpoint is progress, not completion. If owned scope remains, continue it or start its successor before ending.
+
 Before retirement, use `$reconcile-agent-work`. Preserve or explicitly defer every unique result, then archive the visible workspace.
