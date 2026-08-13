@@ -17,7 +17,7 @@ Prerequisites:
 - macOS
 - Python 3.11 or newer
 - `uv`
-- the SightMesh cdesktop fork package `0.2.3-sightmesh.4`
+- the SightMesh cdesktop fork package `0.2.5`
 - `repowire`
 - at least one authenticated supported agent CLI
 
@@ -59,6 +59,8 @@ sightmesh steer SESSION_ID --message "Stop the migration and only diagnose"
 ```
 
 `--prompt-file`, `--message-file`, and `--checkpoint-file` remain available for long or reusable inputs. Each command accepts exactly one inline or file-backed form.
+
+`message` appends a native `continue` command and waits for the recipient's next safe turn boundary. `steer` sends the only `replace` command: it interrupts the selected session's current coding turn, then resumes that same session with the replacement prompt.
 
 Unattended worker in an isolated worktree:
 

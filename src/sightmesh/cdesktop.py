@@ -457,7 +457,7 @@ class CdesktopClient:
         sender_session: str | None = None,
         *,
         dedupe_key: str | None = None,
-        intent: str | None = None,
+        intent: str = "continue",
     ) -> Any:
         headers = {}
         if sender_session:
@@ -465,8 +465,7 @@ class CdesktopClient:
         payload: dict[str, Any] = {"prompt": prompt}
         if dedupe_key:
             payload["dedupe_key"] = dedupe_key
-        if intent:
-            payload["intent"] = intent
+        payload["intent"] = intent
         return self.request(
             "POST",
             f"/sessions/{session_id}/follow-up",

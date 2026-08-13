@@ -31,7 +31,7 @@ def test_send_marks_sender_when_provided() -> None:
         (
             "POST",
             "/sessions/target/follow-up",
-            {"prompt": "hello"},
+            {"prompt": "hello", "intent": "continue"},
             None,
             {"x-cdesktop-from-session": "sender"},
         )
