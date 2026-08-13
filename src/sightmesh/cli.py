@@ -26,6 +26,15 @@ from .repowire import RepowireError
 from .repowire import reply as repowire_reply
 
 CDESKTOP_FORK_MARKER = "sightmesh"
+COORDINATION_MARKER = "## Local agent coordination"
+COORDINATION_CONTRACT = """## Local agent coordination
+
+- Use `sightmesh peers` and `sightmesh peek @agent` for compact fleet awareness.
+- Use `sightmesh steer @agent --message "..."` for immediate peer contact. It interrupts only that agent's active turn.
+- Contact your lead with `cdesktop team manager --message "STATUS: concise details"` when blocked, when a decision is needed, and when complete.
+- Batch independent read-only tool calls and all currently known independent questions. Keep dependent or destructive actions sequential.
+- Do not use hidden or native subagents.
+"""
 
 
 def _read_text(value: str | None, path: str | None, label: str) -> str:
@@ -34,6 +43,12 @@ def _read_text(value: str | None, path: str | None, label: str) -> str:
     if path:
         return Path(path).expanduser().read_text(encoding="utf-8")
     return value or ""
+
+
+def _with_coordination_contract(prompt: str) -> str:
+    if COORDINATION_MARKER in prompt:
+        return prompt
+    return f"{prompt.rstrip()}\n\n{COORDINATION_CONTRACT.rstrip()}\n"
 
 
 def _emit(data: Any, as_json: bool) -> None:
@@ -53,6 +68,10 @@ def _repowire_status_ok(returncode: int, detail: str) -> bool:
     )
 
 
+def _is_sightmesh_cdesktop_version(detail: object) -> bool:
+    return CDESKTOP_FORK_MARKER in str(detail or "").casefold()
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     checks: list[dict[str, Any]] = []
     failures = 0
@@ -64,6 +83,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             config.get("analytics_enabled") is False
             and config.get("relay_enabled") is False
         )
+        runtime_fork_ok = _is_sightmesh_cdesktop_version(info.get("version"))
         checks.append(
             {
                 "check": "cdesktop-local-only",
@@ -77,6 +97,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             }
         )
         failures += int(not local_ok)
+        checks.append(
+            {
+                "check": "cdesktop-runtime-sightmesh-fork",
+                "ok": runtime_fork_ok,
+                "detail": info.get("version") or "version unavailable",
+            }
+        )
+        failures += int(not runtime_fork_ok)
     except CdesktopError as exc:
         checks.append({"check": "cdesktop", "ok": False, "detail": str(exc)})
         failures += 1
@@ -108,7 +136,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             check=False,
         )
         detail = (result.stdout or result.stderr).strip()
-        fork_ok = result.returncode == 0 and CDESKTOP_FORK_MARKER in detail.casefold()
+        fork_ok = result.returncode == 0 and _is_sightmesh_cdesktop_version(detail)
         checks.append(
             {
                 "check": "cdesktop-sightmesh-fork",
@@ -205,6 +233,200 @@ def cmd_list(args: argparse.Namespace) -> int:
             }
         )
     _emit(rows, args.json)
+    return 0
+
+
+def _fleet_sessions(
+    client: CdesktopClient, *, include_archived: bool = False
+) -> list[dict[str, Any]]:
+    archive_states = (False, True) if include_archived else (False,)
+    summaries = {
+        item["workspace_id"]: item
+        for archived in archive_states
+        for item in client.workspace_summaries(archived)
+    }
+    rows: list[dict[str, Any]] = []
+    for workspace in client.workspaces():
+        if workspace.get("archived") and not include_archived:
+            continue
+        sessions = sorted(
+            client.sessions(workspace["id"]),
+            key=lambda item: (str(item.get("created_at") or ""), str(item["id"])),
+        )
+        summary = summaries.get(workspace["id"], {})
+        for index, session in enumerate(sessions):
+            workspace_name = str(workspace.get("name") or workspace["id"])
+            session_name = str(session.get("name") or "")
+            rows.append(
+                {
+                    "workspace_id": str(workspace["id"]),
+                    "workspace": workspace_name,
+                    "session_id": str(session["id"]),
+                    "session": session_name
+                    or ("lead" if index == 0 else f"peer-{index}"),
+                    "session_name": session_name or None,
+                    "is_lead": index == 0,
+                    "executor": session.get("executor"),
+                    "branch": workspace.get("branch"),
+                    "archived": bool(workspace.get("archived")),
+                    "workspace_status": summary.get("latest_process_status"),
+                    "pending_approval": bool(summary.get("has_pending_approval")),
+                    "unseen": bool(summary.get("has_unseen_turns")),
+                }
+            )
+
+    base_aliases = [
+        str(row["session_name"] or row["workspace"])
+        if row["is_lead"] or row["session_name"]
+        else f"{row['workspace']}/{row['session']}"
+        for row in rows
+    ]
+    for row, base_alias in zip(rows, base_aliases, strict=True):
+        duplicate = (
+            sum(
+                candidate.casefold() == base_alias.casefold()
+                for candidate in base_aliases
+            )
+            > 1
+        )
+        row["selector"] = (
+            f"{row['workspace']}/{row['session']}" if duplicate else base_alias
+        )
+    return rows
+
+
+def _resolve_session(
+    client: CdesktopClient, selector: str, *, include_archived: bool = False
+) -> dict[str, Any]:
+    needle = selector.removeprefix("@").casefold()
+    rows = _fleet_sessions(client, include_archived=include_archived)
+    matches = []
+    for row in rows:
+        names = {
+            str(row["session_id"]).casefold(),
+            str(row["selector"]).casefold(),
+            f"{row['workspace']}/{row['session']}".casefold(),
+        }
+        if row["session_name"]:
+            names.add(str(row["session_name"]).casefold())
+        if row["is_lead"]:
+            names.update(
+                {
+                    str(row["workspace"]).casefold(),
+                    str(row["workspace_id"]).casefold(),
+                }
+            )
+        if needle in names:
+            matches.append(row)
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        available = ", ".join(f"@{row['selector']}" for row in rows)
+        raise ValueError(f"Unknown agent {selector!r}. Available: {available}")
+    candidates = ", ".join(f"@{row['selector']}" for row in matches)
+    raise ValueError(f"Ambiguous agent {selector!r}. Use one of: {candidates}")
+
+
+def _session_processes(
+    client: CdesktopClient, row: dict[str, Any]
+) -> list[dict[str, Any]]:
+    return client.execution_processes(str(row["session_id"]))
+
+
+def _latest_process(processes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    eligible = [
+        process
+        for process in processes
+        if not process.get("dropped") and process.get("run_reason") != "devserver"
+    ]
+    return eligible[-1] if eligible else None
+
+
+def cmd_peers(args: argparse.Namespace) -> int:
+    client = CdesktopClient(args.url)
+    rows = _fleet_sessions(client, include_archived=args.include_archived)
+    for row in rows:
+        try:
+            latest = _latest_process(_session_processes(client, row))
+        except CdesktopError:
+            latest = None
+        row["status"] = (
+            latest.get("status") if latest else row.pop("workspace_status", None)
+        )
+        row["execution_process_id"] = latest.get("id") if latest else None
+    if args.json:
+        _emit(rows, True)
+    else:
+        print("AGENT\tSTATUS\tEXECUTOR\tBRANCH")
+        for row in rows:
+            print(
+                f"@{row['selector']}\t{row.get('status') or 'unknown'}\t"
+                f"{row.get('executor') or '-'}\t{row.get('branch') or '-'}"
+            )
+    return 0
+
+
+def _compact_text(value: object, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else f"{text[: max(0, limit - 3)]}..."
+
+
+def cmd_peek(args: argparse.Namespace) -> int:
+    client = CdesktopClient(args.url)
+    row = _resolve_session(client, args.agent, include_archived=args.include_archived)
+    latest = _latest_process(_session_processes(client, row))
+    if latest is None:
+        raise ValueError(f"Agent @{row['selector']} has no execution history")
+    snapshot = client.normalized_snapshot(str(latest["id"]))
+    entries = snapshot.get("entries") if isinstance(snapshot, dict) else []
+    assistants: list[str] = []
+    tools: list[dict[str, Any]] = []
+    token_usage: dict[str, Any] | None = None
+    for wrapped in entries if isinstance(entries, list) else []:
+        content = wrapped.get("content") if isinstance(wrapped, dict) else None
+        if not isinstance(content, dict):
+            continue
+        entry_type = content.get("entry_type")
+        if not isinstance(entry_type, dict):
+            continue
+        kind = entry_type.get("type")
+        if kind == "assistant_message":
+            assistants.append(_compact_text(content.get("content"), args.max_chars))
+        elif kind == "tool_use":
+            tools.append(
+                {
+                    "tool": entry_type.get("tool_name"),
+                    "status": entry_type.get("status"),
+                    "summary": _compact_text(content.get("content"), 240),
+                }
+            )
+        elif kind == "token_usage_info":
+            token_usage = {
+                "used": entry_type.get("total_tokens"),
+                "window": entry_type.get("model_context_window"),
+            }
+    result = {
+        "agent": f"@{row['selector']}",
+        "session_id": row["session_id"],
+        "workspace": row["workspace"],
+        "branch": row["branch"],
+        "status": latest.get("status"),
+        "execution_process_id": latest.get("id"),
+        "last_assistant": assistants[-1] if assistants else None,
+        "recent_tools": tools[-args.tools :],
+        "token_usage": token_usage,
+        "context_pressure": (
+            round(float(token_usage["used"]) / float(token_usage["window"]), 3)
+            if token_usage
+            and isinstance(token_usage.get("used"), (int, float))
+            and isinstance(token_usage.get("window"), (int, float))
+            and token_usage["window"]
+            else None
+        ),
+        "coalesced_patch_count": snapshot.get("patch_count"),
+        "complete": snapshot.get("complete"),
+    }
+    _emit(result, args.json)
     return 0
 
 
@@ -325,7 +547,9 @@ def _validate_base_branch(repo_path: Path, base: str) -> None:
 
 
 def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
-    prompt = _read_text(args.prompt, args.prompt_file, "prompt")
+    prompt = _with_coordination_contract(
+        _read_text(args.prompt, args.prompt_file, "prompt")
+    )
     if not prompt.strip():
         raise ValueError("Prompt must not be empty")
     repo_path = Path(args.repo).expanduser().resolve()
@@ -420,9 +644,10 @@ def cmd_spawn(args: argparse.Namespace) -> int:
 
 def cmd_message(args: argparse.Namespace) -> int:
     message = _read_text(args.message, args.message_file, "message")
-    result = CdesktopClient(args.url).send(
-        args.session_id, message, args.sender_session
-    )
+    client = CdesktopClient(args.url)
+    target = _resolve_session(client, args.session_id)
+    sender = args.sender_session or os.environ.get("CDESKTOP_SESSION_ID")
+    result = client.send(str(target["session_id"]), message, sender)
     _emit(result, args.json)
     return 0
 
@@ -432,44 +657,49 @@ def cmd_steer(args: argparse.Namespace) -> int:
     if not message.strip():
         raise ValueError("Steering message must not be empty")
     client = CdesktopClient(args.url)
-    session = client.session(args.session_id)
-    workspace_id = str(session["workspace_id"])
+    target = _resolve_session(client, args.session_id)
+    session_id = str(target["session_id"])
+    caller_session = args.sender_session or os.environ.get("CDESKTOP_SESSION_ID")
+    if caller_session == session_id:
+        raise ValueError("An agent cannot steer itself")
+    workspace_id = str(target["workspace_id"])
     workspace = client.workspace(workspace_id)
     if workspace.get("archived"):
         raise ValueError("Cannot steer a session in an archived workspace")
 
-    summary = next(
-        (
-            item
-            for item in client.workspace_summaries(False)
-            if item.get("workspace_id") == workspace_id
-        ),
-        None,
-    )
-    if not summary:
-        raise ValueError("Target session is not in an active cdesktop workspace")
-
-    interrupted = summary.get("latest_process_status") == "running"
-    if interrupted:
-        client.stop_workspace(workspace_id)
-        summary = client.wait_for_workspace_idle(
-            workspace_id, timeout_seconds=args.timeout_seconds
-        )
-    if summary.get("has_pending_approval"):
+    processes = _session_processes(client, target)
+    process_ids = {str(process["id"]) for process in processes}
+    pending = [
+        approval
+        for approval in client.pending_approvals()
+        if str(approval.get("execution_process_id")) in process_ids
+    ]
+    if pending:
         raise ValueError(
-            "Target workspace still has a pending approval after interruption; "
-            "resolve it in cdesktop before steering"
+            "Target agent has a pending approval or question; resolve it in cdesktop "
+            "before steering"
         )
+    running = [
+        process
+        for process in processes
+        if process.get("status") == "running"
+        and process.get("run_reason") != "devserver"
+    ]
+    for process in running:
+        client.stop_execution(str(process["id"]))
+    if running:
+        client.wait_for_session_idle(session_id, timeout_seconds=args.timeout_seconds)
 
-    result = client.send(args.session_id, message, args.sender_session)
+    result = client.send(session_id, message, caller_session)
     _emit(
         {
             "workspace_id": workspace_id,
-            "session_id": args.session_id,
-            "interrupted_workspace": interrupted,
-            "scope": "all running executions in the workspace"
-            if interrupted
-            else "idle session",
+            "session_id": session_id,
+            "agent": f"@{target['selector']}",
+            "interrupted_execution_processes": [
+                str(process["id"]) for process in running
+            ],
+            "scope": "selected session only",
             "follow_up": result,
         },
         args.json,
@@ -480,29 +710,30 @@ def cmd_steer(args: argparse.Namespace) -> int:
 def cmd_prompt_idle(args: argparse.Namespace) -> int:
     message = _read_text(args.message, args.message_file, "message")
     client = CdesktopClient(args.url)
-    session = client.session(args.session_id)
-    workspace_id = session["workspace_id"]
-    summary = next(
-        (
-            item
-            for item in client.workspace_summaries(False)
-            if item.get("workspace_id") == workspace_id
-        ),
-        None,
-    )
-    if not summary:
-        raise ValueError("Target session is not in an active cdesktop workspace")
-    if summary.get("latest_process_status") == "running":
-        raise ValueError("Target workspace is running; refusing idle-only prompt")
-    if summary.get("has_pending_approval"):
+    target = _resolve_session(client, args.session_id)
+    session_id = str(target["session_id"])
+    workspace_id = str(target["workspace_id"])
+    processes = _session_processes(client, target)
+    if any(
+        process.get("status") == "running" and process.get("run_reason") != "devserver"
+        for process in processes
+    ):
+        raise ValueError("Target agent is running; refusing idle-only prompt")
+    process_ids = {str(process["id"]) for process in processes}
+    if any(
+        str(approval.get("execution_process_id")) in process_ids
+        for approval in client.pending_approvals()
+    ):
         raise ValueError(
-            "Target workspace has a pending approval; refusing idle-only prompt"
+            "Target agent has a pending approval; refusing idle-only prompt"
         )
-    result = client.send(args.session_id, message, args.sender_session)
+    sender = args.sender_session or os.environ.get("CDESKTOP_SESSION_ID")
+    result = client.send(session_id, message, sender)
     _emit(
         {
             "workspace_id": workspace_id,
-            "session_id": args.session_id,
+            "session_id": session_id,
+            "agent": f"@{target['selector']}",
             "verified_idle": True,
             "follow_up": result,
         },
@@ -645,7 +876,9 @@ def _caller_session(explicit: str | None) -> str:
 
 
 def cmd_teammate_spawn(args: argparse.Namespace) -> int:
-    prompt = _read_text(args.prompt, args.prompt_file, "prompt")
+    prompt = _with_coordination_contract(
+        _read_text(args.prompt, args.prompt_file, "prompt")
+    )
     client = CdesktopClient(args.url)
     executor, provider_id, model, reasoning, profile_name = _profile_selection(
         args, client
@@ -1287,6 +1520,21 @@ def parser() -> argparse.ArgumentParser:
     listing = sub.add_parser("list", help="List cdesktop workspaces and sessions")
     listing.set_defaults(func=cmd_list)
 
+    peers = sub.add_parser(
+        "peers", help="List every visible agent with compact steerable names"
+    )
+    peers.add_argument("--include-archived", action="store_true")
+    peers.set_defaults(func=cmd_peers)
+
+    peek = sub.add_parser(
+        "peek", help="Show a coalesced activity snapshot for one visible agent"
+    )
+    peek.add_argument("agent", help="Agent name from `sightmesh peers` or session UUID")
+    peek.add_argument("--include-archived", action="store_true")
+    peek.add_argument("--tools", type=int, default=3)
+    peek.add_argument("--max-chars", type=int, default=600)
+    peek.set_defaults(func=cmd_peek)
+
     fleet_status = sub.add_parser(
         "status", help="Show joined local fleet and reliability status"
     )
@@ -1336,8 +1584,10 @@ def parser() -> argparse.ArgumentParser:
     spawn.add_argument("--no-bridge", action="store_true")
     spawn.set_defaults(func=cmd_spawn)
 
-    message = sub.add_parser("message", help="Send a visible cdesktop follow-up")
-    message.add_argument("session_id")
+    message = sub.add_parser(
+        "message", help="Send a visible follow-up by agent name or session UUID"
+    )
+    message.add_argument("session_id", help="Agent name from `sightmesh peers` or UUID")
     message_group = message.add_mutually_exclusive_group(required=True)
     message_group.add_argument("--message")
     message_group.add_argument("--message-file")
@@ -1346,9 +1596,9 @@ def parser() -> argparse.ArgumentParser:
 
     steer = sub.add_parser(
         "steer",
-        help="Interrupt a running cdesktop workspace and resume its session with a follow-up",
+        help="Interrupt one selected agent and immediately resume it with a follow-up",
     )
-    steer.add_argument("session_id")
+    steer.add_argument("session_id", help="Agent name from `sightmesh peers` or UUID")
     steer_group = steer.add_mutually_exclusive_group(required=True)
     steer_group.add_argument("--message")
     steer_group.add_argument("--message-file")
@@ -1359,7 +1609,9 @@ def parser() -> argparse.ArgumentParser:
     prompt_idle = sub.add_parser(
         "prompt-idle", help="Prompt a session only when cdesktop reports it idle"
     )
-    prompt_idle.add_argument("session_id")
+    prompt_idle.add_argument(
+        "session_id", help="Agent name from `sightmesh peers` or UUID"
+    )
     idle_group = prompt_idle.add_mutually_exclusive_group(required=True)
     idle_group.add_argument("--message")
     idle_group.add_argument("--message-file")

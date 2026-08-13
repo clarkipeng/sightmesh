@@ -111,6 +111,29 @@ def test_wait_for_workspace_idle_returns_terminal_summary() -> None:
     assert summary["latest_process_status"] == "killed"
 
 
+def test_execution_process_and_snapshot_routes_are_native_gets() -> None:
+    client = FakeClient()
+    client.request = lambda method, path, payload=None, query=None, headers=None: (
+        [] if path == "/execution-processes" else {"entries": []}
+    )
+    assert client.execution_processes("session-a") == []
+    assert client.normalized_snapshot("process-a") == {"entries": []}
+
+
+def test_stop_execution_targets_one_process() -> None:
+    client = FakeClient()
+    client.stop_execution("process-a")
+    assert client.calls == [
+        (
+            "POST",
+            "/execution-processes/process-a/stop",
+            {},
+            None,
+            None,
+        )
+    ]
+
+
 def test_create_direct_workspace_record_and_attach_repo(tmp_path) -> None:
     client = FakeClient()
     client.repos = list

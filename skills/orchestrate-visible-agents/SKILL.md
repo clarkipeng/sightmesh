@@ -17,7 +17,8 @@ Keep the workflow native and unsurprising:
 - keep `.context` handoffs ignored and untracked unless the repository explicitly declares that exact file tracked; never force-add an ignored handoff, and verify it is absent from the candidate tree before push or PR handoff;
 - use Git and the filesystem to inspect sibling worktrees;
 - use cdesktop for session rosters, transcripts, and human interaction;
-- use Repowire for cross-workspace contact;
+- use `sightmesh peers`, `peek`, and `steer` for compact fleet awareness and immediate targeted contact;
+- use Repowire for durable cross-workspace asks and replies that should not interrupt the target;
 - do not create a global context mirror, duplicate transcripts, or introduce another MCP or command when these surfaces already suffice.
 
 ## Choose the topology
@@ -25,9 +26,10 @@ Keep the workflow native and unsurprising:
 1. Use a separate cdesktop workspace with an isolated worktree for implementation, independently shippable changes, or overlapping repository access.
 2. Use `cdesktop team spawn` only for read-only review, research, or disjoint paths in the same workspace.
 3. Keep one lead session per cdesktop workspace. Only the lead spawns teammates.
-4. Use Repowire for communication between different cdesktop workspaces.
+4. Use `sightmesh steer @agent --message "..."` when a peer must see a correction or blocker immediately. It interrupts only that session. Use Repowire when delivery should remain a durable non-interrupting ask or reply.
 5. Queue with `sightmesh message` when the current course remains valid. Use `sightmesh steer` only when continued work would create invalid output, unsafe mutation, scope drift, or avoidable rework. Use `sightmesh prompt-idle` when delivery must wait for an idle session.
 6. Every teammate must contact its workspace lead when it needs a decision, feedback, or help with a blocker, and when it completes. Use `cdesktop team manager --message "STATUS: concise details"`; the command resolves the lead session automatically.
+7. Before asking for input, collect all currently known independent questions and send one multi-question request. Before tool use, batch independent read-only inspections. Keep dependent operations, mutations, approvals, and destructive actions sequential.
 
 Read [references/cdesktop-and-repowire.md](references/cdesktop-and-repowire.md) before the first spawn in a new environment.
 
@@ -74,18 +76,20 @@ Prefer named SightMesh profiles over raw provider IDs when repeatability matters
 
 ## Communicate
 
-Within one workspace:
+Start with the compact local fleet surface:
 
 ```sh
-sightmesh teammate-list
-sightmesh message <session-id> --message-file <message-file>
+sightmesh peers
+sightmesh peek @<agent>
+sightmesh steer @<agent> --message "<immediate correction or blocker>"
 ```
 
-Across workspaces, use the visible cdesktop session ID for immediate routing:
+Selectors are exact and ambiguity-safe. Never steer yourself. Targeted steering leaves other sessions in the same workspace and any dev server running. It refuses to interrupt a pending approval or question.
+
+For a non-interrupting follow-up when the current course remains valid:
 
 ```sh
-sightmesh list
-sightmesh message <session-id> --message-file <message-file>
+sightmesh message @<agent> --message-file <message-file>
 ```
 
 Use Repowire for peer discovery, asks, and delivery tracing when the peer reports online:

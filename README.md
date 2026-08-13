@@ -6,7 +6,7 @@ Delegated work remains visible and interruptible in cdesktop. SightMesh does not
 
 The interface is deliberately native-first. `.context` remains a normal workspace-local, Git-ignored directory. cdesktop remains the source of truth for sessions and transcripts, Git remains the source of truth for worktrees and changes, and Repowire remains the cross-workspace contact layer. SightMesh does not build a global context mirror or copy every conversation into another agent-specific format.
 
-See [compatibility](docs/compatibility.md), [operations](docs/operations.md), and the [source-derived competitive bake-off](docs/competitive-bakeoff.md) for tested versions, limitations, and alternatives.
+See [compatibility](docs/compatibility.md), [operations](docs/operations.md), the [trace-efficiency audit](docs/trace-efficiency.md), and the [source-derived competitive bake-off](docs/competitive-bakeoff.md) for tested versions, limitations, and alternatives.
 
 ## Install
 
@@ -129,6 +129,26 @@ Codex CLI ───────┘            │
 The managed LaunchAgents are `io.sightmesh.cdesktop` and `io.sightmesh.bridge`. cdesktop binds to `127.0.0.1:3210`; analytics and relay are disabled; managed worktrees default to `~/.local/share/sightmesh/.cdesktop-workspaces`; state and logs live under `~/.local/state/sightmesh`.
 
 Every workspace created by `sightmesh spawn` is bridge-enabled unless `--no-bridge` is passed. The bridge registers one durable Repowire proxy peer per enabled cdesktop session. Repowire asks become visible cdesktop follow-ups, and `sightmesh bridge-reply` closes the original correlation.
+
+Same-workspace teammates can contact their lead without looking up a session ID. The cdesktop fork injects this contract into every teammate prompt:
+
+```bash
+cdesktop team manager --message "BLOCKED: need a decision on the storage schema"
+```
+
+Use the same command for questions, status updates, and completion notices. Cross-workspace communication continues to use Repowire.
+
+Every local agent can inspect and immediately steer every other visible agent with compact, exact selectors:
+
+```bash
+sightmesh peers
+sightmesh peek @recorder-v2-provider-proof
+sightmesh steer @recorder-v2-provider-proof --message "Re-check the exact remote head before finishing"
+```
+
+`peers` avoids the full workspace/status payload. `peek` coalesces the live normalized trace into the latest assistant message, recent tools, and token usage in one response. `steer` stops only the selected session's active coding turn, leaves its peer sessions and dev server alone, then starts the follow-up immediately. It refuses self-steering and agents with a pending approval or question.
+
+The fork renders a multi-question request as one scrollable form and submits every answer in one response. Worker prompts also require independent read-only tool calls and currently known independent questions to be batched, while dependent writes, approvals, and destructive actions stay sequential.
 
 cdesktop already groups the sidebar by repository, shows the live transcript and process logs, renders changed-file diffs, opens the full checkout in the configured IDE, and provides a built-in browser preview for running applications and image assets. SightMesh keeps those native surfaces instead of adding a second file viewer or transcript store.
 

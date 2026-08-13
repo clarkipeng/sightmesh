@@ -170,6 +170,53 @@ class CdesktopClient:
     def execution_process(self, execution_process_id: str) -> dict[str, Any]:
         return self.request("GET", f"/execution-processes/{execution_process_id}")
 
+    def execution_processes(self, session_id: str) -> list[dict[str, Any]]:
+        result = self.request(
+            "GET", "/execution-processes", query={"session_id": session_id}
+        )
+        if not isinstance(result, list):
+            raise CdesktopError("cdesktop execution process response is not a list")
+        return [dict(item) for item in result if isinstance(item, dict)]
+
+    def normalized_snapshot(self, execution_process_id: str) -> dict[str, Any]:
+        result = self.request(
+            "GET",
+            f"/execution-processes/{execution_process_id}/normalized-snapshot",
+        )
+        if not isinstance(result, dict):
+            raise CdesktopError("cdesktop normalized snapshot response is invalid")
+        return result
+
+    def stop_execution(self, execution_process_id: str) -> Any:
+        return self.request(
+            "POST", f"/execution-processes/{execution_process_id}/stop", {}
+        )
+
+    def wait_for_session_idle(
+        self,
+        session_id: str,
+        *,
+        timeout_seconds: float = 30.0,
+        poll_seconds: float = 0.1,
+    ) -> list[dict[str, Any]]:
+        deadline = time.monotonic() + timeout_seconds
+        latest: list[dict[str, Any]] = []
+        while time.monotonic() <= deadline:
+            latest = self.execution_processes(session_id)
+            running = [
+                process
+                for process in latest
+                if process.get("status") == "running"
+                and process.get("run_reason") != "devserver"
+            ]
+            if not running:
+                return latest
+            time.sleep(poll_seconds)
+        raise CdesktopError(
+            f"Session {session_id} did not stop within {timeout_seconds:g} seconds; "
+            "the steering follow-up was not sent"
+        )
+
     def pending_approvals(
         self, *, timeout_seconds: float = 5.0
     ) -> list[dict[str, Any]]:

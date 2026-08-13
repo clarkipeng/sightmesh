@@ -6,10 +6,14 @@ import pytest
 
 from sightmesh import __version__, approvals, cli, delivery
 from sightmesh.cli import (
+    _fleet_sessions,
+    _is_sightmesh_cdesktop_version,
     _primary_session_id,
     _read_text,
     _repowire_status_ok,
+    _resolve_session,
     _validate_reasoning,
+    _with_coordination_contract,
     parser,
 )
 from sightmesh.delivery import DeliveryStore, make_record
@@ -22,6 +26,55 @@ def test_read_text_requires_one_source(tmp_path) -> None:
     prompt.write_text("from file", encoding="utf-8")
     assert _read_text(None, str(prompt), "prompt") == "from file"
     assert _read_text("inline", None, "prompt") == "inline"
+
+
+def test_sightmesh_cdesktop_version_requires_fork_marker() -> None:
+    assert _is_sightmesh_cdesktop_version("cdesktop 0.2.3-sightmesh.1")
+    assert _is_sightmesh_cdesktop_version("0.2.3-SIGHTMESH.1")
+    assert not _is_sightmesh_cdesktop_version("0.2.3")
+    assert not _is_sightmesh_cdesktop_version(None)
+
+
+def test_coordination_contract_is_compact_and_idempotent() -> None:
+    prompt = _with_coordination_contract("Do the bounded review.")
+    assert "sightmesh peers" in prompt
+    assert "sightmesh steer @agent" in prompt
+    assert "Batch independent read-only tool calls" in prompt
+    assert _with_coordination_contract(prompt) == prompt
+
+
+def test_fleet_selector_resolves_workspace_and_named_peer() -> None:
+    class FleetClient:
+        def workspace_summaries(self, archived=False):
+            assert archived is False
+            return [{"workspace_id": "workspace-a", "latest_process_status": "running"}]
+
+        def workspaces(self):
+            return [
+                {
+                    "id": "workspace-a",
+                    "name": "alpha",
+                    "branch": "feature-a",
+                    "archived": False,
+                }
+            ]
+
+        def sessions(self, _workspace_id):
+            return [
+                {"id": "lead-a", "name": None, "created_at": "1", "executor": "CODEX"},
+                {
+                    "id": "peer-a",
+                    "name": "reviewer",
+                    "created_at": "2",
+                    "executor": "CLAUDE_CODE",
+                },
+            ]
+
+    client = FleetClient()
+    rows = _fleet_sessions(client)
+    assert [row["selector"] for row in rows] == ["alpha", "reviewer"]
+    assert _resolve_session(client, "@alpha")["session_id"] == "lead-a"
+    assert _resolve_session(client, "reviewer")["session_id"] == "peer-a"
 
 
 def test_namespace_import_is_available() -> None:
@@ -255,9 +308,15 @@ class FakeSpawnClient:
 
 def test_prompt_idle_sends_only_when_not_running(monkeypatch, capsys) -> None:
     class IdleClient(FakeSpawnClient):
-        def session(self, session_id):
-            assert session_id == "session-a"
-            return {"id": session_id, "workspace_id": "workspace-a"}
+        def workspaces(self):
+            return [
+                {
+                    "id": "workspace-a",
+                    "name": "worker-a",
+                    "branch": "feature-a",
+                    "archived": False,
+                }
+            ]
 
         def workspace_summaries(self, archived=False):
             assert archived is False
@@ -276,6 +335,20 @@ def test_prompt_idle_sends_only_when_not_running(monkeypatch, capsys) -> None:
                 "sender": sender_session,
             }
 
+        def execution_processes(self, session_id):
+            assert session_id == "session-a"
+            return [
+                {
+                    "id": "process-a",
+                    "status": "completed",
+                    "run_reason": "codingagent",
+                    "dropped": False,
+                }
+            ]
+
+        def pending_approvals(self):
+            return []
+
     monkeypatch.setattr(cli, "CdesktopClient", IdleClient)
     args = argparse.Namespace(
         session_id="session-a",
@@ -290,13 +363,30 @@ def test_prompt_idle_sends_only_when_not_running(monkeypatch, capsys) -> None:
     assert '"verified_idle": true' in capsys.readouterr().out
 
 
-def test_prompt_idle_refuses_running_workspace(monkeypatch) -> None:
+def test_prompt_idle_refuses_running_agent(monkeypatch) -> None:
     class RunningClient(FakeSpawnClient):
-        def session(self, _session_id):
-            return {"workspace_id": "workspace-a"}
+        def workspaces(self):
+            return [
+                {
+                    "id": "workspace-a",
+                    "name": "worker-a",
+                    "branch": "feature-a",
+                    "archived": False,
+                }
+            ]
 
         def workspace_summaries(self, archived=False):
             return [{"workspace_id": "workspace-a", "latest_process_status": "running"}]
+
+        def execution_processes(self, _session_id):
+            return [
+                {
+                    "id": "process-a",
+                    "status": "running",
+                    "run_reason": "codingagent",
+                    "dropped": False,
+                }
+            ]
 
     monkeypatch.setattr(cli, "CdesktopClient", RunningClient)
     args = argparse.Namespace(
@@ -312,9 +402,7 @@ def test_prompt_idle_refuses_running_workspace(monkeypatch) -> None:
         cli.cmd_prompt_idle(args)
 
 
-def test_steer_stops_running_workspace_then_resumes_same_session(
-    monkeypatch, capsys
-) -> None:
+def test_steer_stops_only_target_session_then_resumes_it(monkeypatch, capsys) -> None:
     instances = []
 
     class RunningClient(FakeSpawnClient):
@@ -322,8 +410,15 @@ def test_steer_stops_running_workspace_then_resumes_same_session(
             super().__init__(_url)
             instances.append(self)
 
-        def session(self, session_id):
-            return {"id": session_id, "workspace_id": "workspace-a"}
+        def workspaces(self):
+            return [
+                {
+                    "id": "workspace-a",
+                    "name": "worker-a",
+                    "branch": "feature-a",
+                    "archived": False,
+                }
+            ]
 
         def workspace_summaries(self, archived=False):
             return [
@@ -334,14 +429,27 @@ def test_steer_stops_running_workspace_then_resumes_same_session(
                 }
             ]
 
-        def wait_for_workspace_idle(self, workspace_id, timeout_seconds):
-            assert workspace_id == "workspace-a"
+        def execution_processes(self, session_id):
+            assert session_id == "session-a"
+            return [
+                {
+                    "id": "process-a",
+                    "status": "running",
+                    "run_reason": "codingagent",
+                    "dropped": False,
+                }
+            ]
+
+        def pending_approvals(self):
+            return []
+
+        def stop_execution(self, process_id):
+            self.stopped.append(process_id)
+
+        def wait_for_session_idle(self, session_id, timeout_seconds):
+            assert session_id == "session-a"
             assert timeout_seconds == 12
-            return {
-                "workspace_id": workspace_id,
-                "latest_process_status": "killed",
-                "has_pending_approval": False,
-            }
+            return []
 
         def send(self, session_id, prompt, sender_session=None):
             return {"session_id": session_id, "prompt": prompt}
@@ -357,9 +465,10 @@ def test_steer_stops_running_workspace_then_resumes_same_session(
         json=True,
     )
     assert cli.cmd_steer(args) == 0
-    assert instances[0].stopped == ["workspace-a"]
+    assert instances[0].stopped == ["process-a"]
     output = capsys.readouterr().out
-    assert '"interrupted_workspace": true' in output
+    assert '"scope": "selected session only"' in output
+    assert '"process-a"' in output
     assert '"session_id": "session-a"' in output
 
 

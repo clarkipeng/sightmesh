@@ -2,11 +2,11 @@
 
 ## Fleet status and idle prompting
 
-`sightmesh status` joins managed service state, active cdesktop workspaces, latest process state, pending approvals, unseen turns, Repowire route policy, delivery counts, ownership leases, redacted cdesktop providers, and named SightMesh profiles. Add `--include-archived` only when historical workspaces are relevant.
+`sightmesh status` joins managed service state, active cdesktop workspaces, latest process state, pending approvals, unseen turns, Repowire route policy, delivery counts, ownership leases, redacted cdesktop providers, and named SightMesh profiles. Add `--include-archived` only when historical workspaces are relevant. Use `sightmesh peers` for the compact agent-facing roster and `sightmesh peek @AGENT` for a coalesced current-activity snapshot.
 
-Use `sightmesh prompt-idle SESSION_ID --message-file FILE` for automation that must not append work behind an active turn or bypass a pending approval. It reads cdesktop's active workspace summary immediately before sending and fails closed unless the target is active and idle.
+Use `sightmesh prompt-idle @AGENT --message-file FILE` for automation that must not append work behind an active turn or bypass a pending approval. It reads that session's process state immediately before sending and fails closed unless the target is active and idle.
 
-Use `sightmesh steer SESSION_ID --message-file FILE` when the current turn must change immediately. If the workspace is running, SightMesh calls cdesktop's native workspace stop, waits for the persisted process state to leave `running`, and then sends a native follow-up to the same session. That preserves the visible transcript and lets cdesktop inherit the session's prior executor, model, reasoning, permissions, and provider. cdesktop's stop endpoint is workspace-scoped, so every running execution in that workspace is interrupted. The command reports that scope and never sends the follow-up if the stop cannot be verified within the timeout.
+Use `sightmesh steer @AGENT --message-file FILE` when the current turn must change immediately. SightMesh resolves an exact ambiguity-safe selector, refuses self-steering and pending interactions, stops only that session's active non-dev-server execution, verifies the persisted state left `running`, and sends a native follow-up. Peer sessions in the same worktree and the dev server remain running. The visible transcript and the session's executor, model, reasoning, permissions, and provider remain intact.
 
 Workspace display names can be corrected without changing Git state:
 
