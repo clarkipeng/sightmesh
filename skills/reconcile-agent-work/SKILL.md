@@ -28,13 +28,13 @@ Use [references/handoff-template.md](references/handoff-template.md) when no own
 
 Read [references/capacity-and-credentials.md](references/capacity-and-credentials.md) before changing an executor, model, provider, or login.
 
-On a rate or context limit:
+On a rate or context limit, or a judgment-based context rotation:
 
 1. Stop issuing new model requests to the exhausted worker.
 2. Request or reconstruct a checkpoint from Git, cdesktop, Repowire, and the PR host.
 3. Mark the exact last completed action and any command with unknown outcome.
 4. Select only a provider profile or API credential the user explicitly configured through supported vendor mechanisms.
-5. When the destination is an approved SightMesh API or enterprise profile, run `sightmesh failover WORKSPACE_ID --profile NAME --checkpoint-file FILE`. This starts a visible successor in the same workspace by default, preserving dirty files and transcript context. Use `--new-worktree` only for a clean committed handoff.
+5. When the destination is an approved SightMesh API or enterprise profile, run the single checkpointed command `sightmesh failover WORKSPACE_ID --profile NAME --checkpoint-file FILE --unattended`. This starts a visible successor in the same workspace by default, preserving dirty files and transcript context. Use `--new-worktree` only for a clean committed handoff.
 6. Otherwise launch or resume a visible cdesktop session and give it the checkpoint.
 7. Record the ownership transition and validate the first read-only inventory before authorizing writes.
 

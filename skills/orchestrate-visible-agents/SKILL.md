@@ -27,7 +27,7 @@ Keep the workflow native and unsurprising:
 2. Use `cdesktop team spawn` only for read-only review, research, or disjoint paths in the same workspace.
 3. Keep one lead session per cdesktop workspace. Only the lead spawns teammates.
 4. Any visible agent may contact any other. Use `sightmesh message @agent --message "..."` to queue information without interrupting valid work; use `sightmesh steer @agent --message "..."` when delay would cause invalid output, unsafe mutation, or avoidable rework. Use Repowire when the ask needs durable cross-workspace delivery.
-5. Every child must use `sightmesh parent --message "..."` for a blocker, decision, or completion that must wake its launcher. Same-workspace teammates may use `cdesktop team manager` as the native lead alias.
+5. Every child must use `sightmesh parent --message "..."` for a blocker, decision, or completion that must wake its launcher. Run it as an independent command and verify success. Never place an optional topology-specific alias before it in an `&&` chain. Same-workspace teammates may notify `cdesktop team manager` separately when that alias is useful.
 7. Before asking for input, collect all currently known independent questions and send one multi-question request. Before tool use, batch independent read-only inspections. Keep dependent operations, mutations, approvals, and destructive actions sequential.
 8. A lead reviewing multiple workers should call `sightmesh inbox` once and answer independent pending requests with one prevalidated `sightmesh respond --responses '<json>'` call.
 
@@ -108,7 +108,7 @@ repowire peer ask <peer-name> "<bounded request>"
 
 For cdesktop, target the online bridge peer whose repository path and backend match the intended session. Repowire chooses the displayed name. Do not target a stale offline identity created by an executor's short-lived app-server hook. If no matching bridge peer is online, use `sightmesh steer` for direct agent contact and report that Repowire delivery was unavailable.
 
-Send a peer message only when it changes the recipient's action or resolves a decision. Keep it to the minimum actionable delta, usually `DONE head=<sha> checks=<result> handoff=<path>`, `BLOCKED cause=<cause> need=<decision>`, or one direct instruction. Put narrative context and evidence in the ignored handoff. Repowire is transport, not the sole record.
+Send a peer message only when it changes the recipient's action, judgment, or decision. Use a compact structured envelope for routine state, usually `DONE head=<sha> checks=<result> handoff=<path>` or `BLOCKED cause=<cause> need=<decision>`. Add concise freeform prose when reasoning, ambiguity, tradeoffs, or unusual context matters. Do not force nuanced information into lossy fields. Put long-lived details and full evidence in the ignored handoff. Repowire is transport, not the sole record.
 
 Before a worker completes, require every finding, blocker, exact SHA, validation result, and next action needed by another workspace to appear in the ignored handoff itself. A terminal response or transcript may summarize or link to that handoff, but must not be the only place containing actionable detail.
 
@@ -131,4 +131,4 @@ Inspect cdesktop transcripts and derived git state. Intervene only on state chan
 
 Keep one writer for each conflict hotspot such as a migration or shared composition file. Parallelize disjoint fixtures, adapters, new test files, docs, and exact-head review. Prefer short pushed checkpoints with explicit remaining scope, and replace a worker from the exact pushed branch before context pressure degrades judgment.
 
-Do not rotate an agent at a fixed context percentage. Rotate when behavior shows degraded state tracking or instruction quality, or when the remaining context is plainly insufficient for the next bounded phase. Otherwise preserve continuity.
+Do not rotate an agent at a fixed context percentage. Rotate when behavior shows degraded state tracking or instruction quality, or when the remaining context is plainly insufficient for the next bounded phase. Otherwise preserve continuity. Once rotation is warranted and the destination profile supports checkpointed failover, make it one operation with `sightmesh failover <workspace-id> --profile <profile> --checkpoint-file <handoff> --unattended`; do not manually replay the transcript.
