@@ -14,6 +14,7 @@ Do not use the host agent's native subagent, Task, delegate, fork, or team mecha
 Keep the workflow native and unsurprising:
 
 - use ordinary workspace-local `.context` files for durable handoffs;
+- keep `.context` handoffs ignored and untracked unless the repository explicitly declares that exact file tracked; never force-add an ignored handoff, and verify it is absent from the candidate tree before push or PR handoff;
 - use Git and the filesystem to inspect sibling worktrees;
 - use cdesktop for session rosters, transcripts, and human interaction;
 - use Repowire for cross-workspace contact;
@@ -25,7 +26,8 @@ Keep the workflow native and unsurprising:
 2. Use `cdesktop team spawn` only for read-only review, research, or disjoint paths in the same workspace.
 3. Keep one lead session per cdesktop workspace. Only the lead spawns teammates.
 4. Use Repowire for communication between different cdesktop workspaces.
-5. Use `sightmesh prompt-idle` when a script or manager must prompt only an idle session. A normal `sightmesh message` is allowed when delivery must queue behind an active turn.
+5. Queue with `sightmesh message` when the current course remains valid. Use `sightmesh steer` only when continued work would create invalid output, unsafe mutation, scope drift, or avoidable rework. Use `sightmesh prompt-idle` when delivery must wait for an idle session.
+6. Every teammate must contact its workspace lead when it needs a decision, feedback, or help with a blocker, and when it completes. Use `cdesktop team manager --message "STATUS: concise details"`; the command resolves the lead session automatically.
 
 Read [references/cdesktop-and-repowire.md](references/cdesktop-and-repowire.md) before the first spawn in a new environment.
 
@@ -95,7 +97,9 @@ repowire peer ask <peer-name> "<bounded request>"
 
 For cdesktop, target the online bridge peer whose repository path and backend match the intended session. Repowire chooses the displayed name. Do not target a stale offline identity created by an executor's short-lived app-server hook. If no matching bridge peer is online, use `sightmesh message` and report that Repowire delivery was unavailable.
 
-Use messages for decisions, exact SHAs, ownership transfers, and blockers. Keep durable evidence in the repository or its ignored handoff directory. Repowire is transport, not the sole record.
+Make queued and steering messages bounded and self-contained: state the authority, exact SHA when relevant, owner, required action, exclusions, and stop condition. Keep durable evidence in the repository or its ignored handoff directory. Files under an ignored handoff directory are local coordination evidence, not PR content. Repowire is transport, not the sole record.
+
+Before a worker completes, require every finding, blocker, exact SHA, validation result, and next action needed by another workspace to appear in the ignored handoff itself. A terminal response or transcript may summarize or link to that handoff, but must not be the only place containing actionable detail.
 
 ## Review plans
 

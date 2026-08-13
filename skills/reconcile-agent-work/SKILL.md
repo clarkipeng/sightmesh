@@ -11,6 +11,8 @@ Turn a running agent assignment into a durable, auditable state before changing 
 
 Record the following in the narrow task handoff file:
 
+- all actionable findings and evidence needed by the recipient; never leave details only in the terminal response or transcript;
+
 - objective, current owner, workspace and session IDs;
 - repository path, branch, exact HEAD, base, and upstream;
 - PR number and draft or review state;
