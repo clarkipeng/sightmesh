@@ -610,6 +610,7 @@ def apply_plan(
     *,
     names: Iterable[str] = (),
     include_archived: bool = False,
+    materialize_archived: bool = False,
     include_dirty: bool = False,
     confirm_conductor_paused: bool = False,
     confirm_checkpointed: bool = False,
@@ -621,6 +622,8 @@ def apply_plan(
         raise ValueError("Apply requires --confirm-conductor-paused")
     if include_dirty and not confirm_checkpointed:
         raise ValueError("--include-dirty requires --confirm-checkpointed")
+    if materialize_archived and not include_archived:
+        raise ValueError("--materialize-archived requires --include-archived")
     if semantic_limit <= 0:
         raise ValueError("--semantic-messages must be positive")
     plan = load_plan(plan_path)
@@ -673,17 +676,33 @@ def apply_plan(
     for workspace in selected:
         key = str(workspace["conductor_id"])
         prior = run["applications"].get(key)
-        if prior and prior.get("status") in {"created", "reused"}:
+        if prior and prior.get("status") in {"cataloged", "created", "reused"}:
             continue
         source_path = workspace.get("source_path")
 
         bundle = _write_context_bundle(workspace, database, run_dir, semantic_limit)
         pointer = _install_context_pointer(workspace, str(plan["run_id"]), bundle)
+        source_archived = (
+            workspace["state"] in {"archived", "orphaned-checkout"}
+            or workspace["kind"] == "orphaned-archive"
+        )
         resolved_source = str(
             Path(source_path).resolve()
             if source_path
             else Path(bundle["handoff"]).resolve().parent
         )
+        if source_archived and not materialize_archived:
+            run["applications"][key] = {
+                "status": "cataloged",
+                "workspace_id": None,
+                "source_path": resolved_source,
+                "context_bundle": bundle,
+                "context_pointer": pointer,
+                "source_archived": True,
+            }
+            run["updated_at"] = time.time()
+            _atomic_json(run_path, run)
+            continue
         matched = existing.get(resolved_source)
         if matched:
             application = {
@@ -695,9 +714,7 @@ def apply_plan(
                 "source_archived": matched.get("archived"),
             }
         else:
-            cdesktop_name = (
-                f"migrated-{workspace['repository_name']}-{workspace['name']}"
-            )
+            cdesktop_name = str(workspace["name"])
             created = client.create_workspace_record(cdesktop_name, use_worktree=False)
             workspace_id = str(created["id"])
             try:
@@ -706,10 +723,6 @@ def apply_plan(
                     Path(resolved_source),
                     str(workspace.get("target_branch") or ""),
                     f"{workspace['repository_name']}:{workspace['name']}",
-                )
-                source_archived = (
-                    workspace["state"] in {"archived", "orphaned-checkout"}
-                    or workspace["kind"] == "orphaned-archive"
                 )
                 lease = None
                 if source_archived:

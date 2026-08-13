@@ -198,6 +198,7 @@ def test_plan_apply_status_and_rollback(tmp_path: Path) -> None:
 
     application = result["applications"]["conductor-alpha"]
     assert application["status"] == "created"
+    assert client.workspace_rows[0]["name"] == "alpha"
     assert client.workspace_rows[0]["use_worktree"] is False
     assert client.workspace_repo_rows["workspace-1"][0]["path"] == str(checkout)
     pointer = json.loads(
@@ -291,6 +292,32 @@ def test_archived_record_without_files_uses_private_handoff(tmp_path: Path) -> N
         lease_store=LeaseStore(tmp_path / "leases"),
     )
     application = result["applications"]["conductor-alpha"]
-    attached = Path(client.workspace_repo_rows["workspace-1"][0]["path"])
-    assert attached == Path(application["context_bundle"]["handoff"]).parent
-    assert "Preserve this migration context" in (attached / "handoff.md").read_text()
+    assert application["status"] == "cataloged"
+    assert application["workspace_id"] is None
+    assert client.created == 0
+    handoff = Path(application["context_bundle"]["handoff"])
+    assert "Preserve this migration context" in handoff.read_text()
+
+
+def test_archived_record_requires_explicit_materialization(tmp_path: Path) -> None:
+    conductor, _, database = _fixture(tmp_path)
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE workspaces SET state = 'archived'")
+        connection.commit()
+    plan_path = write_plan(
+        build_plan(conductor_roots=[conductor], database=database),
+        tmp_path / "run" / "plan.json",
+    )
+    client = FakeMigrationClient()
+    result = apply_plan(
+        plan_path,
+        names=["alpha"],
+        include_archived=True,
+        materialize_archived=True,
+        confirm_conductor_paused=True,
+        client=client,
+        lease_store=LeaseStore(tmp_path / "leases"),
+    )
+    application = result["applications"]["conductor-alpha"]
+    assert application["status"] == "created"
+    assert client.archived == ["workspace-1"]

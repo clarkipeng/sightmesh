@@ -16,6 +16,8 @@
 - full visible Codex teammate launch from a cdesktop parent;
 - teammate roster discovery;
 - visible cross-workspace follow-up by cdesktop session ID;
+- verified workspace-scoped interrupt followed by same-session resume with inherited executor configuration;
+- native cdesktop workspace rename without changing its Git branch;
 - native archive, restore, and confirmed archive deletion with Git branch preservation;
 - clean managed-worktree reclamation after the native one-hour archive grace period;
 - dirty managed-worktree retirement refusal and direct-repository preservation;
@@ -28,7 +30,7 @@
 - correlated plain-ask acknowledgement and structured-question response;
 - bridge peer identity reuse across bridge reconnects.
 - Repowire health-check rejection when its CLI exits successfully but reports a daemon error;
-- worktree-disabled migration import without starting an agent, followed by empty-workspace rollback.
+- worktree-disabled active migration import without starting an agent, catalog-only archived migration, explicit archive materialization, and empty-workspace rollback.
 
 The migration planner was also run read-only against the local Conductor installation on 2026-08-12. It found 365 database and filesystem workspace/context records. Two were blocked because their Conductor sessions were active; all other records had an in-place source or were eligible for a private transcript-only handoff. No real Conductor workspace was migrated during this validation. A disposable direct workspace completed an archive, restore, second archive, and delete lifecycle smoke without launching a model.
 
@@ -39,6 +41,10 @@ The isolated bridge run on 2026-08-12 proved both transports. A blocking `repowi
 ### Codex service tier
 
 cdesktop 0.2.3 uses Codex app-server protocol types from Codex 0.121. An explicit `service_tier = "default"` in current Codex configuration causes cdesktop to reject the thread-start response because its older enum understands only `fast` and `flex`. Omitting the explicit default restores compatibility without selecting a different paid tier.
+
+### Codex 5.6 model selection
+
+cdesktop 0.2.3's picker predates the GPT-5.6 family, but its executor passes an explicit model ID through to Codex. SightMesh therefore supports `--model gpt-5.6-sol` directly. The cdesktop executor currently accepts reasoning levels through `xhigh`; SightMesh exposes that exact native set instead of accepting `max` and silently downgrading it.
 
 ### Claude capacity
 

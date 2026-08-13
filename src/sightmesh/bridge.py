@@ -20,8 +20,12 @@ from .delivery import (
     DeliveryStoreError,
     make_record,
 )
-from .routing import clear_peer_identity, enabled_workspaces, peer_identity, set_peer_identity
-
+from .routing import (
+    clear_peer_identity,
+    enabled_workspaces,
+    peer_identity,
+    set_peer_identity,
+)
 
 LOGGER = logging.getLogger("sightmesh.bridge")
 
@@ -152,15 +156,17 @@ class RepowireSessionBridge:
         if message_type == "ask":
             question_flag = " --question" if message.get("question") else ""
             prompt = (
-                f"Repowire ask from @{from_peer}, correlation ID {correlation_id}:\n\n{text}\n\n"
-                "Do not use native subagents. Complete the bounded request, then acknowledge the "
-                "Repowire ask before ending your response with this command, replacing REPLY with "
-                "a concise answer:\n\n"
+                f"## Request from @{from_peer}\n\n{text}\n\n"
+                "When complete, send a concise result back with:\n\n"
                 f"sightmesh bridge-reply {correlation_id} --from-peer {self.assigned_name}"
-                f"{question_flag} --message 'REPLY'"
+                f"{question_flag} --message 'RESULT'\n\n"
+                "Do not delegate to hidden or native subagents."
             )
         else:
-            prompt = f"Repowire {message_type} from @{from_peer}:\n\n{text}\n\nDo not use native subagents."
+            prompt = (
+                f"## {message_type.title()} from @{from_peer}\n\n{text}\n\n"
+                "Do not delegate to hidden or native subagents."
+            )
 
         record = make_record(
             session_id=self.bridged.session["id"],

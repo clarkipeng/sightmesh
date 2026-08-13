@@ -38,6 +38,35 @@ def test_send_marks_sender_when_provided() -> None:
     ]
 
 
+def test_rename_workspace_preserves_other_mutable_fields() -> None:
+    client = FakeClient()
+    client.rename_workspace("workspace-a", "project/task")
+    assert client.calls == [
+        (
+            "PUT",
+            "/workspaces/workspace-a",
+            {"archived": None, "pinned": None, "name": "project/task"},
+            None,
+            None,
+        )
+    ]
+
+
+def test_wait_for_workspace_idle_returns_terminal_summary() -> None:
+    client = FakeClient()
+    summaries = iter(
+        [
+            [{"workspace_id": "workspace-a", "latest_process_status": "running"}],
+            [{"workspace_id": "workspace-a", "latest_process_status": "killed"}],
+        ]
+    )
+    client.workspace_summaries = lambda _archived=False: next(summaries)
+    summary = client.wait_for_workspace_idle(
+        "workspace-a", timeout_seconds=1, poll_seconds=0
+    )
+    assert summary["latest_process_status"] == "killed"
+
+
 def test_create_direct_workspace_record_and_attach_repo(tmp_path) -> None:
     client = FakeClient()
     client.repos = list

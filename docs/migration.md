@@ -49,7 +49,7 @@ sightmesh migrate apply PLAN_PATH \
   --confirm-checkpointed
 ```
 
-Add `--include-archived` to include archived Conductor records, retained orphaned worktrees, and context-only archives. The command is resumable. Completed entries in `run.json` are skipped on later invocations.
+Add `--include-archived` to catalog archived Conductor records, retained orphaned worktrees, and context-only archives as private handoffs. Cataloged archives do not create cdesktop workspace rows, so historical records do not flood its sidebar. Add `--materialize-archived` only for archives that must be browsable as cdesktop rows. The command is resumable. Completed entries in `run.json` are skipped on later invocations.
 
 For each selection, SightMesh:
 
@@ -57,9 +57,10 @@ For each selection, SightMesh:
 - records the original context directory rather than duplicating it;
 - uses the private transcript handoff directory when an archived checkout and context directory are no longer present;
 - adds a private `.context/sightmesh-migration.json` pointer only when `.context` is Git-ignored;
-- creates a worktree-disabled cdesktop workspace and attaches the existing directory without starting an agent;
+- creates a worktree-disabled cdesktop workspace for each active selection, using its original concise name, and attaches the existing directory without starting an agent;
 - reuses an existing cdesktop workspace attached to the exact same path;
-- leases active imported checkouts and immediately archives source-archived imports.
+- leases active imported checkouts;
+- keeps source-archived selections catalog-only unless materialization is explicit, then immediately archives their cdesktop rows.
 
 No source branch, file, worktree, transcript, or archived context is deleted.
 

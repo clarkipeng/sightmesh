@@ -389,6 +389,56 @@ def cmd_message(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_steer(args: argparse.Namespace) -> int:
+    message = _read_text(args.message, args.message_file, "message")
+    if not message.strip():
+        raise ValueError("Steering message must not be empty")
+    client = CdesktopClient(args.url)
+    session = client.session(args.session_id)
+    workspace_id = str(session["workspace_id"])
+    workspace = client.workspace(workspace_id)
+    if workspace.get("archived"):
+        raise ValueError("Cannot steer a session in an archived workspace")
+
+    summary = next(
+        (
+            item
+            for item in client.workspace_summaries(False)
+            if item.get("workspace_id") == workspace_id
+        ),
+        None,
+    )
+    if not summary:
+        raise ValueError("Target session is not in an active cdesktop workspace")
+
+    interrupted = summary.get("latest_process_status") == "running"
+    if interrupted:
+        client.stop_workspace(workspace_id)
+        summary = client.wait_for_workspace_idle(
+            workspace_id, timeout_seconds=args.timeout_seconds
+        )
+    if summary.get("has_pending_approval"):
+        raise ValueError(
+            "Target workspace still has a pending approval after interruption; "
+            "resolve it in cdesktop before steering"
+        )
+
+    result = client.send(args.session_id, message, args.sender_session)
+    _emit(
+        {
+            "workspace_id": workspace_id,
+            "session_id": args.session_id,
+            "interrupted_workspace": interrupted,
+            "scope": "all running executions in the workspace"
+            if interrupted
+            else "idle session",
+            "follow_up": result,
+        },
+        args.json,
+    )
+    return 0
+
+
 def cmd_prompt_idle(args: argparse.Namespace) -> int:
     message = _read_text(args.message, args.message_file, "message")
     client = CdesktopClient(args.url)
@@ -675,6 +725,13 @@ def _archive_workspace(args: argparse.Namespace, client: CdesktopClient) -> int:
 def cmd_workspace(args: argparse.Namespace) -> int:
     client = CdesktopClient(args.url)
     workspace = client.workspace(args.workspace_id)
+    if args.workspace_action == "rename":
+        name = args.name.strip()
+        if not name:
+            raise ValueError("Workspace name must not be empty")
+        renamed = client.rename_workspace(args.workspace_id, name)
+        _emit({"workspace": renamed, "action": "renamed"}, args.json)
+        return 0
     if args.workspace_action == "archive":
         return _archive_workspace(args, client)
     if args.workspace_action == "restore":
@@ -1013,6 +1070,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
             args.plan,
             names=args.workspace or (),
             include_archived=args.include_archived,
+            materialize_archived=args.materialize_archived,
             include_dirty=args.include_dirty,
             confirm_conductor_paused=args.confirm_conductor_paused,
             confirm_checkpointed=args.confirm_checkpointed,
@@ -1088,7 +1146,9 @@ def parser() -> argparse.ArgumentParser:
         help="Run a worktree-isolated worker without approval prompts",
     )
     spawn.add_argument("--model")
-    spawn.add_argument("--reasoning", choices=["low", "medium", "high", "max"])
+    spawn.add_argument(
+        "--reasoning", choices=["low", "medium", "high", "xhigh"]
+    )
     spawn.add_argument("--provider", help="Configured cdesktop provider UUID")
     spawn.add_argument(
         "--lease-ttl-seconds", type=int, default=leases.DEFAULT_TTL_SECONDS
@@ -1103,6 +1163,18 @@ def parser() -> argparse.ArgumentParser:
     message_group.add_argument("--message-file")
     message.add_argument("--sender-session")
     message.set_defaults(func=cmd_message)
+
+    steer = sub.add_parser(
+        "steer",
+        help="Interrupt a running cdesktop workspace and resume its session with a follow-up",
+    )
+    steer.add_argument("session_id")
+    steer_group = steer.add_mutually_exclusive_group(required=True)
+    steer_group.add_argument("--message")
+    steer_group.add_argument("--message-file")
+    steer.add_argument("--sender-session")
+    steer.add_argument("--timeout-seconds", type=float, default=30.0)
+    steer.set_defaults(func=cmd_steer)
 
     prompt_idle = sub.add_parser(
         "prompt-idle", help="Prompt a session only when cdesktop reports it idle"
@@ -1153,7 +1225,9 @@ def parser() -> argparse.ArgumentParser:
         choices=["SUPERVISED", "PLAN", "ACCEPT_EDITS"],
     )
     teammate_spawn.add_argument("--model")
-    teammate_spawn.add_argument("--reasoning", choices=["low", "medium", "high", "max"])
+    teammate_spawn.add_argument(
+        "--reasoning", choices=["low", "medium", "high", "xhigh"]
+    )
     teammate_spawn.add_argument("--provider")
     teammate_spawn.set_defaults(func=cmd_teammate_spawn)
 
@@ -1185,7 +1259,9 @@ def parser() -> argparse.ArgumentParser:
         "--credential-kind", choices=["ambient", "api", "enterprise"], default="ambient"
     )
     profile_set.add_argument("--model")
-    profile_set.add_argument("--reasoning", choices=["low", "medium", "high", "max"])
+    profile_set.add_argument(
+        "--reasoning", choices=["low", "medium", "high", "xhigh"]
+    )
     profile_set.add_argument(
         "--automatic-failover",
         action="store_true",
@@ -1212,9 +1288,15 @@ def parser() -> argparse.ArgumentParser:
     close.set_defaults(func=cmd_close)
 
     workspace = sub.add_parser(
-        "workspace", help="Archive, restore, or delete a cdesktop workspace"
+        "workspace", help="Rename, archive, restore, or delete a cdesktop workspace"
     )
     workspace_sub = workspace.add_subparsers(dest="workspace_action", required=True)
+    workspace_rename = workspace_sub.add_parser(
+        "rename", help="Rename a cdesktop workspace without changing its branch"
+    )
+    workspace_rename.add_argument("workspace_id")
+    workspace_rename.add_argument("name")
+    workspace_rename.set_defaults(func=cmd_workspace)
     workspace_archive = workspace_sub.add_parser(
         "archive", help="Stop and archive a reconciled workspace"
     )
@@ -1389,6 +1471,11 @@ def parser() -> argparse.ArgumentParser:
     selection.add_argument("--all", action="store_true")
     selection.add_argument("--workspace", action="append")
     migrate_apply.add_argument("--include-archived", action="store_true")
+    migrate_apply.add_argument(
+        "--materialize-archived",
+        action="store_true",
+        help="Create archived cdesktop rows instead of keeping archive handoffs catalog-only",
+    )
     migrate_apply.add_argument("--include-dirty", action="store_true")
     migrate_apply.add_argument("--confirm-conductor-paused", action="store_true")
     migrate_apply.add_argument("--confirm-checkpointed", action="store_true")

@@ -213,6 +213,57 @@ def test_prompt_idle_refuses_running_workspace(monkeypatch) -> None:
         cli.cmd_prompt_idle(args)
 
 
+def test_steer_stops_running_workspace_then_resumes_same_session(
+    monkeypatch, capsys
+) -> None:
+    instances = []
+
+    class RunningClient(FakeSpawnClient):
+        def __init__(self, _url=None) -> None:
+            super().__init__(_url)
+            instances.append(self)
+
+        def session(self, session_id):
+            return {"id": session_id, "workspace_id": "workspace-a"}
+
+        def workspace_summaries(self, archived=False):
+            return [
+                {
+                    "workspace_id": "workspace-a",
+                    "latest_process_status": "running",
+                    "has_pending_approval": False,
+                }
+            ]
+
+        def wait_for_workspace_idle(self, workspace_id, timeout_seconds):
+            assert workspace_id == "workspace-a"
+            assert timeout_seconds == 12
+            return {
+                "workspace_id": workspace_id,
+                "latest_process_status": "killed",
+                "has_pending_approval": False,
+            }
+
+        def send(self, session_id, prompt, sender_session=None):
+            return {"session_id": session_id, "prompt": prompt}
+
+    monkeypatch.setattr(cli, "CdesktopClient", RunningClient)
+    args = argparse.Namespace(
+        session_id="session-a",
+        message="change direction",
+        message_file=None,
+        sender_session="manager",
+        timeout_seconds=12,
+        url=None,
+        json=True,
+    )
+    assert cli.cmd_steer(args) == 0
+    assert instances[0].stopped == ["workspace-a"]
+    output = capsys.readouterr().out
+    assert '"interrupted_workspace": true' in output
+    assert '"session_id": "session-a"' in output
+
+
 def test_failover_starts_visible_successor_on_approved_profile(
     monkeypatch, tmp_path, capsys
 ) -> None:

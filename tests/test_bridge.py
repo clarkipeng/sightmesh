@@ -67,7 +67,7 @@ def test_plain_ask_becomes_visible_follow_up_and_ack_command(tmp_path) -> None:
         )
     )
     assert client.sent[0][0] == "session-123456"
-    assert "Repowire ask from @sender" in client.sent[0][1]
+    assert "## Request from @sender" in client.sent[0][1]
     assert "sightmesh bridge-reply correlation-1" in client.sent[0][1]
     assert "--question" not in client.sent[0][1]
     assert ws.frames == [
@@ -95,7 +95,7 @@ def test_structured_question_uses_answer_endpoint_flag(tmp_path) -> None:
             },
         )
     )
-    assert "--question --message 'REPLY'" in client.sent[0][1]
+    assert "--question --message 'RESULT'" in client.sent[0][1]
 
 
 def test_duplicate_delivery_after_injection_is_not_sent_twice(tmp_path) -> None:

@@ -61,6 +61,8 @@ sightmesh status
 sightmesh list
 sightmesh message SESSION_ID --message-file follow-up.txt
 sightmesh prompt-idle SESSION_ID --message-file follow-up.txt
+sightmesh steer SESSION_ID --message-file correction.txt
+sightmesh workspace rename WORKSPACE_ID catapult-games/voice-manager
 sightmesh bridge-route WORKSPACE_ID --enabled
 sightmesh close WORKSPACE_ID --message-file closeout.txt
 sightmesh workspace archive WORKSPACE_ID --confirm-reconciled
@@ -84,7 +86,7 @@ After pausing the selected Conductor sessions, adopt current workspaces without 
 sightmesh migrate apply PLAN_PATH --all --confirm-conductor-paused
 ```
 
-The migration is resumable and preserves checkouts, dirty files, `.context`, archived contexts, and the original Conductor transcript database in place. It exports bounded handoffs, reuses exact-path cdesktop imports, and supports status plus guarded rollback. See [Conductor migration](docs/migration.md) before applying it to real workspaces and [local storage and retention](docs/storage.md) for the ownership and cleanup contract.
+The migration is resumable and preserves checkouts, dirty files, `.context`, archived contexts, and the original Conductor transcript database in place. Active workspaces become cdesktop rows. Archived history is cataloged as private handoffs without filling the active or archived cdesktop sidebar unless `--materialize-archived` is explicitly selected. See [Conductor migration](docs/migration.md) before applying it to real workspaces and [local storage and retention](docs/storage.md) for the ownership and cleanup contract.
 
 Archive always refuses a dirty cdesktop-managed worktree because cdesktop reclaims archived worktrees after about one hour. Dirty state can be explicitly preserved only for a direct workspace, whose repository cdesktop does not own. Restore keeps the archive's history and recreates a reclaimed managed worktree from its preserved Git branch when execution resumes. Delete is a separate confirmed action that removes the cdesktop archive and owned worktree while preserving the branch by default. Spawn acquires an expiring ownership lease; isolated worktrees from the same repository may coexist, while direct-checkout ownership conflicts fail closed.
 
@@ -102,6 +104,8 @@ Codex CLI ───────┘            │
 The managed LaunchAgents are `io.sightmesh.cdesktop` and `io.sightmesh.bridge`. cdesktop binds to `127.0.0.1:3210`; analytics and relay are disabled; managed worktrees default to `~/.local/share/sightmesh/.cdesktop-workspaces`; state and logs live under `~/.local/state/sightmesh`.
 
 Every workspace created by `sightmesh spawn` is bridge-enabled unless `--no-bridge` is passed. The bridge registers one durable Repowire proxy peer per enabled cdesktop session. Repowire asks become visible cdesktop follow-ups, and `sightmesh bridge-reply` closes the original correlation.
+
+cdesktop already groups the sidebar by repository, shows the live transcript and process logs, renders changed-file diffs, opens the full checkout in the configured IDE, and provides a built-in browser preview for running applications and image assets. SightMesh keeps those native surfaces instead of adding a second file viewer or transcript store.
 
 Set `SIGHTMESH_CDESKTOP_URL` when more than one cdesktop process is running. Otherwise SightMesh uses the managed loopback service or cdesktop's local port file.
 

@@ -6,6 +6,16 @@
 
 Use `sightmesh prompt-idle SESSION_ID --message-file FILE` for automation that must not append work behind an active turn or bypass a pending approval. It reads cdesktop's active workspace summary immediately before sending and fails closed unless the target is active and idle.
 
+Use `sightmesh steer SESSION_ID --message-file FILE` when the current turn must change immediately. If the workspace is running, SightMesh calls cdesktop's native workspace stop, waits for the persisted process state to leave `running`, and then sends a native follow-up to the same session. That preserves the visible transcript and lets cdesktop inherit the session's prior executor, model, reasoning, permissions, and provider. cdesktop's stop endpoint is workspace-scoped, so every running execution in that workspace is interrupted. The command reports that scope and never sends the follow-up if the stop cannot be verified within the timeout.
+
+Workspace display names can be corrected without changing Git state:
+
+```sh
+sightmesh workspace rename WORKSPACE_ID repository/task-name
+```
+
+cdesktop remains the viewing surface. Use its repository-grouped sidebar, conversation panel, process logs, changed-file tree and diff, Open in IDE action for the complete checkout, and built-in preview browser for running applications or image review.
+
 ## Provider profiles and failover
 
 Configure provider credentials in cdesktop through its supported provider UI. SightMesh stores only a provider UUID and non-secret defaults:

@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -259,6 +260,36 @@ class CdesktopClient:
             headers=headers,
         )
 
+    def wait_for_workspace_idle(
+        self,
+        workspace_id: str,
+        *,
+        timeout_seconds: float = 30.0,
+        poll_seconds: float = 0.25,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout_seconds
+        last: dict[str, Any] | None = None
+        while time.monotonic() <= deadline:
+            last = next(
+                (
+                    item
+                    for item in self.workspace_summaries(False)
+                    if item.get("workspace_id") == workspace_id
+                ),
+                None,
+            )
+            if last is None:
+                raise CdesktopError(
+                    f"Workspace {workspace_id} is not active in cdesktop"
+                )
+            if last.get("latest_process_status") != "running":
+                return last
+            time.sleep(poll_seconds)
+        raise CdesktopError(
+            f"Workspace {workspace_id} did not stop within {timeout_seconds:g} seconds; "
+            "the follow-up was not sent"
+        )
+
     def spawn_teammate(
         self,
         *,
@@ -303,6 +334,13 @@ class CdesktopClient:
             "PUT",
             f"/workspaces/{workspace_id}",
             {"archived": archived, "pinned": None, "name": None},
+        )
+
+    def rename_workspace(self, workspace_id: str, name: str) -> dict[str, Any]:
+        return self.request(
+            "PUT",
+            f"/workspaces/{workspace_id}",
+            {"archived": None, "pinned": None, "name": name},
         )
 
     def delete_workspace(self, workspace_id: str) -> Any:
