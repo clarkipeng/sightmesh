@@ -27,7 +27,7 @@ Keep the workflow native and unsurprising:
 2. Use `cdesktop team spawn` only for read-only review, research, or disjoint paths in the same workspace.
 3. Keep one lead session per cdesktop workspace. Only the lead spawns teammates.
 4. Use `sightmesh steer @agent --message "..."` when a peer must see a correction or blocker immediately. It interrupts only that session. Use Repowire when delivery should remain a durable non-interrupting ask or reply.
-5. Queue with `sightmesh message` when the current course remains valid. Use `sightmesh steer` only when continued work would create invalid output, unsafe mutation, scope drift, or avoidable rework. Use `sightmesh prompt-idle` when delivery must wait for an idle session.
+5. Queue with `sightmesh message` when the current course remains valid. Use `sightmesh steer` only when continued work would create invalid output, unsafe mutation, scope drift, or avoidable rework. Use `sightmesh prompt-idle` when delivery must wait for an idle session. If `prompt-idle` fails after the session is independently confirmed idle, retry once with `sightmesh message`; do not keep retrying an unchanged control-plane failure.
 6. Every teammate must contact its workspace lead when it needs a decision, feedback, or help with a blocker, and when it completes. Use `cdesktop team manager --message "STATUS: concise details"`; the command resolves the lead session automatically.
 7. Before asking for input, collect all currently known independent questions and send one multi-question request. Before tool use, batch independent read-only inspections. Keep dependent operations, mutations, approvals, and destructive actions sequential.
 
