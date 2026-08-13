@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -13,13 +14,6 @@ import websockets
 
 from . import leases
 from .cdesktop import CdesktopClient, CdesktopError
-from .delivery import (
-    DeliveryCapacityError,
-    DeliveryRecord,
-    DeliveryStore,
-    DeliveryStoreError,
-    make_record,
-)
 from .routing import (
     clear_peer_identity,
     enabled_workspaces,
@@ -67,12 +61,10 @@ class RepowireSessionBridge:
         client: CdesktopClient,
         bridged: BridgedSession,
         repowire_url: str,
-        delivery_store: DeliveryStore | None = None,
     ) -> None:
         self.client = client
         self.bridged = bridged
         self.repowire_url = repowire_url
-        self.delivery_store = delivery_store or DeliveryStore()
         self.assigned_name = _peer_name(bridged.workspace, bridged.session)
 
     async def run(self) -> None:
@@ -124,19 +116,9 @@ class RepowireSessionBridge:
                 self.assigned_name,
                 self.bridged.session["id"],
             )
-            retry_task = asyncio.create_task(
-                self._retry_loop(ws), name=f"retry-{self.assigned_name}"
-            )
-            try:
-                async for raw in ws:
-                    message = json.loads(raw)
-                    await self._handle(ws, message)
-            finally:
-                retry_task.cancel()
-                try:
-                    await retry_task
-                except asyncio.CancelledError:
-                    pass
+            async for raw in ws:
+                message = json.loads(raw)
+                await self._handle(ws, message)
 
     async def _handle(self, ws: Any, message: dict[str, Any]) -> None:
         message_type = message.get("type")
@@ -174,118 +156,35 @@ class RepowireSessionBridge:
                 "Do not delegate to hidden or native subagents."
             )
 
-        record = make_record(
-            session_id=self.bridged.session["id"],
-            message_type=message_type,
-            prompt=prompt,
-            delivery_id=message.get("delivery_id"),
-            correlation_id=correlation_id,
-            from_peer=from_peer,
-            text=text,
-        )
-        try:
-            stored = await asyncio.to_thread(self.delivery_store.enqueue, record)
-        except (DeliveryCapacityError, DeliveryStoreError) as exc:
-            await self._send_delivery_failure(ws, message, str(exc))
-            return
-        if stored.status == "injected":
-            await self._send_delivery_ack(ws, stored, "injected")
-            return
-        if stored.status == "inflight":
-            return
-        if stored.status == "dead":
-            await self._send_delivery_ack(ws, stored, "dead")
-            if stored.correlation_id:
-                await self._send_error(
-                    ws, stored.correlation_id, stored.last_error or "dead-lettered"
-                )
-            return
-        claimed = await asyncio.to_thread(
-            self.delivery_store.claim,
-            stored.idempotency_key,
-        )
-        if not claimed:
-            return
-        await self._process_record(ws, claimed)
-
-    async def _retry_loop(self, ws: Any) -> None:
-        while True:
-            await self._process_due(ws)
-            await asyncio.sleep(1)
-
-    async def _process_due(self, ws: Any) -> None:
-        try:
-            record = await asyncio.to_thread(
-                self.delivery_store.claim_due,
-                None,
-                self.bridged.session["id"],
-            )
-        except DeliveryStoreError as exc:
-            LOGGER.error("Cannot read delivery retry queue: %s", exc)
-            return
-        if record:
-            await self._process_record(ws, record)
-
-    async def _process_record(self, ws: Any, record: DeliveryRecord) -> None:
-        if record.status != "inflight":
-            await self._send_delivery_ack(ws, record, record.status)
-            return
-        if not record.claim_token:
-            await self._send_delivery_ack(ws, record, "failed")
-            if record.correlation_id:
-                await self._send_error(
-                    ws, record.correlation_id, "Inflight delivery has no claim token"
-                )
-            return
-        if record.prompt is None:
-            failed = await asyncio.to_thread(
-                self.delivery_store.mark_failed,
-                record.idempotency_key,
-                record.claim_token,
-                "Pending delivery has no retained prompt",
-            )
-            await self._send_delivery_ack(ws, failed, failed.status)
-            return
         try:
             await asyncio.to_thread(
                 self.client.send,
-                record.session_id,
-                record.prompt,
+                self.bridged.session["id"],
+                prompt,
                 None,
+                dedupe_key=_dedupe_key(
+                    self.bridged.session["id"], message_type, message
+                ),
             )
-            injected = await asyncio.to_thread(
-                self.delivery_store.mark_injected,
-                record.idempotency_key,
-                record.claim_token,
-            )
-            await self._send_delivery_ack(ws, injected, "injected")
-        except Exception as exc:
-            failed = await asyncio.to_thread(
-                self.delivery_store.mark_failed,
-                record.idempotency_key,
-                record.claim_token,
-                str(exc),
-            )
-            await self._send_delivery_ack(ws, failed, failed.status)
-            if failed.status == "dead" and failed.correlation_id:
-                await self._send_error(
-                    ws, failed.correlation_id, failed.last_error or str(exc)
-                )
-
-    async def _send_delivery_ack(
-        self, ws: Any, record: DeliveryRecord, status: str
-    ) -> None:
-        if not record.delivery_id:
+        except (CdesktopError, OSError, RuntimeError) as exc:
+            await self._send_delivery_failure(ws, message, str(exc))
             return
-        payload: dict[str, Any] = {
-            "type": "delivery_ack",
-            "delivery_id": record.delivery_id,
-            "message_type": record.message_type,
-            "status": "injected" if status == "injected" else "failed",
-        }
-        if status != "injected":
-            payload["detail"] = record.last_error or status
-        await ws.send(json.dumps(payload))
+        await self._send_delivery_ack(ws, message)
+
+    async def _send_delivery_ack(self, ws: Any, message: dict[str, Any]) -> None:
+        delivery_id = message.get("delivery_id")
+        if not delivery_id:
+            return
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "delivery_ack",
+                    "delivery_id": delivery_id,
+                    "message_type": message.get("type"),
+                    "status": "injected",
+                }
+            )
+        )
 
     async def _send_delivery_failure(
         self, ws: Any, message: dict[str, Any], detail: str
@@ -320,11 +219,9 @@ class BridgeSupervisor:
         self,
         client: CdesktopClient,
         repowire_url: str,
-        delivery_store: DeliveryStore | None = None,
     ) -> None:
         self.client = client
         self.repowire_url = repowire_url
-        self.delivery_store = delivery_store or DeliveryStore()
         self.tasks: dict[str, asyncio.Task[None]] = {}
 
     async def run(self) -> None:
@@ -373,7 +270,6 @@ class BridgeSupervisor:
                         self.client,
                         bridged,
                         self.repowire_url,
-                        self.delivery_store,
                     ).run(),
                     name=f"bridge-{session_id}",
                 )
@@ -382,3 +278,18 @@ class BridgeSupervisor:
 async def run_bridge(cdesktop_url: str | None, repowire_url: str) -> None:
     client = CdesktopClient(cdesktop_url)
     await BridgeSupervisor(client, repowire_url).run()
+
+
+def _dedupe_key(session_id: str, message_type: str, message: dict[str, Any]) -> str:
+    source = message.get("delivery_id") or message.get("correlation_id")
+    if not source:
+        source = hashlib.sha256(
+            json.dumps(
+                {
+                    "from_peer": message.get("from_peer"),
+                    "text": message.get("text"),
+                },
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+    return f"repowire:{session_id}:{message_type}:{source}"

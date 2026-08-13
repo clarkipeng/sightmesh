@@ -2,7 +2,7 @@
 
 SightMesh is a local reliability and policy layer for full Claude Code and Codex workers. It launches them as visible cdesktop sessions, gives implementation workers isolated git worktrees, and connects explicitly enabled sessions through Repowire.
 
-Delegated work remains visible and interruptible in cdesktop. SightMesh does not replace cdesktop's UI or the agent CLIs. It adds durable delivery, ownership leases, safe closeout, local-only configuration, service recovery, and shared Claude/Codex skills.
+Delegated work remains visible and interruptible in cdesktop. SightMesh does not replace cdesktop's UI or the agent CLIs. It adds ownership leases, safe closeout, local-only configuration, service recovery, and shared Claude/Codex skills. cdesktop owns durable command delivery.
 
 The interface is deliberately native-first. `.context` remains a normal workspace-local, Git-ignored directory. cdesktop remains the source of truth for sessions and transcripts, Git remains the source of truth for worktrees and changes, and Repowire remains the cross-workspace contact layer. SightMesh does not build a global context mirror or copy every conversation into another agent-specific format.
 
@@ -17,7 +17,7 @@ Prerequisites:
 - macOS
 - Python 3.11 or newer
 - `uv`
-- the SightMesh cdesktop fork package `0.2.3-sightmesh.3`
+- the SightMesh cdesktop fork package `0.2.3-sightmesh.4`
 - `repowire`
 - at least one authenticated supported agent CLI
 
@@ -34,7 +34,7 @@ sightmesh service start
 sightmesh service open
 ```
 
-To cut over an existing installation of the former project name, install SightMesh, run `sightmesh configure`, then run `sightmesh service cutover`. Cutover backs up the old LaunchAgent definitions, stops only the two old owned labels, migrates routing and delivery state, starts the new labels, checks health, and rolls back if startup fails.
+To cut over an existing installation of the former project name, install SightMesh, run `sightmesh configure`, then run `sightmesh service cutover`. Cutover backs up the old LaunchAgent definitions, stops only the two old owned labels, migrates routing and lease state, starts the new labels, and checks health.
 
 The installer links the canonical skills into both `~/.claude/skills` and `~/.codex/skills`. It does not copy, inspect, or alter model-provider credentials.
 
@@ -83,7 +83,6 @@ sightmesh close WORKSPACE_ID --message-file closeout.txt
 sightmesh workspace archive WORKSPACE_ID --confirm-reconciled
 sightmesh workspace restore WORKSPACE_ID
 sightmesh workspace delete WORKSPACE_ID --confirm-delete
-sightmesh delivery status
 sightmesh lease list
 ```
 
@@ -151,14 +150,14 @@ Archive always refuses a dirty cdesktop-managed worktree because cdesktop reclai
 Claude Code CLI ─┐
                  ├─ cdesktop visible sessions and worktrees
 Codex CLI ───────┘            │
-                              ├─ SightMesh lifecycle, leases, delivery queue
+                              ├─ SightMesh lifecycle and leases
                               │
                               └─ Repowire local request/reply mesh
 ```
 
 The managed LaunchAgents are `io.sightmesh.cdesktop` and `io.sightmesh.bridge`. cdesktop binds to `127.0.0.1:3210`; analytics and relay are disabled; managed worktrees default to `~/.local/share/sightmesh/.cdesktop-workspaces`; state and logs live under `~/.local/state/sightmesh`.
 
-Every workspace created by `sightmesh spawn` is bridge-enabled unless `--no-bridge` is passed. The bridge registers one durable Repowire proxy peer per enabled cdesktop session. Repowire asks become visible cdesktop follow-ups, and `sightmesh bridge-reply` closes the original correlation.
+Every workspace created by `sightmesh spawn` is bridge-enabled unless `--no-bridge` is passed. The bridge registers one Repowire proxy peer per enabled cdesktop session. Repowire asks become durable cdesktop commands, and `sightmesh bridge-reply` closes the original correlation.
 
 Every workspace launched from a cdesktop agent records that exact parent session. Children can inspect or immediately contact their launcher without looking up an ID:
 
@@ -216,8 +215,8 @@ Automatic failover is allowed only for API or enterprise profiles explicitly con
 
 SightMesh is not better than Conductor in every dimension. Conductor currently has a more polished native Mac experience, integrated review and merge flows, repository setup and run scripts, file copying, managed settings, cloud workspaces, iOS control, and a hosted API.
 
-SightMesh is the stronger fit when the requirements are local-only execution, a browser-visible fleet of full Claude and Codex sessions, agent-to-agent messaging across independent workspaces, scriptable idle-session prompting, durable message delivery, explicit ownership leases, provider-neutral failover, and open-source control over lifecycle policy. See `docs/conductor-parity.md` for the exact support matrix and remaining gaps.
+SightMesh is the stronger fit when the requirements are local-only execution, a browser-visible fleet of full Claude and Codex sessions, agent-to-agent messaging across independent workspaces, scriptable idle-session prompting, durable cdesktop commands, explicit ownership leases, provider-neutral failover, and open-source control over lifecycle policy. See `docs/conductor-parity.md` for the exact support matrix and remaining gaps.
 
 ## Scope
 
-SightMesh is not novel as a general multi-agent terminal or Claude/Codex bridge. The closest overlapping projects include [Agent Deck](https://github.com/asheshgoplani/agent-deck), [cdesktop](https://github.com/cdesktop-ai/cdesktop), and [Claude Codex Bridge](https://github.com/SeemSeam/claude_codex_bridge). SightMesh focuses narrowly on cdesktop-native visibility plus Repowire messaging, durable delivery, worktree ownership, and auditable local lifecycle controls.
+SightMesh is not novel as a general multi-agent terminal or Claude/Codex bridge. The closest overlapping projects include [Agent Deck](https://github.com/asheshgoplani/agent-deck), [cdesktop](https://github.com/cdesktop-ai/cdesktop), and [Claude Codex Bridge](https://github.com/SeemSeam/claude_codex_bridge). SightMesh focuses narrowly on cdesktop-native visibility plus Repowire messaging, worktree ownership, and auditable local lifecycle controls.

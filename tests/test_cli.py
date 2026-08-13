@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from sightmesh import __version__, approvals, cli, delivery
+from sightmesh import __version__, approvals, cli
 from sightmesh.cli import (
     _fleet_sessions,
     _is_sightmesh_cdesktop_version,
@@ -20,7 +20,6 @@ from sightmesh.cli import (
     _workspace_repository_paths,
     parser,
 )
-from sightmesh.delivery import DeliveryStore, make_record
 from sightmesh.leases import LeaseStore
 from sightmesh.profiles import Profile, ProfileStore
 
@@ -400,62 +399,6 @@ def test_repowire_status_requires_a_responding_daemon() -> None:
     assert not _repowire_status_ok(1, "Daemon responding at http://127.0.0.1:8377")
 
 
-def test_delivery_status_and_list_commands(monkeypatch, tmp_path, capsys) -> None:
-    path = tmp_path / "delivery.sqlite3"
-    monkeypatch.setattr(delivery, "delivery_db_path", lambda: path)
-    DeliveryStore(path).enqueue(
-        make_record(
-            session_id="session-1",
-            message_type="ask",
-            prompt="prompt",
-            delivery_id="delivery-1",
-            correlation_id="correlation-1",
-            from_peer="sender",
-            text="text",
-        )
-    )
-
-    args = parser().parse_args(["--json", "delivery", "status"])
-    assert args.func(args) == 0
-    assert '"pending"' in capsys.readouterr().out
-
-    args = parser().parse_args(["--json", "delivery", "list", "--status", "pending"])
-    assert args.func(args) == 0
-    output = capsys.readouterr().out
-    assert "delivery-1" in output
-    assert '"prompt":' not in output
-
-
-def test_delivery_retry_and_purge_require_exact_keys(
-    monkeypatch, tmp_path, capsys
-) -> None:
-    path = tmp_path / "delivery.sqlite3"
-    monkeypatch.setattr(delivery, "delivery_db_path", lambda: path)
-    store = DeliveryStore(path)
-    record = store.enqueue(
-        make_record(
-            session_id="session-1",
-            message_type="ask",
-            prompt="prompt",
-            delivery_id="delivery-1",
-            correlation_id="correlation-1",
-            from_peer="sender",
-            text="text",
-        )
-    )
-    claimed = store.claim(record.idempotency_key)
-    assert claimed and claimed.claim_token
-    store.mark_failed(record.idempotency_key, claimed.claim_token, "offline")
-
-    args = parser().parse_args(["--json", "delivery", "retry", record.idempotency_key])
-    assert args.func(args) == 0
-    assert '"status": "pending"' in capsys.readouterr().out
-
-    args = parser().parse_args(["--json", "delivery", "purge", record.idempotency_key])
-    assert args.func(args) == 0
-    assert '"deleted": 1' in capsys.readouterr().out
-
-
 class FakeSpawnClient:
     def __init__(self, _url=None) -> None:
         self.stopped = []
@@ -608,7 +551,7 @@ def test_prompt_idle_refuses_running_agent(monkeypatch) -> None:
         cli.cmd_prompt_idle(args)
 
 
-def test_steer_stops_only_target_session_then_resumes_it(monkeypatch, capsys) -> None:
+def test_steer_uses_native_replace_intent(monkeypatch, capsys) -> None:
     instances = []
 
     class RunningClient(FakeSpawnClient):
@@ -646,19 +589,8 @@ def test_steer_stops_only_target_session_then_resumes_it(monkeypatch, capsys) ->
                 }
             ]
 
-        def pending_approvals(self):
-            return []
-
-        def stop_execution(self, process_id):
-            self.stopped.append(process_id)
-
-        def wait_for_session_idle(self, session_id, timeout_seconds):
-            assert session_id == "session-a"
-            assert timeout_seconds == 12
-            return []
-
-        def send(self, session_id, prompt, sender_session=None):
-            return {"session_id": session_id, "prompt": prompt}
+        def send(self, session_id, prompt, sender_session=None, *, intent=None):
+            return {"session_id": session_id, "prompt": prompt, "intent": intent}
 
     monkeypatch.setattr(cli, "CdesktopClient", RunningClient)
     args = argparse.Namespace(
@@ -666,16 +598,16 @@ def test_steer_stops_only_target_session_then_resumes_it(monkeypatch, capsys) ->
         message="change direction",
         message_file=None,
         sender_session="manager",
-        timeout_seconds=12,
         url=None,
         json=True,
     )
     assert cli.cmd_steer(args) == 0
-    assert instances[0].stopped == ["process-a"]
+    assert instances[0].stopped == []
     output = capsys.readouterr().out
     assert '"scope": "selected session only"' in output
     assert '"process-a"' in output
     assert '"session_id": "session-a"' in output
+    assert '"intent": "replace"' in output
 
 
 def test_failover_starts_visible_successor_on_approved_profile(
@@ -785,9 +717,7 @@ def test_spawn_records_automatic_parent(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(cli.leases, "sync_active_workspaces", lambda _client: [])
     monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
     monkeypatch.setenv("CDESKTOP_SESSION_ID", "parent-session")
-    monkeypatch.setenv(
-        "SIGHTMESH_RELATIONSHIPS_DB", str(tmp_path / "relationships.sqlite3")
-    )
+    parents = []
 
     class ParentClient(FakeSpawnClient):
         def workspaces(self):
@@ -812,6 +742,10 @@ def test_spawn_records_automatic_parent(monkeypatch, tmp_path: Path) -> None:
                 }
             ]
 
+        def set_parent(self, session_id, parent_session_id):
+            parents.append((session_id, parent_session_id))
+            return {"id": session_id, "parent_session_id": parent_session_id}
+
     monkeypatch.setattr(cli, "CdesktopClient", ParentClient)
     args = argparse.Namespace(
         prompt="start",
@@ -835,9 +769,7 @@ def test_spawn_records_automatic_parent(monkeypatch, tmp_path: Path) -> None:
 
     assert cli.cmd_spawn(args) == 0
 
-    edge = cli.relationships.RelationshipStore().parent("session-a")
-    assert edge is not None
-    assert edge.parent_session_id == "parent-session"
+    assert parents == [("session-a", "parent-session")]
 
 
 def test_spawn_worktree_acquires_container_lease(monkeypatch, tmp_path: Path) -> None:

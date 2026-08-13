@@ -7,13 +7,15 @@ import os
 import platform
 import plistlib
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
 import zipfile
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
@@ -137,6 +139,75 @@ def _automatic_prune() -> dict[str, Any]:
         return prune()
     except (OSError, RuntimeError, ValueError) as exc:
         return {"removed": [], "retained": [], "dry_run": False, "error": str(exc)}
+
+
+def _sqlite_rows(path: Path, query: str) -> list[dict[str, Any]]:
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in connection.execute(query)]
+    finally:
+        connection.close()
+
+
+def _archive_sqlite(path: Path) -> str:
+    archive_dir = service.state_dir() / "legacy"
+    archive_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target = archive_dir / f"{path.stem}.{int(time.time())}.sqlite3"
+    handle, temp_name = tempfile.mkstemp(prefix=f".{path.stem}.", dir=archive_dir)
+    os.close(handle)
+    temporary = Path(temp_name)
+    source = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    destination = sqlite3.connect(temporary)
+    try:
+        source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
+    os.replace(temporary, target)
+    path.unlink()
+    Path(f"{path}-wal").unlink(missing_ok=True)
+    Path(f"{path}-shm").unlink(missing_ok=True)
+    return str(target)
+
+
+def migrate_native_state(client: CdesktopClient) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "parent_relationships": 0,
+        "pending_commands": 0,
+        "archives": [],
+    }
+    relationships = service.state_dir() / "relationships.sqlite3"
+    if relationships.exists():
+        rows = _sqlite_rows(
+            relationships,
+            "SELECT child_session_id, parent_session_id FROM parent_edges",
+        )
+        for row in rows:
+            client.set_parent(row["child_session_id"], row["parent_session_id"])
+        result["parent_relationships"] = len(rows)
+        result["archives"].append(_archive_sqlite(relationships))
+
+    delivery = service.state_dir() / "delivery.sqlite3"
+    if delivery.exists():
+        rows = _sqlite_rows(
+            delivery,
+            "SELECT session_id, prompt, idempotency_key FROM deliveries "
+            "WHERE status IN ('pending', 'inflight') ORDER BY created_at",
+        )
+        for row in rows:
+            if not row["prompt"]:
+                raise RuntimeError(
+                    f"Legacy delivery {row['idempotency_key']} has no retained prompt"
+                )
+            client.send(
+                row["session_id"],
+                row["prompt"],
+                dedupe_key=f"legacy:{row['idempotency_key']}",
+            )
+        result["pending_commands"] = len(rows)
+        result["archives"].append(_archive_sqlite(delivery))
+    return result
 
 
 @contextmanager
@@ -431,16 +502,19 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
             "updated_at": time.time(),
         }
         _write_json_atomic(state_path(), activating)
+        native_state_migration: dict[str, Any] | None = None
         try:
             service._bootstrap(service.LABEL, target)
             service.wait_until_healthy(port)
-            info = CdesktopClient(service.service_url(port)).info()
+            updated_client = CdesktopClient(service.service_url(port))
+            info = updated_client.info()
             running_version = str(info.get("version") or "")
             if str(pending["version"]) not in running_version:
                 raise RuntimeError(
                     f"Updated cdesktop reports {running_version!r}, expected "
                     f"{pending['version']!r}"
                 )
+            native_state_migration = migrate_native_state(updated_client)
             _restore_bridge()
         except Exception as update_error:
             drain_enabled = False
@@ -475,6 +549,7 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
                 "activated_at": time.time(),
             },
             "last_error": None,
+            "native_state_migration": native_state_migration,
             "updated_at": time.time(),
         }
         _write_json_atomic(state_path(), active)

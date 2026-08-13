@@ -22,7 +22,7 @@
 - clean managed-worktree reclamation after the native one-hour archive grace period;
 - dirty managed-worktree retirement refusal and direct-repository preservation;
 - launchd unload/reload recovery with bounded transient retry and definition rollback;
-- owner-only SightMesh state, configuration, log, lease, delivery, and migration storage;
+- owner-only SightMesh state, configuration, log, lease, and migration storage;
 - shared skill discovery through links in both Claude and Codex skill roots;
 - Repowire local daemon, hooks, MCP installation, and peer registration;
 - opt-in Repowire proxy peer registration for cdesktop sessions;

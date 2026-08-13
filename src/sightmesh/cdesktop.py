@@ -163,6 +163,13 @@ class CdesktopClient:
             {"workspace_id": workspace_id, "executor": executor, "name": name},
         )
 
+    def set_parent(self, session_id: str, parent_session_id: str) -> dict[str, Any]:
+        return self.request(
+            "PUT",
+            f"/sessions/{session_id}",
+            {"name": None, "parent_session_id": parent_session_id},
+        )
+
     def workspaces(self) -> list[dict[str, Any]]:
         return self.request("GET", "/workspaces")
 
@@ -414,15 +421,26 @@ class CdesktopClient:
         )
 
     def send(
-        self, session_id: str, prompt: str, sender_session: str | None = None
+        self,
+        session_id: str,
+        prompt: str,
+        sender_session: str | None = None,
+        *,
+        dedupe_key: str | None = None,
+        intent: str | None = None,
     ) -> Any:
         headers = {}
         if sender_session:
             headers["x-cdesktop-from-session"] = sender_session
+        payload: dict[str, Any] = {"prompt": prompt}
+        if dedupe_key:
+            payload["dedupe_key"] = dedupe_key
+        if intent:
+            payload["intent"] = intent
         return self.request(
             "POST",
             f"/sessions/{session_id}/follow-up",
-            {"prompt": prompt},
+            payload,
             headers=headers,
         )
 

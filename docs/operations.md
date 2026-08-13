@@ -2,7 +2,7 @@
 
 ## Fleet status and idle prompting
 
-`sightmesh status` joins managed service state, active cdesktop workspaces, latest process state, pending approvals, unseen turns, Repowire route policy, delivery counts, ownership leases, redacted cdesktop providers, and named SightMesh profiles. Add `--include-archived` only when historical workspaces are relevant. Use `sightmesh peers` for the compact agent-facing roster and `sightmesh peek @AGENT` for a coalesced current-activity snapshot.
+`sightmesh status` joins managed service state, active cdesktop workspaces, latest process state, pending approvals, unseen turns, Repowire route policy, ownership leases, redacted cdesktop providers, and named SightMesh profiles. Add `--include-archived` only when historical workspaces are relevant. Use `sightmesh peers` for the compact agent-facing roster and `sightmesh peek @AGENT` for a coalesced current-activity snapshot.
 
 Use `sightmesh prompt-idle @AGENT --message-file FILE` for automation that must not append work behind an active turn or bypass a pending approval. It reads that session's process state immediately before sending and fails closed unless the target is active and idle.
 

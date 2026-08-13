@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import plistlib
 import shutil
-import sqlite3
 import subprocess
 import tempfile
 import time
@@ -196,28 +195,6 @@ def migrate_legacy_state() -> dict[str, str]:
         migrated["routing"] = str(new_config)
 
     old_state = Path.home() / ".local" / "state" / "agent-deck"
-    old_delivery = old_state / "delivery.sqlite3"
-    new_delivery = state_dir() / "delivery.sqlite3"
-    if old_delivery.exists() and not new_delivery.exists():
-        new_delivery.parent.mkdir(parents=True, exist_ok=True)
-        handle, temp_name = tempfile.mkstemp(
-            prefix="delivery.", suffix=".sqlite3", dir=new_delivery.parent
-        )
-        os.close(handle)
-        temp_path = Path(temp_name)
-        try:
-            source = sqlite3.connect(f"file:{old_delivery}?mode=ro", uri=True)
-            destination = sqlite3.connect(temp_path)
-            try:
-                source.backup(destination)
-            finally:
-                destination.close()
-                source.close()
-            os.replace(temp_path, new_delivery)
-        finally:
-            temp_path.unlink(missing_ok=True)
-        migrated["delivery"] = str(new_delivery)
-
     old_leases = old_state / "leases"
     new_leases = state_dir() / "leases"
     if old_leases.exists():
@@ -390,10 +367,7 @@ def uninstall() -> None:
 def _remove_obsolete_updater() -> None:
     _bootout(OBSOLETE_UPDATER_LABEL)
     (
-        Path.home()
-        / "Library"
-        / "LaunchAgents"
-        / f"{OBSOLETE_UPDATER_LABEL}.plist"
+        Path.home() / "Library" / "LaunchAgents" / f"{OBSOLETE_UPDATER_LABEL}.plist"
     ).unlink(missing_ok=True)
 
 

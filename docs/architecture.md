@@ -24,7 +24,7 @@ Every prompt source writes the same durable record:
 session_commands (
   id                    BLOB PRIMARY KEY,
   session_id            BLOB NOT NULL REFERENCES sessions(id),
-  dedupe_key            TEXT UNIQUE,
+  dedupe_key            TEXT,
   intent                TEXT NOT NULL CHECK (intent IN ('continue', 'replace')),
   body                  TEXT NOT NULL,
   config                TEXT,
@@ -48,7 +48,7 @@ The dispatcher is the only component that starts agent turns.
 3. Assign all commands claimed together to one execution, preserving order.
 4. Record terminal state before admitting more work for that session.
 
-The same path handles UI prompts, peer messages, resumed work, and Repowire delivery. A duplicate `dedupe_key` returns the existing record. `replace` requests cancellation of the active turn, then runs through the same dispatcher. Restart recovery reads durable command and execution state; it never guesses from process timing.
+The same path handles UI prompts, peer messages, resumed work, and Repowire delivery. A duplicate `dedupe_key` within one session returns the existing record. `replace` requests cancellation of the active turn, then runs through the same dispatcher. Restart recovery reads durable command and execution state; it never guesses from process timing.
 
 The scheduler admits work under a configurable concurrency cap and pauses admission under operating-system memory pressure. Resource accounting includes the agent process group, so tools and builds count with their parent worker. Critical eviction preserves the command, transcript, Git state, and visible workspace for explicit retry.
 

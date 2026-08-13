@@ -1,5 +1,3 @@
-import sqlite3
-
 import pytest
 
 from sightmesh import service
@@ -165,35 +163,23 @@ def test_wait_until_healthy_retries_until_ready(monkeypatch) -> None:
     service.wait_until_healthy(4321, timeout=1)
 
 
-def test_migrate_legacy_state_copies_routing_delivery_and_leases(
-    monkeypatch, tmp_path
-) -> None:
+def test_migrate_legacy_state_copies_routing_and_leases(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     old_config = tmp_path / ".config" / "agent-deck" / "bridge.json"
     old_config.parent.mkdir(parents=True)
     old_config.write_text('{"enabled_workspaces": ["workspace-a"]}', encoding="utf-8")
     old_state = tmp_path / ".local" / "state" / "agent-deck"
     old_state.mkdir(parents=True)
-    database = old_state / "delivery.sqlite3"
-    with sqlite3.connect(database) as connection:
-        connection.execute("create table sample(value text)")
-        connection.execute("insert into sample values ('preserved')")
     old_lease = old_state / "leases" / "lease.json"
     old_lease.parent.mkdir(parents=True)
     old_lease.write_text('{"token": "lease-token"}', encoding="utf-8")
 
     migrated = service.migrate_legacy_state()
 
-    assert set(migrated) == {"routing", "delivery", "leases"}
+    assert set(migrated) == {"routing", "leases"}
     assert (
         tmp_path / ".config" / "sightmesh" / "bridge.json"
     ).read_text() == old_config.read_text()
-    with sqlite3.connect(
-        tmp_path / ".local" / "state" / "sightmesh" / "delivery.sqlite3"
-    ) as connection:
-        assert (
-            connection.execute("select value from sample").fetchone()[0] == "preserved"
-        )
     assert (
         tmp_path / ".local" / "state" / "sightmesh" / "leases" / "lease.json"
     ).exists()

@@ -1,5 +1,6 @@
 import hashlib
 import os
+import sqlite3
 import time
 import zipfile
 from pathlib import Path
@@ -25,6 +26,8 @@ class FakeClient:
         self.drain_supported = drain_supported
         self.queued = queued
         self.drain_calls = []
+        self.parents = []
+        self.sent = []
 
     def set_update_drain(self, seconds):
         if not self.drain_supported:
@@ -63,6 +66,14 @@ class FakeClient:
 
     def info(self):
         return {"version": self.version}
+
+    def set_parent(self, session_id, parent_session_id):
+        self.parents.append((session_id, parent_session_id))
+        return {"id": session_id, "parent_session_id": parent_session_id}
+
+    def send(self, session_id, prompt, sender_session=None, *, dedupe_key=None):
+        self.sent.append((session_id, prompt, sender_session, dedupe_key))
+        return {"state": "pending"}
 
 
 def isolated_state(monkeypatch, tmp_path: Path) -> None:
@@ -217,6 +228,41 @@ def test_activity_waits_for_durable_follow_ups() -> None:
     assert result["queued_follow_ups"] == [
         {"workspace_id": "workspace-1", "session_id": "session-1"}
     ]
+
+
+def test_native_state_migration_imports_then_archives(monkeypatch, tmp_path) -> None:
+    isolated_state(monkeypatch, tmp_path)
+    state = service.state_dir()
+    state.mkdir(parents=True)
+    relationships = sqlite3.connect(state / "relationships.sqlite3")
+    relationships.execute(
+        "CREATE TABLE parent_edges (child_session_id TEXT, parent_session_id TEXT)"
+    )
+    relationships.execute("INSERT INTO parent_edges VALUES ('child', 'parent')")
+    relationships.commit()
+    relationships.close()
+    delivery = sqlite3.connect(state / "delivery.sqlite3")
+    delivery.execute(
+        "CREATE TABLE deliveries (session_id TEXT, prompt TEXT, idempotency_key TEXT, "
+        "status TEXT, created_at REAL)"
+    )
+    delivery.execute(
+        "INSERT INTO deliveries VALUES "
+        "('child', 'continue', 'delivery-1', 'pending', 1)"
+    )
+    delivery.commit()
+    delivery.close()
+    client = FakeClient()
+
+    result = updates.migrate_native_state(client)
+
+    assert client.parents == [("child", "parent")]
+    assert client.sent == [("child", "continue", None, "legacy:delivery-1")]
+    assert result["parent_relationships"] == 1
+    assert result["pending_commands"] == 1
+    assert len(result["archives"]) == 2
+    assert not (state / "relationships.sqlite3").exists()
+    assert not (state / "delivery.sqlite3").exists()
 
 
 def test_prune_preserves_active_pending_and_one_recent_spare(

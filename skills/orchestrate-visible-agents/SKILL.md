@@ -33,6 +33,6 @@ Use `.context` for durable task-local handoffs, Git for source truth, cdesktop f
 
 ## Supervise and finish
 
-Inspect on meaningful state changes, not continuous polling. Intervene for blockers, drift, duplicate ownership, or failed proof. Batch independent questions and reads when useful.
+Inspect on meaningful state changes, not continuous polling. Intervene for blockers, drift, duplicate ownership, or failed proof. Make proof run the owner of each changed artifact; an adjacent check is not equivalent. Batch independent questions and reads when useful.
 
 Before retirement, use `$reconcile-agent-work`. Preserve or explicitly defer every unique result, then archive the visible workspace.

@@ -17,14 +17,12 @@ from . import (
     approvals,
     conductor_migrate,
     leases,
-    relationships,
     routing,
     service,
     updates,
 )
 from .bridge import run_bridge
 from .cdesktop import CdesktopClient, CdesktopError
-from .delivery import DeliveryStore, DeliveryStoreError, to_dict
 from .profiles import (
     Profile,
     ProfileError,
@@ -682,13 +680,13 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
     )
     if parent_selector and session_id:
         parent = _resolve_session(client, parent_selector)
-        edge = relationships.RelationshipStore().record(
-            child_session_id=session_id,
-            child_workspace_id=workspace_id,
-            parent_session_id=str(parent["session_id"]),
-            parent_workspace_id=str(parent["workspace_id"]),
-        )
-        result["parent"] = edge.to_dict()
+        child = client.set_parent(session_id, str(parent["session_id"]))
+        result["parent"] = {
+            "child_session_id": session_id,
+            "child_workspace_id": workspace_id,
+            "parent_session_id": child["parent_session_id"],
+            "parent_workspace_id": str(parent["workspace_id"]),
+        }
     return result
 
 
@@ -720,7 +718,6 @@ def cmd_steer(args: argparse.Namespace) -> int:
         target,
         message,
         caller_session=caller_session,
-        timeout_seconds=args.timeout_seconds,
     )
     _emit(result, args.json)
     return 0
@@ -732,7 +729,6 @@ def _steer_target(
     message: str,
     *,
     caller_session: str | None,
-    timeout_seconds: float,
 ) -> dict[str, Any]:
     session_id = str(target["session_id"])
     if caller_session == session_id:
@@ -743,29 +739,13 @@ def _steer_target(
         raise ValueError("Cannot steer a session in an archived workspace")
 
     processes = _session_processes(client, target)
-    process_ids = {str(process["id"]) for process in processes}
-    pending = [
-        approval
-        for approval in client.pending_approvals()
-        if str(approval.get("execution_process_id")) in process_ids
-    ]
-    if pending:
-        raise ValueError(
-            "Target agent has a pending approval or question; resolve it in cdesktop "
-            "before steering"
-        )
     running = [
         process
         for process in processes
         if process.get("status") == "running"
         and process.get("run_reason") != "devserver"
     ]
-    for process in running:
-        client.stop_execution(str(process["id"]))
-    if running:
-        client.wait_for_session_idle(session_id, timeout_seconds=timeout_seconds)
-
-    result = client.send(session_id, message, caller_session)
+    result = client.send(session_id, message, caller_session, intent="replace")
     return {
         "workspace_id": workspace_id,
         "session_id": session_id,
@@ -780,23 +760,30 @@ def cmd_parent(args: argparse.Namespace) -> int:
     child_session = args.session or os.environ.get("CDESKTOP_SESSION_ID")
     if not child_session:
         raise ValueError("Provide --session or run inside a cdesktop session")
-    edge = relationships.RelationshipStore().parent(child_session)
-    if not edge:
+    client = CdesktopClient(args.url)
+    child = client.session(child_session)
+    parent_session_id = child.get("parent_session_id")
+    if not parent_session_id:
         raise ValueError(f"No recorded parent for session {child_session}")
 
-    result: dict[str, Any] = {"parent": edge.to_dict()}
+    target = _resolve_session(client, str(parent_session_id))
+    result: dict[str, Any] = {
+        "parent": {
+            "child_session_id": child_session,
+            "child_workspace_id": child["workspace_id"],
+            "parent_session_id": parent_session_id,
+            "parent_workspace_id": target["workspace_id"],
+        }
+    }
     if args.message or args.message_file:
         message = _read_text(args.message, args.message_file, "message")
         if not message.strip():
             raise ValueError("Parent message must not be empty")
-        client = CdesktopClient(args.url)
-        target = _resolve_session(client, edge.parent_session_id)
         result["delivery"] = _steer_target(
             client,
             target,
             message,
             caller_session=child_session,
-            timeout_seconds=args.timeout_seconds,
         )
     _emit(result, args.json)
     return 0
@@ -806,8 +793,19 @@ def cmd_children(args: argparse.Namespace) -> int:
     parent_session = args.session or os.environ.get("CDESKTOP_SESSION_ID")
     if not parent_session:
         raise ValueError("Provide --session or run inside a cdesktop session")
-    edges = relationships.RelationshipStore().children(parent_session)
-    _emit([edge.to_dict() for edge in edges], args.json)
+    client = CdesktopClient(args.url)
+    children = []
+    for workspace in client.workspaces():
+        for session in client.sessions(str(workspace["id"])):
+            if str(session.get("parent_session_id") or "") == parent_session:
+                children.append(
+                    {
+                        "child_session_id": session["id"],
+                        "child_workspace_id": workspace["id"],
+                        "parent_session_id": parent_session,
+                    }
+                )
+    _emit(children, args.json)
     return 0
 
 
@@ -1002,14 +1000,12 @@ def cmd_teammate_spawn(args: argparse.Namespace) -> int:
         result["profile"] = profile_name
     child_session = _primary_session_id(result)
     if child_session:
-        parent = client.session(caller_session)
-        edge = relationships.RelationshipStore().record(
-            child_session_id=child_session,
-            child_workspace_id=str(parent["workspace_id"]),
-            parent_session_id=caller_session,
-            parent_workspace_id=str(parent["workspace_id"]),
-        )
-        result["parent"] = edge.to_dict()
+        child = client.session(child_session)
+        result["parent"] = {
+            "child_session_id": child_session,
+            "child_workspace_id": child["workspace_id"],
+            "parent_session_id": child.get("parent_session_id"),
+        }
     _emit(result, args.json)
     return 0
 
@@ -1680,33 +1676,6 @@ def cmd_bridge_reply(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_delivery(args: argparse.Namespace) -> int:
-    store = DeliveryStore()
-    if args.delivery_action == "status":
-        _emit(store.status(), args.json)
-        return 0
-    if args.delivery_action == "list":
-        rows = [
-            to_dict(record)
-            for record in store.list(
-                status=args.status,
-                session_id=args.session_id,
-                limit=args.limit,
-            )
-        ]
-        _emit(rows, args.json)
-        return 0
-    if args.delivery_action == "retry":
-        rows = [to_dict(store.retry(key)) for key in args.idempotency_key]
-        _emit(rows, args.json)
-        return 0
-    if args.delivery_action == "purge":
-        deleted = store.purge(args.idempotency_key)
-        _emit({"deleted": deleted, "requested": args.idempotency_key}, args.json)
-        return 0
-    raise ValueError(f"Unknown delivery action: {args.delivery_action}")
-
-
 def cmd_profile(args: argparse.Namespace) -> int:
     store = ProfileStore()
     if args.profile_action == "list":
@@ -1799,7 +1768,6 @@ def cmd_status(args: argparse.Namespace) -> int:
                     item["has_pending_approval"] for item in workspaces
                 ),
             },
-            "delivery": DeliveryStore().status(),
             "leases": [lease.to_dict() for lease in leases.LeaseStore().list()],
             "profiles": profile_rows,
             "providers": [provider_summary(provider) for provider in providers],
@@ -2028,7 +1996,6 @@ def parser() -> argparse.ArgumentParser:
     parent_message = parent.add_mutually_exclusive_group()
     parent_message.add_argument("--message")
     parent_message.add_argument("--message-file")
-    parent.add_argument("--timeout-seconds", type=float, default=30.0)
     parent.set_defaults(func=cmd_parent)
 
     children = sub.add_parser(
@@ -2058,7 +2025,6 @@ def parser() -> argparse.ArgumentParser:
     steer_group.add_argument("--message")
     steer_group.add_argument("--message-file")
     steer.add_argument("--sender-session")
-    steer.add_argument("--timeout-seconds", type=float, default=30.0)
     steer.set_defaults(func=cmd_steer)
 
     prompt_idle = sub.add_parser(
@@ -2342,32 +2308,6 @@ def parser() -> argparse.ArgumentParser:
     )
     bridge_reply.set_defaults(func=cmd_bridge_reply)
 
-    delivery = sub.add_parser(
-        "delivery", help="Inspect and operate bridge delivery records"
-    )
-    delivery_sub = delivery.add_subparsers(dest="delivery_action", required=True)
-
-    delivery_status = delivery_sub.add_parser(
-        "status", help="Show delivery store status"
-    )
-    delivery_status.set_defaults(func=cmd_delivery)
-
-    delivery_list = delivery_sub.add_parser("list", help="List delivery records")
-    delivery_list.add_argument(
-        "--status", choices=["pending", "inflight", "injected", "dead"]
-    )
-    delivery_list.add_argument("--session-id")
-    delivery_list.add_argument("--limit", type=int, default=50)
-    delivery_list.set_defaults(func=cmd_delivery)
-
-    delivery_retry = delivery_sub.add_parser("retry", help="Retry exact delivery keys")
-    delivery_retry.add_argument("idempotency_key", nargs="+")
-    delivery_retry.set_defaults(func=cmd_delivery)
-
-    delivery_purge = delivery_sub.add_parser("purge", help="Purge exact delivery keys")
-    delivery_purge.add_argument("idempotency_key", nargs="+")
-    delivery_purge.set_defaults(func=cmd_delivery)
-
     lease = sub.add_parser(
         "lease", help="Inspect and manage local workspace ownership leases"
     )
@@ -2472,7 +2412,6 @@ def main() -> None:
     except (
         CdesktopError,
         approvals.ApprovalAuditError,
-        DeliveryStoreError,
         leases.LeaseError,
         RepowireError,
         ProfileError,

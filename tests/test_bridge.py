@@ -1,8 +1,13 @@
 import asyncio
 import json
 
-from sightmesh.bridge import BridgedSession, RepowireSessionBridge, _backend, _peer_name
-from sightmesh.delivery import DeliveryPolicy, DeliveryStore
+from sightmesh.bridge import (
+    BridgedSession,
+    RepowireSessionBridge,
+    _backend,
+    _dedupe_key,
+    _peer_name,
+)
 
 
 class FakeClient:
@@ -10,11 +15,19 @@ class FakeClient:
         self.sent = []
         self.failures = []
 
-    def send(self, session_id, prompt, sender_session):
+    def send(
+        self,
+        session_id,
+        prompt,
+        sender_session,
+        *,
+        dedupe_key=None,
+        intent=None,
+    ):
         if self.failures:
             raise RuntimeError(self.failures.pop(0))
-        self.sent.append((session_id, prompt, sender_session))
-        return {"accepted": True}
+        self.sent.append((session_id, prompt, sender_session, dedupe_key, intent))
+        return {"state": "pending"}
 
 
 class FakeWebSocket:
@@ -25,12 +38,8 @@ class FakeWebSocket:
         self.frames.append(json.loads(frame))
 
 
-def _bridge(tmp_path) -> tuple[RepowireSessionBridge, FakeClient, DeliveryStore]:
+def _bridge() -> tuple[RepowireSessionBridge, FakeClient]:
     client = FakeClient()
-    store = DeliveryStore(
-        tmp_path / "delivery.sqlite3",
-        DeliveryPolicy(max_attempts=2, base_backoff_seconds=0, max_backoff_seconds=0),
-    )
     bridge = RepowireSessionBridge(
         client,
         BridgedSession(
@@ -39,9 +48,8 @@ def _bridge(tmp_path) -> tuple[RepowireSessionBridge, FakeClient, DeliveryStore]
             path="/tmp/repo",
         ),
         "ws://127.0.0.1:8377/ws",
-        store,
     )
-    return bridge, client, store
+    return bridge, client
 
 
 def test_peer_metadata_is_stable_and_normalized() -> None:
@@ -51,25 +59,22 @@ def test_peer_metadata_is_stable_and_normalized() -> None:
     assert _backend(session["executor"]) == "claude-code"
 
 
-def test_plain_ask_becomes_visible_follow_up_and_ack_command(tmp_path) -> None:
-    bridge, client, _store = _bridge(tmp_path)
+def test_plain_ask_becomes_durable_cdesktop_command() -> None:
+    bridge, client = _bridge()
     ws = FakeWebSocket()
-    asyncio.run(
-        bridge._handle(
-            ws,
-            {
-                "type": "ask",
-                "delivery_id": "delivery-1",
-                "correlation_id": "correlation-1",
-                "from_peer": "sender",
-                "text": "Review the change",
-            },
-        )
-    )
+    message = {
+        "type": "ask",
+        "delivery_id": "delivery-1",
+        "correlation_id": "correlation-1",
+        "from_peer": "sender",
+        "text": "Review the change",
+    }
+    asyncio.run(bridge._handle(ws, message))
+
     assert client.sent[0][0] == "session-123456"
     assert "## Request from @sender" in client.sent[0][1]
     assert "sightmesh bridge-reply correlation-1" in client.sent[0][1]
-    assert "--question" not in client.sent[0][1]
+    assert client.sent[0][3] == "repowire:session-123456:ask:delivery-1"
     assert ws.frames == [
         {
             "type": "delivery_ack",
@@ -80,8 +85,8 @@ def test_plain_ask_becomes_visible_follow_up_and_ack_command(tmp_path) -> None:
     ]
 
 
-def test_structured_question_uses_answer_endpoint_flag(tmp_path) -> None:
-    bridge, client, _store = _bridge(tmp_path)
+def test_structured_question_uses_answer_endpoint_flag() -> None:
+    bridge, client = _bridge()
     ws = FakeWebSocket()
     asyncio.run(
         bridge._handle(
@@ -98,25 +103,25 @@ def test_structured_question_uses_answer_endpoint_flag(tmp_path) -> None:
     assert "--question --message 'RESULT'" in client.sent[0][1]
 
 
-def test_duplicate_delivery_after_injection_is_not_sent_twice(tmp_path) -> None:
-    bridge, client, _store = _bridge(tmp_path)
+def test_duplicate_delivery_uses_the_same_cdesktop_dedupe_key() -> None:
+    bridge, client = _bridge()
     ws = FakeWebSocket()
     message = {
         "type": "ask",
         "delivery_id": "delivery-1",
-        "correlation_id": "correlation-1",
         "from_peer": "sender",
         "text": "Review the change",
     }
     asyncio.run(bridge._handle(ws, message))
     asyncio.run(bridge._handle(ws, message))
-    assert len(client.sent) == 1
+
+    assert client.sent[0][3] == client.sent[1][3]
     assert [frame["status"] for frame in ws.frames] == ["injected", "injected"]
 
 
-def test_failed_delivery_dead_letters_and_sends_structured_error(tmp_path) -> None:
-    bridge, client, _store = _bridge(tmp_path)
-    client.failures = ["offline", "still offline"]
+def test_delivery_failure_is_visible_to_repowire() -> None:
+    bridge, client = _bridge()
+    client.failures = ["offline"]
     ws = FakeWebSocket()
     asyncio.run(
         bridge._handle(
@@ -130,46 +135,25 @@ def test_failed_delivery_dead_letters_and_sends_structured_error(tmp_path) -> No
             },
         )
     )
-    asyncio.run(bridge._process_due(ws))
-    assert ws.frames[-2] == {
-        "type": "delivery_ack",
-        "delivery_id": "delivery-2",
-        "message_type": "ask",
-        "status": "failed",
-        "detail": "still offline",
-    }
-    assert ws.frames[-1] == {
-        "type": "error",
-        "correlation_id": "correlation-2",
-        "error": "still offline",
-    }
+
+    assert ws.frames == [
+        {
+            "type": "delivery_ack",
+            "delivery_id": "delivery-2",
+            "message_type": "ask",
+            "status": "failed",
+            "detail": "offline",
+        },
+        {
+            "type": "error",
+            "correlation_id": "correlation-2",
+            "error": "offline",
+        },
+    ]
 
 
-def test_duplicate_pending_delivery_respects_backoff(tmp_path) -> None:
-    client = FakeClient()
-    store = DeliveryStore(
-        tmp_path / "delivery.sqlite3",
-        DeliveryPolicy(max_attempts=3, base_backoff_seconds=100, max_backoff_seconds=100),
-    )
-    bridge = RepowireSessionBridge(
-        client,
-        BridgedSession(
-            workspace={"id": "workspace", "name": "Bridge Test"},
-            session={"id": "session-123456", "executor": "CODEX"},
-            path="/tmp/repo",
-        ),
-        "ws://127.0.0.1:8377/ws",
-        store,
-    )
-    client.failures = ["offline"]
-    ws = FakeWebSocket()
-    message = {
-        "type": "ask",
-        "delivery_id": "delivery-3",
-        "correlation_id": "correlation-3",
-        "from_peer": "sender",
-        "text": "Review the change",
-    }
-    asyncio.run(bridge._handle(ws, message))
-    asyncio.run(bridge._handle(ws, message))
-    assert client.sent == []
+def test_unidentified_messages_still_dedupe_deterministically() -> None:
+    message = {"from_peer": "sender", "text": "same"}
+    first = _dedupe_key("session", "notify", message)
+    second = _dedupe_key("session", "notify", dict(message))
+    assert first == second
