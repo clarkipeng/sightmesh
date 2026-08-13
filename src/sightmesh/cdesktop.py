@@ -301,6 +301,21 @@ class CdesktopClient:
             },
         )
 
+    def respond_to_question(
+        self,
+        approval_id: str,
+        execution_process_id: str,
+        answers: list[dict[str, Any]],
+    ) -> Any:
+        return self.request(
+            "POST",
+            f"/approvals/{approval_id}/respond",
+            {
+                "execution_process_id": execution_process_id,
+                "status": {"status": "answered", "answers": answers},
+            },
+        )
+
     def workspace_summaries(self, archived: bool = False) -> list[dict[str, Any]]:
         result = self.request("POST", "/workspaces/summaries", {"archived": archived})
         summaries = result.get("summaries") if isinstance(result, dict) else None

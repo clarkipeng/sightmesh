@@ -1,4 +1,5 @@
 import argparse
+import json
 import subprocess
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from sightmesh.cli import (
     _fleet_sessions,
     _is_sightmesh_cdesktop_version,
     _normalized_snapshot_with_retry,
+    _pending_request_from_snapshot,
     _primary_session_id,
     _read_text,
     _repowire_status_ok,
@@ -126,6 +128,156 @@ def test_workspace_repository_paths_expose_source_and_checkout() -> None:
 def test_parser_registers_compact_fleet_commands() -> None:
     assert parser().parse_args(["peers"]).func is cli.cmd_peers
     assert parser().parse_args(["peek", "@reviewer"]).func is cli.cmd_peek
+    assert parser().parse_args(["inbox"]).func is cli.cmd_inbox
+    assert parser().parse_args(["respond", "--responses", "[]"]).func is cli.cmd_respond
+
+
+def test_pending_request_is_derived_from_matching_approval() -> None:
+    snapshot = {
+        "entries": [
+            {
+                "content": {
+                    "content": "2 questions",
+                    "entry_type": {
+                        "type": "tool_use",
+                        "status": {
+                            "status": "pending_approval",
+                            "approval_id": "approval-a",
+                        },
+                        "action_type": {
+                            "action": "ask_user_question",
+                            "questions": [
+                                {
+                                    "question": "Ship it?",
+                                    "header": "Release",
+                                    "options": [],
+                                    "multiSelect": False,
+                                }
+                            ],
+                        },
+                    },
+                }
+            }
+        ]
+    }
+    request = _pending_request_from_snapshot(snapshot, "approval-a")
+    assert request["summary"] == "2 questions"
+    assert request["action"]["questions"][0]["question"] == "Ship it?"
+
+
+def test_batch_response_answers_questions_and_approves_plan(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    class BatchClient:
+        def __init__(self, _url=None) -> None:
+            self.responses = []
+
+        def pending_approvals(self):
+            return [
+                {
+                    "approval_id": "question-a",
+                    "execution_process_id": "process-question",
+                    "tool_name": "AskUserQuestion",
+                    "is_question": True,
+                    "created_at": "1",
+                    "timeout_at": "9",
+                },
+                {
+                    "approval_id": "plan-a",
+                    "execution_process_id": "process-plan",
+                    "tool_name": "ExitPlanMode",
+                    "is_question": False,
+                    "created_at": "2",
+                    "timeout_at": "9",
+                },
+            ]
+
+        def execution_process(self, process_id):
+            return {"session_id": f"session-{process_id}"}
+
+        def session(self, _session_id):
+            return {"workspace_id": "workspace-a", "executor": "CODEX"}
+
+        def workspace(self, _workspace_id):
+            return {"name": "catapult", "archived": False}
+
+        def normalized_snapshot(self, process_id):
+            approval_id = "question-a" if process_id == "process-question" else "plan-a"
+            action = (
+                {
+                    "action": "ask_user_question",
+                    "questions": [
+                        {
+                            "question": "Ship it?",
+                            "header": "Release",
+                            "options": [],
+                            "multiSelect": False,
+                        },
+                        {
+                            "question": "Checks?",
+                            "header": "Validation",
+                            "options": [],
+                            "multiSelect": True,
+                        },
+                    ],
+                }
+                if approval_id == "question-a"
+                else {"action": "plan_presentation", "plan": "Do the work"}
+            )
+            return {
+                "complete": True,
+                "patch_count": 1,
+                "entries": [
+                    {
+                        "content": {
+                            "content": "pending",
+                            "entry_type": {
+                                "type": "tool_use",
+                                "status": {
+                                    "status": "pending_approval",
+                                    "approval_id": approval_id,
+                                },
+                                "action_type": action,
+                            },
+                        }
+                    }
+                ],
+            }
+
+        def respond_to_question(self, approval_id, process_id, answers):
+            self.responses.append((approval_id, process_id, answers))
+            return {"status": "answered"}
+
+        def respond_to_approval(
+            self, approval_id, process_id, *, approved, reason=None
+        ):
+            self.responses.append((approval_id, process_id, approved, reason))
+            return {"status": "approved"}
+
+    client = BatchClient()
+    monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
+    monkeypatch.setattr(approvals, "approval_db_path", lambda: tmp_path / "audit.db")
+    payload = json.dumps(
+        [
+            {"approval_id": "question-a", "answers": ["Yes", ["Unit", "UI"]]},
+            {"approval_id": "plan-a", "decision": "approve"},
+        ]
+    )
+    args = parser().parse_args(["--json", "respond", "--responses", payload])
+
+    assert args.func(args) == 0
+    assert client.responses == [
+        (
+            "question-a",
+            "process-question",
+            [
+                {"question": "Ship it?", "answer": ["Yes"]},
+                {"question": "Checks?", "answer": ["Unit", "UI"]},
+            ],
+        ),
+        ("plan-a", "process-plan", True, None),
+    ]
+    assert '"failed": 0' in capsys.readouterr().out
 
 
 def test_namespace_import_is_available() -> None:
@@ -208,6 +360,9 @@ def test_approval_command_approves_reviewed_plan(monkeypatch, tmp_path, capsys) 
 
         def workspace(self, _workspace_id):
             return {"name": "worker", "archived": False}
+
+        def normalized_snapshot(self, _process_id):
+            return {"entries": [], "patch_count": 0, "complete": True}
 
         def respond_to_approval(
             self, approval_id, execution_process_id, *, approved, reason=None

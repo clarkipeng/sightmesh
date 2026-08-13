@@ -6,6 +6,8 @@
 
 Use `sightmesh prompt-idle @AGENT --message-file FILE` for automation that must not append work behind an active turn or bypass a pending approval. It reads that session's process state immediately before sending and fails closed unless the target is active and idle.
 
+Use `sightmesh inbox` for one global view of pending questions, plans, and tool requests. A manager agent can copy the included response templates into one `sightmesh respond --responses JSON` call. The complete batch is structurally validated before any response is sent. Live timeout races are isolated per response, so one expired request does not prevent later valid responses from being attempted.
+
 Use `sightmesh steer @AGENT --message-file FILE` when the current turn must change immediately. SightMesh resolves an exact ambiguity-safe selector, refuses self-steering and pending interactions, stops only that session's active non-dev-server execution, verifies the persisted state left `running`, and sends a native follow-up. Peer sessions in the same worktree and the dev server remain running. The visible transcript and the session's executor, model, reasoning, permissions, and provider remain intact.
 
 Workspace display names can be corrected without changing Git state:
@@ -30,7 +32,7 @@ sightmesh approval history --limit 20
 
 The response is bound to both the approval ID and its execution-process ID. A mismatched process is rejected without consuming the pending approval. When the command runs inside cdesktop, `CDESKTOP_SESSION_ID` identifies the reviewer, self-approval is forbidden, and only the earliest session in that workspace is the lead. Outside cdesktop, the local macOS user is recorded as the human reviewer.
 
-`ExitPlanMode` is the normal plan approval. Questions must be answered in cdesktop because their structured answer choices are part of the visible conversation. Other tool requests fail closed unless `--allow-non-plan` is present. cdesktop currently changes an approved Claude plan session from plan mode to its bypass-permissions mode, so inspect the plan and its worktree boundary before approving it.
+`ExitPlanMode` is the normal plan approval. Questions may be answered in cdesktop or through `sightmesh respond`; the global inbox derives their structured choices from the same normalized conversation. Other tool requests fail closed unless a batch item contains `"allow_non_plan": true`. cdesktop currently changes an approved Claude plan session from plan mode to its bypass-permissions mode, so inspect the plan and its worktree boundary before approving it.
 
 Approval attempts are written to the private local audit store before cdesktop is called. The audit includes the decision, reviewer, target IDs, status, and a SHA-256 digest of a rejection reason. It deliberately does not duplicate the reason or transcript text.
 

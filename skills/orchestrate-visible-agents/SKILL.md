@@ -30,6 +30,7 @@ Keep the workflow native and unsurprising:
 5. Do not use `sightmesh message`, `sightmesh prompt-idle`, or Repowire as the normal peer-contact path. They remain compatibility and durable-delivery surfaces for explicitly non-interrupting workflows.
 6. Every teammate must contact its workspace lead when it needs a decision, feedback, or help with a blocker, and when it completes. Use `cdesktop team manager --message "STATUS: concise details"`; the command resolves the lead session automatically.
 7. Before asking for input, collect all currently known independent questions and send one multi-question request. Before tool use, batch independent read-only inspections. Keep dependent operations, mutations, approvals, and destructive actions sequential.
+8. A lead reviewing multiple workers should call `sightmesh inbox` once and answer independent pending requests with one prevalidated `sightmesh respond --responses '<json>'` call.
 
 Read [references/cdesktop-and-repowire.md](references/cdesktop-and-repowire.md) before the first spawn in a new environment.
 
@@ -82,6 +83,7 @@ Start with the compact local fleet surface:
 sightmesh peers
 sightmesh peek @<agent>
 sightmesh steer @<agent> --message "<immediate correction or blocker>"
+sightmesh inbox
 ```
 
 Selectors are exact and ambiguity-safe. Never steer yourself. Targeted steering leaves other sessions in the same workspace and any dev server running. It refuses to interrupt a pending approval or question.

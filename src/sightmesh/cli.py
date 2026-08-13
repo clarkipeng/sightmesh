@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import getpass
 import json
 import os
@@ -31,6 +32,7 @@ COORDINATION_CONTRACT = """## Local agent coordination
 
 - Use `sightmesh peers` and `sightmesh peek @agent` for compact fleet awareness.
 - Use `sightmesh steer @agent --message "..."` for immediate peer contact. It interrupts only that agent's active turn.
+- Leads use `sightmesh inbox` and one `sightmesh respond --responses '...'` call for pending requests across the fleet.
 - Contact your lead with `cdesktop team manager --message "STATUS: concise details"` when blocked, when a decision is needed, and when complete.
 - Batch independent read-only tool calls and all currently known independent questions. Keep dependent or destructive actions sequential.
 - Do not use hidden or native subagents.
@@ -949,6 +951,14 @@ def _approval_details(
     workspace_id = str(session["workspace_id"])
     workspace = client.workspace(workspace_id)
     tool_name = str(approval.get("tool_name") or "")
+    request = None
+    try:
+        snapshot = _normalized_snapshot_with_retry(
+            client, str(approval["execution_process_id"])
+        )
+        request = _pending_request_from_snapshot(snapshot, str(approval["approval_id"]))
+    except CdesktopError:
+        pass
     details.update(
         {
             "session_id": session_id,
@@ -957,6 +967,7 @@ def _approval_details(
             "workspace_id": workspace_id,
             "workspace_name": workspace.get("name"),
             "workspace_archived": bool(workspace.get("archived")),
+            "request": request,
             "request_kind": (
                 "question"
                 if approval.get("is_question")
@@ -967,6 +978,267 @@ def _approval_details(
         }
     )
     return details
+
+
+def _pending_request_from_snapshot(
+    snapshot: dict[str, Any], approval_id: str
+) -> dict[str, Any] | None:
+    entries = snapshot.get("entries")
+    if not isinstance(entries, list):
+        return None
+    for wrapped in reversed(entries):
+        content = wrapped.get("content") if isinstance(wrapped, dict) else None
+        entry_type = content.get("entry_type") if isinstance(content, dict) else None
+        if not isinstance(entry_type, dict) or entry_type.get("type") != "tool_use":
+            continue
+        status = entry_type.get("status")
+        if (
+            not isinstance(status, dict)
+            or status.get("status") != "pending_approval"
+            or str(status.get("approval_id")) != approval_id
+        ):
+            continue
+        action = entry_type.get("action_type")
+        return {
+            "summary": _compact_text(content.get("content"), 600),
+            "action": action if isinstance(action, dict) else None,
+        }
+    return None
+
+
+def _approval_response_template(approval: dict[str, Any]) -> dict[str, Any]:
+    template: dict[str, Any] = {"approval_id": approval["approval_id"]}
+    if approval.get("is_question"):
+        action = (approval.get("request") or {}).get("action")
+        questions = action.get("questions") if isinstance(action, dict) else None
+        template["answers"] = (
+            [""] * len(questions) if isinstance(questions, list) else []
+        )
+    else:
+        template["decision"] = "approve|deny"
+        if approval.get("request_kind") != "plan":
+            template["allow_non_plan"] = False
+    return template
+
+
+def _approval_details_batch(
+    client: CdesktopClient, items: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    if not items:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(items))) as pool:
+        return list(pool.map(lambda item: _approval_details(client, item), items))
+
+
+def cmd_inbox(args: argparse.Namespace) -> int:
+    client = CdesktopClient(args.url)
+    selectors = {
+        str(row["session_id"]): f"@{row['selector']}" for row in _fleet_sessions(client)
+    }
+    rows = []
+    for details in _approval_details_batch(client, client.pending_approvals()):
+        details["agent"] = selectors.get(
+            str(details["session_id"]), str(details["session_id"])
+        )
+        details["response_template"] = _approval_response_template(details)
+        rows.append(details)
+    _emit(rows, args.json)
+    return 0
+
+
+def _response_items(value: str) -> list[dict[str, Any]]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Responses are not valid JSON: {exc}") from exc
+    if isinstance(parsed, dict):
+        parsed = parsed.get("responses")
+    if not isinstance(parsed, list) or not parsed:
+        raise ValueError("Responses must be a non-empty JSON array")
+    if not all(isinstance(item, dict) for item in parsed):
+        raise ValueError("Every batch response must be a JSON object")
+    return [dict(item) for item in parsed]
+
+
+def _question_items(approval: dict[str, Any]) -> list[dict[str, Any]]:
+    action = (approval.get("request") or {}).get("action")
+    questions = action.get("questions") if isinstance(action, dict) else None
+    if not isinstance(questions, list) or not all(
+        isinstance(question, dict) for question in questions
+    ):
+        raise ValueError(
+            f"Question details are unavailable for approval {approval['approval_id']}"
+        )
+    return [dict(question) for question in questions]
+
+
+def _structured_question_answers(
+    approval: dict[str, Any], supplied: object
+) -> list[dict[str, Any]]:
+    questions = _question_items(approval)
+    if not isinstance(supplied, list) or len(supplied) != len(questions):
+        raise ValueError(
+            f"Approval {approval['approval_id']} requires exactly "
+            f"{len(questions)} ordered answers"
+        )
+    normalized = []
+    for index, (question, answer_value) in enumerate(
+        zip(questions, supplied, strict=True)
+    ):
+        expected_text = str(question.get("question") or "")
+        if isinstance(answer_value, dict):
+            supplied_question = answer_value.get("question")
+            if (
+                supplied_question is not None
+                and str(supplied_question) != expected_text
+            ):
+                raise ValueError(
+                    f"Approval {approval['approval_id']} answer {index + 1} "
+                    "does not match its question"
+                )
+            answer_value = answer_value.get("answer")
+        values = [answer_value] if isinstance(answer_value, str) else answer_value
+        if (
+            not isinstance(values, list)
+            or not values
+            or not all(isinstance(value, str) and value.strip() for value in values)
+        ):
+            raise ValueError(
+                f"Approval {approval['approval_id']} answer {index + 1} must "
+                "contain one or more non-empty strings"
+            )
+        if not question.get("multiSelect") and len(values) != 1:
+            raise ValueError(
+                f"Approval {approval['approval_id']} answer {index + 1} is single-select"
+            )
+        normalized.append(
+            {"question": expected_text, "answer": [value.strip() for value in values]}
+        )
+    return normalized
+
+
+def _prepare_batch_responses(
+    client: CdesktopClient,
+    items: list[dict[str, Any]],
+    reviewer_session: str | None,
+) -> list[dict[str, Any]]:
+    pending_items = client.pending_approvals()
+    pending = {
+        str(item["approval_id"]): item
+        for item in _approval_details_batch(client, pending_items)
+    }
+    seen: set[str] = set()
+    prepared = []
+    for item in items:
+        approval_id = str(item.get("approval_id") or "")
+        if not approval_id or approval_id in seen:
+            raise ValueError("Every batch item needs a unique approval_id")
+        seen.add(approval_id)
+        approval = pending.get(approval_id)
+        if approval is None:
+            raise ValueError(f"Approval is not currently pending: {approval_id}")
+        reviewer_kind, reviewer_id = _approval_reviewer(
+            client, reviewer_session, str(approval["session_id"])
+        )
+        if approval.get("is_question"):
+            if "decision" in item:
+                raise ValueError(
+                    f"Question {approval_id} expects answers, not a decision"
+                )
+            prepared.append(
+                {
+                    "approval": approval,
+                    "kind": "question",
+                    "answers": _structured_question_answers(
+                        approval, item.get("answers")
+                    ),
+                    "reviewer_kind": reviewer_kind,
+                    "reviewer_id": reviewer_id,
+                }
+            )
+            continue
+
+        decision = str(item.get("decision") or "")
+        if decision not in {"approve", "deny"}:
+            raise ValueError(f"Approval {approval_id} decision must be approve or deny")
+        if (
+            decision == "approve"
+            and approval["request_kind"] != "plan"
+            and item.get("allow_non_plan") is not True
+        ):
+            raise ValueError(
+                f"Approval {approval_id} is a non-plan tool request; set "
+                '"allow_non_plan": true only after reviewing the exact action'
+            )
+        reason = item.get("reason")
+        if decision == "deny" and (not isinstance(reason, str) or not reason.strip()):
+            raise ValueError(f"Approval {approval_id} denial requires a reason")
+        prepared.append(
+            {
+                "approval": approval,
+                "kind": "approval",
+                "approved": decision == "approve",
+                "reason": reason.strip() if isinstance(reason, str) else None,
+                "reviewer_kind": reviewer_kind,
+                "reviewer_id": reviewer_id,
+            }
+        )
+    return prepared
+
+
+def cmd_respond(args: argparse.Namespace) -> int:
+    payload = _read_text(args.responses, args.responses_file, "responses")
+    items = _response_items(payload)
+    client = CdesktopClient(args.url)
+    prepared = _prepare_batch_responses(client, items, args.reviewer_session)
+    audit = approvals.ApprovalAuditStore()
+    results = []
+    failures = 0
+    for item in prepared:
+        approval = item["approval"]
+        attempt = None
+        try:
+            if item["kind"] == "question":
+                response = client.respond_to_question(
+                    str(approval["approval_id"]),
+                    str(approval["execution_process_id"]),
+                    item["answers"],
+                )
+            else:
+                attempt = audit.begin(
+                    approval=approval,
+                    decision="approved" if item["approved"] else "denied",
+                    reviewer_kind=item["reviewer_kind"],
+                    reviewer_id=item["reviewer_id"],
+                    reason=item["reason"],
+                )
+                response = client.respond_to_approval(
+                    str(approval["approval_id"]),
+                    str(approval["execution_process_id"]),
+                    approved=item["approved"],
+                    reason=item["reason"],
+                )
+                audit.finish(attempt.decision_id, succeeded=True)
+            results.append(
+                {
+                    "approval_id": approval["approval_id"],
+                    "status": "responded",
+                    "response": response,
+                }
+            )
+        except (CdesktopError, approvals.ApprovalAuditError) as exc:
+            failures += 1
+            if attempt is not None:
+                audit.finish(attempt.decision_id, succeeded=False, error=str(exc))
+            results.append(
+                {
+                    "approval_id": approval["approval_id"],
+                    "status": "failed",
+                    "error": str(exc),
+                }
+            )
+    _emit({"results": results, "failed": failures}, args.json)
+    return int(failures > 0)
 
 
 def _pending_approval(client: CdesktopClient, approval_id: str) -> dict[str, Any]:
@@ -1565,6 +1837,25 @@ def parser() -> argparse.ArgumentParser:
     peek.add_argument("--tools", type=int, default=3)
     peek.add_argument("--max-chars", type=int, default=600)
     peek.set_defaults(func=cmd_peek)
+
+    inbox = sub.add_parser(
+        "inbox", help="Show every pending agent question, plan, and tool request"
+    )
+    inbox.set_defaults(func=cmd_inbox)
+
+    respond = sub.add_parser(
+        "respond", help="Prevalidate and answer multiple pending requests in one call"
+    )
+    response_source = respond.add_mutually_exclusive_group(required=True)
+    response_source.add_argument("--responses", help="Inline JSON response array")
+    response_source.add_argument(
+        "--responses-file", help="Path to a JSON response file"
+    )
+    respond.add_argument(
+        "--reviewer-session",
+        help="Lead session responding; defaults to CDESKTOP_SESSION_ID",
+    )
+    respond.set_defaults(func=cmd_respond)
 
     fleet_status = sub.add_parser(
         "status", help="Show joined local fleet and reliability status"

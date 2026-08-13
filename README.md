@@ -93,9 +93,15 @@ sightmesh approval show APPROVAL_ID
 sightmesh approval approve APPROVAL_ID
 sightmesh approval reject APPROVAL_ID --reason "The migration rollback is incomplete"
 sightmesh approval history
+sightmesh inbox
+sightmesh respond --responses '[{"approval_id":"question-id","answers":["Option A",["Check 1","Check 2"]]},{"approval_id":"plan-id","decision":"approve"}]'
 ```
 
-Visible agent sessions cannot approve their own requests. When `CDESKTOP_SESSION_ID` is set, only the earliest session in that cdesktop workspace is treated as its lead reviewer. Questions remain interactive in cdesktop. Non-plan tool requests require the explicit `--allow-non-plan` acknowledgement.
+Visible agent sessions cannot approve their own requests. When `CDESKTOP_SESSION_ID` is set, only the earliest session in that cdesktop workspace is treated as its lead reviewer. Questions remain interactive in cdesktop and are also available through the global inbox. Non-plan tool requests require an explicit `"allow_non_plan": true` acknowledgement in a batch response.
+
+`sightmesh inbox` joins every pending question, plan, or tool request with its agent, workspace, normalized request payload, and response template. `sightmesh respond` accepts an inline JSON array or file, prevalidates the complete batch before its first response, preserves ordered answers when question text repeats, and reports per-item timeout races without blocking later responses.
+
+Pending metadata could be copied to disk, but the live responder belongs to the running executor. A backend restart interrupts that executor, so SightMesh does not display a persisted request as if its original turn could still accept a response. Restart recovery must resume the visible session with an explicit follow-up.
 
 ## Migrate from Conductor
 

@@ -57,6 +57,24 @@ def test_respond_to_approval_binds_execution_process() -> None:
     ]
 
 
+def test_respond_to_question_binds_process_and_structured_answers() -> None:
+    client = FakeClient()
+    answers = [{"question": "Ship it?", "answer": ["Yes"]}]
+    client.respond_to_question("approval-a", "process-a", answers)
+    assert client.calls == [
+        (
+            "POST",
+            "/approvals/approval-a/respond",
+            {
+                "execution_process_id": "process-a",
+                "status": {"status": "answered", "answers": answers},
+            },
+            None,
+            None,
+        )
+    ]
+
+
 def test_apply_approval_patches_handles_snapshot_and_resolution() -> None:
     pending = _apply_approval_patches(
         {},
