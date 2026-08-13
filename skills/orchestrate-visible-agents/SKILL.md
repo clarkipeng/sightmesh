@@ -48,6 +48,8 @@ Before spawning, write a bounded prompt containing:
 
 Keep ordinary worker prompts under 250 words. Link to repository authority and ignored handoffs instead of copying their prose, matrices, history, or generic workflow. Include a detail only when the worker cannot discover it from the named files or when getting it wrong would change the output. Use short labeled lines or bullets so objective, ownership, exclusions, proof, delivery, and stop condition are visible at a glance.
 
+Never satisfy a handoff requirement by force-adding an ignored `.context` file. Before the final push, run `git check-ignore <handoff>` and `git ls-files --error-unmatch <handoff>`; the first must succeed and the second must fail unless repository authority explicitly declares that exact handoff tracked.
+
 Search cdesktop and Repowire inventories first. Do not spawn a duplicate worker for a branch, PR, or assignment already owned.
 
 Before spawning, run a bounded preflight against the exact base: confirm the branch resolves to the intended SHA, determine whether the new worktree will have required dependencies, verify any required local service, and name one focused command that can execute there. Put the delivery branch and push target in the prompt when SightMesh will create a different local branch. If setup is missing, provision it once through the repository's supported bootstrap path or state the exact setup command in the assignment. Do not make each worker rediscover the same missing dependency or service.
