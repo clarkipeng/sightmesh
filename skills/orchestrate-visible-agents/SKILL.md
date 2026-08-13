@@ -27,7 +27,7 @@ Keep the workflow native and unsurprising:
 2. Use `cdesktop team spawn` only for read-only review, research, or disjoint paths in the same workspace.
 3. Keep one lead session per cdesktop workspace. Only the lead spawns teammates.
 4. Any visible agent may contact any other. Use `sightmesh message @agent --message "..."` to queue information without interrupting valid work; use `sightmesh steer @agent --message "..."` when delay would cause invalid output, unsafe mutation, or avoidable rework. Use Repowire when the ask needs durable cross-workspace delivery.
-5. Every child must use `sightmesh parent --message "..."` for a blocker, decision, or completion that must wake its launcher. Run it as an independent command and verify success. Never place an optional topology-specific alias before it in an `&&` chain. Same-workspace teammates may notify `cdesktop team manager` separately when that alias is useful.
+5. Use `sightmesh parent --message "..."` only when `sightmesh parent` resolves a recorded launcher. A separately spawned isolated workspace may have no recorded parent; include the manager's exact `@selector` in its prompt and use `sightmesh message @manager --message "..."` instead. Run the required notification independently and verify success. Never place an assertion or optional alias before it in an `&&` chain. Same-workspace teammates may notify `cdesktop team manager` separately when useful.
 7. Before asking for input, collect all currently known independent questions and send one multi-question request. Before tool use, batch independent read-only inspections. Keep dependent operations, mutations, approvals, and destructive actions sequential.
 8. A lead reviewing multiple workers should call `sightmesh inbox` once and answer independent pending requests with one prevalidated `sightmesh respond --responses '<json>'` call.
 
@@ -44,6 +44,7 @@ Before spawning, write a bounded prompt containing:
 - handoff location, stated as a path inside the worker's own checkout; require the worker to resolve it against its own verified working directory, never against the canonical repository source, and verify after completion that nothing was written under the canonical root;
 - instruction to use this skill for any further delegation;
 - instruction to use `$reconcile-agent-work` before completion.
+- the exact manager selector and required completion-notification command, unless preflight proves `sightmesh parent` resolves the launcher.
 
 Keep ordinary worker prompts under 250 words. Link to repository authority and ignored handoffs instead of copying their prose, matrices, history, or generic workflow. Include a detail only when the worker cannot discover it from the named files or when getting it wrong would change the output. Use short labeled lines or bullets so objective, ownership, exclusions, proof, delivery, and stop condition are visible at a glance.
 
