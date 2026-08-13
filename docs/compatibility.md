@@ -42,7 +42,7 @@ The isolated bridge run on 2026-08-12 proved both transports. A blocking `repowi
 
 Upstream cdesktop 0.2.3 uses Codex app-server protocol types from Codex 0.121. An explicit `service_tier = "default"` in current Codex configuration causes that build to reject the thread-start response because its older enum understands only `fast` and `flex`.
 
-The SightMesh fork updates the live app-server boundary to Codex protocol 0.135, where service tier is represented as an open string, while retaining 0.121 only for legacy event-log normalization. This selected pre-0.140 line remains compatible with cdesktop's Starlark dependency generation. Codex 0.140 and newer require a separate event-normalizer migration and are not falsely presented as a drop-in dependency bump.
+The SightMesh fork updates both the live app-server boundary and event-log normalizer to Codex protocol 0.147. Service tier is represented as an open string, current server requests are handled, new event fields are tolerated, and image and audio tool outputs remain visible.
 
 ### Codex 5.6 model selection
 
