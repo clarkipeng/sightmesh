@@ -20,6 +20,7 @@ from .cdesktop import CdesktopClient
 
 SCHEMA_VERSION = 1
 QUIET_SECONDS = 2.0
+UNDRAINED_BOOTSTRAP_VERSIONS = {"0.2.3-sightmesh.1"}
 
 
 def root_dir() -> Path:
@@ -250,9 +251,16 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
     service._bootout(service.BRIDGE_LABEL)
     service._wait_until_unloaded(service.BRIDGE_LABEL)
     drain_enabled = False
+    bootstrap_without_drain = False
     try:
-        client.set_update_drain(15)
-        drain_enabled = True
+        running_version = str(client.info().get("version") or "")
+        try:
+            client.set_update_drain(15)
+            drain_enabled = True
+        except Exception:
+            if running_version not in UNDRAINED_BOOTSTRAP_VERSIONS:
+                raise
+            bootstrap_without_drain = True
         time.sleep(QUIET_SECONDS)
         current_activity = activity(client)
         if not current_activity["idle"]:
@@ -282,6 +290,7 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
             **state,
             "status": "activating",
             "previous_plist": str(backup),
+            "bootstrap_without_drain": bootstrap_without_drain,
             "updated_at": time.time(),
         }
         _write_json_atomic(state_path(), activating)

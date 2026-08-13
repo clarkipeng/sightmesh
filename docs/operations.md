@@ -46,6 +46,12 @@ state retains both activation and rollback errors for diagnosis. The updater nev
 claims to preserve an active executor stream across a backend restart. CLI and skill
 updates are one-shot and can take effect while cdesktop workers continue.
 
+The one supported bootstrap exception is `0.2.3-sightmesh.1`, which predates the drain
+endpoint. Its transition to `.2` still stops bridge intake, waits for a completely idle
+fleet, observes the quiet period, and rechecks before restart. An unknown backend that
+lacks the drain endpoint fails closed. After `.2` is active, every update uses the
+native bounded drain.
+
 ## Plan approvals
 
 Inspect and decide pending visible-agent plans without taking over the worker transcript:

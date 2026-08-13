@@ -7,12 +7,23 @@ from sightmesh import service, updates
 
 
 class FakeClient:
-    def __init__(self, *, running: bool = False, approvals: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        running: bool = False,
+        approvals: bool = False,
+        version: str = "0.2.4-sightmesh.1",
+        drain_supported: bool = True,
+    ) -> None:
         self.running = running
         self.approvals = approvals
+        self.version = version
+        self.drain_supported = drain_supported
         self.drain_calls = []
 
     def set_update_drain(self, seconds):
+        if not self.drain_supported:
+            raise RuntimeError("HTTP 404")
         self.drain_calls.append(seconds)
         return {"draining": seconds > 0}
 
@@ -43,7 +54,7 @@ class FakeClient:
         ]
 
     def info(self):
-        return {"version": "0.2.4-sightmesh.1"}
+        return {"version": self.version}
 
 
 def isolated_state(monkeypatch, tmp_path: Path) -> None:
@@ -171,3 +182,70 @@ def test_activation_restarts_owned_services_and_verifies_version(
     ]
     assert b"/tmp/new-cdesktop" in target.read_bytes()
     assert client.drain_calls == [15]
+
+
+def test_activation_allows_exact_legacy_bootstrap_without_drain(
+    monkeypatch, tmp_path
+) -> None:
+    isolated_state(monkeypatch, tmp_path)
+    target = tmp_path / "cdesktop.plist"
+    bridge = tmp_path / "bridge.plist"
+    target.write_bytes(b"old-definition")
+    bridge.write_bytes(b"bridge-definition")
+    updates._write_json_atomic(
+        updates.state_path(),
+        {
+            "schema_version": 1,
+            "status": "staged",
+            "pending": {
+                "version": "0.2.3-sightmesh.2",
+                "executable": "/tmp/new-cdesktop",
+            },
+        },
+    )
+    monkeypatch.setattr(updates, "QUIET_SECONDS", 0)
+    monkeypatch.setattr(service, "plist_path", lambda: target)
+    monkeypatch.setattr(service, "bridge_plist_path", lambda: bridge)
+    monkeypatch.setattr(service, "definition", lambda _port, executable: {"ProgramArguments": [str(executable)]})
+    monkeypatch.setattr(service, "_bootout", lambda _label: None)
+    monkeypatch.setattr(service, "_wait_until_unloaded", lambda _label: None)
+    monkeypatch.setattr(service, "wait_until_healthy", lambda _port: None)
+    monkeypatch.setattr(service, "_loaded", lambda _label: True)
+    monkeypatch.setattr(service, "is_healthy", lambda _port: True)
+    monkeypatch.setattr(service, "_bootstrap", lambda _label, _path: None)
+    monkeypatch.setattr(
+        updates,
+        "CdesktopClient",
+        lambda _url: FakeClient(version="0.2.3-sightmesh.2"),
+    )
+    client = FakeClient(
+        version="0.2.3-sightmesh.1",
+        drain_supported=False,
+    )
+
+    result = updates.activate_if_idle(client, port=4321)
+
+    assert result["action"] == "activated"
+    assert result["active"]["version"] == "0.2.3-sightmesh.2"
+
+
+def test_activation_refuses_unknown_backend_without_drain(monkeypatch, tmp_path) -> None:
+    isolated_state(monkeypatch, tmp_path)
+    updates._write_json_atomic(
+        updates.state_path(),
+        {
+            "schema_version": 1,
+            "status": "staged",
+            "pending": {"version": "next", "executable": "/tmp/cdesktop"},
+        },
+    )
+    monkeypatch.setattr(service, "_bootout", lambda _label: None)
+    monkeypatch.setattr(service, "_wait_until_unloaded", lambda _label: None)
+    monkeypatch.setattr(service, "_loaded", lambda _label: True)
+    monkeypatch.setattr(service, "is_healthy", lambda _port: True)
+
+    with pytest.raises(RuntimeError, match="HTTP 404"):
+        updates.activate_if_idle(
+            FakeClient(version="unknown", drain_supported=False),
+            port=4321,
+        )
