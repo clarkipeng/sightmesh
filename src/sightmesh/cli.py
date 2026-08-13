@@ -384,6 +384,23 @@ def _normalized_snapshot_with_retry(
     return best
 
 
+def _workspace_repository_paths(
+    client: CdesktopClient, workspace_id: str
+) -> list[dict[str, str]]:
+    workspace = client.workspace(workspace_id)
+    container = workspace.get("container_ref")
+    use_worktree = bool(workspace.get("use_worktree"))
+    paths = []
+    for repo in client.workspace_repos(workspace_id):
+        source = str(repo.get("path") or "")
+        name = str(repo.get("name") or "")
+        checkout = (
+            str(Path(str(container)) / name) if use_worktree and container else source
+        )
+        paths.append({"name": name, "source": source, "checkout": checkout})
+    return paths
+
+
 def cmd_peek(args: argparse.Namespace) -> int:
     client = CdesktopClient(args.url)
     row = _resolve_session(client, args.agent, include_archived=args.include_archived)
@@ -423,6 +440,7 @@ def cmd_peek(args: argparse.Namespace) -> int:
         "session_id": row["session_id"],
         "workspace": row["workspace"],
         "branch": row["branch"],
+        "repositories": _workspace_repository_paths(client, str(row["workspace_id"])),
         "status": latest.get("status"),
         "execution_process_id": latest.get("id"),
         "last_assistant": assistants[-1] if assistants else None,

@@ -15,6 +15,7 @@ from sightmesh.cli import (
     _resolve_session,
     _validate_reasoning,
     _with_coordination_contract,
+    _workspace_repository_paths,
     parser,
 )
 from sightmesh.delivery import DeliveryStore, make_record
@@ -100,6 +101,26 @@ def test_normalized_snapshot_retries_cold_partial_result() -> None:
     result = _normalized_snapshot_with_retry(SnapshotClient(), "process-a")
     assert result["complete"] is True
     assert result["patch_count"] == 41
+
+
+def test_workspace_repository_paths_expose_source_and_checkout() -> None:
+    class WorkspaceClient:
+        def workspace(self, _workspace_id):
+            return {
+                "use_worktree": True,
+                "container_ref": "/managed/workspace-a",
+            }
+
+        def workspace_repos(self, _workspace_id):
+            return [{"name": "catapult-games", "path": "/source/catapult-games"}]
+
+    assert _workspace_repository_paths(WorkspaceClient(), "workspace-a") == [
+        {
+            "name": "catapult-games",
+            "source": "/source/catapult-games",
+            "checkout": "/managed/workspace-a/catapult-games",
+        }
+    ]
 
 
 def test_parser_registers_compact_fleet_commands() -> None:
