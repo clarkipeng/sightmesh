@@ -2324,7 +2324,7 @@ def parser() -> argparse.ArgumentParser:
     )
     update_cancel.set_defaults(func=cmd_update)
     update_prune = update_sub.add_parser(
-        "prune", help="Remove superseded packages while retaining active rollback paths"
+        "prune", help="Remove superseded packages while retaining active staged paths"
     )
     update_prune.add_argument("--keep", type=int, default=1)
     update_prune.add_argument("--dry-run", action="store_true")

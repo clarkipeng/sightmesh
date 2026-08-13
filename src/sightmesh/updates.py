@@ -57,6 +57,8 @@ def read_state() -> dict[str, Any]:
         raise RuntimeError(
             f"Unsupported update state schema: {value.get('schema_version')!r}"
         )
+    value.pop("previous_plist", None)
+    value.pop("rollback_error", None)
     return value
 
 
@@ -80,19 +82,6 @@ def _release_for_executable(executable: object, updates_root: Path) -> Path | No
     return release
 
 
-def _plist_executable(path: object) -> str | None:
-    if not path:
-        return None
-    try:
-        value = plistlib.loads(Path(str(path)).expanduser().read_bytes())
-        arguments = value.get("ProgramArguments")
-        if isinstance(arguments, list) and arguments:
-            return str(arguments[0])
-    except (OSError, plistlib.InvalidFileException, TypeError, ValueError):
-        return None
-    return None
-
-
 def prune(*, keep: int = 1, dry_run: bool = False) -> dict[str, Any]:
     if keep < 0:
         raise ValueError("--keep must not be negative")
@@ -109,12 +98,6 @@ def prune(*, keep: int = 1, dry_run: bool = False) -> dict[str, Any]:
             )
             if release:
                 protected.add(release.resolve())
-    rollback_release = _release_for_executable(
-        _plist_executable(state.get("previous_plist")), updates_root
-    )
-    if rollback_release:
-        protected.add(rollback_release.resolve())
-
     releases = sorted(
         (
             path
@@ -139,30 +122,12 @@ def prune(*, keep: int = 1, dry_run: bool = False) -> dict[str, Any]:
             shutil.rmtree(release)
 
     backup_root = updates_root / "backups"
-    protected_backup = (
-        Path(str(state["previous_plist"])).expanduser().resolve()
-        if state.get("previous_plist")
-        else None
-    )
-    backups = sorted(
-        (
-            path
-            for path in backup_root.glob("cdesktop-*.plist")
-            if path.is_file() and not path.is_symlink()
-        ),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    retained_backups = 0
-    for backup in backups:
-        if backup.resolve() == protected_backup or retained_backups < keep:
-            retained.append(str(backup))
-            if backup.resolve() != protected_backup:
-                retained_backups += 1
+    for legacy_backup in sorted(backup_root.glob("cdesktop-*.plist")):
+        if not legacy_backup.is_file() or legacy_backup.is_symlink():
             continue
-        removed.append(str(backup))
+        removed.append(str(legacy_backup))
         if not dry_run:
-            backup.unlink()
+            legacy_backup.unlink()
 
     return {"removed": removed, "retained": retained, "dry_run": dry_run}
 
@@ -343,7 +308,6 @@ def stage(
                 "staged_at": now,
             },
             "active": current_state.get("active"),
-            "previous_plist": current_state.get("previous_plist"),
             "last_error": None,
             "updated_at": now,
         }
@@ -456,11 +420,6 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
             return {**waiting, "action": "activity-resumed"}
 
         target = service.plist_path()
-        previous_definition = target.read_bytes()
-        backup_dir = root_dir() / "backups"
-        backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        backup = backup_dir / f"cdesktop-{int(time.time())}.plist"
-        service._write_bytes_atomic(backup, previous_definition)
         new_definition = plistlib.dumps(
             service.definition(port, executable=Path(str(pending["executable"])))
         )
@@ -468,7 +427,6 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
         activating = {
             **state,
             "status": "activating",
-            "previous_plist": str(backup),
             "bootstrap_without_drain": bootstrap_without_drain,
             "updated_at": time.time(),
         }
@@ -485,33 +443,27 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
                 )
             _restore_bridge()
         except Exception as update_error:
-            try:
-                client.set_update_drain(0)
-            except Exception:
-                pass
             drain_enabled = False
-            service._write_bytes_atomic(target, previous_definition)
-            rollback_error: Exception | None = None
-            try:
-                service._bootstrap(service.LABEL, target)
-                service.wait_until_healthy(port)
-                _restore_bridge()
-            except Exception as exc:
-                rollback_error = exc
+            if service.is_healthy(port):
+                try:
+                    CdesktopClient(service.service_url(port)).set_update_drain(0)
+                except Exception:
+                    pass
+                try:
+                    _restore_bridge()
+                except Exception:
+                    pass
             failed = {
                 **activating,
                 "status": "failed",
+                "pending": None,
+                "failed_package": pending,
                 "last_error": str(update_error),
-                "rollback_error": str(rollback_error) if rollback_error else None,
                 "updated_at": time.time(),
             }
             _write_json_atomic(state_path(), failed)
-            if rollback_error:
-                raise RuntimeError(
-                    f"Update failed ({update_error}) and rollback failed ({rollback_error})"
-                ) from update_error
             raise RuntimeError(
-                f"Update failed and the previous cdesktop was restored: {update_error}"
+                f"Update failed and will not be retried automatically: {update_error}"
             ) from update_error
 
         active = {
@@ -522,7 +474,6 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
                 **pending,
                 "activated_at": time.time(),
             },
-            "previous_plist": str(backup),
             "last_error": None,
             "updated_at": time.time(),
         }

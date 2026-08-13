@@ -12,6 +12,7 @@ def test_service_definition_is_local_and_uses_native_cleanup(
     monkeypatch.setattr(service, "state_dir", lambda: tmp_path)
     definition = service.definition(4321)
     assert definition["ProgramArguments"] == ["/tmp/cdesktop"]
+    assert definition["EnvironmentVariables"]["CDESKTOP_NO_BROWSER"] == "1"
     assert definition["EnvironmentVariables"]["HOST"] == "127.0.0.1"
     assert definition["EnvironmentVariables"]["PORT"] == "4321"
     assert "DISABLE_WORKTREE_CLEANUP" not in definition["EnvironmentVariables"]

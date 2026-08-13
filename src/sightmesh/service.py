@@ -122,6 +122,7 @@ def definition(
         "ProcessType": "Interactive",
         "Umask": 0o077,
         "EnvironmentVariables": {
+            "CDESKTOP_NO_BROWSER": "1",
             "HOST": "127.0.0.1",
             "PORT": str(port),
             "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),

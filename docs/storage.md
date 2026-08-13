@@ -9,7 +9,7 @@ SightMesh keeps orchestration data local and separates durable source state from
 | cdesktop | `~/.local/share/sightmesh/.cdesktop-workspaces` | SightMesh-managed isolated worktrees | Active lifetime; a clean archived worktree may be reclaimed after about one hour |
 | Repowire | `~/.repowire` | Local peer identity, discovery, and request/reply state | Until explicitly reset |
 | SightMesh | `~/.local/state/sightmesh` | Delivery queue, ownership leases, per-spawn parent edges, route policy, approval audit, logs, migration plans, and bounded handoffs | Lifecycle-specific; approval audit, migration plans, and handoffs remain until explicitly removed |
-| SightMesh | `~/.local/share/sightmesh/updates` | Checksum-verified, versioned cdesktop update installations and rollback definitions | Active, pending, and rollback packages plus one recent spare; superseded packages are pruned automatically |
+| SightMesh | `~/.local/share/sightmesh/updates` | Checksum-verified, versioned cdesktop update installations | Active and pending packages plus one recent spare; superseded packages are pruned automatically |
 | SightMesh | `~/.config/sightmesh` | Provider profile identifiers and routing policy | Until explicitly changed or removed |
 | Workspace owner | `<workspace>/.context` | Workspace-local notes and handoffs | Follows the workspace and remains Git-ignored |
 | Conductor during migration | Existing Conductor database and workspaces | Original transcripts, workspace metadata, and checkouts | Preserved until post-migration reconciliation authorizes removal |

@@ -43,10 +43,11 @@ two-second quiet period, and rechecks the complete fleet before changing the cde
 LaunchAgent definition.
 
 Activation checks the new backend health endpoint and exact reported version before
-restarting the bridge. Failure restores the previous plist and backend, and the update
-state retains both activation and rollback errors for diagnosis. The updater never
-claims to preserve an active executor stream across a backend restart. CLI and skill
-updates are one-shot and can take effect while cdesktop workers continue.
+restarting the bridge. Failure is recorded, clears pending activation, and is never
+retried automatically. SightMesh does not keep or restore an update rollback plist.
+The updater never claims to preserve an active executor stream across a backend
+restart. CLI and skill updates are one-shot and can take effect while cdesktop workers
+continue.
 
 The one supported bootstrap exception is `0.2.3-sightmesh.1`, which predates the drain
 endpoint. Its transition to `.2` still stops bridge intake, waits for a completely idle

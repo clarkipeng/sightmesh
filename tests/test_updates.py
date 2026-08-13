@@ -1,6 +1,5 @@
 import hashlib
 import os
-import plistlib
 import time
 import zipfile
 from pathlib import Path
@@ -136,7 +135,6 @@ def test_stage_keeps_active_release_metadata(monkeypatch, tmp_path) -> None:
             "status": "active",
             "pending": None,
             "active": {"version": "current", "executable": "/tmp/current"},
-            "previous_plist": "/tmp/rollback.plist",
         },
     )
     package = tmp_path / "cdesktop.tgz"
@@ -172,7 +170,7 @@ def test_stage_keeps_active_release_metadata(monkeypatch, tmp_path) -> None:
     state = updates.stage(str(package), "next")
 
     assert state["active"]["version"] == "current"
-    assert state["previous_plist"] == "/tmp/rollback.plist"
+    assert "previous_plist" not in state
 
 
 def test_stage_refuses_package_without_backend_archive(monkeypatch, tmp_path) -> None:
@@ -221,7 +219,7 @@ def test_activity_waits_for_durable_follow_ups() -> None:
     ]
 
 
-def test_prune_preserves_active_pending_and_rollback_releases(
+def test_prune_preserves_active_pending_and_one_recent_spare(
     monkeypatch, tmp_path: Path
 ) -> None:
     isolated_state(monkeypatch, tmp_path)
@@ -232,7 +230,6 @@ def test_prune_preserves_active_pending_and_rollback_releases(
         for name in (
             "cdesktop-active",
             "cdesktop-pending",
-            "cdesktop-rollback",
             "cdesktop-extra-new",
             "cdesktop-extra-old",
         )
@@ -246,21 +243,9 @@ def test_prune_preserves_active_pending_and_rollback_releases(
 
     backup_root = root / "backups"
     backup_root.mkdir()
-    rollback_plist = backup_root / "cdesktop-rollback.plist"
-    rollback_plist.write_bytes(
-        plistlib.dumps(
-            {
-                "ProgramArguments": [
-                    str(
-                        releases["cdesktop-rollback"]
-                        / "node_modules"
-                        / ".bin"
-                        / "cdesktop"
-                    )
-                ]
-            }
-        )
-    )
+    legacy_backup = backup_root / "cdesktop-old.plist"
+    legacy_backup.write_bytes(b"obsolete")
+
     updates._write_json_atomic(
         updates.state_path(),
         {
@@ -276,7 +261,6 @@ def test_prune_preserves_active_pending_and_rollback_releases(
                     releases["cdesktop-pending"] / "node_modules" / ".bin" / "cdesktop"
                 )
             },
-            "previous_plist": str(rollback_plist),
         },
     )
 
@@ -284,9 +268,9 @@ def test_prune_preserves_active_pending_and_rollback_releases(
 
     assert releases["cdesktop-active"].exists()
     assert releases["cdesktop-pending"].exists()
-    assert releases["cdesktop-rollback"].exists()
     assert sum(path.exists() for name, path in releases.items() if "extra" in name) == 1
     assert len([path for path in result["removed"] if "extra" in path]) == 1
+    assert not legacy_backup.exists()
 
 
 def test_automatic_prune_reports_cleanup_error_without_failing(monkeypatch) -> None:
@@ -422,6 +406,62 @@ def test_activation_allows_exact_legacy_bootstrap_without_drain(
 
     assert result["action"] == "activated"
     assert result["active"]["version"] == "0.2.3-sightmesh.2"
+
+
+def test_activation_failure_stops_without_rollback_or_retry(
+    monkeypatch, tmp_path
+) -> None:
+    isolated_state(monkeypatch, tmp_path)
+    target = tmp_path / "cdesktop.plist"
+    bridge = tmp_path / "bridge.plist"
+    target.write_bytes(b"old-definition")
+    bridge.write_bytes(b"bridge-definition")
+    updates._write_json_atomic(
+        updates.state_path(),
+        {
+            "schema_version": 1,
+            "status": "staged",
+            "pending": {
+                "version": "expected-version",
+                "executable": "/tmp/new-cdesktop",
+            },
+        },
+    )
+    monkeypatch.setattr(updates, "QUIET_SECONDS", 0)
+    monkeypatch.setattr(service, "plist_path", lambda: target)
+    monkeypatch.setattr(service, "bridge_plist_path", lambda: bridge)
+    monkeypatch.setattr(
+        service,
+        "definition",
+        lambda _port, executable: {"ProgramArguments": [str(executable)]},
+    )
+    monkeypatch.setattr(service, "_bootout", lambda _label: None)
+    monkeypatch.setattr(service, "_wait_until_unloaded", lambda _label: None)
+    monkeypatch.setattr(service, "wait_until_healthy", lambda _port: None)
+    monkeypatch.setattr(service, "is_healthy", lambda _port: True)
+    bootstraps = []
+    monkeypatch.setattr(
+        service, "_bootstrap", lambda label, path: bootstraps.append((label, path))
+    )
+    monkeypatch.setattr(
+        updates,
+        "CdesktopClient",
+        lambda _url: FakeClient(version="wrong-version"),
+    )
+
+    with pytest.raises(RuntimeError, match="will not be retried automatically"):
+        updates.activate_if_idle(FakeClient(), port=4321)
+
+    state = updates.read_state()
+    assert state["status"] == "failed"
+    assert state["pending"] is None
+    assert state["failed_package"]["version"] == "expected-version"
+    assert b"/tmp/new-cdesktop" in target.read_bytes()
+    assert not (updates.root_dir() / "backups").exists()
+    assert [label for label, _path in bootstraps] == [
+        service.LABEL,
+        service.BRIDGE_LABEL,
+    ]
 
 
 def test_activation_refuses_unknown_backend_without_drain(

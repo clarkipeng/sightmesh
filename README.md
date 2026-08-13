@@ -100,9 +100,10 @@ running executable. A separate `io.sightmesh.updater` LaunchAgent checks every f
 seconds. It waits for zero coding executions and zero pending questions or approvals,
 stops bridge intake, observes a two-second quiet period, and checks again. Only then
 does it restart cdesktop on the staged executable. The updater verifies both health and
-the reported version, restarts the bridge, and restores the previous LaunchAgent
-definition automatically if activation fails. `sightmesh update cancel` cancels a
-pending activation without deleting its verified package.
+the reported version and then restarts the bridge. A failed activation is recorded and
+is never retried automatically. SightMesh does not keep or restore an update rollback
+definition. `sightmesh update cancel` cancels a pending activation without deleting its
+verified package.
 
 The SightMesh CLI and skills can be replaced between commands without restarting
 cdesktop. The cdesktop backend cannot be replaced inside an active model turn because
