@@ -30,6 +30,7 @@ mkdir -p "${venv}/empty-conductor-root"
 "${venv}/bin/python" -m pip install --upgrade pip >/dev/null
 "${venv}/bin/python" -m pip install "${DIST_DIR}"/*.whl >/dev/null
 "${venv}/bin/sightmesh" --help >/dev/null
+test "$("${venv}/bin/sightmesh" --version)" = "$("${venv}/bin/python" -c 'import importlib.metadata; print(importlib.metadata.version("sightmesh"))')"
 "${venv}/bin/sightmesh" migrate --help >/dev/null
 "${venv}/bin/sightmesh" --json migration-dry-run \
   --conductor-root "${venv}/empty-conductor-root" >/dev/null

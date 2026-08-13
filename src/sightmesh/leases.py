@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import hashlib
 import fcntl
+import hashlib
 import json
 import os
 import socket
@@ -9,8 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-
+from typing import Any, Self
 
 DEFAULT_TTL_SECONDS = 4 * 60 * 60
 
@@ -58,7 +57,11 @@ class Lease:
 
     def conflicts(self, repo_path: str, worktree_path: str | None) -> bool:
         if self.repo_path != repo_path:
-            return bool(self.worktree_path) and bool(worktree_path) and self.worktree_path == worktree_path
+            return (
+                bool(self.worktree_path)
+                and bool(worktree_path)
+                and self.worktree_path == worktree_path
+            )
         if self.worktree_path is None or worktree_path is None:
             return True
         return self.worktree_path == worktree_path
@@ -77,7 +80,7 @@ class Lease:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Lease":
+    def from_dict(cls, data: dict[str, Any]) -> Lease:
         return cls(
             token=str(data["token"]),
             owner=str(data["owner"]),
@@ -94,6 +97,11 @@ class Lease:
 class LeaseStore:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or default_lease_dir()
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.root.chmod(0o700)
+        workspace_root = self.root / "workspaces"
+        workspace_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        workspace_root.chmod(0o700)
 
     def _lease_path(self, repo_path: str, worktree_path: str | None) -> Path:
         return self.root / f"{_identity_key(repo_path, worktree_path)}.json"
@@ -111,7 +119,10 @@ class LeaseStore:
 
     def _write_atomic(self, path: Path, lease: Lease) -> None:
         tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        tmp.write_text(json.dumps(lease.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+        tmp.write_text(
+            json.dumps(lease.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
+        )
+        tmp.chmod(0o600)
         os.replace(tmp, path)
 
     def _with_lock(self):
@@ -286,7 +297,9 @@ class LeaseStore:
                     )
                     self._write_atomic(path, renewed)
                     return renewed
-            raise LeaseError(f"Workspace lease mapping has no lease record: {workspace_id}")
+            raise LeaseError(
+                f"Workspace lease mapping has no lease record: {workspace_id}"
+            )
 
     def workspace_token(self, workspace_id: str) -> str | None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -304,7 +317,9 @@ class LeaseStore:
                 if not existing.live:
                     self._remove_locked(path, existing)
                     continue
-                if existing.repo_path == repo and (not use_worktree or existing.worktree_path is None):
+                if existing.repo_path == repo and (
+                    not use_worktree or existing.worktree_path is None
+                ):
                     raise LeaseError(
                         "Repository is already owned by "
                         f"{existing.owner} until {existing.expires_at}"
@@ -339,15 +354,20 @@ class LeaseStore:
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
         tmp.write_text(json.dumps({"token": token}, sort_keys=True), encoding="utf-8")
+        tmp.chmod(0o600)
         os_replace_parent(tmp, target)
 
     def _read_workspace(self, workspace_id: str) -> str | None:
         try:
-            data = json.loads(self._workspace_path(workspace_id).read_text(encoding="utf-8"))
+            data = json.loads(
+                self._workspace_path(workspace_id).read_text(encoding="utf-8")
+            )
         except FileNotFoundError:
             return None
         except json.JSONDecodeError as exc:
-            raise LeaseError(f"Invalid workspace lease mapping for {workspace_id}: {exc}") from exc
+            raise LeaseError(
+                f"Invalid workspace lease mapping for {workspace_id}: {exc}"
+            ) from exc
         token = data.get("token")
         return str(token) if token else None
 
@@ -363,10 +383,11 @@ class _FileLock:
         self.timeout = timeout
         self._file: Any = None
 
-    def __enter__(self) -> "_FileLock":
+    def __enter__(self) -> Self:
         deadline = time.monotonic() + self.timeout
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._file = self.path.open("a+")
+        self.path.chmod(0o600)
         while True:
             try:
                 fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -382,7 +403,9 @@ class _FileLock:
             self._file.close()
 
 
-def sync_active_workspaces(client: Any, ttl_seconds: int = DEFAULT_TTL_SECONDS) -> list[Lease]:
+def sync_active_workspaces(
+    client: Any, ttl_seconds: int = DEFAULT_TTL_SECONDS
+) -> list[Lease]:
     """Renew or backfill leases for every active cdesktop workspace."""
     store = LeaseStore()
     synced: list[Lease] = []
@@ -395,7 +418,9 @@ def sync_active_workspaces(client: Any, ttl_seconds: int = DEFAULT_TTL_SECONDS) 
             sessions = client.sessions(workspace_id)
             session_id = str(sessions[0]["id"]) if sessions else None
             if session_id and renewed.session_id != session_id:
-                renewed = store.attach_workspace(renewed.token, workspace_id, session_id)
+                renewed = store.attach_workspace(
+                    renewed.token, workspace_id, session_id
+                )
             synced.append(renewed)
             continue
         repos = client.workspace_repos(workspace_id)
@@ -407,8 +432,12 @@ def sync_active_workspaces(client: Any, ttl_seconds: int = DEFAULT_TTL_SECONDS) 
         if workspace.get("use_worktree"):
             container = workspace.get("container_ref")
             if not container:
-                raise LeaseError(f"Active worktree workspace has no container: {workspace_id}")
-            worktree_path = Path(str(container)).expanduser().resolve() / str(repo["name"])
+                raise LeaseError(
+                    f"Active worktree workspace has no container: {workspace_id}"
+                )
+            worktree_path = Path(str(container)).expanduser().resolve() / str(
+                repo["name"]
+            )
         sessions = client.sessions(workspace_id)
         session_id = str(sessions[0]["id"]) if sessions else None
         try:

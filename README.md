@@ -63,7 +63,9 @@ sightmesh message SESSION_ID --message-file follow-up.txt
 sightmesh prompt-idle SESSION_ID --message-file follow-up.txt
 sightmesh bridge-route WORKSPACE_ID --enabled
 sightmesh close WORKSPACE_ID --message-file closeout.txt
-sightmesh close WORKSPACE_ID --archive --confirm-reconciled
+sightmesh workspace archive WORKSPACE_ID --confirm-reconciled
+sightmesh workspace restore WORKSPACE_ID
+sightmesh workspace delete WORKSPACE_ID --confirm-delete
 sightmesh delivery status
 sightmesh lease list
 ```
@@ -82,9 +84,9 @@ After pausing the selected Conductor sessions, adopt current workspaces without 
 sightmesh migrate apply PLAN_PATH --all --confirm-conductor-paused
 ```
 
-The migration is resumable and preserves checkouts, dirty files, `.context`, archived contexts, and the original Conductor transcript database in place. It exports bounded handoffs, reuses exact-path cdesktop imports, and supports status plus guarded rollback. See [Conductor migration](docs/migration.md) before applying it to real workspaces.
+The migration is resumable and preserves checkouts, dirty files, `.context`, archived contexts, and the original Conductor transcript database in place. It exports bounded handoffs, reuses exact-path cdesktop imports, and supports status plus guarded rollback. See [Conductor migration](docs/migration.md) before applying it to real workspaces and [local storage and retention](docs/storage.md) for the ownership and cleanup contract.
 
-Archive refuses dirty repositories by default. `--preserve-dirty` is available only for explicitly reconciled state. Spawn acquires an expiring ownership lease; isolated worktrees from the same repository may coexist, while direct-checkout ownership conflicts fail closed.
+Archive always refuses a dirty cdesktop-managed worktree because cdesktop reclaims archived worktrees after about one hour. Dirty state can be explicitly preserved only for a direct workspace, whose repository cdesktop does not own. Restore keeps the archive's history and recreates a reclaimed managed worktree from its preserved Git branch when execution resumes. Delete is a separate confirmed action that removes the cdesktop archive and owned worktree while preserving the branch by default. Spawn acquires an expiring ownership lease; isolated worktrees from the same repository may coexist, while direct-checkout ownership conflicts fail closed.
 
 ## Local architecture
 

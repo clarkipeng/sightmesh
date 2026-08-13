@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from sightmesh.leases import LeaseError, LeaseStore, sync_active_workspaces
 from sightmesh import migration
+from sightmesh.leases import LeaseError, LeaseStore, sync_active_workspaces
 
 
 def test_acquire_fails_closed_for_live_repo_owner(tmp_path: Path) -> None:
@@ -14,6 +14,8 @@ def test_acquire_fails_closed_for_live_repo_owner(tmp_path: Path) -> None:
     repo.mkdir()
     store = LeaseStore(tmp_path / "leases")
     first = store.acquire("owner-a", repo, ttl_seconds=60)
+    assert store.root.stat().st_mode & 0o777 == 0o700
+    assert next(store.root.glob("*.json")).stat().st_mode & 0o777 == 0o600
 
     with pytest.raises(LeaseError, match="already owned"):
         store.acquire("owner-b", repo, ttl_seconds=60)
@@ -66,7 +68,9 @@ def test_distinct_worktrees_from_same_repo_can_coexist(tmp_path: Path) -> None:
     assert sorted(item.owner for item in store.list()) == ["owner-a", "owner-b"]
 
 
-def test_direct_checkout_refuses_existing_worktree_and_blocks_new_worktree(tmp_path: Path) -> None:
+def test_direct_checkout_refuses_existing_worktree_and_blocks_new_worktree(
+    tmp_path: Path,
+) -> None:
     repo = tmp_path / "repo"
     worktree = tmp_path / "worktree"
     repo.mkdir()
@@ -81,7 +85,9 @@ def test_direct_checkout_refuses_existing_worktree_and_blocks_new_worktree(tmp_p
     other.mkdir()
     store.acquire("direct-owner", other, ttl_seconds=60)
     with pytest.raises(LeaseError, match="already owned"):
-        store.acquire("worktree-owner", other, tmp_path / "other-worktree", ttl_seconds=60)
+        store.acquire(
+            "worktree-owner", other, tmp_path / "other-worktree", ttl_seconds=60
+        )
 
 
 def test_one_shot_cli_style_lease_lives_until_ttl(tmp_path: Path) -> None:
@@ -108,7 +114,10 @@ def test_release_checks_token_and_owner(tmp_path: Path) -> None:
     with pytest.raises(LeaseError, match="workspace"):
         store.release(lease.token, workspace_id="workspace-b")
 
-    assert store.release(lease.token, owner="owner-a", workspace_id="workspace-a").token == lease.token
+    assert (
+        store.release(lease.token, owner="owner-a", workspace_id="workspace-a").token
+        == lease.token
+    )
 
 
 def test_corrupt_lease_state_fails_closed(tmp_path: Path) -> None:
@@ -165,7 +174,9 @@ def test_recover_stale_removes_workspace_mapping(tmp_path: Path) -> None:
     assert store.workspace_token("workspace-a") is None
 
 
-def test_sync_active_workspaces_backfills_and_renews(monkeypatch, tmp_path: Path) -> None:
+def test_sync_active_workspaces_backfills_and_renews(
+    monkeypatch, tmp_path: Path
+) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     lease_dir = tmp_path / "leases"
@@ -191,14 +202,18 @@ def test_sync_active_workspaces_backfills_and_renews(monkeypatch, tmp_path: Path
 
 
 def test_migration_git_status_parsing() -> None:
-    assert migration.parse_porcelain_paths(" M a.txt\nR  old.txt -> new.txt\n?? scratch\n") == [
+    assert migration.parse_porcelain_paths(
+        " M a.txt\nR  old.txt -> new.txt\n?? scratch\n"
+    ) == [
         "a.txt",
         "new.txt",
         "scratch",
     ]
 
 
-def test_explicit_migration_root_does_not_add_defaults(monkeypatch, tmp_path: Path) -> None:
+def test_explicit_migration_root_does_not_add_defaults(
+    monkeypatch, tmp_path: Path
+) -> None:
     default_root = tmp_path / "conductor"
     explicit_root = tmp_path / "explicit"
     default_root.mkdir()

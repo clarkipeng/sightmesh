@@ -62,9 +62,17 @@ sightmesh close <workspace-id> --message-file <closeout-prompt>
 After the response is complete and reconciliation passes:
 
 ```sh
-sightmesh close <workspace-id> --archive --confirm-reconciled
+sightmesh workspace archive <workspace-id> --confirm-reconciled
 ```
 
-Archiving stops the workspace and hides it from the active list while preserving cdesktop's recorded history. Do not delete the worktree, branch, transcript, or handoff as part of ordinary retirement.
+Archiving stops the workspace and hides it from the active list while preserving cdesktop's recorded history. cdesktop may reclaim the clean managed worktree after about one hour and recreates it from the preserved Git branch when execution resumes. Do not delete the branch, transcript, or handoff as part of ordinary retirement.
 
-The CLI refuses dirty repositories. If dirty state is intentionally preserved and fully recorded in the handoff, add `--preserve-dirty`. Never use that flag merely to silence the guard.
+The CLI always refuses a dirty managed worktree because cdesktop owns and may reclaim it. `--preserve-dirty` is limited to a direct workspace whose repository cdesktop never removes, and only after the dirty state is fully reconciled and recorded.
+
+Delete an archive only when the user explicitly requests history removal and reconciliation proves that no transcript or uncommitted state is still needed:
+
+```sh
+sightmesh workspace delete <workspace-id> --confirm-delete
+```
+
+This removes the cdesktop archive and any cdesktop-owned worktree but preserves its Git branch. Remove a branch separately with native Git only after its commits and remaining scope are accounted for. Never use archive deletion as ordinary closeout.

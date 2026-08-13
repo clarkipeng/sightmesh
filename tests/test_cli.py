@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from sightmesh import cli, delivery
-from sightmesh.cli import _primary_session_id, _read_text, parser
+from sightmesh import __version__, cli, delivery
+from sightmesh.cli import _primary_session_id, _read_text, _repowire_status_ok, parser
 from sightmesh.delivery import DeliveryStore, make_record
 from sightmesh.leases import LeaseStore
 from sightmesh.profiles import Profile, ProfileStore
@@ -22,11 +22,24 @@ def test_namespace_import_is_available() -> None:
     assert argparse.Namespace is not None
 
 
+def test_version_flag_uses_package_version(capsys) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        parser().parse_args(["--version"])
+    assert exit_info.value.code == 0
+    assert capsys.readouterr().out.strip() == __version__
+
+
 def test_primary_session_id_reads_execution_process() -> None:
     assert (
         _primary_session_id({"execution_process": {"session_id": "session-a"}})
         == "session-a"
     )
+
+
+def test_repowire_status_requires_a_responding_daemon() -> None:
+    assert _repowire_status_ok(0, "Daemon responding at http://127.0.0.1:8377")
+    assert not _repowire_status_ok(0, "Daemon error at http://127.0.0.1:8377")
+    assert not _repowire_status_ok(1, "Daemon responding at http://127.0.0.1:8377")
 
 
 def test_delivery_status_and_list_commands(monkeypatch, tmp_path, capsys) -> None:
@@ -89,6 +102,8 @@ class FakeSpawnClient:
     def __init__(self, _url=None) -> None:
         self.stopped = []
         self.archived = []
+        self.restored = []
+        self.deleted = []
         self.dirty = []
         self.workspace_data = {
             "id": "workspace-a",
@@ -118,12 +133,22 @@ class FakeSpawnClient:
         self.archived.append(workspace_id)
         return {"id": workspace_id, "archived": True}
 
+    def restore_workspace(self, workspace_id):
+        self.restored.append(workspace_id)
+        return {"id": workspace_id, "archived": False}
+
+    def delete_workspace(self, workspace_id):
+        self.deleted.append(workspace_id)
+
     def dirty_repositories(self, workspace_id):
         assert workspace_id == "workspace-a"
         return list(self.dirty)
 
     def sessions(self, _workspace_id):
         return [{"id": "session-a", "created_at": "2026-08-12T00:00:00Z"}]
+
+    def workspace_repos(self, _workspace_id):
+        return []
 
     def providers(self):
         return []
@@ -364,6 +389,142 @@ def test_close_archive_releases_only_workspace_lease(
 
     remaining = LeaseStore(lease_dir).list()
     assert [lease.token for lease in remaining] == [other.token]
+
+
+def test_archive_refuses_dirty_managed_worktree_even_when_preserve_requested(
+    monkeypatch, tmp_path: Path
+) -> None:
+    class DirtyWorktreeClient(FakeSpawnClient):
+        def __init__(self, _url=None) -> None:
+            super().__init__(_url)
+            self.workspace_data["use_worktree"] = True
+            self.dirty = [{"path": str(tmp_path), "status": "M file.txt"}]
+
+    monkeypatch.setattr(cli, "CdesktopClient", DirtyWorktreeClient)
+    args = parser().parse_args(
+        [
+            "workspace",
+            "archive",
+            "workspace-a",
+            "--confirm-reconciled",
+            "--preserve-dirty",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="dirty managed worktree"):
+        args.func(args)
+
+
+def test_workspace_delete_requires_archived_and_preserves_branch(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    lease_dir = tmp_path / "leases"
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
+    monkeypatch.setattr(cli.routing, "disable", lambda _workspace_id: None)
+
+    class ArchivedClient(FakeSpawnClient):
+        def __init__(self, _url=None) -> None:
+            super().__init__(_url)
+            self.workspace_data["archived"] = True
+
+    client = ArchivedClient()
+    monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
+    args = parser().parse_args(
+        ["--json", "workspace", "delete", "workspace-a", "--confirm-delete"]
+    )
+
+    assert args.func(args) == 0
+    assert client.deleted == ["workspace-a"]
+    assert '"branch_preserved": true' in capsys.readouterr().out
+
+
+def test_workspace_delete_requires_extra_confirmation_for_missing_direct_repo(
+    monkeypatch,
+) -> None:
+    class MissingRepoClient(FakeSpawnClient):
+        def __init__(self, _url=None) -> None:
+            super().__init__(_url)
+            self.workspace_data["archived"] = True
+            self.dirty = [
+                {"path": "/missing/repo", "status": "repository path is missing"}
+            ]
+
+    client = MissingRepoClient()
+    monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
+    args = parser().parse_args(
+        ["workspace", "delete", "workspace-a", "--confirm-delete"]
+    )
+    with pytest.raises(ValueError, match="--allow-missing-repo"):
+        args.func(args)
+
+    monkeypatch.setattr(cli.routing, "disable", lambda _workspace_id: None)
+    args = parser().parse_args(
+        [
+            "workspace",
+            "delete",
+            "workspace-a",
+            "--confirm-delete",
+            "--allow-missing-repo",
+        ]
+    )
+    assert args.func(args) == 0
+    assert client.deleted == ["workspace-a"]
+
+
+def test_workspace_delete_can_preserve_dirty_direct_repo(monkeypatch) -> None:
+    class DirtyDirectClient(FakeSpawnClient):
+        def __init__(self, _url=None) -> None:
+            super().__init__(_url)
+            self.workspace_data["archived"] = True
+            self.dirty = [{"path": "/repo", "status": "?? marker.txt"}]
+
+    client = DirtyDirectClient()
+    monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
+    monkeypatch.setattr(cli.routing, "disable", lambda _workspace_id: None)
+    args = parser().parse_args(
+        [
+            "workspace",
+            "delete",
+            "workspace-a",
+            "--confirm-delete",
+            "--preserve-dirty",
+        ]
+    )
+
+    assert args.func(args) == 0
+    assert client.deleted == ["workspace-a"]
+
+
+def test_workspace_restore_reactivates_route_and_lease(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lease_dir = tmp_path / "leases"
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
+    enabled = []
+    monkeypatch.setattr(cli.routing, "enable", enabled.append)
+
+    class ArchivedClient(FakeSpawnClient):
+        def __init__(self, _url=None) -> None:
+            super().__init__(_url)
+            self.workspace_data["archived"] = True
+
+        def workspaces(self):
+            return [{**self.workspace_data, "archived": False}]
+
+        def workspace_repos(self, _workspace_id):
+            return [{"path": str(repo), "name": repo.name}]
+
+    client = ArchivedClient()
+    monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
+    args = parser().parse_args(["workspace", "restore", "workspace-a"])
+
+    assert args.func(args) == 0
+    assert client.restored == ["workspace-a"]
+    assert enabled == ["workspace-a"]
+    lease = LeaseStore(lease_dir).list()[0]
+    assert lease.workspace_id == "workspace-a"
 
 
 def test_spawn_direct_fails_closed_when_repo_leased(

@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import conductor_migrate, leases, routing, service
+from . import __version__, conductor_migrate, leases, routing, service
 from .bridge import run_bridge
 from .cdesktop import CdesktopClient, CdesktopError
 from .delivery import DeliveryStore, DeliveryStoreError, to_dict
@@ -42,6 +42,14 @@ def _emit(data: Any, as_json: bool) -> None:
         print(json.dumps(data, indent=2))
 
 
+def _repowire_status_ok(returncode: int, detail: str) -> bool:
+    return (
+        returncode == 0
+        and "Daemon responding at" in detail
+        and "Daemon error" not in detail
+    )
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     checks: list[dict[str, Any]] = []
     failures = 0
@@ -70,6 +78,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         checks.append({"check": "cdesktop", "ok": False, "detail": str(exc)})
         failures += 1
 
+    private, insecure = service.local_storage_is_private()
+    checks.append(
+        {
+            "check": "local-storage-permissions",
+            "ok": private,
+            "detail": "private" if private else {"insecure_roots": insecure},
+        }
+    )
+    failures += int(not private)
+
     for command in ("repowire", "codex", "claude", "cdesktop"):
         found = shutil.which(command)
         checks.append(
@@ -85,14 +103,16 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             timeout=20,
             check=False,
         )
+        detail = (result.stdout or result.stderr).strip()
+        repowire_ok = _repowire_status_ok(result.returncode, detail)
         checks.append(
             {
                 "check": "repowire",
-                "ok": result.returncode == 0,
-                "detail": (result.stdout or result.stderr).strip(),
+                "ok": repowire_ok,
+                "detail": detail,
             }
         )
-        failures += int(result.returncode != 0)
+        failures += int(not repowire_ok)
 
     if shutil.which("claude"):
         result = subprocess.run(
@@ -201,12 +221,14 @@ def _profile_selection(
 def cmd_configure(args: argparse.Namespace) -> int:
     client = CdesktopClient(args.url)
     config = client.configure_local(Path(args.workspace_root))
+    secured = service.harden_local_storage()
     _emit(
         {
             "url": client.base_url,
             "analytics_enabled": config.get("analytics_enabled"),
             "relay_enabled": config.get("relay_enabled"),
             "workspace_dir": config.get("workspace_dir"),
+            "secured_storage_roots": secured,
         },
         args.json,
     )
@@ -595,29 +617,7 @@ def cmd_close(args: argparse.Namespace) -> int:
     client = CdesktopClient(args.url)
     workspace = client.workspace(args.workspace_id)
     if args.archive:
-        if not args.confirm_reconciled:
-            raise ValueError("--archive requires --confirm-reconciled")
-        dirty = client.dirty_repositories(args.workspace_id)
-        if dirty and not args.preserve_dirty:
-            raise ValueError(
-                "Refusing to archive dirty repositories. Reconcile them or pass "
-                f"--preserve-dirty explicitly. Dirty state: {json.dumps(dirty)}"
-            )
-        client.stop_workspace(args.workspace_id)
-        archived = client.archive_workspace(args.workspace_id)
-        routing.disable(args.workspace_id)
-        released = leases.LeaseStore().release_workspace_if_present(args.workspace_id)
-        released_lease = released.to_dict() if released else None
-        _emit(
-            {
-                "workspace": archived,
-                "action": "stopped-and-archived",
-                "preserved_dirty": dirty,
-                "released_lease": released_lease,
-            },
-            args.json,
-        )
-        return 0
+        return _archive_workspace(args, client)
 
     message = _read_text(args.message, args.message_file, "message")
     sessions = sorted(
@@ -636,6 +636,125 @@ def cmd_close(args: argparse.Namespace) -> int:
         args.json,
     )
     return 0
+
+
+def _archive_workspace(args: argparse.Namespace, client: CdesktopClient) -> int:
+    if not args.confirm_reconciled:
+        raise ValueError("Archiving requires --confirm-reconciled")
+    workspace = client.workspace(args.workspace_id)
+    if workspace.get("archived"):
+        raise ValueError("Workspace is already archived")
+    dirty = client.dirty_repositories(args.workspace_id)
+    if dirty and workspace.get("use_worktree"):
+        raise ValueError(
+            "Refusing to archive a dirty managed worktree. cdesktop may remove archived "
+            "worktrees after one hour, so commit, hand off, or otherwise reconcile these "
+            f"files first. Dirty state: {json.dumps(dirty)}"
+        )
+    if dirty and not args.preserve_dirty:
+        raise ValueError(
+            "Refusing to archive a dirty direct workspace. Reconcile it or pass "
+            f"--preserve-dirty explicitly. Dirty state: {json.dumps(dirty)}"
+        )
+    client.stop_workspace(args.workspace_id)
+    archived = client.archive_workspace(args.workspace_id)
+    routing.disable(args.workspace_id)
+    released = leases.LeaseStore().release_workspace_if_present(args.workspace_id)
+    _emit(
+        {
+            "workspace": archived,
+            "action": "stopped-and-archived",
+            "preserved_dirty": dirty,
+            "released_lease": released.to_dict() if released else None,
+        },
+        args.json,
+    )
+    return 0
+
+
+def cmd_workspace(args: argparse.Namespace) -> int:
+    client = CdesktopClient(args.url)
+    workspace = client.workspace(args.workspace_id)
+    if args.workspace_action == "archive":
+        return _archive_workspace(args, client)
+    if args.workspace_action == "restore":
+        if not workspace.get("archived"):
+            raise ValueError("Workspace is already active")
+        lease_store = leases.LeaseStore()
+        repos = client.workspace_repos(args.workspace_id)
+        if not repos:
+            raise ValueError("Archived workspace has no repository")
+        for repo in repos:
+            lease_store.assert_spawn_allowed(
+                Path(str(repo["path"])),
+                use_worktree=bool(workspace.get("use_worktree")),
+            )
+        restored = client.restore_workspace(args.workspace_id)
+        try:
+            synced = leases.sync_active_workspaces(
+                client, ttl_seconds=args.lease_ttl_seconds
+            )
+        except Exception:
+            client.archive_workspace(args.workspace_id)
+            raise
+        routing.enable(args.workspace_id)
+        _emit(
+            {
+                "workspace": restored,
+                "action": "restored",
+                "leases": [
+                    lease.to_dict()
+                    for lease in synced
+                    if lease.workspace_id == args.workspace_id
+                ],
+            },
+            args.json,
+        )
+        return 0
+    if args.workspace_action == "delete":
+        if not args.confirm_delete:
+            raise ValueError("Deleting an archive requires --confirm-delete")
+        if not workspace.get("archived"):
+            raise ValueError("Refusing to delete an active workspace; archive it first")
+        dirty = client.dirty_repositories(args.workspace_id)
+        missing = [
+            item for item in dirty if item.get("status") == "repository path is missing"
+        ]
+        substantive_dirty = [item for item in dirty if item not in missing]
+        if missing and not args.allow_missing_repo:
+            raise ValueError(
+                "The archived direct workspace's repository path is missing. Refusing "
+                "to delete its remaining cdesktop history without --allow-missing-repo. "
+                f"Missing state: {json.dumps(missing)}"
+            )
+        if substantive_dirty and workspace.get("use_worktree"):
+            raise ValueError(
+                "Refusing to delete an archived managed worktree with dirty files. "
+                f"Dirty state: {json.dumps(substantive_dirty)}"
+            )
+        if substantive_dirty and not args.preserve_dirty:
+            raise ValueError(
+                "Refusing to delete cdesktop history for a dirty direct workspace "
+                "without --preserve-dirty. The repository itself will remain untouched. "
+                f"Dirty state: {json.dumps(substantive_dirty)}"
+            )
+        result = client.delete_workspace(args.workspace_id)
+        routing.disable(args.workspace_id)
+        released = leases.LeaseStore().release_workspace_if_present(args.workspace_id)
+        _emit(
+            {
+                "workspace_id": args.workspace_id,
+                "action": "deleted",
+                "branch_preserved": True,
+                "missing_repositories": missing,
+                "preserved_dirty": substantive_dirty,
+                "cdesktop_result": result,
+                "released_lease": released.to_dict() if released else None,
+            },
+            args.json,
+        )
+        return 0
+    raise ValueError(f"Unknown workspace action: {args.workspace_action}")
 
 
 def cmd_bridge(args: argparse.Namespace) -> int:
@@ -917,6 +1036,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="sightmesh")
+    root.add_argument("--version", action="version", version=__version__)
     root.add_argument("--url", help="Exact local cdesktop backend URL")
     root.add_argument("--json", action="store_true", help="Emit JSON")
     sub = root.add_subparsers(dest="command", required=True)
@@ -1090,6 +1210,47 @@ def parser() -> argparse.ArgumentParser:
         help="Archive while preserving explicitly reconciled dirty state",
     )
     close.set_defaults(func=cmd_close)
+
+    workspace = sub.add_parser(
+        "workspace", help="Archive, restore, or delete a cdesktop workspace"
+    )
+    workspace_sub = workspace.add_subparsers(dest="workspace_action", required=True)
+    workspace_archive = workspace_sub.add_parser(
+        "archive", help="Stop and archive a reconciled workspace"
+    )
+    workspace_archive.add_argument("workspace_id")
+    workspace_archive.add_argument("--confirm-reconciled", action="store_true")
+    workspace_archive.add_argument(
+        "--preserve-dirty",
+        action="store_true",
+        help="Preserve reconciled dirty state only for a direct workspace",
+    )
+    workspace_archive.set_defaults(func=cmd_workspace)
+    workspace_restore = workspace_sub.add_parser(
+        "restore", help="Restore an archived workspace and its ownership lease"
+    )
+    workspace_restore.add_argument("workspace_id")
+    workspace_restore.add_argument(
+        "--lease-ttl-seconds", type=int, default=leases.DEFAULT_TTL_SECONDS
+    )
+    workspace_restore.set_defaults(func=cmd_workspace)
+    workspace_delete = workspace_sub.add_parser(
+        "delete",
+        help="Delete an archive and owned worktree while preserving its branch",
+    )
+    workspace_delete.add_argument("workspace_id")
+    workspace_delete.add_argument("--confirm-delete", action="store_true")
+    workspace_delete.add_argument(
+        "--allow-missing-repo",
+        action="store_true",
+        help="Delete remaining cdesktop history after its direct repository disappeared",
+    )
+    workspace_delete.add_argument(
+        "--preserve-dirty",
+        action="store_true",
+        help="Delete cdesktop history while leaving a dirty direct repository untouched",
+    )
+    workspace_delete.set_defaults(func=cmd_workspace)
 
     managed = sub.add_parser("service", help="Manage the local cdesktop service")
     managed.add_argument(

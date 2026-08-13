@@ -49,11 +49,11 @@ Existing workspaces are opted in explicitly:
 sightmesh bridge-route <workspace-id> --enabled
 ```
 
-`sightmesh spawn` enables its new workspace automatically. Archiving through `sightmesh close` disables the route.
+`sightmesh spawn` enables its new workspace automatically. `sightmesh workspace archive` disables the route and `sightmesh workspace restore` re-enables it.
 
 ## Safety
 
 - Bind cdesktop and Repowire to loopback unless the user explicitly configures another trusted local network surface.
 - Disable cdesktop analytics and relay for a local-only control plane.
 - Do not place secrets in prompts, transcripts, handoff files, command arguments, or the orchestration repository.
-- Do not rely on a beta application's automatic cleanup for imported worktrees. Reconcile and archive explicitly.
+- Reconcile before archiving. cdesktop's native cleanup may reclaim a clean archived managed worktree after about one hour, while imported direct workspaces remain outside cdesktop's filesystem ownership.

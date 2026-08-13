@@ -16,17 +16,21 @@
 - full visible Codex teammate launch from a cdesktop parent;
 - teammate roster discovery;
 - visible cross-workspace follow-up by cdesktop session ID;
-- completed-session stop and archive;
-- dirty-repository retirement refusal;
+- native archive, restore, and confirmed archive deletion with Git branch preservation;
+- clean managed-worktree reclamation after the native one-hour archive grace period;
+- dirty managed-worktree retirement refusal and direct-repository preservation;
+- launchd unload/reload recovery with bounded transient retry and definition rollback;
+- owner-only SightMesh state, configuration, log, lease, delivery, and migration storage;
 - shared skill discovery through links in both Claude and Codex skill roots;
 - Repowire local daemon, hooks, MCP installation, and peer registration;
 - opt-in Repowire proxy peer registration for cdesktop sessions;
 - Repowire ask injection as a visible cdesktop follow-up;
 - correlated plain-ask acknowledgement and structured-question response;
 - bridge peer identity reuse across bridge reconnects.
+- Repowire health-check rejection when its CLI exits successfully but reports a daemon error;
 - worktree-disabled migration import without starting an agent, followed by empty-workspace rollback.
 
-The migration planner was also run read-only against the local Conductor installation on 2026-08-12. It found 365 database and filesystem workspace/context records. Two were blocked because their Conductor sessions were active; all other records had an in-place source or were eligible for a private transcript-only handoff. No real Conductor workspace was migrated during this validation.
+The migration planner was also run read-only against the local Conductor installation on 2026-08-12. It found 365 database and filesystem workspace/context records. Two were blocked because their Conductor sessions were active; all other records had an in-place source or were eligible for a private transcript-only handoff. No real Conductor workspace was migrated during this validation. A disposable direct workspace completed an archive, restore, second archive, and delete lifecycle smoke without launching a model.
 
 The isolated bridge run on 2026-08-12 proved both transports. A blocking `repowire peer ask` returned `REPOWIRE_VISIBLE_OK`. A normal non-blocking ask returned `PLAIN_REPLY_OK`, and its trace recorded `created`, `resolved_peer`, `routed`, `hook_received`, `pane_injected`, `acked`, and `closed`. Restarting the foreground bridge reclaimed the same Repowire peer ID.
 

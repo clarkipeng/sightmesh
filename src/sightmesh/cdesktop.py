@@ -52,7 +52,11 @@ class CdesktopClient:
     ) -> Any:
         url = f"{self.base_url}/api{path}"
         if query:
-            url = f"{url}?{urlencode(query)}"
+            encoded_query = {
+                key: str(value).lower() if isinstance(value, bool) else value
+                for key, value in query.items()
+            }
+            url = f"{url}?{urlencode(encoded_query)}"
         body = None
         request_headers = {"Accept": "application/json", **(headers or {})}
         if payload is not None:
@@ -176,11 +180,20 @@ class CdesktopClient:
             if workspace.get("use_worktree"):
                 container = workspace.get("container_ref")
                 if not container:
+                    if workspace.get("archived"):
+                        continue
                     dirty.append({"path": "", "status": "missing container_ref"})
                     continue
                 path = Path(container) / repo["name"]
             else:
                 path = Path(repo["path"])
+            if not path.is_dir():
+                if workspace.get("archived") and workspace.get("use_worktree"):
+                    continue
+                dirty.append(
+                    {"path": str(path), "status": "repository path is missing"}
+                )
+                continue
             result = subprocess.run(
                 ["git", "status", "--porcelain=v1", "--untracked-files=all"],
                 cwd=path,
@@ -278,8 +291,23 @@ class CdesktopClient:
         return self.request("POST", f"/workspaces/{workspace_id}/execution/stop", {})
 
     def archive_workspace(self, workspace_id: str) -> dict[str, Any]:
+        return self.set_workspace_archived(workspace_id, True)
+
+    def restore_workspace(self, workspace_id: str) -> dict[str, Any]:
+        return self.set_workspace_archived(workspace_id, False)
+
+    def set_workspace_archived(
+        self, workspace_id: str, archived: bool
+    ) -> dict[str, Any]:
         return self.request(
             "PUT",
             f"/workspaces/{workspace_id}",
-            {"archived": True, "pinned": None, "name": None},
+            {"archived": archived, "pinned": None, "name": None},
+        )
+
+    def delete_workspace(self, workspace_id: str) -> Any:
+        return self.request(
+            "DELETE",
+            f"/workspaces/{workspace_id}",
+            query={"delete_remote": False, "delete_branches": False},
         )

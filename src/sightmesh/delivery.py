@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 import sqlite3
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from .service import state_dir
-
 
 DEFAULT_MAX_PENDING = 500
 DEFAULT_MAX_PENDING_BYTES = 5 * 1024 * 1024
@@ -95,10 +96,13 @@ def idempotency_key(
 
 
 class DeliveryStore:
-    def __init__(self, path: Path | None = None, policy: DeliveryPolicy | None = None) -> None:
+    def __init__(
+        self, path: Path | None = None, policy: DeliveryPolicy | None = None
+    ) -> None:
         self.path = path or delivery_db_path()
         self.policy = policy or DeliveryPolicy()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.path.parent.chmod(0o700)
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -108,9 +112,18 @@ class DeliveryStore:
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA busy_timeout = 30000")
+            for path in (
+                self.path,
+                self.path.with_name(f"{self.path.name}-wal"),
+                self.path.with_name(f"{self.path.name}-shm"),
+            ):
+                if path.exists():
+                    os.chmod(path, 0o600)
             return conn
         except sqlite3.Error as exc:
-            raise DeliveryStoreError(f"Cannot open delivery store {self.path}: {exc}") from exc
+            raise DeliveryStoreError(
+                f"Cannot open delivery store {self.path}: {exc}"
+            ) from exc
 
     def _initialize(self) -> None:
         try:
@@ -121,7 +134,9 @@ class DeliveryStore:
                     "ON deliveries(status, next_attempt_at, created_at)"
                 )
         except sqlite3.DatabaseError as exc:
-            raise DeliveryStoreError(f"Cannot initialize delivery store {self.path}: {exc}") from exc
+            raise DeliveryStoreError(
+                f"Cannot initialize delivery store {self.path}: {exc}"
+            ) from exc
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
         row = conn.execute(
@@ -136,11 +151,7 @@ class DeliveryStore:
             column["name"]
             for column in conn.execute("PRAGMA table_info(deliveries)").fetchall()
         }
-        if (
-            "'inflight'" in sql
-            and "claim_token" in columns
-            and "claimed_at" in columns
-        ):
+        if "'inflight'" in sql and "claim_token" in columns and "claimed_at" in columns:
             return
 
         conn.execute("DROP INDEX IF EXISTS idx_deliveries_status_next")
@@ -241,7 +252,9 @@ class DeliveryStore:
         except sqlite3.DatabaseError as exc:
             raise DeliveryStoreError(f"Cannot read delivery: {exc}") from exc
 
-    def _get(self, conn: sqlite3.Connection, idempotency_key: str) -> DeliveryRecord | None:
+    def _get(
+        self, conn: sqlite3.Connection, idempotency_key: str
+    ) -> DeliveryRecord | None:
         row = conn.execute(
             "SELECT * FROM deliveries WHERE idempotency_key = ?", (idempotency_key,)
         ).fetchone()
@@ -314,7 +327,9 @@ class DeliveryStore:
             "claim_timeout_seconds": self.policy.claim_timeout_seconds,
         }
 
-    def claim(self, idempotency_key: str, now: float | None = None) -> DeliveryRecord | None:
+    def claim(
+        self, idempotency_key: str, now: float | None = None
+    ) -> DeliveryRecord | None:
         current = time.time() if now is None else now
         try:
             with self._connect() as conn:
@@ -344,9 +359,7 @@ class DeliveryStore:
     ) -> DeliveryRecord | None:
         current = time.time() if now is None else now
         session_clause = "AND session_id = ?" if session_id else ""
-        params: tuple[Any, ...] = (
-            (current, session_id) if session_id else (current,)
-        )
+        params: tuple[Any, ...] = (current, session_id) if session_id else (current,)
         try:
             with self._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -456,7 +469,13 @@ class DeliveryStore:
                             claim_token = NULL, claimed_at = NULL
                         WHERE idempotency_key = ?
                         """,
-                        (attempts, current, current, _trim_error(error), idempotency_key),
+                        (
+                            attempts,
+                            current,
+                            current,
+                            _trim_error(error),
+                            idempotency_key,
+                        ),
                     )
                 else:
                     conn.execute(
@@ -616,9 +635,13 @@ def _record(row: sqlite3.Row) -> DeliveryRecord:
         last_error=row["last_error"],
         created_at=float(row["created_at"]),
         updated_at=float(row["updated_at"]),
-        injected_at=float(row["injected_at"]) if row["injected_at"] is not None else None,
+        injected_at=float(row["injected_at"])
+        if row["injected_at"] is not None
+        else None,
         dead_lettered_at=(
-            float(row["dead_lettered_at"]) if row["dead_lettered_at"] is not None else None
+            float(row["dead_lettered_at"])
+            if row["dead_lettered_at"] is not None
+            else None
         ),
         prompt_bytes=int(row["prompt_bytes"]),
         claim_token=row["claim_token"],

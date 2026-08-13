@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from sightmesh import cdesktop
 from sightmesh.cdesktop import CdesktopClient
 
 
@@ -101,3 +102,26 @@ def test_dirty_repositories_reports_direct_checkout(monkeypatch, tmp_path) -> No
     assert client.dirty_repositories("workspace") == [
         {"path": str(tmp_path), "status": "?? pending.txt"}
     ]
+
+
+def test_delete_workspace_encodes_rust_booleans_in_lowercase(monkeypatch) -> None:
+    requests = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"success":true,"data":null}'
+
+    def fake_urlopen(request, timeout):
+        requests.append((request, timeout))
+        return Response()
+
+    monkeypatch.setattr(cdesktop, "urlopen", fake_urlopen)
+    CdesktopClient("http://127.0.0.1:3210").delete_workspace("workspace-a")
+
+    assert requests[0][0].full_url.endswith("delete_remote=false&delete_branches=false")

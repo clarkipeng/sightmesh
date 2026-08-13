@@ -112,14 +112,18 @@ def test_dead_lettering_is_inspectable_and_retryable(tmp_path) -> None:
 
 
 def test_successful_closeout_clears_retained_prompt(tmp_path) -> None:
-    store = DeliveryStore(tmp_path / "delivery.sqlite3")
+    path = tmp_path / "delivery.sqlite3"
+    store = DeliveryStore(path)
     record = store.enqueue(_record())
     claimed = store.claim(record.idempotency_key, now=19.0)
     assert claimed and claimed.claim_token
-    injected = store.mark_injected(record.idempotency_key, claimed.claim_token, now=20.0)
+    injected = store.mark_injected(
+        record.idempotency_key, claimed.claim_token, now=20.0
+    )
     assert injected.status == "injected"
     assert injected.prompt is None
     assert injected.prompt_bytes == 0
+    assert path.stat().st_mode & 0o777 == 0o600
 
 
 def test_competing_processors_cannot_claim_the_same_record(tmp_path) -> None:
