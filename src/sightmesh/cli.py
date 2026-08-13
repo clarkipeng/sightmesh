@@ -371,13 +371,26 @@ def _compact_text(value: object, limit: int) -> str:
     return text if len(text) <= limit else f"{text[: max(0, limit - 3)]}..."
 
 
+def _normalized_snapshot_with_retry(
+    client: CdesktopClient, execution_process_id: str, attempts: int = 3
+) -> dict[str, Any]:
+    best: dict[str, Any] = {}
+    for _ in range(attempts):
+        candidate = client.normalized_snapshot(execution_process_id)
+        if candidate.get("complete"):
+            return candidate
+        if int(candidate.get("patch_count") or 0) >= int(best.get("patch_count") or 0):
+            best = candidate
+    return best
+
+
 def cmd_peek(args: argparse.Namespace) -> int:
     client = CdesktopClient(args.url)
     row = _resolve_session(client, args.agent, include_archived=args.include_archived)
     latest = _latest_process(_session_processes(client, row))
     if latest is None:
         raise ValueError(f"Agent @{row['selector']} has no execution history")
-    snapshot = client.normalized_snapshot(str(latest["id"]))
+    snapshot = _normalized_snapshot_with_retry(client, str(latest["id"]))
     entries = snapshot.get("entries") if isinstance(snapshot, dict) else []
     assistants: list[str] = []
     tools: list[dict[str, Any]] = []

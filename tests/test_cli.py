@@ -8,6 +8,7 @@ from sightmesh import __version__, approvals, cli, delivery
 from sightmesh.cli import (
     _fleet_sessions,
     _is_sightmesh_cdesktop_version,
+    _normalized_snapshot_with_retry,
     _primary_session_id,
     _read_text,
     _repowire_status_ok,
@@ -75,6 +76,35 @@ def test_fleet_selector_resolves_workspace_and_named_peer() -> None:
     assert [row["selector"] for row in rows] == ["alpha", "reviewer"]
     assert _resolve_session(client, "@alpha")["session_id"] == "lead-a"
     assert _resolve_session(client, "reviewer")["session_id"] == "peer-a"
+
+
+def test_normalized_snapshot_retries_cold_partial_result() -> None:
+    class SnapshotClient:
+        def __init__(self) -> None:
+            self.responses = iter(
+                [
+                    {"entries": [], "patch_count": 1, "complete": False},
+                    {
+                        "entries": [
+                            {"content": {"entry_type": {"type": "assistant_message"}}}
+                        ],
+                        "patch_count": 41,
+                        "complete": True,
+                    },
+                ]
+            )
+
+        def normalized_snapshot(self, _execution_process_id):
+            return next(self.responses)
+
+    result = _normalized_snapshot_with_retry(SnapshotClient(), "process-a")
+    assert result["complete"] is True
+    assert result["patch_count"] == 41
+
+
+def test_parser_registers_compact_fleet_commands() -> None:
+    assert parser().parse_args(["peers"]).func is cli.cmd_peers
+    assert parser().parse_args(["peek", "@reviewer"]).func is cli.cmd_peek
 
 
 def test_namespace_import_is_available() -> None:
