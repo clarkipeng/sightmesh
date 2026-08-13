@@ -201,6 +201,34 @@ def test_sync_active_workspaces_backfills_and_renews(
     assert second.workspace_id == "workspace-a"
 
 
+def test_sync_active_workspaces_can_isolate_invalid_workspace(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lease_dir = tmp_path / "leases"
+    monkeypatch.setattr("sightmesh.leases.default_lease_dir", lambda: lease_dir)
+
+    class Client:
+        def workspaces(self):
+            return [
+                {"id": "broken", "archived": False, "use_worktree": True},
+                {"id": "healthy", "archived": False, "use_worktree": False},
+            ]
+
+        def workspace_repos(self, workspace_id):
+            return [{"path": str(repo), "name": repo.name}]
+
+        def sessions(self, workspace_id):
+            return [{"id": f"session-{workspace_id}"}]
+
+    errors = []
+    synced = sync_active_workspaces(Client(), ttl_seconds=60, on_error=errors.append)
+
+    assert [lease.workspace_id for lease in synced] == ["healthy"]
+    assert errors == ["Active worktree workspace has no container: broken"]
+
+
 def test_migration_git_status_parsing() -> None:
     assert migration.parse_porcelain_paths(
         " M a.txt\nR  old.txt -> new.txt\n?? scratch\n"

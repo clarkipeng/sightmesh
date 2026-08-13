@@ -89,7 +89,9 @@ class RepowireSessionBridge:
                 delay = min(delay * 2, 15.0)
 
     async def _connection(self) -> None:
-        async with websockets.connect(self.repowire_url, ping_interval=20, ping_timeout=20) as ws:
+        async with websockets.connect(
+            self.repowire_url, ping_interval=20, ping_timeout=20
+        ) as ws:
             connect: dict[str, Any] = {
                 "type": "connect",
                 "display_name": self.assigned_name,
@@ -114,13 +116,17 @@ class RepowireSessionBridge:
                 raise RuntimeError(str(connected))
             set_peer_identity(self.bridged.session["id"], connected["session_id"])
             self.assigned_name = connected.get("display_name") or self.assigned_name
-            await ws.send(json.dumps({"type": "status", "status": "online", "turn_state": "idle"}))
+            await ws.send(
+                json.dumps({"type": "status", "status": "online", "turn_state": "idle"})
+            )
             LOGGER.info(
                 "Bridged %s to cdesktop session %s",
                 self.assigned_name,
                 self.bridged.session["id"],
             )
-            retry_task = asyncio.create_task(self._retry_loop(ws), name=f"retry-{self.assigned_name}")
+            retry_task = asyncio.create_task(
+                self._retry_loop(ws), name=f"retry-{self.assigned_name}"
+            )
             try:
                 async for raw in ws:
                     message = json.loads(raw)
@@ -190,7 +196,9 @@ class RepowireSessionBridge:
         if stored.status == "dead":
             await self._send_delivery_ack(ws, stored, "dead")
             if stored.correlation_id:
-                await self._send_error(ws, stored.correlation_id, stored.last_error or "dead-lettered")
+                await self._send_error(
+                    ws, stored.correlation_id, stored.last_error or "dead-lettered"
+                )
             return
         claimed = await asyncio.to_thread(
             self.delivery_store.claim,
@@ -225,7 +233,9 @@ class RepowireSessionBridge:
         if not record.claim_token:
             await self._send_delivery_ack(ws, record, "failed")
             if record.correlation_id:
-                await self._send_error(ws, record.correlation_id, "Inflight delivery has no claim token")
+                await self._send_error(
+                    ws, record.correlation_id, "Inflight delivery has no claim token"
+                )
             return
         if record.prompt is None:
             failed = await asyncio.to_thread(
@@ -258,7 +268,9 @@ class RepowireSessionBridge:
             )
             await self._send_delivery_ack(ws, failed, failed.status)
             if failed.status == "dead" and failed.correlation_id:
-                await self._send_error(ws, failed.correlation_id, failed.last_error or str(exc))
+                await self._send_error(
+                    ws, failed.correlation_id, failed.last_error or str(exc)
+                )
 
     async def _send_delivery_ack(
         self, ws: Any, record: DeliveryRecord, status: str
@@ -296,7 +308,11 @@ class RepowireSessionBridge:
             await self._send_error(ws, correlation_id, detail)
 
     async def _send_error(self, ws: Any, correlation_id: str, error: str) -> None:
-        await ws.send(json.dumps({"type": "error", "correlation_id": correlation_id, "error": error}))
+        await ws.send(
+            json.dumps(
+                {"type": "error", "correlation_id": correlation_id, "error": error}
+            )
+        )
 
 
 class BridgeSupervisor:
@@ -320,16 +336,26 @@ class BridgeSupervisor:
         enabled = enabled_workspaces()
         desired: dict[str, BridgedSession] = {}
         try:
-            await asyncio.to_thread(leases.sync_active_workspaces, self.client)
+            await asyncio.to_thread(
+                leases.sync_active_workspaces,
+                self.client,
+                on_error=lambda detail: LOGGER.warning(
+                    "Cannot reconcile one cdesktop workspace: %s", detail
+                ),
+            )
             workspaces = await asyncio.to_thread(self.client.workspaces)
             for workspace in workspaces:
                 if workspace["id"] not in enabled or workspace.get("archived"):
                     continue
                 try:
                     path = await asyncio.to_thread(_repo_path, self.client, workspace)
-                    sessions = await asyncio.to_thread(self.client.sessions, workspace["id"])
+                    sessions = await asyncio.to_thread(
+                        self.client.sessions, workspace["id"]
+                    )
                 except CdesktopError as exc:
-                    LOGGER.warning("Cannot bridge workspace %s: %s", workspace["id"], exc)
+                    LOGGER.warning(
+                        "Cannot bridge workspace %s: %s", workspace["id"], exc
+                    )
                     continue
                 for session in sessions:
                     desired[session["id"]] = BridgedSession(workspace, session, path)

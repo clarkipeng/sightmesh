@@ -7,6 +7,7 @@ import os
 import socket
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self
@@ -403,55 +404,64 @@ class _FileLock:
             self._file.close()
 
 
+def _sync_active_workspace(
+    store: LeaseStore, client: Any, workspace: dict[str, Any], ttl_seconds: int
+) -> Lease:
+    workspace_id = str(workspace["id"])
+    renewed = store.renew_workspace(workspace_id, ttl_seconds)
+    if renewed:
+        sessions = client.sessions(workspace_id)
+        session_id = str(sessions[0]["id"]) if sessions else None
+        if session_id and renewed.session_id != session_id:
+            renewed = store.attach_workspace(renewed.token, workspace_id, session_id)
+        return renewed
+
+    repos = client.workspace_repos(workspace_id)
+    if not repos:
+        raise LeaseError(f"Active workspace has no repository: {workspace_id}")
+    repo = repos[0]
+    repo_path = Path(str(repo["path"])).expanduser().resolve()
+    worktree_path = None
+    if workspace.get("use_worktree"):
+        container = workspace.get("container_ref")
+        if not container:
+            raise LeaseError(
+                f"Active worktree workspace has no container: {workspace_id}"
+            )
+        worktree_path = Path(str(container)).expanduser().resolve() / str(repo["name"])
+    sessions = client.sessions(workspace_id)
+    session_id = str(sessions[0]["id"]) if sessions else None
+    try:
+        return store.acquire(
+            f"cdesktop-workspace:{workspace_id}",
+            repo_path,
+            worktree_path,
+            ttl_seconds,
+            workspace_id=workspace_id,
+            session_id=session_id,
+        )
+    except LeaseError:
+        renewed = store.renew_workspace(workspace_id, ttl_seconds)
+        if not renewed:
+            raise
+        return renewed
+
+
 def sync_active_workspaces(
-    client: Any, ttl_seconds: int = DEFAULT_TTL_SECONDS
+    client: Any,
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    on_error: Callable[[str], None] | None = None,
 ) -> list[Lease]:
-    """Renew or backfill leases for every active cdesktop workspace."""
+    """Renew or backfill leases for every valid active cdesktop workspace."""
     store = LeaseStore()
     synced: list[Lease] = []
     for workspace in client.workspaces():
         if workspace.get("archived"):
             continue
-        workspace_id = str(workspace["id"])
-        renewed = store.renew_workspace(workspace_id, ttl_seconds)
-        if renewed:
-            sessions = client.sessions(workspace_id)
-            session_id = str(sessions[0]["id"]) if sessions else None
-            if session_id and renewed.session_id != session_id:
-                renewed = store.attach_workspace(
-                    renewed.token, workspace_id, session_id
-                )
-            synced.append(renewed)
-            continue
-        repos = client.workspace_repos(workspace_id)
-        if not repos:
-            raise LeaseError(f"Active workspace has no repository: {workspace_id}")
-        repo = repos[0]
-        repo_path = Path(str(repo["path"])).expanduser().resolve()
-        worktree_path = None
-        if workspace.get("use_worktree"):
-            container = workspace.get("container_ref")
-            if not container:
-                raise LeaseError(
-                    f"Active worktree workspace has no container: {workspace_id}"
-                )
-            worktree_path = Path(str(container)).expanduser().resolve() / str(
-                repo["name"]
-            )
-        sessions = client.sessions(workspace_id)
-        session_id = str(sessions[0]["id"]) if sessions else None
         try:
-            lease = store.acquire(
-                f"cdesktop-workspace:{workspace_id}",
-                repo_path,
-                worktree_path,
-                ttl_seconds,
-                workspace_id=workspace_id,
-                session_id=session_id,
-            )
-        except LeaseError:
-            lease = store.renew_workspace(workspace_id, ttl_seconds)
-            if not lease:
+            synced.append(_sync_active_workspace(store, client, workspace, ttl_seconds))
+        except LeaseError as exc:
+            if on_error is None:
                 raise
-        synced.append(lease)
+            on_error(str(exc))
     return synced
