@@ -48,6 +48,8 @@ Before spawning, write a bounded prompt containing:
 
 Search cdesktop and Repowire inventories first. Do not spawn a duplicate worker for a branch, PR, or assignment already owned.
 
+Before spawning, run a bounded preflight against the exact base: confirm the branch resolves to the intended SHA, determine whether the new worktree will have required dependencies, verify any required local service, and name one focused command that can execute there. Put the delivery branch and push target in the prompt when SightMesh will create a different local branch. If setup is missing, provision it once through the repository's supported bootstrap path or state the exact setup command in the assignment. Do not make each worker rediscover the same missing dependency or service.
+
 When taking over a workspace imported from Conductor, check for `.context/sightmesh-migration.json`. Read the referenced handoff before writing, then validate the live branch, HEAD, dirty state, and remaining scope against it. The original checkout and Conductor database remain authoritative historical sources.
 
 ## Spawn visible workers
@@ -117,3 +119,5 @@ An agent must never approve its own request. When invoked from cdesktop, only th
 ## Supervise and finish
 
 Inspect cdesktop transcripts and derived git state. Intervene only on state change, a blocker, scope drift, duplicate ownership, or failed validation. Before retirement, invoke `$reconcile-agent-work`. Archive only after the branch, PR, dirty state, handoff, and remaining scope are reconciled.
+
+Keep one writer for each conflict hotspot such as a migration or shared composition file. Parallelize disjoint fixtures, adapters, new test files, docs, and exact-head review. Prefer short pushed checkpoints with explicit remaining scope, and replace a worker from the exact pushed branch before context pressure degrades judgment.
