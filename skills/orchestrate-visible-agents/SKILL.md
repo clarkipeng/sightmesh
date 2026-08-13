@@ -28,7 +28,7 @@ Keep the workflow native and unsurprising:
 3. Keep one lead session per cdesktop workspace. Only the lead spawns teammates.
 4. Use `sightmesh steer @agent --message "..."` for agent-to-agent contact. It interrupts only that selected session and makes the message the next turn instead of appending behind current work.
 5. Do not use `sightmesh message`, `sightmesh prompt-idle`, or Repowire as the normal peer-contact path. They remain compatibility and durable-delivery surfaces for explicitly non-interrupting workflows.
-6. Every teammate must contact its workspace lead when it needs a decision, feedback, or help with a blocker, and when it completes. Use `cdesktop team manager --message "STATUS: concise details"`; the command resolves the lead session automatically.
+6. Every child must contact its launcher when it needs a decision, feedback, or help with a blocker, and when it completes. Use `sightmesh parent --message "STATUS: concise details"`; the per-spawn edge resolves the exact parent session automatically. Same-workspace teammates may use `cdesktop team manager` as the native lead alias.
 7. Before asking for input, collect all currently known independent questions and send one multi-question request. Before tool use, batch independent read-only inspections. Keep dependent operations, mutations, approvals, and destructive actions sequential.
 8. A lead reviewing multiple workers should call `sightmesh inbox` once and answer independent pending requests with one prevalidated `sightmesh respond --responses '<json>'` call.
 
@@ -45,6 +45,8 @@ Before spawning, write a bounded prompt containing:
 - handoff location;
 - instruction to use this skill for any further delegation;
 - instruction to use `$reconcile-agent-work` before completion.
+
+Keep ordinary worker prompts under 250 words. Link to repository authority and ignored handoffs instead of copying their prose, matrices, history, or generic workflow. Include a detail only when the worker cannot discover it from the named files or when getting it wrong would change the output. Use short labeled lines or bullets so objective, ownership, exclusions, proof, delivery, and stop condition are visible at a glance.
 
 Search cdesktop and Repowire inventories first. Do not spawn a duplicate worker for a branch, PR, or assignment already owned.
 
@@ -89,6 +91,7 @@ Start with the compact local fleet surface:
 sightmesh peers
 sightmesh peek @<agent>
 sightmesh steer @<agent> --message "<immediate correction or blocker>"
+sightmesh parent --message "<status, decision request, or blocker>"
 sightmesh inbox
 ```
 
