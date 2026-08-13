@@ -25,6 +25,7 @@ Use a release archive and its independently published SHA-256 digest:
 ```sh
 sightmesh update stage --package URL_OR_LOCAL_TGZ --version VERSION --sha256 SHA256
 sightmesh update status
+sightmesh update prune --dry-run
 sightmesh update cancel
 ```
 

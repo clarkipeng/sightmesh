@@ -42,7 +42,7 @@ The isolated bridge run on 2026-08-12 proved both transports. A blocking `repowi
 
 Upstream cdesktop 0.2.3 uses Codex app-server protocol types from Codex 0.121. An explicit `service_tier = "default"` in current Codex configuration causes that build to reject the thread-start response because its older enum understands only `fast` and `flex`.
 
-The SightMesh fork updates both the live app-server boundary and event-log normalizer to Codex protocol 0.147. Service tier is represented as an open string, current server requests are handled, new event fields are tolerated, and image and audio tool outputs remain visible. Fork version `0.2.3-sightmesh.2` also adds the bounded maintenance drain required by SightMesh's staged updater. The drain rejects new mutations for at most 30 seconds while leaving reads and existing executor streams intact.
+The SightMesh fork updates both the live app-server boundary and event-log normalizer to Codex protocol 0.147. Service tier is represented as an open string, current server requests are handled, new event fields are tolerated, and image and audio tool outputs remain visible. Fork version `0.2.3-sightmesh.3` adds durable queued follow-ups and a compact, redacted update-status surface. The bounded maintenance drain rejects new mutations for at most 30 seconds while leaving reads and existing executor streams intact.
 
 ### Codex 5.6 model selection
 

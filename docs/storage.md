@@ -8,8 +8,8 @@ SightMesh keeps orchestration data local and separates durable source state from
 | cdesktop | `~/Library/Application Support/ai.cdesktop.cdesktop` | Workspace records, visible session history, and process metadata | Until the archive is explicitly deleted |
 | cdesktop | `~/.local/share/sightmesh/.cdesktop-workspaces` | SightMesh-managed isolated worktrees | Active lifetime; a clean archived worktree may be reclaimed after about one hour |
 | Repowire | `~/.repowire` | Local peer identity, discovery, and request/reply state | Until explicitly reset |
-| SightMesh | `~/.local/state/sightmesh` | Delivery queue, ownership leases, route policy, approval audit, logs, migration plans, and bounded handoffs | Lifecycle-specific; approval audit, migration plans, and handoffs remain until explicitly removed |
-| SightMesh | `~/.local/share/sightmesh/updates` | Checksum-verified, versioned cdesktop update installations and rollback definitions | Until explicitly removed after the version is no longer active or needed for rollback |
+| SightMesh | `~/.local/state/sightmesh` | Delivery queue, ownership leases, per-spawn parent edges, route policy, approval audit, logs, migration plans, and bounded handoffs | Lifecycle-specific; approval audit, migration plans, and handoffs remain until explicitly removed |
+| SightMesh | `~/.local/share/sightmesh/updates` | Checksum-verified, versioned cdesktop update installations and rollback definitions | Active, pending, and rollback packages plus one recent spare; superseded packages are pruned automatically |
 | SightMesh | `~/.config/sightmesh` | Provider profile identifiers and routing policy | Until explicitly changed or removed |
 | Workspace owner | `<workspace>/.context` | Workspace-local notes and handoffs | Follows the workspace and remains Git-ignored |
 | Conductor during migration | Existing Conductor database and workspaces | Original transcripts, workspace metadata, and checkouts | Preserved until post-migration reconciliation authorizes removal |
@@ -31,3 +31,5 @@ Delete is deliberately separate from archive. It requires an archived workspace 
 Do not place secrets in prompts, transcripts, `.context`, handoffs, command arguments, or the orchestration repository. Local-only storage and restrictive permissions reduce exposure but do not turn those surfaces into a secrets manager.
 
 Approval decisions are stored in `~/.local/state/sightmesh/approvals.sqlite3`. The database and its WAL files are owner-only. Rejection text is not copied into this store; SightMesh records only its SHA-256 digest so an audit can correlate a decision without creating another transcript.
+
+Parent return addresses are stored in `~/.local/state/sightmesh/relationships.sqlite3`. They contain cdesktop workspace and session IDs only, not prompts or transcripts. Queued cdesktop follow-ups live in cdesktop's existing application database and are removed only after the next execution starts successfully or the user cancels them.

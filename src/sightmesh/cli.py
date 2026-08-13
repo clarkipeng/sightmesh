@@ -17,6 +17,7 @@ from . import (
     approvals,
     conductor_migrate,
     leases,
+    relationships,
     routing,
     service,
     updates,
@@ -41,7 +42,7 @@ COORDINATION_CONTRACT = """## Local agent coordination
 - Use `sightmesh peers` and `sightmesh peek @agent` for compact fleet awareness.
 - Use `sightmesh steer @agent --message "..."` for immediate peer contact. It interrupts only that agent's active turn.
 - Leads use `sightmesh inbox` and one `sightmesh respond --responses '...'` call for pending requests across the fleet.
-- Contact your lead with `cdesktop team manager --message "STATUS: concise details"` when blocked, when a decision is needed, and when complete.
+- Contact your launcher with `sightmesh parent --message "STATUS: concise details"` when blocked, when a decision is needed, and when complete.
 - Batch independent read-only tool calls and all currently known independent questions. Keep dependent or destructive actions sequential.
 - Do not use hidden or native subagents.
 """
@@ -546,6 +547,8 @@ def _workspace_id(result: dict[str, Any]) -> str:
 
 
 def _primary_session_id(result: dict[str, Any]) -> str | None:
+    if isinstance(result, dict) and result.get("session_id"):
+        return str(result["session_id"])
     sessions = result.get("sessions") if isinstance(result, dict) else None
     if isinstance(sessions, list) and sessions and isinstance(sessions[0], dict):
         return str(sessions[0].get("id")) if sessions[0].get("id") else None
@@ -674,6 +677,18 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
         result["lease"] = lease.to_dict()
     if profile_name:
         result["profile"] = profile_name
+    parent_selector = getattr(args, "parent_session", None) or os.environ.get(
+        "CDESKTOP_SESSION_ID"
+    )
+    if parent_selector and session_id:
+        parent = _resolve_session(client, parent_selector)
+        edge = relationships.RelationshipStore().record(
+            child_session_id=session_id,
+            child_workspace_id=workspace_id,
+            parent_session_id=str(parent["session_id"]),
+            parent_workspace_id=str(parent["workspace_id"]),
+        )
+        result["parent"] = edge.to_dict()
     return result
 
 
@@ -699,8 +714,27 @@ def cmd_steer(args: argparse.Namespace) -> int:
         raise ValueError("Steering message must not be empty")
     client = CdesktopClient(args.url)
     target = _resolve_session(client, args.session_id)
-    session_id = str(target["session_id"])
     caller_session = args.sender_session or os.environ.get("CDESKTOP_SESSION_ID")
+    result = _steer_target(
+        client,
+        target,
+        message,
+        caller_session=caller_session,
+        timeout_seconds=args.timeout_seconds,
+    )
+    _emit(result, args.json)
+    return 0
+
+
+def _steer_target(
+    client: CdesktopClient,
+    target: dict[str, Any],
+    message: str,
+    *,
+    caller_session: str | None,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    session_id = str(target["session_id"])
     if caller_session == session_id:
         raise ValueError("An agent cannot steer itself")
     workspace_id = str(target["workspace_id"])
@@ -729,22 +763,51 @@ def cmd_steer(args: argparse.Namespace) -> int:
     for process in running:
         client.stop_execution(str(process["id"]))
     if running:
-        client.wait_for_session_idle(session_id, timeout_seconds=args.timeout_seconds)
+        client.wait_for_session_idle(session_id, timeout_seconds=timeout_seconds)
 
     result = client.send(session_id, message, caller_session)
-    _emit(
-        {
-            "workspace_id": workspace_id,
-            "session_id": session_id,
-            "agent": f"@{target['selector']}",
-            "interrupted_execution_processes": [
-                str(process["id"]) for process in running
-            ],
-            "scope": "selected session only",
-            "follow_up": result,
-        },
-        args.json,
-    )
+    return {
+        "workspace_id": workspace_id,
+        "session_id": session_id,
+        "agent": f"@{target['selector']}",
+        "interrupted_execution_processes": [str(process["id"]) for process in running],
+        "scope": "selected session only",
+        "follow_up": result,
+    }
+
+
+def cmd_parent(args: argparse.Namespace) -> int:
+    child_session = args.session or os.environ.get("CDESKTOP_SESSION_ID")
+    if not child_session:
+        raise ValueError("Provide --session or run inside a cdesktop session")
+    edge = relationships.RelationshipStore().parent(child_session)
+    if not edge:
+        raise ValueError(f"No recorded parent for session {child_session}")
+
+    result: dict[str, Any] = {"parent": edge.to_dict()}
+    if args.message or args.message_file:
+        message = _read_text(args.message, args.message_file, "message")
+        if not message.strip():
+            raise ValueError("Parent message must not be empty")
+        client = CdesktopClient(args.url)
+        target = _resolve_session(client, edge.parent_session_id)
+        result["delivery"] = _steer_target(
+            client,
+            target,
+            message,
+            caller_session=child_session,
+            timeout_seconds=args.timeout_seconds,
+        )
+    _emit(result, args.json)
+    return 0
+
+
+def cmd_children(args: argparse.Namespace) -> int:
+    parent_session = args.session or os.environ.get("CDESKTOP_SESSION_ID")
+    if not parent_session:
+        raise ValueError("Provide --session or run inside a cdesktop session")
+    edges = relationships.RelationshipStore().children(parent_session)
+    _emit([edge.to_dict() for edge in edges], args.json)
     return 0
 
 
@@ -924,8 +987,9 @@ def cmd_teammate_spawn(args: argparse.Namespace) -> int:
     executor, provider_id, model, reasoning, profile_name = _profile_selection(
         args, client
     )
+    caller_session = _caller_session(args.caller)
     result = client.spawn_teammate(
-        caller_session=_caller_session(args.caller),
+        caller_session=caller_session,
         name=args.name,
         prompt=prompt,
         executor=executor,
@@ -936,6 +1000,16 @@ def cmd_teammate_spawn(args: argparse.Namespace) -> int:
     )
     if profile_name and isinstance(result, dict):
         result["profile"] = profile_name
+    child_session = _primary_session_id(result)
+    if child_session:
+        parent = client.session(caller_session)
+        edge = relationships.RelationshipStore().record(
+            child_session_id=child_session,
+            child_workspace_id=str(parent["workspace_id"]),
+            parent_session_id=caller_session,
+            parent_workspace_id=str(parent["workspace_id"]),
+        )
+        result["parent"] = edge.to_dict()
     _emit(result, args.json)
     return 0
 
@@ -1420,6 +1494,8 @@ def cmd_update(args: argparse.Namespace) -> int:
             result["activity"] = updates.activity(CdesktopClient(args.url))
     elif args.update_action == "cancel":
         result = updates.cancel()
+    elif args.update_action == "prune":
+        result = updates.prune(keep=args.keep, dry_run=args.dry_run)
     else:
         raise ValueError(f"Unknown update action: {args.update_action}")
     if not getattr(args, "quiet", False):
@@ -1948,10 +2024,34 @@ def parser() -> argparse.ArgumentParser:
     spawn.add_argument("--reasoning", choices=["low", "medium", "high", "xhigh", "max"])
     spawn.add_argument("--provider", help="Configured cdesktop provider UUID")
     spawn.add_argument(
+        "--parent-session",
+        help="Launching cdesktop session; defaults to CDESKTOP_SESSION_ID",
+    )
+    spawn.add_argument(
         "--lease-ttl-seconds", type=int, default=leases.DEFAULT_TTL_SECONDS
     )
     spawn.add_argument("--no-bridge", action="store_true")
     spawn.set_defaults(func=cmd_spawn)
+
+    parent = sub.add_parser(
+        "parent", help="Show or immediately contact the session that spawned this agent"
+    )
+    parent.add_argument(
+        "--session", help="Child session; defaults to CDESKTOP_SESSION_ID"
+    )
+    parent_message = parent.add_mutually_exclusive_group()
+    parent_message.add_argument("--message")
+    parent_message.add_argument("--message-file")
+    parent.add_argument("--timeout-seconds", type=float, default=30.0)
+    parent.set_defaults(func=cmd_parent)
+
+    children = sub.add_parser(
+        "children", help="List visible workspaces launched directly by this session"
+    )
+    children.add_argument(
+        "--session", help="Parent session; defaults to CDESKTOP_SESSION_ID"
+    )
+    children.set_defaults(func=cmd_children)
 
     message = sub.add_parser(
         "message", help="Send a visible follow-up by agent name or session UUID"
@@ -2210,7 +2310,9 @@ def parser() -> argparse.ArgumentParser:
         "activate",
         help="Activate only after workers and approvals are idle",
     )
-    update_activate.add_argument("--if-idle", action="store_true", help=argparse.SUPPRESS)
+    update_activate.add_argument(
+        "--if-idle", action="store_true", help=argparse.SUPPRESS
+    )
     update_activate.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS)
     update_activate.add_argument("--port", type=int, default=service.DEFAULT_PORT)
     update_activate.set_defaults(func=cmd_update)
@@ -2221,6 +2323,12 @@ def parser() -> argparse.ArgumentParser:
         "cancel", help="Cancel a staged update without removing its verified package"
     )
     update_cancel.set_defaults(func=cmd_update)
+    update_prune = update_sub.add_parser(
+        "prune", help="Remove superseded packages while retaining active rollback paths"
+    )
+    update_prune.add_argument("--keep", type=int, default=1)
+    update_prune.add_argument("--dry-run", action="store_true")
+    update_prune.set_defaults(func=cmd_update)
 
     bridge = sub.add_parser(
         "bridge", help="Bridge enabled cdesktop sessions into Repowire"

@@ -746,6 +746,7 @@ def test_spawn_direct_acquires_workspace_lease(monkeypatch, tmp_path: Path) -> N
     monkeypatch.setattr(cli, "CdesktopClient", FakeSpawnClient)
     monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
     monkeypatch.setattr(cli.routing, "enable", lambda _workspace_id: None)
+    monkeypatch.setattr(cli.leases, "sync_active_workspaces", lambda _client: [])
 
     args = argparse.Namespace(
         prompt="start",
@@ -774,6 +775,69 @@ def test_spawn_direct_acquires_workspace_lease(monkeypatch, tmp_path: Path) -> N
     assert leases[0].worktree_path is None
     assert leases[0].workspace_id == "workspace-a"
     assert leases[0].session_id == "session-a"
+
+
+def test_spawn_records_automatic_parent(monkeypatch, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: tmp_path / "leases")
+    monkeypatch.setattr(cli.routing, "enable", lambda _workspace_id: None)
+    monkeypatch.setattr(cli.leases, "sync_active_workspaces", lambda _client: [])
+    monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
+    monkeypatch.setenv("CDESKTOP_SESSION_ID", "parent-session")
+    monkeypatch.setenv(
+        "SIGHTMESH_RELATIONSHIPS_DB", str(tmp_path / "relationships.sqlite3")
+    )
+
+    class ParentClient(FakeSpawnClient):
+        def workspaces(self):
+            return [
+                {
+                    "id": "parent-workspace",
+                    "name": "parent",
+                    "archived": False,
+                }
+            ]
+
+        def workspace_summaries(self, _archived=False):
+            return []
+
+        def sessions(self, workspace_id):
+            assert workspace_id == "parent-workspace"
+            return [
+                {
+                    "id": "parent-session",
+                    "name": "lead",
+                    "created_at": "2026-08-13T00:00:00Z",
+                }
+            ]
+
+    monkeypatch.setattr(cli, "CdesktopClient", ParentClient)
+    args = argparse.Namespace(
+        prompt="start",
+        prompt_file=None,
+        repo=str(repo),
+        url=None,
+        name="child",
+        base="main",
+        executor="CODEX",
+        worktree=False,
+        permission="SUPERVISED",
+        unattended=False,
+        model=None,
+        reasoning=None,
+        provider=None,
+        parent_session=None,
+        lease_ttl_seconds=60,
+        no_bridge=False,
+        json=True,
+    )
+
+    assert cli.cmd_spawn(args) == 0
+
+    edge = cli.relationships.RelationshipStore().parent("session-a")
+    assert edge is not None
+    assert edge.parent_session_id == "parent-session"
 
 
 def test_spawn_worktree_acquires_container_lease(monkeypatch, tmp_path: Path) -> None:

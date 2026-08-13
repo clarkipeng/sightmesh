@@ -1,4 +1,7 @@
 import hashlib
+import os
+import plistlib
+import time
 import zipfile
 from pathlib import Path
 
@@ -15,11 +18,13 @@ class FakeClient:
         approvals: bool = False,
         version: str = "0.2.4-sightmesh.1",
         drain_supported: bool = True,
+        queued: bool = False,
     ) -> None:
         self.running = running
         self.approvals = approvals
         self.version = version
         self.drain_supported = drain_supported
+        self.queued = queued
         self.drain_calls = []
 
     def set_update_drain(self, seconds):
@@ -54,13 +59,18 @@ class FakeClient:
             }
         ]
 
+    def queue_status(self, _session_id):
+        return {"status": "queued" if self.queued else "empty"}
+
     def info(self):
         return {"version": self.version}
 
 
 def isolated_state(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(updates, "root_dir", lambda: tmp_path / "releases")
-    monkeypatch.setattr(updates, "state_path", lambda: tmp_path / "state" / "update.json")
+    monkeypatch.setattr(
+        updates, "state_path", lambda: tmp_path / "state" / "update.json"
+    )
     monkeypatch.setattr(service, "state_dir", lambda: tmp_path / "state")
 
 
@@ -117,6 +127,54 @@ def test_stage_verifies_and_installs_into_versioned_directory(
     assert updates.read_state()["pending"]["version"] == "0.2.4-sightmesh.1"
 
 
+def test_stage_keeps_active_release_metadata(monkeypatch, tmp_path) -> None:
+    isolated_state(monkeypatch, tmp_path)
+    updates._write_json_atomic(
+        updates.state_path(),
+        {
+            "schema_version": 1,
+            "status": "active",
+            "pending": None,
+            "active": {"version": "current", "executable": "/tmp/current"},
+            "previous_plist": "/tmp/rollback.plist",
+        },
+    )
+    package = tmp_path / "cdesktop.tgz"
+    package.write_bytes(b"verified-package")
+
+    class Result:
+        returncode = 0
+        stdout = "cdesktop/next darwin-arm64"
+        stderr = ""
+
+    def run(command, **_kwargs):
+        if command[0] == "npm":
+            prefix = Path(command[command.index("--prefix") + 1])
+            executable = prefix / "node_modules" / ".bin" / "cdesktop"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("fixture", encoding="utf-8")
+            archive = (
+                prefix
+                / "node_modules"
+                / "cdesktop"
+                / "dist"
+                / "macos-arm64"
+                / "cdesktop.zip"
+            )
+            archive.parent.mkdir(parents=True)
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr("cdesktop", b"backend")
+        return Result()
+
+    monkeypatch.setattr(updates.subprocess, "run", run)
+    monkeypatch.setattr(updates, "_platform_directory", lambda: "macos-arm64")
+
+    state = updates.stage(str(package), "next")
+
+    assert state["active"]["version"] == "current"
+    assert state["previous_plist"] == "/tmp/rollback.plist"
+
+
 def test_stage_refuses_package_without_backend_archive(monkeypatch, tmp_path) -> None:
     isolated_state(monkeypatch, tmp_path)
     package = tmp_path / "cdesktop.tgz"
@@ -152,6 +210,94 @@ def test_activity_ignores_devservers_and_reports_agent_work() -> None:
     client.running = False
     client.approvals = False
     assert updates.activity(client)["idle"] is True
+
+
+def test_activity_waits_for_durable_follow_ups() -> None:
+    result = updates.activity(FakeClient(queued=True))
+
+    assert result["idle"] is False
+    assert result["queued_follow_ups"] == [
+        {"workspace_id": "workspace-1", "session_id": "session-1"}
+    ]
+
+
+def test_prune_preserves_active_pending_and_rollback_releases(
+    monkeypatch, tmp_path: Path
+) -> None:
+    isolated_state(monkeypatch, tmp_path)
+    root = updates.root_dir()
+    root.mkdir(parents=True)
+    releases = {
+        name: root / name
+        for name in (
+            "cdesktop-active",
+            "cdesktop-pending",
+            "cdesktop-rollback",
+            "cdesktop-extra-new",
+            "cdesktop-extra-old",
+        )
+    }
+    for index, release in enumerate(releases.values()):
+        executable = release / "node_modules" / ".bin" / "cdesktop"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("fixture", encoding="utf-8")
+        timestamp = time.time() + index
+        os.utime(release, (timestamp, timestamp))
+
+    backup_root = root / "backups"
+    backup_root.mkdir()
+    rollback_plist = backup_root / "cdesktop-rollback.plist"
+    rollback_plist.write_bytes(
+        plistlib.dumps(
+            {
+                "ProgramArguments": [
+                    str(
+                        releases["cdesktop-rollback"]
+                        / "node_modules"
+                        / ".bin"
+                        / "cdesktop"
+                    )
+                ]
+            }
+        )
+    )
+    updates._write_json_atomic(
+        updates.state_path(),
+        {
+            "schema_version": 1,
+            "status": "staged",
+            "active": {
+                "executable": str(
+                    releases["cdesktop-active"] / "node_modules" / ".bin" / "cdesktop"
+                )
+            },
+            "pending": {
+                "executable": str(
+                    releases["cdesktop-pending"] / "node_modules" / ".bin" / "cdesktop"
+                )
+            },
+            "previous_plist": str(rollback_plist),
+        },
+    )
+
+    result = updates.prune(keep=1)
+
+    assert releases["cdesktop-active"].exists()
+    assert releases["cdesktop-pending"].exists()
+    assert releases["cdesktop-rollback"].exists()
+    assert sum(path.exists() for name, path in releases.items() if "extra" in name) == 1
+    assert len([path for path in result["removed"] if "extra" in path]) == 1
+
+
+def test_automatic_prune_reports_cleanup_error_without_failing(monkeypatch) -> None:
+    def fail() -> None:
+        raise OSError("read only")
+
+    monkeypatch.setattr(updates, "prune", fail)
+
+    result = updates._automatic_prune()
+
+    assert result["error"] == "read only"
 
 
 def test_activation_waits_without_touching_services(monkeypatch, tmp_path) -> None:
@@ -199,14 +345,20 @@ def test_activation_restarts_owned_services_and_verifies_version(
     monkeypatch.setattr(updates, "QUIET_SECONDS", 0)
     monkeypatch.setattr(service, "plist_path", lambda: target)
     monkeypatch.setattr(service, "bridge_plist_path", lambda: bridge)
-    monkeypatch.setattr(service, "definition", lambda _port, executable: {"ProgramArguments": [str(executable)]})
+    monkeypatch.setattr(
+        service,
+        "definition",
+        lambda _port, executable: {"ProgramArguments": [str(executable)]},
+    )
     monkeypatch.setattr(service, "_bootout", lambda _label: None)
     monkeypatch.setattr(service, "_wait_until_unloaded", lambda _label: None)
     monkeypatch.setattr(service, "wait_until_healthy", lambda _port: None)
     monkeypatch.setattr(service, "_loaded", lambda _label: True)
     monkeypatch.setattr(service, "is_healthy", lambda _port: True)
     bootstraps = []
-    monkeypatch.setattr(service, "_bootstrap", lambda label, path: bootstraps.append((label, path)))
+    monkeypatch.setattr(
+        service, "_bootstrap", lambda label, path: bootstraps.append((label, path))
+    )
     monkeypatch.setattr(updates, "CdesktopClient", lambda _url: FakeClient())
 
     client = FakeClient()
@@ -245,7 +397,11 @@ def test_activation_allows_exact_legacy_bootstrap_without_drain(
     monkeypatch.setattr(updates, "QUIET_SECONDS", 0)
     monkeypatch.setattr(service, "plist_path", lambda: target)
     monkeypatch.setattr(service, "bridge_plist_path", lambda: bridge)
-    monkeypatch.setattr(service, "definition", lambda _port, executable: {"ProgramArguments": [str(executable)]})
+    monkeypatch.setattr(
+        service,
+        "definition",
+        lambda _port, executable: {"ProgramArguments": [str(executable)]},
+    )
     monkeypatch.setattr(service, "_bootout", lambda _label: None)
     monkeypatch.setattr(service, "_wait_until_unloaded", lambda _label: None)
     monkeypatch.setattr(service, "wait_until_healthy", lambda _port: None)
@@ -268,7 +424,9 @@ def test_activation_allows_exact_legacy_bootstrap_without_drain(
     assert result["active"]["version"] == "0.2.3-sightmesh.2"
 
 
-def test_activation_refuses_unknown_backend_without_drain(monkeypatch, tmp_path) -> None:
+def test_activation_refuses_unknown_backend_without_drain(
+    monkeypatch, tmp_path
+) -> None:
     isolated_state(monkeypatch, tmp_path)
     updates._write_json_atomic(
         updates.state_path(),

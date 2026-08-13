@@ -186,6 +186,12 @@ class CdesktopClient:
             raise CdesktopError("cdesktop execution process response is not a list")
         return [dict(item) for item in result if isinstance(item, dict)]
 
+    def queue_status(self, session_id: str) -> dict[str, Any]:
+        result = self.request("GET", f"/sessions/{session_id}/queue")
+        if not isinstance(result, dict):
+            raise CdesktopError("cdesktop queue status response is invalid")
+        return result
+
     def normalized_snapshot(self, execution_process_id: str) -> dict[str, Any]:
         result = self.request(
             "GET",

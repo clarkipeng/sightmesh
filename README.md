@@ -15,7 +15,7 @@ Prerequisites:
 - macOS
 - Python 3.11 or newer
 - `uv`
-- the SightMesh cdesktop fork package `0.2.3-sightmesh.2`
+- the SightMesh cdesktop fork package `0.2.3-sightmesh.3`
 - `repowire`
 - at least one authenticated supported agent CLI
 
@@ -161,13 +161,14 @@ The managed LaunchAgents are `io.sightmesh.cdesktop`, `io.sightmesh.bridge`, and
 
 Every workspace created by `sightmesh spawn` is bridge-enabled unless `--no-bridge` is passed. The bridge registers one durable Repowire proxy peer per enabled cdesktop session. Repowire asks become visible cdesktop follow-ups, and `sightmesh bridge-reply` closes the original correlation.
 
-Same-workspace teammates can contact their lead without looking up a session ID. The cdesktop fork injects this contract into every teammate prompt:
+Every workspace launched from a cdesktop agent records that exact parent session. Children can inspect or immediately contact their launcher without looking up an ID:
 
 ```bash
-cdesktop team manager --message "BLOCKED: need a decision on the storage schema"
+sightmesh parent
+sightmesh parent --message "BLOCKED: need a decision on the storage schema"
 ```
 
-Use the same command for questions, status updates, and completion notices. Cross-workspace communication continues to use Repowire.
+`sightmesh children` lists only the workspaces directly launched by the current session. These edges are return addresses, not authority locks. Same-workspace teammates can also use the native `cdesktop team manager` alias. Cross-workspace durable, non-interrupting communication continues to use Repowire.
 
 Every local agent can inspect and immediately steer every other visible agent with compact, exact selectors:
 

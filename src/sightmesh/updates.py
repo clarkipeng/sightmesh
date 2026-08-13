@@ -54,8 +54,124 @@ def read_state() -> dict[str, Any]:
         return {"schema_version": SCHEMA_VERSION, "status": "idle", "pending": None}
     value = json.loads(path.read_text(encoding="utf-8"))
     if value.get("schema_version") != SCHEMA_VERSION:
-        raise RuntimeError(f"Unsupported update state schema: {value.get('schema_version')!r}")
+        raise RuntimeError(
+            f"Unsupported update state schema: {value.get('schema_version')!r}"
+        )
     return value
+
+
+def _release_for_executable(executable: object, updates_root: Path) -> Path | None:
+    if not executable:
+        return None
+    try:
+        relative = (
+            Path(str(executable))
+            .expanduser()
+            .resolve()
+            .relative_to(updates_root.resolve())
+        )
+    except (OSError, ValueError):
+        return None
+    if not relative.parts:
+        return None
+    release = updates_root / relative.parts[0]
+    if not release.name.startswith("cdesktop-") or not release.is_dir():
+        return None
+    return release
+
+
+def _plist_executable(path: object) -> str | None:
+    if not path:
+        return None
+    try:
+        value = plistlib.loads(Path(str(path)).expanduser().read_bytes())
+        arguments = value.get("ProgramArguments")
+        if isinstance(arguments, list) and arguments:
+            return str(arguments[0])
+    except (OSError, plistlib.InvalidFileException, TypeError, ValueError):
+        return None
+    return None
+
+
+def prune(*, keep: int = 1, dry_run: bool = False) -> dict[str, Any]:
+    if keep < 0:
+        raise ValueError("--keep must not be negative")
+    updates_root = root_dir()
+    if not updates_root.exists():
+        return {"removed": [], "retained": [], "dry_run": dry_run}
+
+    state = read_state()
+    protected: set[Path] = set()
+    for release_state in (state.get("active"), state.get("pending")):
+        if isinstance(release_state, dict):
+            release = _release_for_executable(
+                release_state.get("executable"), updates_root
+            )
+            if release:
+                protected.add(release.resolve())
+    rollback_release = _release_for_executable(
+        _plist_executable(state.get("previous_plist")), updates_root
+    )
+    if rollback_release:
+        protected.add(rollback_release.resolve())
+
+    releases = sorted(
+        (
+            path
+            for path in updates_root.glob("cdesktop-*")
+            if path.is_dir() and not path.is_symlink()
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    retained_unprotected = 0
+    removed: list[str] = []
+    retained: list[str] = []
+    for release in releases:
+        resolved = release.resolve()
+        if resolved in protected or retained_unprotected < keep:
+            retained.append(str(release))
+            if resolved not in protected:
+                retained_unprotected += 1
+            continue
+        removed.append(str(release))
+        if not dry_run:
+            shutil.rmtree(release)
+
+    backup_root = updates_root / "backups"
+    protected_backup = (
+        Path(str(state["previous_plist"])).expanduser().resolve()
+        if state.get("previous_plist")
+        else None
+    )
+    backups = sorted(
+        (
+            path
+            for path in backup_root.glob("cdesktop-*.plist")
+            if path.is_file() and not path.is_symlink()
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    retained_backups = 0
+    for backup in backups:
+        if backup.resolve() == protected_backup or retained_backups < keep:
+            retained.append(str(backup))
+            if backup.resolve() != protected_backup:
+                retained_backups += 1
+            continue
+        removed.append(str(backup))
+        if not dry_run:
+            backup.unlink()
+
+    return {"removed": removed, "retained": retained, "dry_run": dry_run}
+
+
+def _automatic_prune() -> dict[str, Any]:
+    try:
+        return prune()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {"removed": [], "retained": [], "dry_run": False, "error": str(exc)}
 
 
 @contextmanager
@@ -149,7 +265,9 @@ def _validate_package_payload(package_root: Path) -> str:
                     f"Staged backend archive has a corrupt member {corrupt_member}: {archive}"
                 )
     except zipfile.BadZipFile as exc:
-        raise RuntimeError(f"Staged cdesktop backend archive is invalid: {archive}") from exc
+        raise RuntimeError(
+            f"Staged cdesktop backend archive is invalid: {archive}"
+        ) from exc
     return str(archive)
 
 
@@ -166,6 +284,7 @@ def stage(
         raise ValueError("Remote update packages require --sha256")
 
     updates_root = root_dir()
+    current_state = read_state()
     updates_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     updates_root.chmod(0o700)
     temporary = Path(tempfile.mkdtemp(prefix="stage.", dir=updates_root))
@@ -223,10 +342,13 @@ def stage(
                 "backend_archive": backend_archive,
                 "staged_at": now,
             },
+            "active": current_state.get("active"),
+            "previous_plist": current_state.get("previous_plist"),
             "last_error": None,
             "updated_at": now,
         }
         _write_json_atomic(state_path(), state)
+        state["cleanup"] = _automatic_prune()
         return state
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -235,10 +357,19 @@ def stage(
 def activity(client: CdesktopClient) -> dict[str, Any]:
     approvals = client.pending_approvals()
     running: list[dict[str, Any]] = []
+    queued: list[dict[str, Any]] = []
     for workspace in client.workspaces():
         if workspace.get("archived"):
             continue
         for session in client.sessions(str(workspace["id"])):
+            queue_status = client.queue_status(str(session["id"]))
+            if queue_status.get("status") == "queued":
+                queued.append(
+                    {
+                        "workspace_id": workspace["id"],
+                        "session_id": session["id"],
+                    }
+                )
             for process in client.execution_processes(str(session["id"])):
                 if (
                     process.get("status") == "running"
@@ -253,8 +384,9 @@ def activity(client: CdesktopClient) -> dict[str, Any]:
                         }
                     )
     return {
-        "idle": not running and not approvals,
+        "idle": not running and not approvals and not queued,
         "running": running,
+        "queued_follow_ups": queued,
         "pending_approvals": [
             {
                 "approval_id": item.get("approval_id"),
@@ -395,6 +527,7 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
             "updated_at": time.time(),
         }
         _write_json_atomic(state_path(), active)
+        active["cleanup"] = _automatic_prune()
         return {**active, "action": "activated"}
     except Exception:
         if drain_enabled and service.is_healthy(port):
