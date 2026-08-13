@@ -1469,27 +1469,13 @@ def cmd_update(args: argparse.Namespace) -> int:
             args.version,
             expected_sha256=args.sha256,
         )
-        service.install_updater(args.port, start_now=True)
-        result = {
-            **result,
-            "updater": {
-                "installed": service.updater_plist_path().exists(),
-                "loaded": service._loaded(service.UPDATER_LABEL),
-            },
-        }
     elif args.update_action == "activate":
         result = updates.activate_if_idle(
             CdesktopClient(args.url),
             port=args.port,
         )
     elif args.update_action == "status":
-        result = {
-            **updates.read_state(),
-            "updater": {
-                "installed": service.updater_plist_path().exists(),
-                "loaded": service._loaded(service.UPDATER_LABEL),
-            },
-        }
+        result = updates.read_state()
         if result.get("pending") and service.is_healthy(args.port):
             result["activity"] = updates.activity(CdesktopClient(args.url))
     elif args.update_action == "cancel":
@@ -2304,16 +2290,11 @@ def parser() -> argparse.ArgumentParser:
     update_stage.add_argument(
         "--sha256", help="Required SHA-256 digest for remote packages"
     )
-    update_stage.add_argument("--port", type=int, default=service.DEFAULT_PORT)
     update_stage.set_defaults(func=cmd_update)
     update_activate = update_sub.add_parser(
         "activate",
-        help="Activate only after workers and approvals are idle",
+        help="Activate now, or return safely while workers are busy",
     )
-    update_activate.add_argument(
-        "--if-idle", action="store_true", help=argparse.SUPPRESS
-    )
-    update_activate.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS)
     update_activate.add_argument("--port", type=int, default=service.DEFAULT_PORT)
     update_activate.set_defaults(func=cmd_update)
     update_status = update_sub.add_parser("status", help="Show staged update state")

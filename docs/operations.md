@@ -35,12 +35,10 @@ checks the platform-specific backend ZIP and every member without executing the 
 backend, and records pending state atomically under `~/.local/state/sightmesh/update.json`. It
 does not overwrite the globally installed cdesktop package or restart a worker.
 
-The separate updater LaunchAgent attempts activation every five seconds. Busy coding,
-setup, cleanup, or archive processes and pending questions or approvals keep the update
-in `waiting-for-idle`. Dev servers do not block activation because they are disposable
-children of the backend. Once idle, the updater stops Repowire bridge intake, observes a
-two-second quiet period, and rechecks the complete fleet before changing the cdesktop
-LaunchAgent definition.
+Run `sightmesh update activate` when you want to apply the staged release. Busy coding,
+setup, cleanup, or archive processes and pending questions or approvals cause it to
+return without changing the service. Dev servers do not block activation because they
+are disposable children of the backend.
 
 Activation checks the new backend health endpoint and exact reported version before
 restarting the bridge. Failure is recorded, clears pending activation, and is never
@@ -127,4 +125,4 @@ Use `sightmesh --json lease list` for inspection. Workspace-to-token mappings ar
 
 `scripts/recovery-smoke.sh` defaults to dry-run mode. With `DRY_RUN=0`, it creates a temporary `HOME`, fake disposable `cdesktop` and `sightmesh` executables, installs SightMesh LaunchAgent plists without starting launchd, and verifies lease workspace release inside that temporary state root. It never stops Conductor workers, provider sessions, cdesktop sessions, or unmanaged launchd labels.
 
-Managed service operations remain scoped to the explicit SightMesh labels `io.sightmesh.cdesktop`, `io.sightmesh.bridge`, and `io.sightmesh.updater`. Cutover touches the former two legacy labels only and saves their plist definitions for rollback.
+Managed service operations remain scoped to `io.sightmesh.cdesktop` and `io.sightmesh.bridge`. Installation removes the obsolete updater label. Cutover touches the former two legacy labels only and saves their plist definitions for rollback.

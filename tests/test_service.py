@@ -35,30 +35,9 @@ def test_bridge_definition_targets_managed_local_cdesktop(
     assert definition["Label"] == "io.sightmesh.bridge"
 
 
-def test_updater_definition_retries_quietly_without_restarting_workers(
-    monkeypatch, tmp_path
-) -> None:
-    monkeypatch.setattr(service.shutil, "which", lambda _: "/tmp/sightmesh")
-    monkeypatch.setattr(service, "state_dir", lambda: tmp_path)
-    definition = service.updater_definition(4321)
-    assert definition["ProgramArguments"] == [
-        "/tmp/sightmesh",
-        "--url",
-        "http://127.0.0.1:4321",
-        "update",
-        "activate",
-        "--if-idle",
-        "--quiet",
-    ]
-    assert definition["StartInterval"] == 5
-    assert "KeepAlive" not in definition
-    assert definition["Label"] == "io.sightmesh.updater"
-
-
 def test_service_paths_are_scoped_to_sightmesh() -> None:
     assert service.plist_path().name == "io.sightmesh.cdesktop.plist"
     assert service.bridge_plist_path().name == "io.sightmesh.bridge.plist"
-    assert service.updater_plist_path().name == "io.sightmesh.updater.plist"
     assert service.state_dir().name == "sightmesh"
 
 
@@ -83,11 +62,9 @@ def test_start_reloads_only_the_owned_launch_agent(monkeypatch, tmp_path) -> Non
     target.write_text("fixture", encoding="utf-8")
     bridge_target = tmp_path / "io.sightmesh.bridge.plist"
     bridge_target.write_text("fixture", encoding="utf-8")
-    updater_target = tmp_path / "io.sightmesh.updater.plist"
-    updater_target.write_text("fixture", encoding="utf-8")
     monkeypatch.setattr(service, "plist_path", lambda: target)
     monkeypatch.setattr(service, "bridge_plist_path", lambda: bridge_target)
-    monkeypatch.setattr(service, "updater_plist_path", lambda: updater_target)
+    monkeypatch.setattr(service, "_remove_obsolete_updater", lambda: None)
     monkeypatch.setattr(service, "is_healthy", lambda _port: True)
     monkeypatch.setattr(service, "_wait_until_unloaded", lambda _label: None)
     calls = []
@@ -104,16 +81,13 @@ def test_start_reloads_only_the_owned_launch_agent(monkeypatch, tmp_path) -> Non
     monkeypatch.setattr(service.subprocess, "run", run)
     service.start()
     assert calls[0][0:2] == ["launchctl", "bootout"]
-    assert calls[0][2].endswith("/io.sightmesh.updater")
+    assert calls[0][2].endswith("/io.sightmesh.bridge")
     assert calls[1][0:2] == ["launchctl", "bootout"]
-    assert calls[1][2].endswith("/io.sightmesh.bridge")
-    assert calls[2][0:2] == ["launchctl", "bootout"]
-    assert calls[2][2].endswith("/io.sightmesh.cdesktop")
+    assert calls[1][2].endswith("/io.sightmesh.cdesktop")
     bootstraps = [call for call in calls if call[0:2] == ["launchctl", "bootstrap"]]
     assert [call[-1] for call in bootstraps] == [
         str(target),
         str(bridge_target),
-        str(updater_target),
     ]
 
 
@@ -150,13 +124,10 @@ def test_install_restores_previous_definitions_when_reload_fails(
 ) -> None:
     target = tmp_path / "io.sightmesh.cdesktop.plist"
     bridge_target = tmp_path / "io.sightmesh.bridge.plist"
-    updater_target = tmp_path / "io.sightmesh.updater.plist"
     target.write_bytes(b"old-cdesktop")
     bridge_target.write_bytes(b"old-bridge")
-    updater_target.write_bytes(b"old-updater")
     monkeypatch.setattr(service, "plist_path", lambda: target)
     monkeypatch.setattr(service, "bridge_plist_path", lambda: bridge_target)
-    monkeypatch.setattr(service, "updater_plist_path", lambda: updater_target)
     monkeypatch.setattr(service, "state_dir", lambda: tmp_path)
     monkeypatch.setattr(service.shutil, "which", lambda name: f"/tmp/{name}")
     attempts = []
@@ -180,12 +151,10 @@ def test_install_restores_previous_definitions_when_reload_fails(
 
     assert target.read_bytes() == b"old-cdesktop"
     assert bridge_target.read_bytes() == b"old-bridge"
-    assert updater_target.read_bytes() == b"old-updater"
     assert len(attempts) == 1
     assert bootstraps == [
         (service.LABEL, b"old-cdesktop"),
         (service.BRIDGE_LABEL, b"old-bridge"),
-        (service.UPDATER_LABEL, b"old-updater"),
     ]
 
 
