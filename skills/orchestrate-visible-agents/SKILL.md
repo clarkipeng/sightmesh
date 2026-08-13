@@ -132,6 +132,8 @@ An agent must never approve its own request. When invoked from cdesktop, only th
 
 Inspect cdesktop transcripts and derived git state. Intervene only on state change, a blocker, scope drift, duplicate ownership, or failed validation. Before retirement, invoke `$reconcile-agent-work`. Archive only after the branch, PR, dirty state, handoff, and remaining scope are reconciled.
 
+Do not run unmanaged shell loops that repeatedly invoke `sightmesh peers`, `peek`, `status`, or `doctor`. Use worker-triggered messages for wakes and bounded one-shot inspections for confirmation. If the bridge reports file-descriptor exhaustion or delivery-store failures, stop issuing new client calls, restart only the SightMesh bridge, verify service health and queued delivery once, then resume from Git and durable handoffs without restarting product workers.
+
 Keep one writer for each conflict hotspot such as a migration or shared composition file. Parallelize disjoint fixtures, adapters, new test files, docs, and exact-head review. Prefer short pushed checkpoints with explicit remaining scope, and replace a worker from the exact pushed branch before context pressure degrades judgment.
 
 Do not rotate an agent at a fixed context percentage. Rotate when behavior shows degraded state tracking or instruction quality, or when the remaining context is plainly insufficient for the next bounded phase. Otherwise preserve continuity. Once rotation is warranted and the destination profile supports checkpointed failover, make it one operation with `sightmesh failover <workspace-id> --profile <profile> --checkpoint-file <handoff> --unattended`; do not manually replay the transcript.
