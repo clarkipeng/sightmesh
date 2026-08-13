@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from . import service
-from .cdesktop import CdesktopClient
+from .cdesktop import CdesktopClient, CdesktopError
 
 SCHEMA_VERSION = 1
 QUIET_SECONDS = 2.0
@@ -393,23 +393,18 @@ def activity(client: CdesktopClient) -> dict[str, Any]:
     approvals = client.pending_approvals()
     running: list[dict[str, Any]] = []
     queued: list[dict[str, Any]] = []
+    unreadable: list[dict[str, Any]] = []
     for workspace in client.workspaces():
         if workspace.get("archived"):
             continue
         for session in client.sessions(str(workspace["id"])):
-            queue_status = client.queue_status(str(session["id"]))
-            if queue_status.get("status") == "queued":
-                queued.append(
-                    {
-                        "workspace_id": workspace["id"],
-                        "session_id": session["id"],
-                    }
-                )
+            session_running = False
             for process in client.execution_processes(str(session["id"])):
                 if (
                     process.get("status") == "running"
                     and process.get("run_reason") != "devserver"
                 ):
+                    session_running = True
                     running.append(
                         {
                             "workspace_id": workspace["id"],
@@ -418,10 +413,31 @@ def activity(client: CdesktopClient) -> dict[str, Any]:
                             "run_reason": process.get("run_reason"),
                         }
                     )
+            if session_running:
+                continue
+            try:
+                queue_status = client.queue_status(str(session["id"]))
+            except CdesktopError as exc:
+                unreadable.append(
+                    {
+                        "workspace_id": workspace["id"],
+                        "session_id": session["id"],
+                        "error": str(exc),
+                    }
+                )
+            else:
+                if queue_status.get("status") == "queued":
+                    queued.append(
+                        {
+                            "workspace_id": workspace["id"],
+                            "session_id": session["id"],
+                        }
+                    )
     return {
-        "idle": not running and not approvals and not queued,
+        "idle": not running and not approvals and not queued and not unreadable,
         "running": running,
         "queued_follow_ups": queued,
+        "unreadable_sessions": unreadable,
         "pending_approvals": [
             {
                 "approval_id": item.get("approval_id"),

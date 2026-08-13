@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from sightmesh import service, updates
+from sightmesh.cdesktop import CdesktopError
 
 
 class FakeClient:
@@ -228,6 +229,19 @@ def test_activity_waits_for_durable_follow_ups() -> None:
     assert result["queued_follow_ups"] == [
         {"workspace_id": "workspace-1", "session_id": "session-1"}
     ]
+
+
+def test_activity_stays_busy_when_an_idle_session_cannot_be_read() -> None:
+    client = FakeClient()
+
+    def fail_queue(_session_id):
+        raise CdesktopError("queue unavailable")
+
+    client.queue_status = fail_queue
+    result = updates.activity(client)
+
+    assert result["idle"] is False
+    assert result["unreadable_sessions"][0]["session_id"] == "session-1"
 
 
 def test_native_state_migration_imports_then_archives(monkeypatch, tmp_path) -> None:
