@@ -12,7 +12,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import __version__, approvals, conductor_migrate, leases, routing, service
+from . import (
+    __version__,
+    approvals,
+    conductor_migrate,
+    leases,
+    routing,
+    service,
+    updates,
+)
 from .bridge import run_bridge
 from .cdesktop import CdesktopClient, CdesktopError
 from .delivery import DeliveryStore, DeliveryStoreError, to_dict
@@ -1380,6 +1388,45 @@ def cmd_service(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_update(args: argparse.Namespace) -> int:
+    if args.update_action == "stage":
+        result = updates.stage(
+            args.package,
+            args.version,
+            expected_sha256=args.sha256,
+        )
+        service.install_updater(args.port, start_now=True)
+        result = {
+            **result,
+            "updater": {
+                "installed": service.updater_plist_path().exists(),
+                "loaded": service._loaded(service.UPDATER_LABEL),
+            },
+        }
+    elif args.update_action == "activate":
+        result = updates.activate_if_idle(
+            CdesktopClient(args.url),
+            port=args.port,
+        )
+    elif args.update_action == "status":
+        result = {
+            **updates.read_state(),
+            "updater": {
+                "installed": service.updater_plist_path().exists(),
+                "loaded": service._loaded(service.UPDATER_LABEL),
+            },
+        }
+        if result.get("pending") and service.is_healthy(args.port):
+            result["activity"] = updates.activity(CdesktopClient(args.url))
+    elif args.update_action == "cancel":
+        result = updates.cancel()
+    else:
+        raise ValueError(f"Unknown update action: {args.update_action}")
+    if not getattr(args, "quiet", False):
+        _emit(result, args.json)
+    return 0
+
+
 def cmd_close(args: argparse.Namespace) -> int:
     client = CdesktopClient(args.url)
     workspace = client.workspace(args.workspace_id)
@@ -2144,6 +2191,37 @@ def parser() -> argparse.ArgumentParser:
     managed.add_argument("--no-start", action="store_true")
     managed.set_defaults(func=cmd_service)
 
+    update = sub.add_parser(
+        "update", help="Stage and safely activate versioned cdesktop releases"
+    )
+    update_sub = update.add_subparsers(dest="update_action", required=True)
+    update_stage = update_sub.add_parser(
+        "stage",
+        help="Verify and install a release without interrupting active workers",
+    )
+    update_stage.add_argument("--package", required=True, help="Local tgz or HTTPS URL")
+    update_stage.add_argument("--version", required=True)
+    update_stage.add_argument(
+        "--sha256", help="Required SHA-256 digest for remote packages"
+    )
+    update_stage.add_argument("--port", type=int, default=service.DEFAULT_PORT)
+    update_stage.set_defaults(func=cmd_update)
+    update_activate = update_sub.add_parser(
+        "activate",
+        help="Activate only after workers and approvals are idle",
+    )
+    update_activate.add_argument("--if-idle", action="store_true", help=argparse.SUPPRESS)
+    update_activate.add_argument("--quiet", action="store_true", help=argparse.SUPPRESS)
+    update_activate.add_argument("--port", type=int, default=service.DEFAULT_PORT)
+    update_activate.set_defaults(func=cmd_update)
+    update_status = update_sub.add_parser("status", help="Show staged update state")
+    update_status.add_argument("--port", type=int, default=service.DEFAULT_PORT)
+    update_status.set_defaults(func=cmd_update)
+    update_cancel = update_sub.add_parser(
+        "cancel", help="Cancel a staged update without removing its verified package"
+    )
+    update_cancel.set_defaults(func=cmd_update)
+
     bridge = sub.add_parser(
         "bridge", help="Bridge enabled cdesktop sessions into Repowire"
     )
@@ -2309,6 +2387,7 @@ def main() -> None:
         leases.LeaseError,
         RepowireError,
         ProfileError,
+        RuntimeError,
         OSError,
         ValueError,
     ) as exc:

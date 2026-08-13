@@ -15,7 +15,7 @@ Prerequisites:
 - macOS
 - Python 3.11 or newer
 - `uv`
-- the SightMesh cdesktop fork package `0.2.3-sightmesh.1`
+- the SightMesh cdesktop fork package `0.2.3-sightmesh.2`
 - `repowire`
 - at least one authenticated supported agent CLI
 
@@ -85,6 +85,31 @@ sightmesh delivery status
 sightmesh lease list
 ```
 
+Stage a verified cdesktop release while workers continue running:
+
+```sh
+sightmesh update stage \
+  --package https://github.com/OWNER/cdesktop/releases/download/TAG/cdesktop.tgz \
+  --version VERSION \
+  --sha256 EXPECTED_SHA256
+sightmesh update status
+```
+
+Staging installs the package in a private versioned directory and never modifies the
+running executable. A separate `io.sightmesh.updater` LaunchAgent checks every five
+seconds. It waits for zero coding executions and zero pending questions or approvals,
+stops bridge intake, observes a two-second quiet period, and checks again. Only then
+does it restart cdesktop on the staged executable. The updater verifies both health and
+the reported version, restarts the bridge, and restores the previous LaunchAgent
+definition automatically if activation fails. `sightmesh update cancel` cancels a
+pending activation without deleting its verified package.
+
+The SightMesh CLI and skills can be replaced between commands without restarting
+cdesktop. The cdesktop backend cannot be replaced inside an active model turn because
+that process owns the executor stream and live approval responder. The staged updater
+therefore performs an automatic boundary handoff rather than claiming an unsafe
+mid-turn hot swap.
+
 Review pending agent plans from a lead session or directly as the local human:
 
 ```sh
@@ -132,7 +157,7 @@ Codex CLI ───────┘            │
                               └─ Repowire local request/reply mesh
 ```
 
-The managed LaunchAgents are `io.sightmesh.cdesktop` and `io.sightmesh.bridge`. cdesktop binds to `127.0.0.1:3210`; analytics and relay are disabled; managed worktrees default to `~/.local/share/sightmesh/.cdesktop-workspaces`; state and logs live under `~/.local/state/sightmesh`.
+The managed LaunchAgents are `io.sightmesh.cdesktop`, `io.sightmesh.bridge`, and `io.sightmesh.updater`. cdesktop binds to `127.0.0.1:3210`; analytics and relay are disabled; managed worktrees default to `~/.local/share/sightmesh/.cdesktop-workspaces`; state and logs live under `~/.local/state/sightmesh`.
 
 Every workspace created by `sightmesh spawn` is bridge-enabled unless `--no-bridge` is passed. The bridge registers one durable Repowire proxy peer per enabled cdesktop session. Repowire asks become visible cdesktop follow-ups, and `sightmesh bridge-reply` closes the original correlation.
 

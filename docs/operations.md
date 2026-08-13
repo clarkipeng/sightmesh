@@ -18,6 +18,34 @@ sightmesh workspace rename WORKSPACE_ID repository/task-name
 
 cdesktop remains the viewing surface. Use its repository-grouped sidebar, conversation panel, process logs, changed-file tree and diff, Open in IDE action for the complete checkout, and built-in preview browser for running applications or image review.
 
+## Staged cdesktop updates
+
+Use a release archive and its independently published SHA-256 digest:
+
+```sh
+sightmesh update stage --package URL_OR_LOCAL_TGZ --version VERSION --sha256 SHA256
+sightmesh update status
+sightmesh update cancel
+```
+
+Remote packages require a digest. Staging downloads and verifies the archive, installs
+it under `~/.local/share/sightmesh/updates`, runs the staged executable's version check,
+and records pending state atomically under `~/.local/state/sightmesh/update.json`. It
+does not overwrite the globally installed cdesktop package or restart a worker.
+
+The separate updater LaunchAgent attempts activation every five seconds. Busy coding,
+setup, cleanup, or archive processes and pending questions or approvals keep the update
+in `waiting-for-idle`. Dev servers do not block activation because they are disposable
+children of the backend. Once idle, the updater stops Repowire bridge intake, observes a
+two-second quiet period, and rechecks the complete fleet before changing the cdesktop
+LaunchAgent definition.
+
+Activation checks the new backend health endpoint and exact reported version before
+restarting the bridge. Failure restores the previous plist and backend, and the update
+state retains both activation and rollback errors for diagnosis. The updater never
+claims to preserve an active executor stream across a backend restart. CLI and skill
+updates are one-shot and can take effect while cdesktop workers continue.
+
 ## Plan approvals
 
 Inspect and decide pending visible-agent plans without taking over the worker transcript:
@@ -90,4 +118,4 @@ Use `sightmesh --json lease list` for inspection. Workspace-to-token mappings ar
 
 `scripts/recovery-smoke.sh` defaults to dry-run mode. With `DRY_RUN=0`, it creates a temporary `HOME`, fake disposable `cdesktop` and `sightmesh` executables, installs SightMesh LaunchAgent plists without starting launchd, and verifies lease workspace release inside that temporary state root. It never stops Conductor workers, provider sessions, cdesktop sessions, or unmanaged launchd labels.
 
-Managed service operations remain scoped to the explicit SightMesh labels `io.sightmesh.cdesktop` and `io.sightmesh.bridge`. Cutover touches the former two owned labels only and saves their plist definitions for rollback.
+Managed service operations remain scoped to the explicit SightMesh labels `io.sightmesh.cdesktop`, `io.sightmesh.bridge`, and `io.sightmesh.updater`. Cutover touches the former two legacy labels only and saves their plist definitions for rollback.

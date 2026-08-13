@@ -90,6 +90,14 @@ class CdesktopClient:
     def info(self) -> dict[str, Any]:
         return self.request("GET", "/info")
 
+    def set_update_drain(self, seconds: int) -> dict[str, Any]:
+        if not 0 <= seconds <= 30:
+            raise ValueError("Update drain seconds must be between 0 and 30")
+        result = self.request("POST", "/maintenance/drain", {"seconds": seconds})
+        if not isinstance(result, dict):
+            raise CdesktopError("cdesktop update drain response is invalid")
+        return result
+
     def configure_local(self, workspace_root: Path) -> dict[str, Any]:
         info = self.info()
         config = dict(info["config"])

@@ -15,6 +15,7 @@ from urllib.request import urlopen
 
 LABEL = "io.sightmesh.cdesktop"
 BRIDGE_LABEL = "io.sightmesh.bridge"
+UPDATER_LABEL = "io.sightmesh.updater"
 LEGACY_LABEL = "io.agent-deck.cdesktop"
 LEGACY_BRIDGE_LABEL = "io.agent-deck.bridge"
 DEFAULT_PORT = 3210
@@ -30,6 +31,10 @@ def plist_path() -> Path:
 
 def bridge_plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{BRIDGE_LABEL}.plist"
+
+
+def updater_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{UPDATER_LABEL}.plist"
 
 
 def state_dir() -> Path:
@@ -101,15 +106,17 @@ def is_healthy(port: int = DEFAULT_PORT) -> bool:
         return False
 
 
-def definition(port: int = DEFAULT_PORT) -> dict[str, Any]:
-    executable = shutil.which("cdesktop")
-    if not executable:
+def definition(
+    port: int = DEFAULT_PORT, *, executable: Path | str | None = None
+) -> dict[str, Any]:
+    resolved_executable = str(executable) if executable else shutil.which("cdesktop")
+    if not resolved_executable:
         raise RuntimeError("cdesktop is not installed")
     logs = state_dir()
     logs.mkdir(parents=True, exist_ok=True)
     return {
         "Label": LABEL,
-        "ProgramArguments": [executable],
+        "ProgramArguments": [resolved_executable],
         "RunAtLoad": True,
         "KeepAlive": True,
         "ProcessType": "Interactive",
@@ -150,16 +157,66 @@ def bridge_definition(port: int = DEFAULT_PORT) -> dict[str, Any]:
     }
 
 
+def updater_definition(port: int = DEFAULT_PORT) -> dict[str, Any]:
+    executable = shutil.which("sightmesh")
+    if not executable:
+        raise RuntimeError("sightmesh is not installed")
+    logs = state_dir()
+    logs.mkdir(parents=True, exist_ok=True)
+    return {
+        "Label": UPDATER_LABEL,
+        "ProgramArguments": [
+            executable,
+            "--url",
+            service_url(port),
+            "update",
+            "activate",
+            "--if-idle",
+            "--quiet",
+        ],
+        "RunAtLoad": True,
+        "StartInterval": 5,
+        "ProcessType": "Background",
+        "Umask": 0o077,
+        "EnvironmentVariables": {
+            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        },
+        "StandardOutPath": str(logs / "updater.stdout.log"),
+        "StandardErrorPath": str(logs / "updater.stderr.log"),
+    }
+
+
+def install_updater(port: int = DEFAULT_PORT, start_now: bool = True) -> Path:
+    harden_local_storage()
+    target = updater_plist_path()
+    previous = target.read_bytes() if target.exists() else None
+    _write_bytes_atomic(target, plistlib.dumps(updater_definition(port)))
+    if start_now:
+        try:
+            _bootstrap(UPDATER_LABEL, target)
+        except RuntimeError:
+            if previous is None:
+                target.unlink(missing_ok=True)
+            else:
+                _write_bytes_atomic(target, previous)
+                _bootstrap(UPDATER_LABEL, target)
+            raise
+    return target
+
+
 def install(port: int = DEFAULT_PORT, start_now: bool = True) -> Path:
     harden_local_storage()
     target = plist_path()
     bridge_target = bridge_plist_path()
+    updater_target = updater_plist_path()
     previous = {
         target: target.read_bytes() if target.exists() else None,
         bridge_target: bridge_target.read_bytes() if bridge_target.exists() else None,
+        updater_target: updater_target.read_bytes() if updater_target.exists() else None,
     }
     _write_bytes_atomic(target, plistlib.dumps(definition(port)))
     _write_bytes_atomic(bridge_target, plistlib.dumps(bridge_definition(port)))
+    _write_bytes_atomic(updater_target, plistlib.dumps(updater_definition(port)))
     if start_now:
         try:
             start(port)
@@ -169,9 +226,13 @@ def install(port: int = DEFAULT_PORT, start_now: bool = True) -> Path:
                     path.unlink(missing_ok=True)
                 else:
                     _write_bytes_atomic(path, payload)
-            if all(payload is not None for payload in previous.values()):
+            if previous[target] is not None and previous[bridge_target] is not None:
                 try:
-                    start(port)
+                    _bootstrap(LABEL, target)
+                    wait_until_healthy(port)
+                    _bootstrap(BRIDGE_LABEL, bridge_target)
+                    if previous[updater_target] is not None:
+                        _bootstrap(UPDATER_LABEL, updater_target)
                 except RuntimeError as rollback_error:
                     raise RuntimeError(
                         "Managed service reload failed and the previous definition "
@@ -311,18 +372,22 @@ def wait_until_healthy(port: int = DEFAULT_PORT, timeout: float = 10.0) -> None:
 def start(port: int = DEFAULT_PORT) -> None:
     target = plist_path()
     bridge_target = bridge_plist_path()
-    for service_path in (target, bridge_target):
+    updater_target = updater_plist_path()
+    for service_path in (target, bridge_target, updater_target):
         if not service_path.exists():
             raise RuntimeError(f"Service is not installed: {service_path}")
+    _bootout(UPDATER_LABEL)
+    _wait_until_unloaded(UPDATER_LABEL)
     _bootout(BRIDGE_LABEL)
     _wait_until_unloaded(BRIDGE_LABEL)
     _bootstrap(LABEL, target)
     wait_until_healthy(port)
     _bootstrap(BRIDGE_LABEL, bridge_target)
+    _bootstrap(UPDATER_LABEL, updater_target)
 
 
 def stop() -> None:
-    for label in (BRIDGE_LABEL, LABEL):
+    for label in (UPDATER_LABEL, BRIDGE_LABEL, LABEL):
         _bootout(label)
 
 
@@ -346,7 +411,9 @@ def cutover(port: int = DEFAULT_PORT) -> dict[str, Any]:
         _bootstrap(BRIDGE_LABEL, bridge_plist_path())
         if not _loaded(BRIDGE_LABEL):
             raise RuntimeError("SightMesh bridge did not remain loaded")
+        _bootstrap(UPDATER_LABEL, updater_plist_path())
     except Exception:
+        _bootout(UPDATER_LABEL)
         _bootout(BRIDGE_LABEL)
         _bootout(LABEL)
         if legacy_cdesktop_loaded and legacy_plist_path().exists():
@@ -377,6 +444,9 @@ def uninstall() -> None:
     bridge_target = bridge_plist_path()
     if bridge_target.exists():
         bridge_target.unlink()
+    updater_target = updater_plist_path()
+    if updater_target.exists():
+        updater_target.unlink()
 
 
 def status(port: int = DEFAULT_PORT) -> dict[str, Any]:
@@ -385,10 +455,13 @@ def status(port: int = DEFAULT_PORT) -> dict[str, Any]:
         "loaded": _loaded(LABEL),
         "bridge_installed": bridge_plist_path().exists(),
         "bridge_loaded": _loaded(BRIDGE_LABEL),
+        "updater_installed": updater_plist_path().exists(),
+        "updater_loaded": _loaded(UPDATER_LABEL),
         "healthy": is_healthy(port),
         "url": service_url(port),
         "plist": str(plist_path()),
         "bridge_plist": str(bridge_plist_path()),
+        "updater_plist": str(updater_plist_path()),
         "logs": str(state_dir()),
     }
 
