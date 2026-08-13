@@ -31,9 +31,10 @@ def test_read_text_requires_one_source(tmp_path) -> None:
     assert _read_text("inline", None, "prompt") == "inline"
 
 
-def test_sightmesh_cdesktop_version_requires_fork_marker() -> None:
+def test_sightmesh_cdesktop_version_accepts_compatible_releases() -> None:
     assert _is_sightmesh_cdesktop_version("cdesktop 0.2.3-sightmesh.1")
     assert _is_sightmesh_cdesktop_version("0.2.3-SIGHTMESH.1")
+    assert _is_sightmesh_cdesktop_version("cdesktop/0.2.4 darwin-arm64")
     assert not _is_sightmesh_cdesktop_version("0.2.3")
     assert not _is_sightmesh_cdesktop_version(None)
 

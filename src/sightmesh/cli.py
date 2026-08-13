@@ -34,6 +34,7 @@ from .repowire import RepowireError
 from .repowire import reply as repowire_reply
 
 CDESKTOP_FORK_MARKER = "sightmesh"
+CDESKTOP_MIN_VERSION = (0, 2, 4)
 COORDINATION_MARKER = "## Local agent coordination"
 COORDINATION_CONTRACT = """## Local agent coordination
 
@@ -78,7 +79,18 @@ def _repowire_status_ok(returncode: int, detail: str) -> bool:
 
 
 def _is_sightmesh_cdesktop_version(detail: object) -> bool:
-    return CDESKTOP_FORK_MARKER in str(detail or "").casefold()
+    normalized = str(detail or "").casefold()
+    if CDESKTOP_FORK_MARKER in normalized:
+        return True
+    parts = normalized.removeprefix("cdesktop/").split(maxsplit=1)
+    if not parts:
+        return False
+    candidate = parts[0]
+    try:
+        version = tuple(int(part) for part in candidate.split(".")[:3])
+    except ValueError:
+        return False
+    return len(version) == 3 and version >= CDESKTOP_MIN_VERSION
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
