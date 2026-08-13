@@ -69,7 +69,7 @@ sightmesh spawn --name worker-name --repo /path/to/repo \
 
 `--unattended` is deliberately worktree-only and selects cdesktop's bypass permission policy. Direct checkouts remain supervised. The SightMesh cdesktop fork adds scriptable plan approvals for supervised work; unattended mode remains an explicit opt-in for isolated autonomous work.
 
-For a worktree spawn, `.conductor/settings.toml` `[scripts] setup` runs in the new worktree before the coding agent starts.
+For a worktree spawn, `.conductor/settings.toml` `[scripts] setup` runs in the new worktree before the coding agent starts. The managed cdesktop service receives the invoking user's interactive-login command path, so setup tools and the executor resolve as they do in a normal terminal. If cdesktop cannot start the executor after creating a workspace, SightMesh reports the native error and deletes the one unambiguous partial workspace through cdesktop's normal delete lifecycle.
 
 Other lifecycle commands:
 

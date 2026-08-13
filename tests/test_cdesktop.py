@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from sightmesh import cdesktop
 from sightmesh.cdesktop import CdesktopClient, _apply_approval_patches
 
@@ -22,6 +24,90 @@ def test_register_repo_reuses_exact_path() -> None:
     repo = client.register_repo(Path("/tmp/repo"))
     assert repo["id"] == "existing"
     assert client.calls == []
+
+
+def test_failed_start_cleans_the_one_new_native_workspace() -> None:
+    class Client(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.workspace_lists = iter(
+                [
+                    [{"id": "existing", "name": "other"}],
+                    [
+                        {"id": "existing", "name": "other"},
+                        {"id": "partial", "name": "worker"},
+                    ],
+                ]
+            )
+
+        def workspaces(self):
+            return next(self.workspace_lists)
+
+        def request(self, method, path, payload=None, query=None, headers=None):
+            self.calls.append((method, path, payload, query, headers))
+            if path == "/workspaces/start":
+                raise cdesktop.CdesktopError("POST /workspaces/start failed: HTTP 500: SpawnError")
+            return {"id": "created"}
+
+    client = Client()
+    with pytest.raises(cdesktop.CdesktopError, match="native cleanup deleted partial workspace partial"):
+        client.spawn_workspace(
+            name="worker",
+            repo_path=Path("/tmp/repo"),
+            target_branch="main",
+            executor="CODEX",
+            prompt="start",
+            use_worktree=True,
+            permission_policy="SUPERVISED",
+            model=None,
+            reasoning=None,
+            provider_id=None,
+        )
+    assert client.calls[-1] == (
+        "DELETE",
+        "/workspaces/partial",
+        None,
+        {"delete_remote": False, "delete_branches": False},
+        None,
+    )
+
+
+def test_failed_start_never_guesses_between_partial_workspaces() -> None:
+    class Client(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.workspace_lists = iter(
+                [
+                    [],
+                    [
+                        {"id": "partial-a", "name": "worker"},
+                        {"id": "partial-b", "name": "worker"},
+                    ],
+                ]
+            )
+
+        def workspaces(self):
+            return next(self.workspace_lists)
+
+        def request(self, method, path, payload=None, query=None, headers=None):
+            if path == "/workspaces/start":
+                raise cdesktop.CdesktopError("SpawnError")
+            return {"id": "created"}
+
+    client = Client()
+    with pytest.raises(cdesktop.CdesktopError, match="cleanup was ambiguous"):
+        client.spawn_workspace(
+            name="worker",
+            repo_path=Path("/tmp/repo"),
+            target_branch="main",
+            executor="CODEX",
+            prompt="start",
+            use_worktree=True,
+            permission_policy="SUPERVISED",
+            model=None,
+            reasoning=None,
+            provider_id=None,
+        )
 
 
 def test_send_marks_sender_when_provided() -> None:
