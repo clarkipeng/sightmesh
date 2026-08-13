@@ -8,7 +8,7 @@ SightMesh keeps orchestration data local and separates durable source state from
 | cdesktop | `~/Library/Application Support/ai.cdesktop.cdesktop` | Workspace records, visible session history, and process metadata | Until the archive is explicitly deleted |
 | cdesktop | `~/.local/share/sightmesh/.cdesktop-workspaces` | SightMesh-managed isolated worktrees | Active lifetime; a clean archived worktree may be reclaimed after about one hour |
 | Repowire | `~/.repowire` | Local peer identity, discovery, and request/reply state | Until explicitly reset |
-| SightMesh | `~/.local/state/sightmesh` | Delivery queue, ownership leases, route policy, logs, migration plans, and bounded handoffs | Lifecycle-specific; migration plans and handoffs remain until explicitly removed |
+| SightMesh | `~/.local/state/sightmesh` | Delivery queue, ownership leases, route policy, approval audit, logs, migration plans, and bounded handoffs | Lifecycle-specific; approval audit, migration plans, and handoffs remain until explicitly removed |
 | SightMesh | `~/.config/sightmesh` | Provider profile identifiers and routing policy | Until explicitly changed or removed |
 | Workspace owner | `<workspace>/.context` | Workspace-local notes and handoffs | Follows the workspace and remains Git-ignored |
 | Conductor during migration | Existing Conductor database and workspaces | Original transcripts, workspace metadata, and checkouts | Preserved until post-migration reconciliation authorizes removal |
@@ -28,3 +28,5 @@ Delete is deliberately separate from archive. It requires an archived workspace 
 `sightmesh migrate plan` is read-only. Applying a plan adopts existing Conductor checkouts as direct cdesktop workspaces and does not start a model. A bounded semantic handoff may be written under the private migration state directory so a resumed agent can recover immediate context. The original Conductor transcript database remains the complete authority until the user verifies the migrated workspace and explicitly retires the old data.
 
 Do not place secrets in prompts, transcripts, `.context`, handoffs, command arguments, or the orchestration repository. Local-only storage and restrictive permissions reduce exposure but do not turn those surfaces into a secrets manager.
+
+Approval decisions are stored in `~/.local/state/sightmesh/approvals.sqlite3`. The database and its WAL files are owner-only. Rejection text is not copied into this store; SightMesh records only its SHA-256 digest so an audit can correlate a decision without creating another transcript.

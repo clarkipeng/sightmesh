@@ -16,6 +16,26 @@ sightmesh workspace rename WORKSPACE_ID repository/task-name
 
 cdesktop remains the viewing surface. Use its repository-grouped sidebar, conversation panel, process logs, changed-file tree and diff, Open in IDE action for the complete checkout, and built-in preview browser for running applications or image review.
 
+## Plan approvals
+
+Inspect and decide pending visible-agent plans without taking over the worker transcript:
+
+```sh
+sightmesh approval list
+sightmesh approval show APPROVAL_ID
+sightmesh approval approve APPROVAL_ID
+sightmesh approval reject APPROVAL_ID --reason "Narrow the write scope and resubmit"
+sightmesh approval history --limit 20
+```
+
+The response is bound to both the approval ID and its execution-process ID. A mismatched process is rejected without consuming the pending approval. When the command runs inside cdesktop, `CDESKTOP_SESSION_ID` identifies the reviewer, self-approval is forbidden, and only the earliest session in that workspace is the lead. Outside cdesktop, the local macOS user is recorded as the human reviewer.
+
+`ExitPlanMode` is the normal plan approval. Questions must be answered in cdesktop because their structured answer choices are part of the visible conversation. Other tool requests fail closed unless `--allow-non-plan` is present. cdesktop currently changes an approved Claude plan session from plan mode to its bypass-permissions mode, so inspect the plan and its worktree boundary before approving it.
+
+Approval attempts are written to the private local audit store before cdesktop is called. The audit includes the decision, reviewer, target IDs, status, and a SHA-256 digest of a rejection reason. It deliberately does not duplicate the reason or transcript text.
+
+For short automation inputs, use `--prompt`, `--message`, `--checkpoint`, or `--reason`. Their `*-file` forms remain available for multiline or reusable content, and the two forms are mutually exclusive.
+
 ## Provider profiles and failover
 
 Configure provider credentials in cdesktop through its supported provider UI. SightMesh stores only a provider UUID and non-secret defaults:

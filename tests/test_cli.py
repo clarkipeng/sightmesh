@@ -4,8 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from sightmesh import __version__, cli, delivery
-from sightmesh.cli import _primary_session_id, _read_text, _repowire_status_ok, parser
+from sightmesh import __version__, approvals, cli, delivery
+from sightmesh.cli import (
+    _primary_session_id,
+    _read_text,
+    _repowire_status_ok,
+    _validate_reasoning,
+    parser,
+)
 from sightmesh.delivery import DeliveryStore, make_record
 from sightmesh.leases import LeaseStore
 from sightmesh.profiles import Profile, ProfileStore
@@ -27,6 +33,99 @@ def test_version_flag_uses_package_version(capsys) -> None:
         parser().parse_args(["--version"])
     assert exit_info.value.code == 0
     assert capsys.readouterr().out.strip() == __version__
+
+
+def test_inline_text_flags_are_available_for_text_commands() -> None:
+    parsed = [
+        parser().parse_args(["message", "session", "--message", "hello"]),
+        parser().parse_args(["steer", "session", "--message", "correct course"]),
+        parser().parse_args(["prompt-idle", "session", "--message", "continue"]),
+        parser().parse_args(
+            [
+                "failover",
+                "workspace",
+                "--profile",
+                "backup",
+                "--checkpoint",
+                "clean checkpoint",
+            ]
+        ),
+        parser().parse_args(
+            ["teammate-spawn", "--name", "reviewer", "--prompt", "review this"]
+        ),
+        parser().parse_args(["close", "workspace", "--message", "reconcile"]),
+        parser().parse_args(
+            [
+                "bridge-reply",
+                "correlation",
+                "--from-peer",
+                "manager",
+                "--message",
+                "done",
+            ]
+        ),
+        parser().parse_args(
+            ["approval", "reject", "approval", "--reason", "revise plan"]
+        ),
+    ]
+    assert len(parsed) == 8
+
+
+def test_max_reasoning_is_supported_for_claude_and_codex() -> None:
+    _validate_reasoning("CLAUDE_CODE", "max")
+    _validate_reasoning("CODEX", "max")
+
+
+def test_approval_command_approves_reviewed_plan(monkeypatch, tmp_path, capsys) -> None:
+    class ApprovalClient:
+        def __init__(self, _url=None) -> None:
+            self.responses = []
+
+        def pending_approvals(self):
+            return [
+                {
+                    "approval_id": "approval-a",
+                    "execution_process_id": "process-a",
+                    "tool_name": "ExitPlanMode",
+                    "is_question": False,
+                    "created_at": "2026-08-12T00:00:00Z",
+                }
+            ]
+
+        def execution_process(self, _process_id):
+            return {"session_id": "worker-session"}
+
+        def session(self, _session_id):
+            return {
+                "workspace_id": "worker-workspace",
+                "executor": "CLAUDE_CODE",
+                "name": "worker",
+            }
+
+        def workspace(self, _workspace_id):
+            return {"name": "worker", "archived": False}
+
+        def respond_to_approval(
+            self, approval_id, execution_process_id, *, approved, reason=None
+        ):
+            self.responses.append((approval_id, execution_process_id, approved, reason))
+            return {"status": "approved"}
+
+    instances = []
+
+    def client_factory(url=None):
+        client = ApprovalClient(url)
+        instances.append(client)
+        return client
+
+    monkeypatch.setattr(cli, "CdesktopClient", client_factory)
+    monkeypatch.setattr(approvals, "approval_db_path", lambda: tmp_path / "audit.db")
+    monkeypatch.delenv("CDESKTOP_SESSION_ID", raising=False)
+    args = parser().parse_args(["--json", "approval", "approve", "approval-a"])
+
+    assert args.func(args) == 0
+    assert instances[0].responses == [("approval-a", "process-a", True, None)]
+    assert '"status": "responded"' in capsys.readouterr().out
 
 
 def test_primary_session_id_reads_execution_process() -> None:

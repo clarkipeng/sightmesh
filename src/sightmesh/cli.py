@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import json
 import os
 import shutil
@@ -10,7 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import __version__, conductor_migrate, leases, routing, service
+from . import __version__, approvals, conductor_migrate, leases, routing, service
 from .bridge import run_bridge
 from .cdesktop import CdesktopClient, CdesktopError
 from .delivery import DeliveryStore, DeliveryStoreError, to_dict
@@ -193,13 +194,15 @@ def _profile_selection(
         executor = getattr(args, "executor", None)
         if not executor:
             raise ValueError("Provide --executor or --profile")
-        return (
+        selection = (
             executor,
             getattr(args, "provider", None),
             getattr(args, "model", None),
             getattr(args, "reasoning", None),
             None,
         )
+        _validate_reasoning(selection[0], selection[3])
+        return selection
 
     profile = ProfileStore().get(profile_name)
     validate_provider(profile, client.providers())
@@ -209,13 +212,26 @@ def _profile_selection(
         raise ValueError("--executor cannot override a profile's executor")
     if provider_override and provider_override != profile.provider_id:
         raise ValueError("--provider cannot override a profile's provider")
-    return (
+    selection = (
         profile.executor,
         profile.provider_id,
         getattr(args, "model", None) or profile.model,
         getattr(args, "reasoning", None) or profile.reasoning,
         profile.name,
     )
+    _validate_reasoning(selection[0], selection[3])
+    return selection
+
+
+def _validate_reasoning(executor: str, reasoning: str | None) -> None:
+    if reasoning is None:
+        return
+    allowed = {"low", "medium", "high", "xhigh", "max"}
+    if reasoning not in allowed:
+        raise ValueError(
+            f"Reasoning {reasoning!r} is unsupported by {executor}; "
+            f"choose one of {', '.join(sorted(allowed))}"
+        )
 
 
 def cmd_configure(args: argparse.Namespace) -> int:
@@ -637,6 +653,149 @@ def cmd_teammate_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _approval_details(
+    client: CdesktopClient, approval: dict[str, Any]
+) -> dict[str, Any]:
+    details = dict(approval)
+    process = client.execution_process(str(approval["execution_process_id"]))
+    session_id = str(process["session_id"])
+    session = client.session(session_id)
+    workspace_id = str(session["workspace_id"])
+    workspace = client.workspace(workspace_id)
+    tool_name = str(approval.get("tool_name") or "")
+    details.update(
+        {
+            "session_id": session_id,
+            "session_name": session.get("name"),
+            "executor": session.get("executor"),
+            "workspace_id": workspace_id,
+            "workspace_name": workspace.get("name"),
+            "workspace_archived": bool(workspace.get("archived")),
+            "request_kind": (
+                "question"
+                if approval.get("is_question")
+                else "plan"
+                if tool_name == "ExitPlanMode"
+                else "tool"
+            ),
+        }
+    )
+    return details
+
+
+def _pending_approval(client: CdesktopClient, approval_id: str) -> dict[str, Any]:
+    approval = next(
+        (
+            item
+            for item in client.pending_approvals()
+            if item.get("approval_id") == approval_id
+        ),
+        None,
+    )
+    if approval is None:
+        raise ValueError(f"Approval is not currently pending: {approval_id}")
+    return _approval_details(client, approval)
+
+
+def _approval_reviewer(
+    client: CdesktopClient,
+    explicit_session: str | None,
+    target_session_id: str,
+) -> tuple[str, str]:
+    reviewer_session_id = explicit_session or os.environ.get("CDESKTOP_SESSION_ID")
+    if not reviewer_session_id:
+        return "human", f"{getpass.getuser()}@local"
+    if reviewer_session_id == target_session_id:
+        raise ValueError("A session cannot approve its own plan")
+    reviewer = client.session(reviewer_session_id)
+    reviewer_workspace_id = str(reviewer["workspace_id"])
+    sessions = sorted(
+        client.sessions(reviewer_workspace_id),
+        key=lambda item: (str(item.get("created_at") or ""), str(item["id"])),
+    )
+    if not sessions or str(sessions[0]["id"]) != reviewer_session_id:
+        raise ValueError(
+            "Only the lead session in a cdesktop workspace may approve another "
+            "agent's plan"
+        )
+    return "session", reviewer_session_id
+
+
+def cmd_approval(args: argparse.Namespace) -> int:
+    client = CdesktopClient(args.url)
+    if args.approval_action == "history":
+        records = [
+            record.to_dict()
+            for record in approvals.ApprovalAuditStore().history(limit=args.limit)
+        ]
+        _emit(records, args.json)
+        return 0
+
+    if args.approval_action == "list":
+        rows = [_approval_details(client, item) for item in client.pending_approvals()]
+        if args.workspace_id:
+            rows = [item for item in rows if item["workspace_id"] == args.workspace_id]
+        if args.session_id:
+            rows = [item for item in rows if item["session_id"] == args.session_id]
+        _emit(rows, args.json)
+        return 0
+
+    approval = _pending_approval(client, args.approval_id)
+    if args.approval_action == "show":
+        _emit(approval, args.json)
+        return 0
+    if approval.get("is_question"):
+        raise ValueError(
+            "This request expects structured answers, not plan approval; answer it in "
+            "the visible cdesktop session"
+        )
+
+    approved = args.approval_action == "approve"
+    if approved and approval["request_kind"] != "plan" and not args.allow_non_plan:
+        raise ValueError(
+            "Refusing to approve a non-plan tool request. Review it in cdesktop or "
+            "repeat with --allow-non-plan after verifying the exact tool action."
+        )
+    reason = None
+    if not approved:
+        reason = _read_text(args.reason, args.reason_file, "reason")
+        if not reason.strip():
+            raise ValueError("Rejection reason must not be empty")
+    reviewer_kind, reviewer_id = _approval_reviewer(
+        client,
+        args.reviewer_session,
+        str(approval["session_id"]),
+    )
+    store = approvals.ApprovalAuditStore()
+    attempt = store.begin(
+        approval=approval,
+        decision="approved" if approved else "denied",
+        reviewer_kind=reviewer_kind,
+        reviewer_id=reviewer_id,
+        reason=reason,
+    )
+    try:
+        response = client.respond_to_approval(
+            str(approval["approval_id"]),
+            str(approval["execution_process_id"]),
+            approved=approved,
+            reason=reason,
+        )
+    except Exception as exc:
+        store.finish(attempt.decision_id, succeeded=False, error=str(exc))
+        raise
+    completed = store.finish(attempt.decision_id, succeeded=True)
+    _emit(
+        {
+            "approval": approval,
+            "decision": completed.to_dict(),
+            "cdesktop_response": response,
+        },
+        args.json,
+    )
+    return 0
+
+
 def cmd_service(args: argparse.Namespace) -> int:
     if args.action == "install":
         path = service.install(args.port, start_now=not args.no_start)
@@ -893,6 +1052,7 @@ def cmd_profile(args: argparse.Namespace) -> int:
         _emit(providers, args.json)
         return 0
     if args.profile_action == "set":
+        _validate_reasoning(args.executor, args.reasoning)
         profile = Profile(
             name=args.name,
             executor=args.executor,
@@ -1146,9 +1306,7 @@ def parser() -> argparse.ArgumentParser:
         help="Run a worktree-isolated worker without approval prompts",
     )
     spawn.add_argument("--model")
-    spawn.add_argument(
-        "--reasoning", choices=["low", "medium", "high", "xhigh"]
-    )
+    spawn.add_argument("--reasoning", choices=["low", "medium", "high", "xhigh", "max"])
     spawn.add_argument("--provider", help="Configured cdesktop provider UUID")
     spawn.add_argument(
         "--lease-ttl-seconds", type=int, default=leases.DEFAULT_TTL_SECONDS
@@ -1226,7 +1384,7 @@ def parser() -> argparse.ArgumentParser:
     )
     teammate_spawn.add_argument("--model")
     teammate_spawn.add_argument(
-        "--reasoning", choices=["low", "medium", "high", "xhigh"]
+        "--reasoning", choices=["low", "medium", "high", "xhigh", "max"]
     )
     teammate_spawn.add_argument("--provider")
     teammate_spawn.set_defaults(func=cmd_teammate_spawn)
@@ -1236,6 +1394,53 @@ def parser() -> argparse.ArgumentParser:
     )
     teammate_list.add_argument("--caller")
     teammate_list.set_defaults(func=cmd_teammate_list)
+
+    approval = sub.add_parser(
+        "approval", help="Review and respond to visible cdesktop plan approvals"
+    )
+    approval_sub = approval.add_subparsers(dest="approval_action", required=True)
+    approval_list = approval_sub.add_parser(
+        "list", help="List currently pending cdesktop approvals"
+    )
+    approval_list.add_argument("--workspace-id")
+    approval_list.add_argument("--session-id")
+    approval_list.set_defaults(func=cmd_approval)
+    approval_show = approval_sub.add_parser(
+        "show", help="Show one currently pending approval with workspace context"
+    )
+    approval_show.add_argument("approval_id")
+    approval_show.set_defaults(func=cmd_approval)
+    approval_approve = approval_sub.add_parser(
+        "approve", help="Approve a reviewed plan and continue its visible session"
+    )
+    approval_approve.add_argument("approval_id")
+    approval_approve.add_argument(
+        "--reviewer-session",
+        help="Lead cdesktop session performing the review; defaults to CDESKTOP_SESSION_ID",
+    )
+    approval_approve.add_argument(
+        "--allow-non-plan",
+        action="store_true",
+        help="Explicitly allow a reviewed non-plan tool request",
+    )
+    approval_approve.set_defaults(func=cmd_approval)
+    approval_reject = approval_sub.add_parser(
+        "reject", help="Reject a pending approval with actionable feedback"
+    )
+    approval_reject.add_argument("approval_id")
+    rejection_reason = approval_reject.add_mutually_exclusive_group(required=True)
+    rejection_reason.add_argument("--reason")
+    rejection_reason.add_argument("--reason-file")
+    approval_reject.add_argument(
+        "--reviewer-session",
+        help="Lead cdesktop session performing the review; defaults to CDESKTOP_SESSION_ID",
+    )
+    approval_reject.set_defaults(func=cmd_approval, allow_non_plan=False)
+    approval_history = approval_sub.add_parser(
+        "history", help="Show the private local approval decision audit"
+    )
+    approval_history.add_argument("--limit", type=int, default=50)
+    approval_history.set_defaults(func=cmd_approval)
 
     profile = sub.add_parser(
         "profile", help="Manage safe named mappings to configured cdesktop providers"
@@ -1260,7 +1465,7 @@ def parser() -> argparse.ArgumentParser:
     )
     profile_set.add_argument("--model")
     profile_set.add_argument(
-        "--reasoning", choices=["low", "medium", "high", "xhigh"]
+        "--reasoning", choices=["low", "medium", "high", "xhigh", "max"]
     )
     profile_set.add_argument(
         "--automatic-failover",
@@ -1503,6 +1708,7 @@ def main() -> None:
         code = args.func(args)
     except (
         CdesktopError,
+        approvals.ApprovalAuditError,
         DeliveryStoreError,
         leases.LeaseError,
         RepowireError,

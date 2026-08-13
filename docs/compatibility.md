@@ -3,7 +3,7 @@
 ## Tested local stack
 
 - macOS 26.5.1 arm64
-- cdesktop 0.2.3
+- cdesktop 0.2.3 and local fork package 0.2.3-sightmesh.1
 - Repowire 0.17.0
 - Codex CLI 0.147.0
 - Claude Code 2.1.228
@@ -38,13 +38,15 @@ The isolated bridge run on 2026-08-12 proved both transports. A blocking `repowi
 
 ## Current constraints
 
-### Codex service tier
+### Codex protocol boundary
 
-cdesktop 0.2.3 uses Codex app-server protocol types from Codex 0.121. An explicit `service_tier = "default"` in current Codex configuration causes cdesktop to reject the thread-start response because its older enum understands only `fast` and `flex`. Omitting the explicit default restores compatibility without selecting a different paid tier.
+Upstream cdesktop 0.2.3 uses Codex app-server protocol types from Codex 0.121. An explicit `service_tier = "default"` in current Codex configuration causes that build to reject the thread-start response because its older enum understands only `fast` and `flex`.
+
+The SightMesh fork updates the live app-server boundary to Codex protocol 0.135, where service tier is represented as an open string, while retaining 0.121 only for legacy event-log normalization. This selected pre-0.140 line remains compatible with cdesktop's Starlark dependency generation. Codex 0.140 and newer require a separate event-normalizer migration and are not falsely presented as a drop-in dependency bump.
 
 ### Codex 5.6 model selection
 
-cdesktop 0.2.3's picker predates the GPT-5.6 family, but its executor passes an explicit model ID through to Codex. SightMesh therefore supports `--model gpt-5.6-sol` directly. The cdesktop executor currently accepts reasoning levels through `xhigh`; SightMesh exposes that exact native set instead of accepting `max` and silently downgrading it.
+The fork's picker includes the GPT-5.6 family and accepts an exact free-form model ID when a newly released or provider-specific model is not yet listed. Codex and Claude selections expose `low`, `medium`, `high`, `xhigh`, and `max`; SightMesh validates and forwards the same set instead of silently downgrading it.
 
 ### Claude capacity
 
@@ -62,6 +64,8 @@ The bridge is local and opt-in. It does not inspect or migrate message routing f
 
 The managed LaunchAgents are installed without starting them when an unmanaged cdesktop instance already exists. Close unmanaged instances before starting `io.sightmesh.cdesktop` and `io.sightmesh.bridge` so only one process owns cdesktop's local database and port file. `sightmesh service cutover` handles the former owned labels with health-checked rollback.
 
-### Codex approval compatibility
+### Approval compatibility
 
-cdesktop `0.2.3` does not surface the approval and MCP elicitation flow from Codex CLI `0.147.0` reliably. Supervised sessions can stall at the first approval request. SightMesh therefore makes unattended execution explicit with `--unattended`, requires an isolated worktree, and maps that mode to cdesktop's bypass permission policy. Direct checkouts cannot use unattended mode.
+Upstream cdesktop 0.2.3 does not surface every approval and MCP elicitation flow from Codex CLI 0.147.0 reliably. The SightMesh fork adds a native pending-approval snapshot API and rejects a response whose execution-process ID does not match the pending request. SightMesh records every decision attempt locally and permits only a lead session or the local human to decide another session's plan.
+
+The websocket stream remains as a compatibility fallback for an upstream cdesktop process. `--unattended` still requires an isolated worktree and maps to bypass permissions. Direct checkouts cannot use unattended mode.

@@ -8,8 +8,11 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
+
+from websockets.exceptions import WebSocketException
+from websockets.sync.client import connect as websocket_connect
 
 from .service import DEFAULT_PORT, is_healthy, service_url
 
@@ -163,6 +166,93 @@ class CdesktopClient:
 
     def session(self, session_id: str) -> dict[str, Any]:
         return self.request("GET", f"/sessions/{session_id}")
+
+    def execution_process(self, execution_process_id: str) -> dict[str, Any]:
+        return self.request("GET", f"/execution-processes/{execution_process_id}")
+
+    def pending_approvals(
+        self, *, timeout_seconds: float = 5.0
+    ) -> list[dict[str, Any]]:
+        try:
+            result = self.request("GET", "/approvals")
+        except (CdesktopError, json.JSONDecodeError):
+            return self._pending_approvals_websocket(timeout_seconds=timeout_seconds)
+        if not isinstance(result, list):
+            raise CdesktopError("cdesktop pending approval response is not a list")
+        return [dict(item) for item in result if isinstance(item, dict)]
+
+    def _pending_approvals_websocket(
+        self, *, timeout_seconds: float
+    ) -> list[dict[str, Any]]:
+        parsed = urlsplit(self.base_url)
+        if parsed.scheme not in {"http", "https"}:
+            raise CdesktopError(
+                f"Unsupported cdesktop URL scheme for approvals: {parsed.scheme!r}"
+            )
+        websocket_url = urlunsplit(
+            (
+                "wss" if parsed.scheme == "https" else "ws",
+                parsed.netloc,
+                f"{parsed.path.rstrip('/')}/api/approvals/stream/ws",
+                "",
+                "",
+            )
+        )
+        pending: dict[str, dict[str, Any]] = {}
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            with websocket_connect(
+                websocket_url,
+                open_timeout=timeout_seconds,
+                close_timeout=1,
+            ) as socket:
+                while time.monotonic() < deadline:
+                    remaining = max(0.01, deadline - time.monotonic())
+                    raw = socket.recv(timeout=remaining)
+                    message = json.loads(raw)
+                    patches = message.get("JsonPatch")
+                    if isinstance(patches, list):
+                        pending = _apply_approval_patches(pending, patches)
+                    if message.get("Ready") is True:
+                        return sorted(
+                            pending.values(),
+                            key=lambda item: (
+                                str(item.get("created_at") or ""),
+                                str(item.get("approval_id") or ""),
+                            ),
+                        )
+        except (OSError, TimeoutError, WebSocketException, json.JSONDecodeError) as exc:
+            raise CdesktopError(
+                f"Cannot read cdesktop approval stream at {websocket_url}: {exc}"
+            ) from exc
+        raise CdesktopError(
+            f"cdesktop approval stream did not become ready within {timeout_seconds:g} seconds"
+        )
+
+    def respond_to_approval(
+        self,
+        approval_id: str,
+        execution_process_id: str,
+        *,
+        approved: bool,
+        reason: str | None = None,
+    ) -> Any:
+        status: dict[str, Any]
+        if approved:
+            status = {"status": "approved"}
+        else:
+            status = {
+                "status": "denied",
+                "reason": reason or "Reviewer denied this request.",
+            }
+        return self.request(
+            "POST",
+            f"/approvals/{approval_id}/respond",
+            {
+                "execution_process_id": execution_process_id,
+                "status": status,
+            },
+        )
 
     def workspace_summaries(self, archived: bool = False) -> list[dict[str, Any]]:
         result = self.request("POST", "/workspaces/summaries", {"archived": archived})
@@ -349,3 +439,34 @@ class CdesktopClient:
             f"/workspaces/{workspace_id}",
             query={"delete_remote": False, "delete_branches": False},
         )
+
+
+def _apply_approval_patches(
+    pending: dict[str, dict[str, Any]], patches: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    updated = dict(pending)
+    for patch in patches:
+        operation = patch.get("op")
+        path = patch.get("path")
+        if path == "/pending" and operation in {"add", "replace"}:
+            value = patch.get("value")
+            if not isinstance(value, dict):
+                raise CdesktopError(
+                    "cdesktop approval snapshot has invalid pending data"
+                )
+            updated = {
+                str(key): dict(item)
+                for key, item in value.items()
+                if isinstance(item, dict)
+            }
+            continue
+        if not isinstance(path, str) or not path.startswith("/pending/"):
+            continue
+        approval_id = (
+            path.removeprefix("/pending/").replace("~1", "/").replace("~0", "~")
+        )
+        if operation == "remove":
+            updated.pop(approval_id, None)
+        elif operation in {"add", "replace"} and isinstance(patch.get("value"), dict):
+            updated[approval_id] = dict(patch["value"])
+    return updated

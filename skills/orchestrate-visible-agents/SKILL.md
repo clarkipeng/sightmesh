@@ -97,6 +97,19 @@ For cdesktop, target the online bridge peer whose repository path and backend ma
 
 Use messages for decisions, exact SHAs, ownership transfers, and blockers. Keep durable evidence in the repository or its ignored handoff directory. Repowire is transport, not the sole record.
 
+## Review plans
+
+Use SightMesh's cdesktop-native approval commands instead of answering for a worker in its transcript:
+
+```sh
+sightmesh approval list
+sightmesh approval show <approval-id>
+sightmesh approval approve <approval-id>
+sightmesh approval reject <approval-id> --reason "<bounded reason>"
+```
+
+An agent must never approve its own request. When invoked from cdesktop, only the lead session in the reviewer workspace may decide another session's plan. Questions remain interactive in cdesktop. Do not approve a non-plan tool request unless the assignment explicitly authorizes it and `--allow-non-plan` is present. Record significant plan changes in the owning workspace's `.context` handoff.
+
 ## Supervise and finish
 
 Inspect cdesktop transcripts and derived git state. Intervene only on state change, a blocker, scope drift, duplicate ownership, or failed validation. Before retirement, invoke `$reconcile-agent-work`. Archive only after the branch, PR, dirty state, handoff, and remaining scope are reconciled.

@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from sightmesh import cdesktop
-from sightmesh.cdesktop import CdesktopClient
+from sightmesh.cdesktop import CdesktopClient, _apply_approval_patches
 
 
 class FakeClient(CdesktopClient):
@@ -36,6 +36,50 @@ def test_send_marks_sender_when_provided() -> None:
             {"x-cdesktop-from-session": "sender"},
         )
     ]
+
+
+def test_respond_to_approval_binds_execution_process() -> None:
+    client = FakeClient()
+    client.respond_to_approval(
+        "approval-a", "process-a", approved=False, reason="Revise the plan"
+    )
+    assert client.calls == [
+        (
+            "POST",
+            "/approvals/approval-a/respond",
+            {
+                "execution_process_id": "process-a",
+                "status": {"status": "denied", "reason": "Revise the plan"},
+            },
+            None,
+            None,
+        )
+    ]
+
+
+def test_apply_approval_patches_handles_snapshot_and_resolution() -> None:
+    pending = _apply_approval_patches(
+        {},
+        [
+            {
+                "op": "replace",
+                "path": "/pending",
+                "value": {
+                    "approval-a": {
+                        "approval_id": "approval-a",
+                        "tool_name": "ExitPlanMode",
+                    }
+                },
+            }
+        ],
+    )
+    assert list(pending) == ["approval-a"]
+    assert (
+        _apply_approval_patches(
+            pending, [{"op": "remove", "path": "/pending/approval-a"}]
+        )
+        == {}
+    )
 
 
 def test_rename_workspace_preserves_other_mutable_fields() -> None:

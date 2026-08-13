@@ -45,6 +45,17 @@ sightmesh spawn --name worker-name --repo /path/to/repo \
   --base main --executor CODEX --prompt-file prompt.txt --worktree
 ```
 
+Short inputs can be passed inline instead of through a file:
+
+```sh
+sightmesh spawn --name worker-name --repo /path/to/repo \
+  --base main --executor CODEX --prompt "Implement the bounded task" --worktree
+sightmesh message SESSION_ID --message "Review the failing check"
+sightmesh steer SESSION_ID --message "Stop the migration and only diagnose"
+```
+
+`--prompt-file`, `--message-file`, and `--checkpoint-file` remain available for long or reusable inputs. Each command accepts exactly one inline or file-backed form.
+
 Unattended worker in an isolated worktree:
 
 ```sh
@@ -52,7 +63,7 @@ sightmesh spawn --name worker-name --repo /path/to/repo \
   --base main --executor CODEX --prompt-file prompt.txt --worktree --unattended
 ```
 
-`--unattended` is deliberately worktree-only and selects cdesktop's bypass permission policy. Direct checkouts remain supervised. This boundary is required by the tested cdesktop `0.2.3` and Codex CLI `0.147.0` approval behavior.
+`--unattended` is deliberately worktree-only and selects cdesktop's bypass permission policy. Direct checkouts remain supervised. The SightMesh cdesktop fork adds scriptable plan approvals for supervised work; unattended mode remains an explicit opt-in for isolated autonomous work.
 
 Other lifecycle commands:
 
@@ -71,6 +82,18 @@ sightmesh workspace delete WORKSPACE_ID --confirm-delete
 sightmesh delivery status
 sightmesh lease list
 ```
+
+Review pending agent plans from a lead session or directly as the local human:
+
+```sh
+sightmesh approval list
+sightmesh approval show APPROVAL_ID
+sightmesh approval approve APPROVAL_ID
+sightmesh approval reject APPROVAL_ID --reason "The migration rollback is incomplete"
+sightmesh approval history
+```
+
+Visible agent sessions cannot approve their own requests. When `CDESKTOP_SESSION_ID` is set, only the earliest session in that cdesktop workspace is treated as its lead reviewer. Questions remain interactive in cdesktop. Non-plan tool requests require the explicit `--allow-non-plan` acknowledgement.
 
 ## Migrate from Conductor
 
