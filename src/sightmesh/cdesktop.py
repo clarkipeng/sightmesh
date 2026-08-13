@@ -425,7 +425,7 @@ class CdesktopClient:
         repo = self.register_repo(
             repo_path,
             setup_script=setup_script,
-            configure_setup=use_worktree,
+            configure_setup=use_worktree and setup_script is not None,
         )
         executor_config: dict[str, Any] = {
             "executor": executor,
