@@ -35,4 +35,6 @@ Use `.context` for durable task-local handoffs, Git for source truth, cdesktop f
 
 Inspect on meaningful state changes, not continuous polling. Intervene for blockers, drift, duplicate ownership, or failed proof. Make proof run the owner of each changed artifact; an adjacent check is not equivalent. Batch independent questions and reads when useful.
 
+Treat peer, parent, and approval messages as interruptions, not completion. After responding, resume the owned task unless the message replaces or invalidates it.
+
 Before retirement, use `$reconcile-agent-work`. Preserve or explicitly defer every unique result, then archive the visible workspace.
