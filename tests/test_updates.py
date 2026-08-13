@@ -485,6 +485,7 @@ def test_activation_failure_stops_without_rollback_or_retry(
     monkeypatch.setattr(service, "_wait_until_unloaded", lambda _label: None)
     monkeypatch.setattr(service, "wait_until_healthy", lambda _port: None)
     monkeypatch.setattr(service, "is_healthy", lambda _port: True)
+    monkeypatch.setattr(service, "_loaded", lambda _label: False)
     bootstraps = []
     monkeypatch.setattr(
         service, "_bootstrap", lambda label, path: bootstraps.append((label, path))
@@ -524,7 +525,7 @@ def test_activation_refuses_unknown_backend_without_drain(
     )
     monkeypatch.setattr(service, "_bootout", lambda _label: None)
     monkeypatch.setattr(service, "_wait_until_unloaded", lambda _label: None)
-    monkeypatch.setattr(service, "_loaded", lambda _label: True)
+    monkeypatch.setattr(service, "_bootstrap", lambda _label, _path: None)
     monkeypatch.setattr(service, "is_healthy", lambda _port: True)
 
     with pytest.raises(RuntimeError, match="HTTP 404"):

@@ -466,6 +466,7 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
     service._wait_until_unloaded(service.BRIDGE_LABEL)
     drain_enabled = False
     bootstrap_without_drain = False
+    bridge_restored = False
     try:
         running_version = str(client.info().get("version") or "")
         try:
@@ -516,6 +517,7 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
                 )
             native_state_migration = migrate_native_state(updated_client)
             _restore_bridge()
+            bridge_restored = True
         except Exception as update_error:
             drain_enabled = False
             if service.is_healthy(port):
@@ -525,6 +527,7 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
                     pass
                 try:
                     _restore_bridge()
+                    bridge_restored = True
                 except Exception:
                     pass
             failed = {
@@ -561,7 +564,7 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
                 client.set_update_drain(0)
             except Exception:
                 pass
-        if not service._loaded(service.BRIDGE_LABEL) and service.is_healthy(port):
+        if not bridge_restored and service.is_healthy(port):
             _restore_bridge()
         raise
 
