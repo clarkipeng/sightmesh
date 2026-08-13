@@ -13,6 +13,6 @@ The read-only Catapult fleet audit on 2026-08-12 inspected the latest coding tur
 ## Deliberate boundaries
 
 - `sightmesh steer` interrupts only the selected session's non-dev-server execution. It refuses self-steering and any target with a pending approval or question.
-- `sightmesh message` remains available for a non-interrupting follow-up. Repowire remains the durable ask/reply transport when interruption is not appropriate.
+- `sightmesh message` and Repowire remain compatibility surfaces for explicitly non-interrupting or durable workflows, not the normal agent-to-agent path.
 - Independent network or filesystem reads may run together. Commands whose output determines a later target, writes to the same files, Git mutations, approvals, and destructive actions must remain ordered.
 - Snapshot coalescing is bounded by time and patch count. It reports whether the execution was complete and how many patches could not be applied instead of pretending a partial snapshot is complete.

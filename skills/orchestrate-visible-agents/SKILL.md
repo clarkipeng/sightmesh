@@ -26,8 +26,8 @@ Keep the workflow native and unsurprising:
 1. Use a separate cdesktop workspace with an isolated worktree for implementation, independently shippable changes, or overlapping repository access.
 2. Use `cdesktop team spawn` only for read-only review, research, or disjoint paths in the same workspace.
 3. Keep one lead session per cdesktop workspace. Only the lead spawns teammates.
-4. Use `sightmesh steer @agent --message "..."` when a peer must see a correction or blocker immediately. It interrupts only that session. Use Repowire when delivery should remain a durable non-interrupting ask or reply.
-5. Queue with `sightmesh message` when the current course remains valid. Use `sightmesh steer` only when continued work would create invalid output, unsafe mutation, scope drift, or avoidable rework. Use `sightmesh prompt-idle` when delivery must wait for an idle session. If `prompt-idle` fails after the session is independently confirmed idle, retry once with `sightmesh message`; do not keep retrying an unchanged control-plane failure.
+4. Use `sightmesh steer @agent --message "..."` for agent-to-agent contact. It interrupts only that selected session and makes the message the next turn instead of appending behind current work.
+5. Do not use `sightmesh message`, `sightmesh prompt-idle`, or Repowire as the normal peer-contact path. They remain compatibility and durable-delivery surfaces for explicitly non-interrupting workflows.
 6. Every teammate must contact its workspace lead when it needs a decision, feedback, or help with a blocker, and when it completes. Use `cdesktop team manager --message "STATUS: concise details"`; the command resolves the lead session automatically.
 7. Before asking for input, collect all currently known independent questions and send one multi-question request. Before tool use, batch independent read-only inspections. Keep dependent operations, mutations, approvals, and destructive actions sequential.
 
@@ -86,12 +86,6 @@ sightmesh steer @<agent> --message "<immediate correction or blocker>"
 
 Selectors are exact and ambiguity-safe. Never steer yourself. Targeted steering leaves other sessions in the same workspace and any dev server running. It refuses to interrupt a pending approval or question.
 
-For a non-interrupting follow-up when the current course remains valid:
-
-```sh
-sightmesh message @<agent> --message-file <message-file>
-```
-
 Use Repowire for peer discovery, asks, and delivery tracing when the peer reports online:
 
 ```sh
@@ -99,7 +93,7 @@ repowire peer list -a
 repowire peer ask <peer-name> "<bounded request>"
 ```
 
-For cdesktop, target the online bridge peer whose repository path and backend match the intended session. Repowire chooses the displayed name. Do not target a stale offline identity created by an executor's short-lived app-server hook. If no matching bridge peer is online, use `sightmesh message` and report that Repowire delivery was unavailable.
+For cdesktop, target the online bridge peer whose repository path and backend match the intended session. Repowire chooses the displayed name. Do not target a stale offline identity created by an executor's short-lived app-server hook. If no matching bridge peer is online, use `sightmesh steer` for direct agent contact and report that Repowire delivery was unavailable.
 
 Make queued and steering messages bounded and self-contained: state the authority, exact SHA when relevant, owner, required action, exclusions, and stop condition. Keep durable evidence in the repository or its ignored handoff directory. Files under an ignored handoff directory are local coordination evidence, not PR content. Repowire is transport, not the sole record.
 

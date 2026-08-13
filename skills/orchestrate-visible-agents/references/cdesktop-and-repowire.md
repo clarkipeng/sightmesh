@@ -24,7 +24,7 @@ Every cdesktop-launched executor receives `CDESKTOP_SESSION_ID`.
 ```sh
 sightmesh teammate-list
 sightmesh teammate-spawn --name reviewer --prompt-file prompt.txt
-sightmesh message <session-id> --message-file follow-up.txt
+sightmesh steer @<agent> --message-file follow-up.txt
 ```
 
 The oldest session in a workspace is the lead. The CLI permits only that lead to spawn teammates.
@@ -41,7 +41,7 @@ repowire trace <correlation-id>
 
 Prefer Repowire's in-agent MCP tools when available. Use the CLI as a diagnostic and fallback surface. A new cdesktop session must appear online in `repowire peer list` before relying on cross-workspace delivery.
 
-Target the online proxy identity created by SightMesh by matching repository path and backend. Repowire assigns its displayed name. The executor's own app-server hook may appear offline and is not the inbound route. If the proxy is not online, route the immediate message with `sightmesh message` so it becomes a visible follow-up in the target transcript. Do not claim Repowire delivery when the proxy is offline.
+Target the online proxy identity created by SightMesh by matching repository path and backend. Repowire assigns its displayed name. The executor's own app-server hook may appear offline and is not the inbound route. If the proxy is not online, use `sightmesh steer` for immediate direct contact. Do not claim Repowire delivery when the proxy is offline.
 
 Existing workspaces are opted in explicitly:
 
