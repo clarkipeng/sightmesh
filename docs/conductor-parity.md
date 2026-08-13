@@ -2,6 +2,8 @@
 
 SightMesh is designed for a different center of gravity than Conductor. It does not claim universal superiority.
 
+Both systems treat `.context` as workspace-local files rather than a global context database. SightMesh keeps that familiar convention. Cross-workspace visibility comes from the cdesktop fleet and normal Git worktree inspection; communication comes from Repowire.
+
 | Requirement | SightMesh 0.3 | Conductor | Current verdict |
 | --- | --- | --- | --- |
 | Local full Claude Code and Codex processes | Yes | Yes | Parity |

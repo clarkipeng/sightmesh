@@ -7,6 +7,8 @@
 - Git and the PR host own source, branch, review, and merge truth.
 - Handoff files own durable task-local context that must survive a session restart.
 
+`.context` is local to each workspace. It is not a global coordination database. Inspect sibling worktrees with normal filesystem and Git commands, inspect conversations in cdesktop, and contact their owners through Repowire. Do not mirror all worktrees or transcripts into a second knowledge system.
+
 ## cdesktop topology
 
 `cdesktop team spawn` creates a visible teammate in the same workspace. Teammates share that workspace filesystem. Use this only for read-only work or explicitly disjoint paths.

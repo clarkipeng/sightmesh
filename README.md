@@ -4,6 +4,8 @@ SightMesh is a local reliability and policy layer for full Claude Code and Codex
 
 Delegated work remains visible and interruptible in cdesktop. SightMesh does not replace cdesktop's UI or the agent CLIs. It adds durable delivery, ownership leases, safe closeout, local-only configuration, service recovery, and shared Claude/Codex skills.
 
+The interface is deliberately native-first. `.context` remains a normal workspace-local, Git-ignored directory. cdesktop remains the source of truth for sessions and transcripts, Git remains the source of truth for worktrees and changes, and Repowire remains the cross-workspace contact layer. SightMesh does not build a global context mirror or copy every conversation into another agent-specific format.
+
 See [compatibility](docs/compatibility.md), [operations](docs/operations.md), and the [source-derived competitive bake-off](docs/competitive-bakeoff.md) for tested versions, limitations, and alternatives.
 
 ## Install

@@ -11,6 +11,14 @@ Run every delegated assignment as a first-class cdesktop session. Preserve a liv
 
 Do not use the host agent's native subagent, Task, delegate, fork, or team mechanism. Do not hide delegated work inside the parent transcript. Use cdesktop even if a native mechanism seems faster.
 
+Keep the workflow native and unsurprising:
+
+- use ordinary workspace-local `.context` files for durable handoffs;
+- use Git and the filesystem to inspect sibling worktrees;
+- use cdesktop for session rosters, transcripts, and human interaction;
+- use Repowire for cross-workspace contact;
+- do not create a global context mirror, duplicate transcripts, or introduce another MCP or command when these surfaces already suffice.
+
 ## Choose the topology
 
 1. Use a separate cdesktop workspace with an isolated worktree for implementation, independently shippable changes, or overlapping repository access.
