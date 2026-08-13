@@ -4,11 +4,13 @@ import fcntl
 import hashlib
 import json
 import os
+import platform
 import plistlib
 import shutil
 import subprocess
 import tempfile
 import time
+import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -110,6 +112,47 @@ def _validate_executable(executable: Path, version: str) -> str:
     return detail
 
 
+def _platform_directory() -> str:
+    system = platform.system().casefold()
+    machine = platform.machine().casefold()
+    operating_system = {
+        "darwin": "macos",
+        "linux": "linux",
+        "windows": "windows",
+    }.get(system)
+    architecture = "arm64" if machine in {"arm64", "aarch64"} else "x64"
+    if not operating_system or machine not in {
+        "arm64",
+        "aarch64",
+        "x86_64",
+        "amd64",
+    }:
+        raise RuntimeError(f"Unsupported cdesktop update platform: {system}-{machine}")
+    return f"{operating_system}-{architecture}"
+
+
+def _validate_package_payload(package_root: Path) -> str:
+    archive = package_root / "dist" / _platform_directory() / "cdesktop.zip"
+    if not archive.is_file():
+        raise RuntimeError(f"Staged cdesktop backend archive is missing: {archive}")
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            expected = "cdesktop.exe" if platform.system() == "Windows" else "cdesktop"
+            members = {Path(name).name for name in bundle.namelist()}
+            if expected not in members:
+                raise RuntimeError(
+                    f"Staged backend archive does not contain {expected}: {archive}"
+                )
+            corrupt_member = bundle.testzip()
+            if corrupt_member:
+                raise RuntimeError(
+                    f"Staged backend archive has a corrupt member {corrupt_member}: {archive}"
+                )
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError(f"Staged cdesktop backend archive is invalid: {archive}") from exc
+    return str(archive)
+
+
 def stage(
     source: str,
     version: str,
@@ -164,6 +207,9 @@ def stage(
                 pass
         executable = release / "node_modules" / ".bin" / "cdesktop"
         reported_version = _validate_executable(executable, version)
+        backend_archive = _validate_package_payload(
+            release / "node_modules" / "cdesktop"
+        )
         now = time.time()
         state = {
             "schema_version": SCHEMA_VERSION,
@@ -174,6 +220,7 @@ def stage(
                 "sha256": digest,
                 "executable": str(executable),
                 "reported_version": reported_version,
+                "backend_archive": backend_archive,
                 "staged_at": now,
             },
             "last_error": None,

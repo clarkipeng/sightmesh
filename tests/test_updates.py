@@ -1,4 +1,5 @@
 import hashlib
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -87,9 +88,21 @@ def test_stage_verifies_and_installs_into_versioned_directory(
             executable = prefix / "node_modules" / ".bin" / "cdesktop"
             executable.parent.mkdir(parents=True)
             executable.write_text("fixture", encoding="utf-8")
+            archive = (
+                prefix
+                / "node_modules"
+                / "cdesktop"
+                / "dist"
+                / "macos-arm64"
+                / "cdesktop.zip"
+            )
+            archive.parent.mkdir(parents=True)
+            with zipfile.ZipFile(archive, "w") as bundle:
+                bundle.writestr("cdesktop", b"backend")
         return Result()
 
     monkeypatch.setattr(updates.subprocess, "run", run)
+    monkeypatch.setattr(updates, "_platform_directory", lambda: "macos-arm64")
 
     state = updates.stage(
         str(package),
@@ -100,7 +113,33 @@ def test_stage_verifies_and_installs_into_versioned_directory(
     assert state["status"] == "staged"
     assert state["pending"]["sha256"] == digest
     assert Path(state["pending"]["executable"]).exists()
+    assert Path(state["pending"]["backend_archive"]).exists()
     assert updates.read_state()["pending"]["version"] == "0.2.4-sightmesh.1"
+
+
+def test_stage_refuses_package_without_backend_archive(monkeypatch, tmp_path) -> None:
+    isolated_state(monkeypatch, tmp_path)
+    package = tmp_path / "cdesktop.tgz"
+    package.write_bytes(b"wrapper-only")
+
+    class Result:
+        returncode = 0
+        stdout = "cdesktop/0.2.4-sightmesh.1 darwin-arm64"
+        stderr = ""
+
+    def run(command, **_kwargs):
+        if command[0] == "npm":
+            prefix = Path(command[command.index("--prefix") + 1])
+            executable = prefix / "node_modules" / ".bin" / "cdesktop"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("fixture", encoding="utf-8")
+        return Result()
+
+    monkeypatch.setattr(updates.subprocess, "run", run)
+    monkeypatch.setattr(updates, "_platform_directory", lambda: "macos-arm64")
+
+    with pytest.raises(RuntimeError, match="backend archive is missing"):
+        updates.stage(str(package), "0.2.4-sightmesh.1")
 
 
 def test_activity_ignores_devservers_and_reports_agent_work() -> None:

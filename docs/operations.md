@@ -30,7 +30,8 @@ sightmesh update cancel
 
 Remote packages require a digest. Staging downloads and verifies the archive, installs
 it under `~/.local/share/sightmesh/updates`, runs the staged executable's version check,
-and records pending state atomically under `~/.local/state/sightmesh/update.json`. It
+checks the platform-specific backend ZIP and every member without executing the raw
+backend, and records pending state atomically under `~/.local/state/sightmesh/update.json`. It
 does not overwrite the globally installed cdesktop package or restart a worker.
 
 The separate updater LaunchAgent attempts activation every five seconds. Busy coding,
