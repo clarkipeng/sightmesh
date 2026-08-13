@@ -113,6 +113,8 @@ Send a peer message only when it changes the recipient's action, judgment, or de
 
 Before a worker completes, require every finding, blocker, exact SHA, validation result, and next action needed by another workspace to appear in the ignored handoff itself. A terminal response or transcript may summarize or link to that handoff, but must not be the only place containing actionable detail.
 
+When a terminal summary, status surface, or relayed message conflicts with the durable handoff, inspect exact-head Git and the handoff before routing work. Those evidence surfaces control; summaries are lossy routing aids.
+
 ## Review plans
 
 Use SightMesh's cdesktop-native approval commands instead of answering for a worker in its transcript:
