@@ -15,7 +15,7 @@ Prerequisites:
 - macOS
 - Python 3.11 or newer
 - `uv`
-- `cdesktop`
+- the SightMesh cdesktop fork package `0.2.3-sightmesh.1`
 - `repowire`
 - at least one authenticated supported agent CLI
 
@@ -35,6 +35,8 @@ sightmesh service open
 To cut over an existing installation of the former project name, install SightMesh, run `sightmesh configure`, then run `sightmesh service cutover`. Cutover backs up the old LaunchAgent definitions, stops only the two old owned labels, migrates routing and delivery state, starts the new labels, checks health, and rolls back if startup fails.
 
 The installer links the canonical skills into both `~/.claude/skills` and `~/.codex/skills`. It does not copy, inspect, or alter model-provider credentials.
+
+Bootstrap installs the tested cdesktop fork from its public GitHub release. `sightmesh doctor` rejects an upstream-only CLI installation so the approval API, exact model input, and process-bound response guarantees cannot silently disappear.
 
 ## Core workflow
 

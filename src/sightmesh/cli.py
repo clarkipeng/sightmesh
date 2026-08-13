@@ -25,6 +25,8 @@ from .profiles import (
 from .repowire import RepowireError
 from .repowire import reply as repowire_reply
 
+CDESKTOP_FORK_MARKER = "sightmesh"
+
 
 def _read_text(value: str | None, path: str | None, label: str) -> str:
     if bool(value) == bool(path):
@@ -95,6 +97,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             {"check": f"command:{command}", "ok": bool(found), "detail": found}
         )
         failures += int(not bool(found) and command in {"repowire", "cdesktop"})
+
+    cdesktop_command = shutil.which("cdesktop")
+    if cdesktop_command:
+        result = subprocess.run(
+            [cdesktop_command, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        detail = (result.stdout or result.stderr).strip()
+        fork_ok = result.returncode == 0 and CDESKTOP_FORK_MARKER in detail.casefold()
+        checks.append(
+            {
+                "check": "cdesktop-sightmesh-fork",
+                "ok": fork_ok,
+                "detail": detail or "version unavailable",
+            }
+        )
+        failures += int(not fork_ok)
 
     if shutil.which("repowire"):
         result = subprocess.run(

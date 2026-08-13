@@ -3,7 +3,7 @@ set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
-npm install -g cdesktop@0.2.3
+npm install -g "https://github.com/clarkipeng/cdesktop/releases/download/v0.2.3-sightmesh.1/cdesktop-0.2.3-sightmesh.1.tgz"
 uv tool install "git+https://github.com/prassanna-ravishankar/repowire.git@v0.17.0" --force
 uv pip install --python "$HOME/.local/share/uv/tools/repowire/bin/python" "mcp<2"
 repowire setup --non-interactive --no-update-checks
