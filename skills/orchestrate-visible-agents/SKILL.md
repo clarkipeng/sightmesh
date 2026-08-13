@@ -42,7 +42,7 @@ Before spawning, write a bounded prompt containing:
 - exact repository, an existing base branch, and the frozen 40-character SHA in the prompt when correctness depends on it;
 - owned paths and forbidden paths;
 - expected artifact, checks, branch, PR state, and completion marker;
-- handoff location;
+- handoff location, stated as a path inside the worker's own checkout; require the worker to resolve it against its own verified working directory, never against the canonical repository source, and verify after completion that nothing was written under the canonical root;
 - instruction to use this skill for any further delegation;
 - instruction to use `$reconcile-agent-work` before completion.
 
