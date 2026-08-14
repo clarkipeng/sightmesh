@@ -11,6 +11,7 @@ from sightmesh.bridge import (
     _dedupe_key,
     _peer_name,
 )
+from sightmesh.stalls import RecoveryIntentStore
 
 
 class FakeClient:
@@ -188,6 +189,9 @@ def test_no_bridge_child_still_gets_stall_recovery(monkeypatch) -> None:
 
     client = StallClient()
     client.stopped = []
+    monkeypatch.setattr(
+        bridge_module, "RecoveryIntentStore", lambda _path: RecoveryIntentStore()
+    )
     supervisor = BridgeSupervisor(client, "ws://127.0.0.1:8377/ws")
     supervisor.stalls.threshold = timedelta(0)
     monkeypatch.setattr(bridge_module, "enabled_workspaces", lambda: set())

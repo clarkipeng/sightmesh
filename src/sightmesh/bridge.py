@@ -20,7 +20,7 @@ from .routing import (
     peer_identity,
     set_peer_identity,
 )
-from .stalls import StallDetector
+from .stalls import RecoveryIntentStore, StallDetector
 
 LOGGER = logging.getLogger("sightmesh.bridge")
 
@@ -224,7 +224,11 @@ class BridgeSupervisor:
         self.client = client
         self.repowire_url = repowire_url
         self.tasks: dict[str, asyncio.Task[None]] = {}
-        self.stalls = StallDetector()
+        self.stalls = StallDetector(
+            recovery_store=RecoveryIntentStore(
+                Path.home() / ".local" / "state" / "sightmesh" / "stall-recovery.json"
+            )
+        )
 
     async def run(self) -> None:
         while True:

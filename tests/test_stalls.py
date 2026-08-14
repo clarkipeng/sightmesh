@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from sightmesh.cdesktop import CdesktopError
 from sightmesh.stalls import StallDetector
 
 
@@ -152,4 +153,74 @@ def test_running_partial_snapshot_without_new_events_eventually_recovers_child()
     detector.reconcile(client, session)
 
     assert client.stopped == ["process-1"]
+    assert client.sent[0][0][0] == "parent"
+
+
+def test_lost_stop_response_never_repeats_stop_and_retries_parent_wake():
+    class LostStopClient(FakeClient):
+        def __init__(self):
+            super().__init__([_process()], {"process-1": {"entries": []}})
+            self.stop_responses = [CdesktopError("Cannot reach cdesktop after stop")]
+            self.send_responses = [CdesktopError("Cannot reach cdesktop parent")]
+
+        def stop_execution(self, process_id):
+            self.stopped.append(process_id)
+            if self.stop_responses:
+                raise self.stop_responses.pop()
+
+        def send(self, *args, **kwargs):
+            if self.send_responses:
+                raise self.send_responses.pop()
+            super().send(*args, **kwargs)
+
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    client = LostStopClient()
+    detector = StallDetector(threshold=timedelta(minutes=2), now=lambda: now)
+    session = {"id": "child", "parent_session_id": "parent"}
+
+    detector.reconcile(client, session)
+    detector.now = lambda: now + timedelta(minutes=2)
+    detector.reconcile(client, session)
+    detector.reconcile(client, session)
+
+    assert client.stopped == ["process-1"]
+    assert client.sent == [
+        (
+            (
+                "parent",
+                (
+                    "STALL: child execution produced no session events past the configured "
+                    "threshold and was handed to native killed-child recovery."
+                ),
+                "child",
+            ),
+            {"dedupe_key": "stall:process-1:parent"},
+        )
+    ]
+
+
+def test_definitive_stop_failure_remains_retryable():
+    class RetryStopClient(FakeClient):
+        def __init__(self):
+            super().__init__([_process()], {"process-1": {"entries": []}})
+            self.stop_responses = [
+                CdesktopError("POST /execution-processes/process-1/stop failed: HTTP 500")
+            ]
+
+        def stop_execution(self, process_id):
+            self.stopped.append(process_id)
+            if self.stop_responses:
+                raise self.stop_responses.pop()
+
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    client = RetryStopClient()
+    detector = StallDetector(threshold=timedelta(minutes=2), now=lambda: now)
+    session = {"id": "child", "parent_session_id": "parent"}
+
+    detector.reconcile(client, session)
+    detector.now = lambda: now + timedelta(minutes=2)
+    detector.reconcile(client, session)
+    detector.reconcile(client, session)
+
+    assert client.stopped == ["process-1", "process-1"]
     assert client.sent[0][0][0] == "parent"
