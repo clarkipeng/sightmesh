@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sightmesh pool</title>
+<style>
+  :root {
+    --bg: oklch(17% 0.012 260);
+    --surface: oklch(22% 0.014 260);
+    --surface-hi: oklch(26% 0.016 260);
+    --line: oklch(32% 0.014 260);
+    --text: oklch(94% 0.004 260);
+    --muted: oklch(68% 0.012 260);
+    --faint: oklch(52% 0.012 260);
+
+    --ok: oklch(72% 0.16 155);
+    --warn: oklch(80% 0.15 85);
+    --bad: oklch(65% 0.19 25);
+    --accent: oklch(70% 0.15 250);
+
+    --radius: 10px;
+    --gap: 14px;
+    --duration: 180ms;
+    --ease: cubic-bezier(0.16, 1, 0.3, 1);
+
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  }
+
+  * { box-sizing: border-box; min-width: 0; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 var(--mono);
+    padding: 28px clamp(16px, 4vw, 48px) 64px;
+  }
+
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: var(--gap);
+    margin-bottom: 26px;
+  }
+  h1 { font-size: 19px; margin: 0; letter-spacing: -0.01em; }
+  h1 span { color: var(--faint); font-weight: 400; }
+  .spacer { flex: 1 1 auto; }
+
+  main {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(420px, 100%), 1fr));
+    gap: 26px;
+    align-items: start;
+  }
+
+  section { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+  .section-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 11px 15px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
+  }
+  .section-head h2 { font-size: 13px; margin: 0; text-transform: uppercase; letter-spacing: 0.08em; }
+  .count { color: var(--faint); font-size: 12px; }
+
+  ol { list-style: none; margin: 0; padding: 0; }
+
+  /* Three fixed columns with a nested body: cards carry a variable number of
+     notes, and any row-spanning scheme collapses as soon as that count differs. */
+  li.card {
+    display: grid;
+    grid-template-columns: 26px minmax(0, 1fr) auto;
+    gap: 12px;
+    align-items: start;
+    padding: 13px 15px;
+    border-bottom: 1px solid var(--line);
+    transition: background var(--duration) var(--ease);
+  }
+  li.card:last-child { border-bottom: 0; }
+  li.card:hover { background: var(--surface); }
+  li.card.dragging { opacity: 0.45; }
+  li.card.drop-target { box-shadow: inset 0 2px 0 var(--accent); }
+
+  .body { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+
+  .pos {
+    font-size: 12px; color: var(--faint);
+    cursor: grab; user-select: none;
+    padding-top: 3px;
+  }
+  .pos:active { cursor: grabbing; }
+
+  .who { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+  .id { font-weight: 600; }
+  .email { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+
+  /* Badges get their own row so they never wrap raggedly behind a long email. */
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+
+  .badge {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em;
+    padding: 2px 6px; border-radius: 4px;
+    background: var(--surface-hi); color: var(--muted);
+    white-space: nowrap;
+  }
+  .badge.ok   { color: var(--ok); }
+  .badge.warn { color: var(--warn); }
+  .badge.bad  { color: var(--bad); }
+
+  .meter { display: flex; align-items: center; gap: 10px; }
+  .track {
+    flex: 1 1 auto; min-width: 70px; height: 5px; border-radius: 3px;
+    background: var(--surface-hi); overflow: hidden;
+  }
+  .fill {
+    height: 100%; border-radius: 3px;
+    transform-origin: left center;
+    transition: transform var(--duration) var(--ease), background var(--duration) var(--ease);
+  }
+  .meter-text { flex: 0 0 auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
+
+  .note { margin: 0; font-size: 12px; color: var(--faint); overflow-wrap: anywhere; }
+  .note.bad { color: var(--bad); }
+
+  .actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+
+  button {
+    font: inherit; font-size: 12px;
+    color: var(--muted); background: var(--surface-hi);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 4px 9px; cursor: pointer;
+    transition: color var(--duration) var(--ease), border-color var(--duration) var(--ease);
+  }
+  button:hover { color: var(--text); border-color: var(--faint); }
+  button.danger:hover { color: var(--bad); border-color: var(--bad); }
+  button.primary { color: var(--text); border-color: var(--accent); }
+  button:disabled { opacity: 0.45; cursor: default; }
+
+  .adder { padding: 13px 15px; background: var(--surface); border-top: 1px solid var(--line); }
+  .adder summary { cursor: pointer; color: var(--muted); font-size: 12.5px; list-style: none; }
+  .adder summary::-webkit-details-marker { display: none; }
+  .adder summary::before { content: "+ "; color: var(--accent); }
+  .adder[open] summary { margin-bottom: 11px; color: var(--text); }
+
+  form { display: grid; gap: 9px; }
+  .row { display: flex; gap: 9px; flex-wrap: wrap; }
+  input, select, textarea {
+    font: inherit; font-size: 12.5px;
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 9px; flex: 1 1 150px;
+  }
+  textarea { resize: vertical; overflow-wrap: anywhere; }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .hint { font-size: 11.5px; color: var(--faint); line-height: 1.55; }
+  .hint code { color: var(--muted); }
+
+  #toast {
+    position: fixed; left: 50%; bottom: 26px;
+    transform: translate(-50%, 14px);
+    background: var(--surface-hi); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 16px; font-size: 12.5px;
+    opacity: 0; pointer-events: none; max-width: min(640px, 90vw);
+    transition: opacity var(--duration) var(--ease), transform var(--duration) var(--ease);
+  }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); }
+  #toast.bad { border-color: var(--bad); color: var(--bad); }
+
+  .empty { padding: 22px 15px; color: var(--faint); font-size: 12.5px; }
+
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>sightmesh pool <span>fallback order</span></h1>
+  <div class="spacer"></div>
+  <button id="refresh">refresh quota</button>
+  <button id="verify">verify accounts</button>
+</header>
+
+<main id="main"></main>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+const PROVIDERS = [
+  { key: "claude", title: "Claude", modes: null },
+  { key: "codex",  title: "Codex",  modes: ["sub", "apikey"] },
+];
+
+let state = null;
+let dragId = null;
+
+const fmt = (s) => {
+  s = Math.max(0, Math.round(s));
+  if (s >= 86400) return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
+  if (s >= 3600)  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  if (s >= 60)    return `${Math.floor(s / 60)}m`;
+  return `${s}s`;
+};
+
+function toast(message, bad = false) {
+  const el = document.getElementById("toast");
+  el.textContent = message;
+  el.classList.toggle("bad", bad);
+  el.classList.add("show");
+  clearTimeout(el.timer);
+  el.timer = setTimeout(() => el.classList.remove("show"), 5200);
+}
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: body ? "POST" : "GET",
+    headers: body ? { "Content-Type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return res.json();
+}
+
+async function runJob(path, body, label) {
+  toast(`${label}...`);
+  const { job } = await api(path, body || {});
+  while (true) {
+    await new Promise((r) => setTimeout(r, 700));
+    const status = await api(`/api/job/${job}`);
+    if (status.done) {
+      toast(status.message, !status.ok);
+      await load();
+      return status.ok;
+    }
+  }
+}
+
+/* The badge states status only. Reset times belong to the meter, which has the
+   quota context - saying it in both places is the same fact twice. */
+function healthBadge(row) {
+  if (!row.hasCredential) return { text: "no credential", cls: "bad" };
+  if (row.coolingFor > 0) return { text: "spent", cls: "warn" };
+  if (row.health === "unhealthy") return { text: "unusable", cls: "bad" };
+  if (row.health === "ok") return { text: "ready", cls: "ok" };
+  return { text: "unprobed", cls: "" };
+}
+
+function meter(row) {
+  const q = row.quota || {};
+  if (q.metered) return `<p class="note">metered billing - no quota window</p>`;
+  if (!q.known)  return `<p class="note">${q.reason || "quota unknown"}</p>`;
+
+  const remaining = Math.max(0, Math.min(100, q.remaining ?? 0));
+  const color = remaining === 0 ? "var(--bad)" : remaining < 25 ? "var(--warn)" : "var(--ok)";
+  const resets = q.resetsIn > 0 ? `resets in ${fmt(q.resetsIn)}` : "";
+  return `
+    <div class="meter">
+      <div class="track">
+        <div class="fill" style="background:${color};transform:scaleX(${remaining / 100})"></div>
+      </div>
+      <span class="meter-text">${remaining.toFixed(0)}% left</span>
+    </div>
+    ${resets ? `<p class="note">${resets}</p>` : ""}`;
+}
+
+function card(row) {
+  const badge = healthBadge(row);
+  const q = row.quota || {};
+  const reason = row.health === "unhealthy" && row.healthReason
+    ? `<p class="note bad">${row.healthReason}</p>` : "";
+  // Only surface the cooldown separately when quota did not already report a reset.
+  const cooldown = row.coolingFor > 0 && !(q.known && q.resetsIn > 0)
+    ? `<p class="note">available in ${fmt(row.coolingFor)}</p>` : "";
+  return `
+    <li class="card" draggable="true" data-id="${row.id}" data-provider="${row.provider}">
+      <div class="pos" title="drag to reorder">${row.position}</div>
+      <div class="body">
+        <div class="who">
+          <span class="id">${row.id}</span>
+          <span class="email">${row.email || row.label}</span>
+        </div>
+        <div class="tags">
+          ${row.plan ? `<span class="badge">${row.plan}</span>` : ""}
+          <span class="badge ${badge.cls}">${badge.text}</span>
+        </div>
+        ${meter(row)}
+        ${cooldown}
+        ${reason}
+      </div>
+      <div class="actions">
+        ${row.coolingFor > 0
+          ? `<button data-act="clear" data-id="${row.id}">clear</button>`
+          : `<button data-act="cool" data-id="${row.id}">mark spent</button>`}
+        <button class="danger" data-act="remove" data-id="${row.id}">remove</button>
+      </div>
+    </li>`;
+}
+
+function adder(provider) {
+  if (provider.key === "claude") {
+    return `
+      <details class="adder">
+        <summary>add a Claude account</summary>
+        <form data-add="claude">
+          <p class="hint">
+            Log into the account first, then run <code>claude setup-token</code> and paste it here.
+            The terminal wraps it onto two lines - paste both; line breaks are stripped.
+            Do not log out before adding, that revokes the token.
+          </p>
+          <div class="row"><input name="id" placeholder="name (e.g. max-b)" required></div>
+          <div class="row">
+            <textarea name="token" rows="2" placeholder="sk-ant-oat01-..." required></textarea>
+          </div>
+          <div class="row"><button class="primary" type="submit">add and validate</button></div>
+        </form>
+      </details>`;
+  }
+  return `
+    <details class="adder">
+      <summary>add a Codex account</summary>
+      <form data-add="codex">
+        <p class="hint">
+          Subscription opens a browser login. Each account gets its own
+          <code>CODEX_HOME</code>, which is the only way to hold two auth modes at once.
+        </p>
+        <div class="row">
+          <input name="id" placeholder="name (e.g. codex-sub2)" required>
+          <select name="mode">
+            <option value="sub">subscription</option>
+            <option value="apikey">API key</option>
+          </select>
+        </div>
+        <div class="row"><input name="key" type="password" placeholder="API key (key mode only)"></div>
+        <div class="row"><button class="primary" type="submit">add</button></div>
+      </form>
+    </details>`;
+}
+
+function render() {
+  document.getElementById("main").innerHTML = PROVIDERS.map((provider) => {
+    const rows = (state.providers[provider.key] || []);
+    const body = rows.length
+      ? `<ol data-provider="${provider.key}">${rows.map(card).join("")}</ol>`
+      : `<p class="empty">No ${provider.title} accounts yet.</p>`;
+    return `
+      <section>
+        <div class="section-head">
+          <h2>${provider.title}</h2>
+          <span class="count">${rows.length ? `${rows.length} in order, first wins` : "empty"}</span>
+        </div>
+        ${body}
+        ${adder(provider)}
+      </section>`;
+  }).join("");
+  wire();
+}
+
+function wire() {
+  document.querySelectorAll("[data-act]").forEach((btn) => {
+    btn.onclick = async () => {
+      const { act, id } = btn.dataset;
+      if (act === "remove" && !confirm(`Remove ${id} and delete its stored credential?`)) return;
+      await api(`/api/${act}`, { id, seconds: 18000 });
+      await load();
+    };
+  });
+
+  document.querySelectorAll("li.card").forEach((li) => {
+    li.ondragstart = () => { dragId = li.dataset.id; li.classList.add("dragging"); };
+    li.ondragend   = () => {
+      li.classList.remove("dragging");
+      document.querySelectorAll(".drop-target").forEach((n) => n.classList.remove("drop-target"));
+    };
+    li.ondragover  = (e) => { e.preventDefault(); li.classList.add("drop-target"); };
+    li.ondragleave = () => li.classList.remove("drop-target");
+    li.ondrop = async (e) => {
+      e.preventDefault();
+      const list = li.closest("ol");
+      const provider = list.dataset.provider;
+      const ids = [...list.querySelectorAll("li.card")].map((n) => n.dataset.id);
+      const from = ids.indexOf(dragId);
+      const to = ids.indexOf(li.dataset.id);
+      if (from < 0 || to < 0 || from === to) return;
+      ids.splice(to, 0, ids.splice(from, 1)[0]);
+      const res = await api("/api/order", { provider, ids });
+      if (!res.ok) toast(res.message, true);
+      await load();
+    };
+  });
+
+  document.querySelectorAll("form[data-add]").forEach((form) => {
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const data = Object.fromEntries(new FormData(form));
+      const kind = form.dataset.add;
+      form.querySelector("button").disabled = true;
+      await runJob(`/api/add-${kind}`, data,
+        kind === "codex" && data.mode === "sub" ? "waiting for browser login" : "validating");
+      form.querySelector("button").disabled = false;
+    };
+  });
+}
+
+async function load() {
+  state = await api("/api/state");
+  render();
+}
+
+document.getElementById("refresh").onclick = () => runJob("/api/refresh", {}, "refreshing quota");
+document.getElementById("verify").onclick  = () => runJob("/api/verify", {}, "verifying accounts");
+
+load();
+setInterval(load, 30000);
+</script>
+</body>
+</html>

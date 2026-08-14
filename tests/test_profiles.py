@@ -24,14 +24,38 @@ def test_profile_store_round_trips_without_credentials(tmp_path) -> None:
     assert path.stat().st_mode & 0o777 == 0o600
 
 
-def test_ambient_subscription_cannot_enter_automatic_failover() -> None:
-    with pytest.raises(ProfileError, match="never ambient consumer subscriptions"):
+def test_ambient_subscription_can_enter_automatic_failover() -> None:
+    # This asserts the reverse of what it used to. The old rule barred ambient
+    # profiles from failover on the theory that a consumer subscription could
+    # only be reached by borrowing someone's session. Credential pools removed
+    # that premise: an ambient profile names an account the operator owns and
+    # logged into through the provider's own interface, and a successor launches
+    # on that account's own normal credentials. Kind now records how a profile
+    # was authenticated, not whether it may be selected. Guarding this keeps a
+    # future tightening of Profile validation from silently disabling pools of
+    # Claude Max and Codex subscription accounts, which is the common case.
+    profile = Profile(
+        name="consumer",
+        executor="CODEX",
+        provider_id="default",
+        credential_kind="ambient",
+        automatic_failover=True,
+    )
+
+    assert profile.automatic_failover
+    assert profile.credential_kind == "ambient"
+
+
+def test_profile_still_rejects_unknown_credential_kind() -> None:
+    # Lifting the failover restriction must not turn credential_kind into a free
+    # text field - the enum is what keeps a typo from being persisted as a new
+    # kind that no policy or docs describe.
+    with pytest.raises(ProfileError, match="Unsupported credential kind"):
         Profile(
-            name="consumer",
+            name="typo",
             executor="CODEX",
             provider_id="default",
-            credential_kind="ambient",
-            automatic_failover=True,
+            credential_kind="ambiant",
         )
 
 

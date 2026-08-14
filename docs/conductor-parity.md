@@ -16,7 +16,7 @@ Both systems treat `.context` as workspace-local files rather than a global cont
 | Checkout ownership conflict prevention | Explicit expiring leases | Workspace isolation | Different mechanisms; SightMesh exposes ownership state |
 | Claude/Codex provider selection | Named mapping to cdesktop providers | Agent authentication and environment settings | Both supported |
 | Checkpointed provider failover | Visible successor session or clean new worktree | Manual restart or new workspace | SightMesh advantage for local scripted handoff |
-| Automatic consumer subscription rotation | No | No documented support | Intentionally unsupported |
+| Ordered fallback across operator-owned accounts | Credential pool selects the first account with quota | No documented support | SightMesh advantage |
 | Repository setup and run scripts | cdesktop repository configuration | Mature first-class support | Conductor advantage |
 | Copying ignored workspace files | cdesktop capability, not yet wrapped by SightMesh | First-class Files to copy and `.worktreeinclude` | Conductor advantage |
 | Diff review, comments, checks, and merge | cdesktop/GitHub surfaces | Deep native integration | Conductor advantage |
@@ -30,9 +30,9 @@ Both systems treat `.context` as workspace-local files rather than a global cont
 
 SightMesh profiles contain only a name, executor, cdesktop provider UUID, optional model and reasoning defaults, credential classification, and policy flags. Provider keys remain inside cdesktop's provider configuration.
 
-For an explicitly approved API or enterprise profile, `sightmesh failover` starts a visible successor. The default keeps the same cdesktop workspace so dirty files and transcript context remain visible. A clean committed source can instead use `--new-worktree`. Archival is a separate confirmed action.
+For a profile the operator configured, `sightmesh failover` starts a visible successor on the next account in the pool that still has quota. The default keeps the same cdesktop workspace so dirty files and transcript context remain visible. A clean committed source can instead use `--new-worktree`. Archival is a separate confirmed action.
 
-The shared reconciliation skill instructs Claude and Codex managers to invoke this handoff when they observe a capacity or authentication boundary. This is automatic orchestration through supported profiles, not silent login mutation.
+The shared reconciliation skill instructs Claude and Codex managers to invoke this handoff when they observe a capacity or authentication boundary. This is orchestration across accounts the operator owns, each used with its own normal credentials, not credential extraction, auth-header replay, or limit evasion.
 
 ## Remaining work before a broad replace-Conductor claim
 

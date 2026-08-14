@@ -10,7 +10,6 @@ from typing import Any
 PROFILE_VERSION = 1
 EXECUTORS = {"CLAUDE_CODE", "CODEX"}
 CREDENTIAL_KINDS = {"ambient", "api", "enterprise"}
-AUTO_FAILOVER_KINDS = {"api", "enterprise"}
 
 
 class ProfileError(RuntimeError):
@@ -40,11 +39,6 @@ class Profile:
             raise ProfileError("Profile must reference a cdesktop provider id")
         if self.credential_kind not in CREDENTIAL_KINDS:
             raise ProfileError(f"Unsupported credential kind: {self.credential_kind}")
-        if self.automatic_failover and self.credential_kind not in AUTO_FAILOVER_KINDS:
-            raise ProfileError(
-                "Automatic failover is allowed only for explicitly configured API or "
-                "enterprise profiles, never ambient consumer subscriptions"
-            )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -17,3 +17,7 @@ sightmesh = "sightmesh.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sightmesh"]
+artifacts = ["src/sightmesh/pool/ui.html"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/sightmesh", "tests", "scripts", "README.md", "LICENSE"]
