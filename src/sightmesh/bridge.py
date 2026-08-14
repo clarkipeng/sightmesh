@@ -20,6 +20,7 @@ from .routing import (
     peer_identity,
     set_peer_identity,
 )
+from .stalls import StallDetector
 
 LOGGER = logging.getLogger("sightmesh.bridge")
 
@@ -223,6 +224,7 @@ class BridgeSupervisor:
         self.client = client
         self.repowire_url = repowire_url
         self.tasks: dict[str, asyncio.Task[None]] = {}
+        self.stalls = StallDetector()
 
     async def run(self) -> None:
         while True:
@@ -256,6 +258,14 @@ class BridgeSupervisor:
                     continue
                 for session in sessions:
                     desired[session["id"]] = BridgedSession(workspace, session, path)
+                    try:
+                        await asyncio.to_thread(
+                            self.stalls.reconcile, self.client, session
+                        )
+                    except CdesktopError as exc:
+                        LOGGER.warning(
+                            "Cannot inspect session %s for stalls: %s", session["id"], exc
+                        )
         except (CdesktopError, leases.LeaseError) as exc:
             LOGGER.warning("Cannot reconcile cdesktop ownership: %s", exc)
             return
