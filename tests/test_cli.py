@@ -40,6 +40,13 @@ def test_sightmesh_cdesktop_version_requires_safe_command_lifecycle() -> None:
     assert not _is_sightmesh_cdesktop_version(None)
 
 
+def test_bootstrap_installs_the_safe_cdesktop_release() -> None:
+    bootstrap = (Path(__file__).parents[1] / "scripts" / "bootstrap-local.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "v0.2.5-20260813115508/cdesktop-0.2.5.tgz" in bootstrap
+
+
 def test_coordination_contract_is_compact_and_idempotent() -> None:
     prompt = _with_coordination_contract("Do the bounded review.")
     assert "sightmesh peers" in prompt
