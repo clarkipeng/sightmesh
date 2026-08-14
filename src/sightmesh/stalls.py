@@ -14,6 +14,7 @@ from .cdesktop import CdesktopClient, CdesktopError, CdesktopRejectedError
 from .stall_settings import threshold_minutes
 
 LOGGER = logging.getLogger("sightmesh.stalls")
+MAX_CONFIRMATION_POLLS = 3
 
 def threshold_from_environment() -> timedelta:
     """Return the bounded, operator-configurable no-event threshold."""
@@ -85,14 +86,27 @@ class RecoveryIntentStore:
     def begin(self, process_id: str) -> tuple[str, bool]:
         state = self.intents.get(process_id)
         if state:
-            return state, False
+            return self.state(process_id), False
         self.intents[process_id] = "intent"
         self._write()
         return "intent", True
 
     def set(self, process_id: str, state: str) -> None:
-        self.intents[process_id] = state
+        self.intents[process_id] = f"{state}:0" if state in {"accepted", "uncertain"} else state
         self._write()
+
+    def state(self, process_id: str) -> str:
+        return self.intents[process_id].split(":", 1)[0]
+
+    def confirmation_poll(self, process_id: str) -> int:
+        state, _, raw_count = self.intents[process_id].partition(":")
+        try:
+            count = int(raw_count or 0) + 1
+        except ValueError:
+            count = 1
+        self.intents[process_id] = f"{state}:{count}"
+        self._write()
+        return count
 
     def discard(self, process_id: str) -> None:
         if process_id in self.intents:
@@ -113,7 +127,9 @@ class RecoveryIntentStore:
             key: value
             for key, value in data.items()
             if isinstance(key, str)
-            and value in {"intent", "stopping", "handoff", "notified"}
+            and isinstance(value, str)
+            and value.split(":", 1)[0]
+            in {"intent", "stopping", "accepted", "uncertain", "handoff", "notified", "escalated"}
         } if isinstance(data, dict) else {}
 
     def _write(self) -> None:
@@ -168,7 +184,7 @@ class StallDetector:
                 client, session, parent_session_id, process_id, by_id[process_id]
             )
         for process_id in self.recovery_store.process_ids() - active_ids:
-            if self.recovery_store.intents[process_id] == "notified":
+            if self.recovery_store.state(process_id) == "notified":
                 self.recovery_store.discard(process_id)
 
         for process in processes:
@@ -229,15 +245,32 @@ class StallDetector:
         except CdesktopError as exc:
             LOGGER.warning("Cannot reconcile stalled execution %s: %s", process_id, exc)
             return
+        state = self.recovery_store.state(process_id)
         if current.get("status") != "running":
-            if self.recovery_store.intents[process_id] != "notified":
+            if state != "notified":
                 self.recovery_store.set(process_id, "handoff")
                 self._notify_parent(client, session, parent_session_id, process_id)
             return
-        if self.recovery_store.intents[process_id] == "notified":
+        if state == "notified":
             return
-        # No synchronous stop call survives a restart. A persisted intent alone
-        # never proves recovery; authoritative running state retries the stop.
+        if state in {"accepted", "uncertain"}:
+            # A successful POST, or one whose transport outcome is unknown, is
+            # non-idempotent.  Keep reading the authoritative process state;
+            # never turn normal shutdown latency into a second stop request.
+            polls = self.recovery_store.confirmation_poll(process_id)
+            if polls >= MAX_CONFIRMATION_POLLS:
+                self.recovery_store.set(process_id, "escalated")
+                LOGGER.error(
+                    "Stalled execution %s did not settle after %s confirmations; "
+                    "leaving standard failed-child recovery for operator escalation",
+                    process_id,
+                    polls,
+                )
+            return
+        if state == "escalated":
+            return
+        # An intent/stopping record can be left by a crash before the call was
+        # accepted.  Authoritative running state makes that retry safe.
         self.recovery_store.set(process_id, "stopping")
         try:
             client.stop_execution(process_id)
@@ -246,7 +279,26 @@ class StallDetector:
             LOGGER.warning("Stop rejected for execution %s; it remains retryable: %s", process_id, exc)
             return
         except CdesktopError as exc:
+            self.recovery_store.set(process_id, "uncertain")
             LOGGER.warning("Stop outcome for execution %s is ambiguous: %s", process_id, exc)
+            # A transport failure may have followed a successful side effect.
+            # One authoritative read can establish recovery; otherwise retain
+            # uncertainty and wait rather than retrying the destructive call.
+            try:
+                confirmed = client.execution_process(process_id)
+            except CdesktopError as confirm_exc:
+                LOGGER.warning("Cannot confirm stalled execution %s: %s", process_id, confirm_exc)
+                return
+            if confirmed.get("status") != "running":
+                self.recovery_store.set(process_id, "handoff")
+                self._notify_parent(client, session, parent_session_id, process_id)
+            else:
+                self.recovery_store.confirmation_poll(process_id)
+            return
+        self.recovery_store.set(process_id, "accepted")
+        # Confirm promptly when possible, but an unavailable read leaves the
+        # accepted state durable for the next reconciliation rather than
+        # making another destructive request.
         try:
             confirmed = client.execution_process(process_id)
         except CdesktopError as exc:

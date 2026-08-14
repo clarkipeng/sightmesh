@@ -209,7 +209,7 @@ def test_definitive_stop_failure_remains_retryable():
         def __init__(self):
             super().__init__([_process()], {"process-1": {"entries": []}})
             self.stop_responses = [
-                CdesktopError("POST /execution-processes/process-1/stop failed: HTTP 500")
+                CdesktopRejectedError("POST /execution-processes/process-1/stop failed: HTTP 500")
             ]
 
         def stop_execution(self, process_id):
@@ -277,7 +277,52 @@ def test_definitive_server_rejection_retries_without_parent_wake():
     assert client.sent[0][0][0] == "parent"
 
 
-def test_ambiguous_stop_with_authoritatively_running_process_waits_for_retry():
+def test_accepted_stop_waits_for_confirmation_without_a_duplicate_request(tmp_path):
+    class DelayedConfirmationClient(FakeClient):
+        def __init__(self):
+            super().__init__([_process()], {"process-1": {"entries": []}})
+            self.confirmation_reads = 0
+
+        def execution_process(self, process_id):
+            self.confirmation_reads += 1
+            if self.confirmation_reads == 2:
+                raise CdesktopError("confirmation read timed out")
+            return super().execution_process(process_id)
+
+        def stop_execution(self, process_id):
+            self.stopped.append(process_id)
+
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    client = DelayedConfirmationClient()
+    store_path = tmp_path / "stall-recovery.json"
+    detector = StallDetector(
+        threshold=timedelta(minutes=2),
+        now=lambda: now,
+        recovery_store=RecoveryIntentStore(store_path),
+    )
+    session = {"id": "child", "parent_session_id": "parent"}
+
+    detector.reconcile(client, session)
+    detector.now = lambda: now + timedelta(minutes=2)
+    detector.reconcile(client, session)
+    restarted = StallDetector(
+        threshold=timedelta(minutes=2),
+        now=lambda: now + timedelta(minutes=2),
+        recovery_store=RecoveryIntentStore(store_path),
+    )
+    restarted.reconcile(client, session)
+
+    assert client.stopped == ["process-1"]
+    assert client.sent == []
+
+    client.processes[0]["status"] = "killed"
+    restarted.reconcile(client, session)
+
+    assert client.stopped == ["process-1"]
+    assert client.sent[0][0][0] == "parent"
+
+
+def test_ambiguous_stop_with_delayed_running_transition_never_repeats_stop():
     class AmbiguousStopClient(FakeClient):
         def __init__(self):
             super().__init__([_process()], {"process-1": {"entries": []}})
@@ -303,5 +348,11 @@ def test_ambiguous_stop_with_authoritatively_running_process_waits_for_retry():
 
     detector.reconcile(client, session)
 
-    assert client.stopped == ["process-1", "process-1"]
+    assert client.stopped == ["process-1"]
+    assert client.sent == []
+
+    client.processes[0]["status"] = "killed"
+    detector.reconcile(client, session)
+
+    assert client.stopped == ["process-1"]
     assert client.sent[0][0][0] == "parent"
