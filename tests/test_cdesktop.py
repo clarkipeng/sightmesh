@@ -258,6 +258,20 @@ def test_stop_execution_targets_one_process() -> None:
     ]
 
 
+def test_stop_execution_passes_process_scoped_dedupe_key() -> None:
+    client = FakeClient()
+    client.stop_execution("process-a", dedupe_key="stall:process-a:stop")
+    assert client.calls == [
+        (
+            "POST",
+            "/execution-processes/process-a/stop",
+            {"dedupe_key": "stall:process-a:stop"},
+            None,
+            None,
+        )
+    ]
+
+
 def test_create_direct_workspace_record_and_attach_repo(tmp_path) -> None:
     client = FakeClient()
     client.repos = list

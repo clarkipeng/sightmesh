@@ -22,7 +22,7 @@ class FakeClient:
     def execution_process(self, process_id):
         return next(process for process in self.processes if process["id"] == process_id)
 
-    def stop_execution(self, process_id):
+    def stop_execution(self, process_id, *, dedupe_key=None):
         self.stopped.append(process_id)
         self.execution_process(process_id)["status"] = "killed"
 
@@ -167,7 +167,7 @@ def test_lost_stop_response_never_repeats_stop_and_retries_parent_wake():
             self.stop_responses = [CdesktopError("Cannot reach cdesktop after stop")]
             self.send_responses = [CdesktopError("Cannot reach cdesktop parent")]
 
-        def stop_execution(self, process_id):
+        def stop_execution(self, process_id, *, dedupe_key=None):
             self.stopped.append(process_id)
             self.execution_process(process_id)["status"] = "killed"
             if self.stop_responses:
@@ -212,7 +212,7 @@ def test_definitive_stop_failure_remains_retryable():
                 CdesktopRejectedError("POST /execution-processes/process-1/stop failed: HTTP 500")
             ]
 
-        def stop_execution(self, process_id):
+        def stop_execution(self, process_id, *, dedupe_key=None):
             self.stopped.append(process_id)
             if self.stop_responses:
                 raise self.stop_responses.pop()
@@ -253,7 +253,7 @@ def test_definitive_server_rejection_retries_without_parent_wake():
             super().__init__([_process()], {"process-1": {"entries": []}})
             self.stop_responses = [CdesktopRejectedError("server rejected stop")]
 
-        def stop_execution(self, process_id):
+        def stop_execution(self, process_id, *, dedupe_key=None):
             self.stopped.append(process_id)
             if self.stop_responses:
                 raise self.stop_responses.pop()
@@ -289,7 +289,7 @@ def test_accepted_stop_waits_for_confirmation_without_a_duplicate_request(tmp_pa
                 raise CdesktopError("confirmation read timed out")
             return super().execution_process(process_id)
 
-        def stop_execution(self, process_id):
+        def stop_execution(self, process_id, *, dedupe_key=None):
             self.stopped.append(process_id)
 
     now = datetime(2026, 8, 14, tzinfo=UTC)
@@ -322,13 +322,60 @@ def test_accepted_stop_waits_for_confirmation_without_a_duplicate_request(tmp_pa
     assert client.sent[0][0][0] == "parent"
 
 
+@pytest.mark.parametrize("accepted_before_crash", [False, True])
+def test_stopping_crash_window_uses_one_logical_cdesktop_stop(
+    tmp_path, accepted_before_crash
+):
+    class IdempotentStopClient(FakeClient):
+        def __init__(self):
+            super().__init__([_process()], {"process-1": {"entries": []}})
+            self.accepted_keys = (
+                {"stall:process-1:stop"} if accepted_before_crash else set()
+            )
+            self.destructive_stop_calls = int(accepted_before_crash)
+            self.stop_requests = []
+
+        def stop_execution(self, process_id, *, dedupe_key=None):
+            self.stop_requests.append(dedupe_key)
+            if dedupe_key not in self.accepted_keys:
+                self.accepted_keys.add(dedupe_key)
+                self.destructive_stop_calls += 1
+
+    client = IdempotentStopClient()
+    store_path = tmp_path / "stall-recovery.json"
+    store = RecoveryIntentStore(store_path)
+    # This is the exact durable state left by a bridge crash on either side of
+    # the POST; the process can remain authoritatively running while shutdown
+    # settles.
+    store.set("process-1", "stopping")
+    detector = StallDetector(recovery_store=RecoveryIntentStore(store_path))
+    session = {"id": "child", "parent_session_id": "parent"}
+
+    detector.reconcile(client, session)
+
+    assert client.stop_requests == ["stall:process-1:stop"]
+    assert client.destructive_stop_calls == 1
+    assert client.sent == []
+
+    restarted = StallDetector(recovery_store=RecoveryIntentStore(store_path))
+    restarted.reconcile(client, session)
+
+    assert client.stop_requests == ["stall:process-1:stop"]
+    assert client.destructive_stop_calls == 1
+
+    client.processes[0]["status"] = "killed"
+    restarted.reconcile(client, session)
+
+    assert client.sent[0][0][0] == "parent"
+
+
 def test_ambiguous_stop_with_delayed_running_transition_never_repeats_stop():
     class AmbiguousStopClient(FakeClient):
         def __init__(self):
             super().__init__([_process()], {"process-1": {"entries": []}})
             self.stop_responses = [CdesktopError("connection closed before response")]
 
-        def stop_execution(self, process_id):
+        def stop_execution(self, process_id, *, dedupe_key=None):
             self.stopped.append(process_id)
             if self.stop_responses:
                 raise self.stop_responses.pop()

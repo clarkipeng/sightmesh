@@ -269,11 +269,13 @@ class StallDetector:
             return
         if state == "escalated":
             return
-        # An intent/stopping record can be left by a crash before the call was
-        # accepted.  Authoritative running state makes that retry safe.
+        # A crash can leave ``stopping`` before or after cdesktop accepts the
+        # POST. Reissuing the same process-scoped key is the cross-service
+        # invariant: cdesktop performs the destructive stop once and returns
+        # that original outcome on a retry.
         self.recovery_store.set(process_id, "stopping")
         try:
-            client.stop_execution(process_id)
+            client.stop_execution(process_id, dedupe_key=f"stall:{process_id}:stop")
         except CdesktopRejectedError as exc:
             self.recovery_store.set(process_id, "intent")
             LOGGER.warning("Stop rejected for execution %s; it remains retryable: %s", process_id, exc)

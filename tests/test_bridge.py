@@ -189,7 +189,7 @@ def test_no_bridge_child_still_gets_stall_recovery(monkeypatch) -> None:
         def execution_process(self, _process_id):
             return self.execution_processes("child")[0]
 
-        def stop_execution(self, process_id):
+        def stop_execution(self, process_id, *, dedupe_key=None):
             self.stopped.append(process_id)
             self.execution_process("child")["status"] = "killed"
 

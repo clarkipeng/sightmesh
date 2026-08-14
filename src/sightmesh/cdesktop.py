@@ -237,9 +237,14 @@ class CdesktopClient:
             raise CdesktopError("cdesktop normalized snapshot response is invalid")
         return result
 
-    def stop_execution(self, execution_process_id: str) -> Any:
+    def stop_execution(
+        self, execution_process_id: str, *, dedupe_key: str | None = None
+    ) -> Any:
+        """Stop one execution through cdesktop's process-scoped dedupe contract."""
         return self.request(
-            "POST", f"/execution-processes/{execution_process_id}/stop", {}
+            "POST",
+            f"/execution-processes/{execution_process_id}/stop",
+            {"dedupe_key": dedupe_key} if dedupe_key else {},
         )
 
     def wait_for_session_idle(
