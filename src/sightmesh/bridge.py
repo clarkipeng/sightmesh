@@ -244,20 +244,18 @@ class BridgeSupervisor:
             )
             workspaces = await asyncio.to_thread(self.client.workspaces)
             for workspace in workspaces:
-                if workspace["id"] not in enabled or workspace.get("archived"):
+                if workspace.get("archived"):
                     continue
                 try:
-                    path = await asyncio.to_thread(_repo_path, self.client, workspace)
                     sessions = await asyncio.to_thread(
                         self.client.sessions, workspace["id"]
                     )
                 except CdesktopError as exc:
                     LOGGER.warning(
-                        "Cannot bridge workspace %s: %s", workspace["id"], exc
+                        "Cannot inspect workspace %s sessions: %s", workspace["id"], exc
                     )
                     continue
                 for session in sessions:
-                    desired[session["id"]] = BridgedSession(workspace, session, path)
                     try:
                         await asyncio.to_thread(
                             self.stalls.reconcile, self.client, session
@@ -266,6 +264,17 @@ class BridgeSupervisor:
                         LOGGER.warning(
                             "Cannot inspect session %s for stalls: %s", session["id"], exc
                         )
+                if workspace["id"] not in enabled:
+                    continue
+                try:
+                    path = await asyncio.to_thread(_repo_path, self.client, workspace)
+                except CdesktopError as exc:
+                    LOGGER.warning(
+                        "Cannot bridge workspace %s: %s", workspace["id"], exc
+                    )
+                    continue
+                for session in sessions:
+                    desired[session["id"]] = BridgedSession(workspace, session, path)
         except (CdesktopError, leases.LeaseError) as exc:
             LOGGER.warning("Cannot reconcile cdesktop ownership: %s", exc)
             return

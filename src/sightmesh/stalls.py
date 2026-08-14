@@ -2,31 +2,19 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .cdesktop import CdesktopClient, CdesktopError
+from .stall_settings import threshold_minutes
 
 LOGGER = logging.getLogger("sightmesh.stalls")
 
-DEFAULT_THRESHOLD_MINUTES = 30
-
-
 def threshold_from_environment() -> timedelta:
     """Return the bounded, operator-configurable no-event threshold."""
-    raw = os.environ.get("SIGHTMESH_STALL_THRESHOLD_MINUTES")
-    if raw is None:
-        return timedelta(minutes=DEFAULT_THRESHOLD_MINUTES)
-    try:
-        minutes = int(raw)
-    except ValueError as exc:
-        raise ValueError("SIGHTMESH_STALL_THRESHOLD_MINUTES must be a whole number") from exc
-    if minutes < 1:
-        raise ValueError("SIGHTMESH_STALL_THRESHOLD_MINUTES must be at least 1")
-    return timedelta(minutes=minutes)
+    return timedelta(minutes=threshold_minutes())
 
 
 def _parse_time(value: object) -> datetime | None:
@@ -100,6 +88,9 @@ class StallDetector:
         self.notified: set[str] = set()
 
     def reconcile(self, client: CdesktopClient, session: dict[str, Any]) -> None:
+        parent_session_id = session.get("parent_session_id")
+        if not isinstance(parent_session_id, str) or not parent_session_id:
+            return
         session_id = str(session["id"])
         processes = client.execution_processes(session_id)
         running_ids = {
@@ -116,12 +107,13 @@ class StallDetector:
         for process in processes:
             if str(process.get("id")) not in running_ids:
                 continue
-            self._reconcile_process(client, session, process)
+            self._reconcile_process(client, session, parent_session_id, process)
 
     def _reconcile_process(
         self,
         client: CdesktopClient,
         session: dict[str, Any],
+        parent_session_id: str,
         process: dict[str, Any],
     ) -> None:
         process_id = str(process["id"])
@@ -129,6 +121,11 @@ class StallDetector:
             snapshot = client.normalized_snapshot(process_id)
         except CdesktopError as exc:
             LOGGER.warning("Cannot inspect execution %s for stalls: %s", process_id, exc)
+            return
+        # A snapshot is only evidence of silence after cdesktop has completed
+        # its bounded read. A cold/partial read can legitimately be empty while
+        # an active executor is still filling the event stream.
+        if snapshot.get("complete") is not True:
             return
 
         now = self.now()
@@ -159,12 +156,11 @@ class StallDetector:
         if process_id not in self.recovering:
             client.stop_execution(process_id)
             self.recovering.add(process_id)
-        parent_session_id = session.get("parent_session_id")
-        if not parent_session_id or process_id in self.notified:
+        if process_id in self.notified:
             return
         dedupe_key = f"stall:{process_id}:parent"
         client.send(
-            str(parent_session_id),
+            parent_session_id,
             "STALL: child execution produced no session events past the configured "
             "threshold and was handed to native killed-child recovery.",
             str(session["id"]),

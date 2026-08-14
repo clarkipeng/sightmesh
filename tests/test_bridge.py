@@ -1,8 +1,10 @@
 import asyncio
 import json
 
+from sightmesh import bridge as bridge_module
 from sightmesh.bridge import (
     BridgedSession,
+    BridgeSupervisor,
     RepowireSessionBridge,
     _backend,
     _dedupe_key,
@@ -157,3 +159,41 @@ def test_unidentified_messages_still_dedupe_deterministically() -> None:
     first = _dedupe_key("session", "notify", message)
     second = _dedupe_key("session", "notify", dict(message))
     assert first == second
+
+
+def test_no_bridge_child_still_gets_stall_recovery(monkeypatch) -> None:
+    class StallClient(FakeClient):
+        def workspaces(self):
+            return [{"id": "child-workspace", "archived": False}]
+
+        def sessions(self, _workspace_id):
+            return [{"id": "child", "parent_session_id": "parent"}]
+
+        def execution_processes(self, _session_id):
+            return [
+                {
+                    "id": "process-1",
+                    "status": "running",
+                    "run_reason": "coding_agent",
+                    "started_at": "2026-08-14T00:00:00Z",
+                }
+            ]
+
+        def normalized_snapshot(self, _process_id):
+            return {"complete": True, "entries": []}
+
+        def stop_execution(self, process_id):
+            self.stopped.append(process_id)
+
+    client = StallClient()
+    client.stopped = []
+    supervisor = BridgeSupervisor(client, "ws://127.0.0.1:8377/ws")
+    monkeypatch.setattr(bridge_module, "enabled_workspaces", lambda: set())
+    monkeypatch.setattr(bridge_module.leases, "sync_active_workspaces", lambda *_args, **_kwargs: [])
+
+    asyncio.run(supervisor.reconcile())
+    asyncio.run(supervisor.reconcile())
+
+    assert client.stopped == ["process-1"]
+    assert client.sent[0][0] == "parent"
+    assert supervisor.tasks == {}

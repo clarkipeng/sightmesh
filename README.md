@@ -161,6 +161,8 @@ The managed LaunchAgents are `io.sightmesh.cdesktop` and `io.sightmesh.bridge`. 
 
 Every workspace created by `sightmesh spawn` is bridge-enabled unless `--no-bridge` is passed. The bridge registers one Repowire proxy peer per enabled cdesktop session. Repowire asks become durable cdesktop commands, and `sightmesh bridge-reply` closes the original correlation.
 
+The managed bridge checks every active spawned child for a completed event-snapshot silence interval, including `--no-bridge` children. Set `SIGHTMESH_STALL_THRESHOLD_MINUTES` before `sightmesh service install` to configure the managed LaunchAgent; rerun install after changing it. Invalid values safely use the 30-minute default.
+
 Every workspace launched from a cdesktop agent records that exact parent session. Children can inspect or immediately contact their launcher without looking up an ID:
 
 ```bash

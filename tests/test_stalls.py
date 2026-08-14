@@ -36,7 +36,7 @@ def _process():
 
 def test_true_idle_stall_stops_once_and_notifies_parent():
     now = datetime(2026, 8, 14, tzinfo=UTC)
-    client = FakeClient([_process()], {"process-1": {"entries": []}})
+    client = FakeClient([_process()], {"process-1": {"complete": True, "entries": []}})
     detector = StallDetector(threshold=timedelta(minutes=2), now=lambda: now)
     session = {"id": "child", "parent_session_id": "parent"}
 
@@ -66,7 +66,12 @@ def test_active_child_process_suppresses_stall(command):
     now = datetime(2026, 8, 14, tzinfo=UTC)
     client = FakeClient(
         [_process()],
-        {"process-1": {"entries": [{"tool_name": command, "status": "running"}]}},
+        {
+            "process-1": {
+                "complete": True,
+                "entries": [{"tool_name": command, "status": "running"}],
+            }
+        },
     )
     detector = StallDetector(threshold=timedelta(minutes=2), now=lambda: now)
     session = {"id": "child", "parent_session_id": "parent"}
@@ -81,15 +86,53 @@ def test_active_child_process_suppresses_stall(command):
 
 def test_new_event_resets_idle_threshold():
     now = datetime(2026, 8, 14, tzinfo=UTC)
-    client = FakeClient([_process()], {"process-1": {"entries": [{"content": "compile"}]}})
+    client = FakeClient(
+        [_process()],
+        {"process-1": {"complete": True, "entries": [{"content": "compile"}]}},
+    )
     detector = StallDetector(threshold=timedelta(minutes=2), now=lambda: now)
-    session = {"id": "child"}
+    session = {"id": "child", "parent_session_id": "parent"}
 
     detector.reconcile(client, session)
     detector.now = lambda: now + timedelta(minutes=1)
-    client.snapshots["process-1"] = {"entries": [{"content": "compile failed"}]}
+    client.snapshots["process-1"] = {
+        "complete": True,
+        "entries": [{"content": "compile failed"}],
+    }
     detector.reconcile(client, session)
     detector.now = lambda: now + timedelta(minutes=3)
     detector.reconcile(client, session)
 
     assert client.stopped == ["process-1"]
+
+
+def test_root_session_is_never_eligible_for_stall_recovery():
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    client = FakeClient([_process()], {"process-1": {"complete": True, "entries": []}})
+    detector = StallDetector(threshold=timedelta(minutes=2), now=lambda: now)
+
+    detector.reconcile(client, {"id": "lead"})
+    detector.now = lambda: now + timedelta(hours=1)
+    detector.reconcile(client, {"id": "lead"})
+
+    assert client.stopped == []
+    assert client.sent == []
+
+
+def test_incomplete_cold_snapshots_cannot_start_or_trigger_recovery():
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    client = FakeClient([_process()], {"process-1": {"complete": False, "entries": []}})
+    detector = StallDetector(threshold=timedelta(minutes=2), now=lambda: now)
+    session = {"id": "child", "parent_session_id": "parent"}
+
+    detector.reconcile(client, session)
+    detector.now = lambda: now + timedelta(hours=1)
+    detector.reconcile(client, session)
+    client.snapshots["process-1"] = {
+        "complete": True,
+        "entries": [{"content": "still running"}],
+    }
+    detector.reconcile(client, session)
+
+    assert client.stopped == []
+    assert client.sent == []
