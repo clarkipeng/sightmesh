@@ -50,7 +50,7 @@ The fork's picker includes the GPT-5.6 family and accepts an exact free-form mod
 
 ### Claude capacity
 
-An initial live run on 2026-08-12 encountered the account's weekly Max limit. After the provider's stated reset, a fresh visible Claude Code workspace completed successfully with `CLAUDE_SIGHTMESH_OK`, and a blocking Repowire request returned `CLAUDE_REPOWIRE_OK`. SightMesh treats a capacity boundary as a checkpointed handoff to the next account in the credential pool that still has quota. It does not bypass limits or manipulate credentials.
+An initial live run on 2026-08-12 encountered the account's weekly Max limit. After the provider's stated reset, a fresh visible Claude Code workspace completed successfully with `CLAUDE_SIGHTMESH_OK`, and a blocking Repowire request returned `CLAUDE_REPOWIRE_OK`. SightMesh treats a capacity boundary as a checkpointed handoff to an explicitly selected configured profile. Its separate credential pool selects the next operator-owned account with quota for direct CLI launches. It does not bypass limits or manipulate credentials.
 
 ### Repowire app-server hook replacement
 

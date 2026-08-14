@@ -10,7 +10,7 @@ cooled until the provider's reported reset time rather than retried, so the pool
 moves to the next owned account instead of pushing past a limit.
 
 Secrets live in credentials/<id>.token (0600) outside the repository and are
-never printed - only length, prefix, and fingerprint.
+never printed - only length and fingerprint.
 """
 
 from __future__ import annotations
@@ -146,7 +146,7 @@ def shape(secret: str) -> str:
     """Describe a secret without disclosing it."""
     if not secret:
         return "empty"
-    return f"len={len(secret)} prefix={secret[:12]}... fp={fingerprint(secret)}"
+    return f"len={len(secret)} fp={fingerprint(secret)}"
 
 
 # ---------------------------------------------------------------- model

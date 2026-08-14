@@ -30,7 +30,7 @@ Both systems treat `.context` as workspace-local files rather than a global cont
 
 SightMesh profiles contain only a name, executor, cdesktop provider UUID, optional model and reasoning defaults, credential classification, and policy flags. Provider keys remain inside cdesktop's provider configuration.
 
-For a profile the operator configured, `sightmesh failover` starts a visible successor on the next account in the pool that still has quota. The default keeps the same cdesktop workspace so dirty files and transcript context remain visible. A clean committed source can instead use `--new-worktree`. Archival is a separate confirmed action.
+For the explicitly named profile the operator configured, `sightmesh failover` starts a visible successor. The default keeps the same cdesktop workspace so dirty files and transcript context remain visible. A clean committed source can instead use `--new-worktree`. Credential-pool selection is provided separately by `sightmesh pool exec` for direct Claude and Codex CLI launches.
 
 The shared reconciliation skill instructs Claude and Codex managers to invoke this handoff when they observe a capacity or authentication boundary. This is orchestration across accounts the operator owns, each used with its own normal credentials, not credential extraction, auth-header replay, or limit evasion.
 

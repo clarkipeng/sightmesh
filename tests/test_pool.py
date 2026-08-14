@@ -97,6 +97,7 @@ def test_shape_describes_a_secret_without_revealing_it() -> None:
     rendered = core.shape(token)
 
     assert token not in rendered
+    assert token[:12] not in rendered
     assert "len=133" in rendered
     assert core.fingerprint(token)[:12] in rendered
 

@@ -2207,24 +2207,6 @@ def cmd_pool(args: argparse.Namespace) -> int:
         _emit(chosen["id"], args.json)
         return 0
 
-    if action == "env":
-        # The one place a credential value is emitted: these lines are meant to
-        # be eval'd by a launching shell. Everything else prints shapes only.
-        chosen, notes = pool_core.select(args.provider, verify=not args.no_verify)
-        for note in notes:
-            print(f"# {note}", file=sys.stderr)
-        if not chosen:
-            raise PoolError(f"No {args.provider} account available")
-        print(
-            f"# using {chosen['id']} ({pool_core.identity_label(chosen)})",
-            file=sys.stderr,
-        )
-        for key, value in pool_core.env_for(chosen).items():
-            quoted = value.replace("'", "'\\''")
-            print(f"export {key}='{quoted}'")
-        print(f"export SIGHTMESH_POOL_ACCOUNT='{chosen['id']}'")
-        return 0
-
     if action == "exec":
         # Preferred launcher: the credential is handed to the child process
         # directly, so it never reaches the terminal or shell history.
@@ -2515,7 +2497,7 @@ def parser() -> argparse.ArgumentParser:
 
     failover = sub.add_parser(
         "failover",
-        help="Start a visible checkpointed replacement on an approved API or enterprise profile",
+        help="Start a visible checkpointed replacement on an approved profile",
     )
     failover.add_argument("workspace_id")
     failover.add_argument("--profile", dest="profile_name", required=True)
@@ -2639,7 +2621,7 @@ def parser() -> argparse.ArgumentParser:
     profile_set.add_argument(
         "--automatic-failover",
         action="store_true",
-        help="Allow checkpointed failover to this API or enterprise profile",
+        help="Allow checkpointed failover to this configured profile",
     )
     profile_set.set_defaults(func=cmd_profile)
     profile_remove = profile_sub.add_parser("remove", help="Remove a named profile")
@@ -2664,13 +2646,6 @@ def parser() -> argparse.ArgumentParser:
     pool_which.add_argument("provider", choices=pool_core.PROVIDERS)
     pool_which.add_argument("--verify", action="store_true")
     pool_which.set_defaults(func=cmd_pool)
-
-    pool_env = pool_sub.add_parser(
-        "env", help="Emit shell export lines for the selected account"
-    )
-    pool_env.add_argument("provider", choices=pool_core.PROVIDERS)
-    pool_env.add_argument("--no-verify", action="store_true")
-    pool_env.set_defaults(func=cmd_pool)
 
     pool_exec = pool_sub.add_parser(
         "exec",
