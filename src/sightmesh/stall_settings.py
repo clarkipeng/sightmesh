@@ -6,6 +6,7 @@ import os
 LOGGER = logging.getLogger("sightmesh.stalls")
 
 DEFAULT_THRESHOLD_MINUTES = 30
+MAX_THRESHOLD_MINUTES = 24 * 60
 THRESHOLD_ENV = "SIGHTMESH_STALL_THRESHOLD_MINUTES"
 
 
@@ -18,10 +19,11 @@ def threshold_minutes() -> int:
         minutes = int(raw)
     except ValueError:
         minutes = 0
-    if minutes < 1:
+    if not 1 <= minutes <= MAX_THRESHOLD_MINUTES:
         LOGGER.warning(
-            "%s must be a positive whole number; using %s minutes",
+            "%s must be a whole number from 1 to %s; using %s minutes",
             THRESHOLD_ENV,
+            MAX_THRESHOLD_MINUTES,
             DEFAULT_THRESHOLD_MINUTES,
         )
         return DEFAULT_THRESHOLD_MINUTES

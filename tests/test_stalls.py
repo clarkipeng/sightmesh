@@ -119,6 +119,14 @@ def test_root_session_is_never_eligible_for_stall_recovery():
     assert client.sent == []
 
 
+def test_huge_threshold_cannot_overflow_detector_construction(monkeypatch):
+    monkeypatch.setenv("SIGHTMESH_STALL_THRESHOLD_MINUTES", "999999999999999999999")
+
+    detector = StallDetector()
+
+    assert detector.threshold == timedelta(minutes=30)
+
+
 def test_incomplete_cold_snapshots_cannot_start_or_trigger_recovery():
     now = datetime(2026, 8, 14, tzinfo=UTC)
     client = FakeClient([_process()], {"process-1": {"complete": False, "entries": []}})
