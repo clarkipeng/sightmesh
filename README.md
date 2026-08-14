@@ -200,6 +200,8 @@ sightmesh profile set work-claude-api \
   --automatic-failover
 ```
 
+A profile is a named cdesktop provider mapping used by `spawn` and `failover`. A credential pool is separate: it is an ordered list of Claude or Codex accounts the operator owns, and `sightmesh pool exec` selects the first account with quota before launching that provider CLI. Claude Max and Codex subscription accounts may appear alongside API accounts.
+
 Use a profile at launch with `sightmesh spawn ... --profile work-claude-api`. When a worker reaches a capacity or authentication boundary, a manager can automatically start a visible successor in the same cdesktop workspace, preserving the existing files and transcript:
 
 ```sh
@@ -211,7 +213,7 @@ sightmesh failover WORKSPACE_ID \
 
 Use `--new-worktree` only for a clean committed handoff that needs a separate workspace. The source is preserved unless `--archive-source --confirm-reconciled` is explicit.
 
-Automatic failover is allowed only for API or enterprise profiles explicitly configured through cdesktop. Ambient Claude Max, ChatGPT, or Codex consumer subscriptions can be selected for normal launches but cannot enter an automatic failover chain. SightMesh does not extract auth headers, copy cookies or tokens, silently switch logins, rotate consumer subscriptions, or evade rate limits.
+Every account in a pool is one the operator owns and logged into through the provider's own interface, and each worker runs on that account's own normal credentials. SightMesh observes quota and selects the next owned account. It does not print, extract, or replay credentials; copy cookies or tokens; share one account's session with another worker; or evade rate limits.
 
 ## Conductor comparison
 

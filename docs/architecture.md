@@ -12,6 +12,7 @@ Encode semantics and invariants, not catalogs of edge cases. Prefer one general 
 - Git owns source, branches, and worktrees.
 - Repowire transports cross-workspace messages.
 - `.context` holds ignored workspace-local handoffs.
+- SightMesh owns credential-pool order and quota-aware account selection.
 - SightMesh validates intent and calls those owners.
 
 SightMesh keeps no long-running updater and no runtime SQLite databases.
@@ -59,9 +60,19 @@ The scheduler admits work under a configurable concurrency cap and pauses admiss
 - Updates are explicit: verify, require idle, replace, and health-check. No updater daemon or retry loop.
 - The UI uses event streams for fleet, command, approval, and update state.
 
+## Credential selection
+
+SightMesh keeps the pool's credentials under `~/.config/agent-pool/`; cdesktop profiles retain only provider mappings and non-secret defaults.
+
+- A profile names a cdesktop provider mapping for `spawn` and `failover`.
+- A pool is an ordered list of operator-owned accounts for one provider CLI.
+- `pool exec` takes the first account whose quota allows a launch.
+- An exhausted account is skipped until its provider reports capacity again.
+- Selection observes quota. It never prints, extracts, or replays credentials, or retries past a reported limit.
+
 ## SightMesh surface
 
-Keep only high-value local verbs: service, open, status, spawn, message, steer, peers, peek, approvals, workspace lifecycle, migrate, and explicit update. Prefer cdesktop or Git directly when they already express the operation.
+Keep only high-value local verbs: service, open, status, spawn, message, steer, peers, peek, approvals, profiles, failover, workspace lifecycle, migrate, and explicit update. Prefer cdesktop or Git directly when they already express the operation.
 
 ## Replacement boundary
 

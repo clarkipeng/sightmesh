@@ -86,7 +86,9 @@ sightmesh profile set codex-work-api \
   --automatic-failover
 ```
 
-`credential-kind=ambient` is appropriate for a normal CLI login or consumer subscription, but SightMesh rejects `--automatic-failover` for that kind. API and enterprise profiles may opt in.
+`credential-kind=ambient` records a normal CLI login or consumer subscription; `api` and `enterprise` record a keyed provider. Any kind may opt into `--automatic-failover` when the operator configured that provider through its supported interface.
+
+Profiles are explicit `spawn` and `failover` destinations. Independently, a credential pool orders operator-owned accounts for the Claude or Codex CLI. `sightmesh pool exec` takes the first account with quota and moves to the next account when one is exhausted. Selection never prints, extracts, or replays credentials, or pushes requests past a reported limit.
 
 On a capacity or authentication boundary, create a durable checkpoint and run:
 

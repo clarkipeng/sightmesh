@@ -4,8 +4,9 @@
 
 - Detect provider rate limits, context exhaustion, authentication expiry, and unavailable models.
 - Pause new requests and preserve exact work state.
-- Resume through another provider profile or API key that the user explicitly configured through the provider's supported interface.
-- Map supported cdesktop providers to secret-free SightMesh profile names and mark automatic failover only on API or enterprise profiles.
+- Resume through another provider profile or credential that the user explicitly configured through the provider's supported interface.
+- Map supported cdesktop providers to secret-free SightMesh profile names for explicit `sightmesh failover` selection.
+- For direct Claude or Codex CLI launches, order operator-owned accounts in a credential pool and move to the next account when the current one is exhausted, using that account's own normal credentials.
 - Start the replacement as a visible cdesktop successor with `sightmesh failover`; keep the prior session and transcript until reconciliation is complete.
 - Keep each provider profile isolated and label the transition in the handoff.
 - Respect each provider's rate limits, subscription terms, organization policy, and billing controls.
@@ -13,8 +14,9 @@
 ## Prohibited behavior
 
 - Extracting or replaying auth headers, cookies, refresh tokens, bearer tokens, session databases, or keychain contents.
-- Automatically cycling consumer Claude Max, ChatGPT, Codex, or similar subscription accounts to avoid usage limits.
+- Using an account the operator does not own, or one not logged in through the provider's own interface.
 - Sharing one person's session credential with another process or worker.
+- Working around a reported usage limit instead of moving to the next owned account in a direct CLI credential pool or to an explicitly selected configured failover profile.
 - Concealing the effective account, provider, model, or billing identity.
 - Retrying indefinitely after a provider communicates a hard usage limit.
 
