@@ -68,7 +68,7 @@ def test_active_child_process_suppresses_stall(command):
         [_process()],
         {
             "process-1": {
-                "complete": True,
+                "complete": False,
                 "entries": [{"tool_name": command, "status": "running"}],
             }
         },
@@ -127,20 +127,29 @@ def test_huge_threshold_cannot_overflow_detector_construction(monkeypatch):
     assert detector.threshold == timedelta(minutes=30)
 
 
-def test_incomplete_cold_snapshots_cannot_start_or_trigger_recovery():
+def test_cold_partial_snapshot_cannot_immediately_trigger_recovery():
     now = datetime(2026, 8, 14, tzinfo=UTC)
     client = FakeClient([_process()], {"process-1": {"complete": False, "entries": []}})
     detector = StallDetector(threshold=timedelta(minutes=2), now=lambda: now)
     session = {"id": "child", "parent_session_id": "parent"}
 
     detector.reconcile(client, session)
-    detector.now = lambda: now + timedelta(hours=1)
-    detector.reconcile(client, session)
-    client.snapshots["process-1"] = {
-        "complete": True,
-        "entries": [{"content": "still running"}],
-    }
+    detector.now = lambda: now + timedelta(minutes=1)
     detector.reconcile(client, session)
 
     assert client.stopped == []
     assert client.sent == []
+
+
+def test_running_partial_snapshot_without_new_events_eventually_recovers_child():
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    client = FakeClient([_process()], {"process-1": {"complete": False, "entries": []}})
+    detector = StallDetector(threshold=timedelta(minutes=2), now=lambda: now)
+    session = {"id": "child", "parent_session_id": "parent"}
+
+    detector.reconcile(client, session)
+    detector.now = lambda: now + timedelta(minutes=2)
+    detector.reconcile(client, session)
+
+    assert client.stopped == ["process-1"]
+    assert client.sent[0][0][0] == "parent"

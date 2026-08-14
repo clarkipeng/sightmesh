@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import timedelta
 
 from sightmesh import bridge as bridge_module
 from sightmesh.bridge import (
@@ -188,6 +189,7 @@ def test_no_bridge_child_still_gets_stall_recovery(monkeypatch) -> None:
     client = StallClient()
     client.stopped = []
     supervisor = BridgeSupervisor(client, "ws://127.0.0.1:8377/ws")
+    supervisor.stalls.threshold = timedelta(0)
     monkeypatch.setattr(bridge_module, "enabled_workspaces", lambda: set())
     monkeypatch.setattr(bridge_module.leases, "sync_active_workspaces", lambda *_args, **_kwargs: [])
 

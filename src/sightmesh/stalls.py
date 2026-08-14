@@ -122,23 +122,17 @@ class StallDetector:
         except CdesktopError as exc:
             LOGGER.warning("Cannot inspect execution %s for stalls: %s", process_id, exc)
             return
-        # A snapshot is only evidence of silence after cdesktop has completed
-        # its bounded read. A cold/partial read can legitimately be empty while
-        # an active executor is still filling the event stream.
-        if snapshot.get("complete") is not True:
-            return
-
         now = self.now()
         signature = _event_signature(snapshot)
         recorded_event = _latest_event_time(snapshot)
         observed = self.observed.get(process_id)
         if observed is None:
-            started = _parse_time(process.get("updated_at")) or _parse_time(
-                process.get("started_at")
-            )
+            # The first read is a warm baseline, never stale evidence. cdesktop
+            # leaves a running stream partial until it emits Finished, so using
+            # process start time here would kill a cold active stream at once.
             self.observed[process_id] = _ObservedProcess(
                 signature=signature,
-                last_event_at=recorded_event or started or now,
+                last_event_at=recorded_event or now,
             )
             return
         if signature != observed.signature or _has_active_child(snapshot):
