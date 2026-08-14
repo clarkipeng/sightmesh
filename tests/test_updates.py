@@ -222,10 +222,10 @@ def test_activity_ignores_devservers_and_reports_agent_work() -> None:
     assert updates.activity(client)["idle"] is True
 
 
-def test_activity_waits_for_durable_follow_ups() -> None:
+def test_activity_reports_durable_follow_ups_without_blocking_activation() -> None:
     result = updates.activity(FakeClient(queued=True))
 
-    assert result["idle"] is False
+    assert result["idle"] is True
     assert result["queued_follow_ups"] == [
         {"workspace_id": "workspace-1", "session_id": "session-1"}
     ]

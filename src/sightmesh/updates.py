@@ -434,7 +434,11 @@ def activity(client: CdesktopClient) -> dict[str, Any]:
                         }
                     )
     return {
-        "idle": not running and not approvals and not queued and not unreadable,
+        # A queued follow-up has no live executor or approval responder to
+        # preserve. It remains durable in cdesktop's database and can resume
+        # after the replacement backend starts, so it must not deadlock an
+        # otherwise idle update.
+        "idle": not running and not approvals and not unreadable,
         "running": running,
         "queued_follow_ups": queued,
         "unreadable_sessions": unreadable,
