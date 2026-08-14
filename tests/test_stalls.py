@@ -2,8 +2,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from sightmesh.cdesktop import CdesktopError
-from sightmesh.stalls import StallDetector
+from sightmesh.cdesktop import CdesktopError, CdesktopRejectedError
+from sightmesh.stalls import RecoveryIntentStore, StallDetector
 
 
 class FakeClient:
@@ -19,8 +19,12 @@ class FakeClient:
     def normalized_snapshot(self, process_id):
         return self.snapshots[process_id]
 
+    def execution_process(self, process_id):
+        return next(process for process in self.processes if process["id"] == process_id)
+
     def stop_execution(self, process_id):
         self.stopped.append(process_id)
+        self.execution_process(process_id)["status"] = "killed"
 
     def send(self, *args, **kwargs):
         self.sent.append((args, kwargs))
@@ -165,6 +169,7 @@ def test_lost_stop_response_never_repeats_stop_and_retries_parent_wake():
 
         def stop_execution(self, process_id):
             self.stopped.append(process_id)
+            self.execution_process(process_id)["status"] = "killed"
             if self.stop_responses:
                 raise self.stop_responses.pop()
 
@@ -211,6 +216,7 @@ def test_definitive_stop_failure_remains_retryable():
             self.stopped.append(process_id)
             if self.stop_responses:
                 raise self.stop_responses.pop()
+            self.execution_process(process_id)["status"] = "killed"
 
     now = datetime(2026, 8, 14, tzinfo=UTC)
     client = RetryStopClient()
@@ -220,6 +226,81 @@ def test_definitive_stop_failure_remains_retryable():
     detector.reconcile(client, session)
     detector.now = lambda: now + timedelta(minutes=2)
     detector.reconcile(client, session)
+    detector.reconcile(client, session)
+
+    assert client.stopped == ["process-1", "process-1"]
+    assert client.sent[0][0][0] == "parent"
+
+
+def test_restart_after_intent_before_stop_retries_from_authoritative_running_state():
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    client = FakeClient([_process()], {"process-1": {"entries": []}})
+    store = RecoveryIntentStore()
+    store.begin("process-1")
+    detector = StallDetector(
+        threshold=timedelta(minutes=2), now=lambda: now, recovery_store=store
+    )
+
+    detector.reconcile(client, {"id": "child", "parent_session_id": "parent"})
+
+    assert client.stopped == ["process-1"]
+    assert client.sent[0][0][0] == "parent"
+
+
+def test_definitive_server_rejection_retries_without_parent_wake():
+    class RejectedStopClient(FakeClient):
+        def __init__(self):
+            super().__init__([_process()], {"process-1": {"entries": []}})
+            self.stop_responses = [CdesktopRejectedError("server rejected stop")]
+
+        def stop_execution(self, process_id):
+            self.stopped.append(process_id)
+            if self.stop_responses:
+                raise self.stop_responses.pop()
+            self.execution_process(process_id)["status"] = "killed"
+
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    client = RejectedStopClient()
+    detector = StallDetector(threshold=timedelta(minutes=2), now=lambda: now)
+    session = {"id": "child", "parent_session_id": "parent"}
+
+    detector.reconcile(client, session)
+    detector.now = lambda: now + timedelta(minutes=2)
+    detector.reconcile(client, session)
+
+    assert client.stopped == ["process-1"]
+    assert client.sent == []
+
+    detector.reconcile(client, session)
+
+    assert client.stopped == ["process-1", "process-1"]
+    assert client.sent[0][0][0] == "parent"
+
+
+def test_ambiguous_stop_with_authoritatively_running_process_waits_for_retry():
+    class AmbiguousStopClient(FakeClient):
+        def __init__(self):
+            super().__init__([_process()], {"process-1": {"entries": []}})
+            self.stop_responses = [CdesktopError("connection closed before response")]
+
+        def stop_execution(self, process_id):
+            self.stopped.append(process_id)
+            if self.stop_responses:
+                raise self.stop_responses.pop()
+            self.execution_process(process_id)["status"] = "killed"
+
+    now = datetime(2026, 8, 14, tzinfo=UTC)
+    client = AmbiguousStopClient()
+    detector = StallDetector(threshold=timedelta(minutes=2), now=lambda: now)
+    session = {"id": "child", "parent_session_id": "parent"}
+
+    detector.reconcile(client, session)
+    detector.now = lambda: now + timedelta(minutes=2)
+    detector.reconcile(client, session)
+
+    assert client.stopped == ["process-1"]
+    assert client.sent == []
+
     detector.reconcile(client, session)
 
     assert client.stopped == ["process-1", "process-1"]

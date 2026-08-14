@@ -21,6 +21,10 @@ class CdesktopError(RuntimeError):
     pass
 
 
+class CdesktopRejectedError(CdesktopError):
+    """A cdesktop server response definitively rejected the requested action."""
+
+
 class CdesktopClient:
     def __init__(self, base_url: str | None = None) -> None:
         configured = base_url or os.environ.get("SIGHTMESH_CDESKTOP_URL")
@@ -72,7 +76,7 @@ class CdesktopClient:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise CdesktopError(
+            raise CdesktopRejectedError(
                 f"{method} {path} failed: HTTP {exc.code}: {detail}"
             ) from exc
         except URLError as exc:
@@ -82,7 +86,7 @@ class CdesktopClient:
 
         data = json.loads(raw) if raw else None
         if isinstance(data, dict) and data.get("success") is False:
-            raise CdesktopError(str(data.get("message") or data))
+            raise CdesktopRejectedError(str(data.get("message") or data))
         if isinstance(data, dict) and "data" in data:
             return data["data"]
         return data

@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .cdesktop import CdesktopClient, CdesktopError
+from .cdesktop import CdesktopClient, CdesktopError, CdesktopRejectedError
 from .stall_settings import threshold_minutes
 
 LOGGER = logging.getLogger("sightmesh.stalls")
@@ -86,9 +86,9 @@ class RecoveryIntentStore:
         state = self.intents.get(process_id)
         if state:
             return state, False
-        self.intents[process_id] = "stopping"
+        self.intents[process_id] = "intent"
         self._write()
-        return "stopping", True
+        return "intent", True
 
     def set(self, process_id: str, state: str) -> None:
         self.intents[process_id] = state
@@ -113,7 +113,7 @@ class RecoveryIntentStore:
             key: value
             for key, value in data.items()
             if isinstance(key, str)
-            and value in {"stopping", "stopped", "ambiguous", "retry"}
+            and value in {"intent", "stopping", "handoff", "notified"}
         } if isinstance(data, dict) else {}
 
     def _write(self) -> None:
@@ -162,17 +162,18 @@ class StallDetector:
         active_ids = {str(process.get("id")) for process in processes}
         for process_id in set(self.observed) - running_ids:
             self.observed.pop(process_id, None)
+        by_id = {str(process.get("id")): process for process in processes}
+        for process_id in self.recovery_store.process_ids() & active_ids:
+            self._reconcile_recovery(
+                client, session, parent_session_id, process_id, by_id[process_id]
+            )
         for process_id in self.recovery_store.process_ids() - active_ids:
-            self.recovery_store.discard(process_id)
-            self.notified.discard(process_id)
-        for process_id in (active_ids - running_ids) & self.recovery_store.process_ids():
-            if process_id not in self.notified:
-                self._notify_parent(client, session, parent_session_id, process_id)
-            if process_id in self.notified:
+            if self.recovery_store.intents[process_id] == "notified":
                 self.recovery_store.discard(process_id)
 
         for process in processes:
-            if str(process.get("id")) not in running_ids:
+            process_id = str(process.get("id"))
+            if process_id not in running_ids or process_id in self.recovery_store.process_ids():
                 continue
             self._reconcile_process(client, session, parent_session_id, process)
 
@@ -212,23 +213,48 @@ class StallDetector:
         if now - observed.last_event_at < self.threshold:
             return
 
-        state, created = self.recovery_store.begin(process_id)
-        if created or state == "retry":
-            try:
-                # This is deliberately the normal killed-child path. cdesktop
-                # releases the claimed command and dispatches recovery itself.
-                client.stop_execution(process_id)
-            except CdesktopError as exc:
-                if _stop_outcome_is_ambiguous(exc):
-                    self.recovery_store.set(process_id, "ambiguous")
-                    LOGGER.warning("Stop outcome for execution %s is ambiguous: %s", process_id, exc)
-                else:
-                    self.recovery_store.set(process_id, "retry")
-                    LOGGER.warning("Stop failed for execution %s; it remains retryable: %s", process_id, exc)
-                    return
-            else:
-                self.recovery_store.set(process_id, "stopped")
-        self._notify_parent(client, session, parent_session_id, process_id)
+        self.recovery_store.begin(process_id)
+        self._reconcile_recovery(client, session, parent_session_id, process_id, process)
+
+    def _reconcile_recovery(
+        self,
+        client: CdesktopClient,
+        session: dict[str, Any],
+        parent_session_id: str,
+        process_id: str,
+        process: dict[str, Any],
+    ) -> None:
+        try:
+            current = client.execution_process(process_id)
+        except CdesktopError as exc:
+            LOGGER.warning("Cannot reconcile stalled execution %s: %s", process_id, exc)
+            return
+        if current.get("status") != "running":
+            if self.recovery_store.intents[process_id] != "notified":
+                self.recovery_store.set(process_id, "handoff")
+                self._notify_parent(client, session, parent_session_id, process_id)
+            return
+        if self.recovery_store.intents[process_id] == "notified":
+            return
+        # No synchronous stop call survives a restart. A persisted intent alone
+        # never proves recovery; authoritative running state retries the stop.
+        self.recovery_store.set(process_id, "stopping")
+        try:
+            client.stop_execution(process_id)
+        except CdesktopRejectedError as exc:
+            self.recovery_store.set(process_id, "intent")
+            LOGGER.warning("Stop rejected for execution %s; it remains retryable: %s", process_id, exc)
+            return
+        except CdesktopError as exc:
+            LOGGER.warning("Stop outcome for execution %s is ambiguous: %s", process_id, exc)
+        try:
+            confirmed = client.execution_process(process_id)
+        except CdesktopError as exc:
+            LOGGER.warning("Cannot confirm stalled execution %s: %s", process_id, exc)
+            return
+        if confirmed.get("status") != "running":
+            self.recovery_store.set(process_id, "handoff")
+            self._notify_parent(client, session, parent_session_id, process_id)
 
     def _notify_parent(
         self,
@@ -252,13 +278,10 @@ class StallDetector:
             LOGGER.warning("Cannot notify parent for stalled execution %s: %s", process_id, exc)
             return
         self.notified.add(process_id)
+        self.recovery_store.set(process_id, "notified")
         LOGGER.warning(
             "Marked session %s stalled through execution %s and notified parent %s",
             session["id"],
             process_id,
             parent_session_id,
         )
-
-
-def _stop_outcome_is_ambiguous(error: CdesktopError) -> bool:
-    return not str(error).startswith("POST /execution-processes/")

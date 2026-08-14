@@ -26,6 +26,26 @@ def test_register_repo_reuses_exact_path() -> None:
     assert client.calls == []
 
 
+def test_success_false_is_a_typed_server_rejection(monkeypatch) -> None:
+    class Response:
+        status = 200
+
+        def read(self):
+            return b'{"success": false, "message": "stop rejected"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(cdesktop, "urlopen", lambda *_args, **_kwargs: Response())
+    client = CdesktopClient("http://127.0.0.1:1")
+
+    with pytest.raises(cdesktop.CdesktopRejectedError, match="stop rejected"):
+        client.stop_execution("process-a")
+
+
 def test_failed_start_cleans_the_one_new_native_workspace() -> None:
     class Client(FakeClient):
         def __init__(self) -> None:

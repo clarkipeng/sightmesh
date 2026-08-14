@@ -165,6 +165,15 @@ def test_unidentified_messages_still_dedupe_deterministically() -> None:
 
 def test_no_bridge_child_still_gets_stall_recovery(monkeypatch) -> None:
     class StallClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.process = {
+                "id": "process-1",
+                "status": "running",
+                "run_reason": "coding_agent",
+                "started_at": "2026-08-14T00:00:00Z",
+            }
+
         def workspaces(self):
             return [{"id": "child-workspace", "archived": False}]
 
@@ -172,20 +181,17 @@ def test_no_bridge_child_still_gets_stall_recovery(monkeypatch) -> None:
             return [{"id": "child", "parent_session_id": "parent"}]
 
         def execution_processes(self, _session_id):
-            return [
-                {
-                    "id": "process-1",
-                    "status": "running",
-                    "run_reason": "coding_agent",
-                    "started_at": "2026-08-14T00:00:00Z",
-                }
-            ]
+            return [self.process]
 
         def normalized_snapshot(self, _process_id):
             return {"complete": True, "entries": []}
 
+        def execution_process(self, _process_id):
+            return self.execution_processes("child")[0]
+
         def stop_execution(self, process_id):
             self.stopped.append(process_id)
+            self.execution_process("child")["status"] = "killed"
 
     client = StallClient()
     client.stopped = []
