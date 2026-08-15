@@ -20,6 +20,7 @@ from .routing import (
     peer_identity,
     set_peer_identity,
 )
+from .stalls import RecoveryIntentStore, StallDetector
 
 LOGGER = logging.getLogger("sightmesh.bridge")
 
@@ -223,6 +224,11 @@ class BridgeSupervisor:
         self.client = client
         self.repowire_url = repowire_url
         self.tasks: dict[str, asyncio.Task[None]] = {}
+        self.stalls = StallDetector(
+            recovery_store=RecoveryIntentStore(
+                Path.home() / ".local" / "state" / "sightmesh" / "stall-recovery.json"
+            )
+        )
 
     async def run(self) -> None:
         while True:
@@ -242,13 +248,30 @@ class BridgeSupervisor:
             )
             workspaces = await asyncio.to_thread(self.client.workspaces)
             for workspace in workspaces:
-                if workspace["id"] not in enabled or workspace.get("archived"):
+                if workspace.get("archived"):
                     continue
                 try:
-                    path = await asyncio.to_thread(_repo_path, self.client, workspace)
                     sessions = await asyncio.to_thread(
                         self.client.sessions, workspace["id"]
                     )
+                except CdesktopError as exc:
+                    LOGGER.warning(
+                        "Cannot inspect workspace %s sessions: %s", workspace["id"], exc
+                    )
+                    continue
+                for session in sessions:
+                    try:
+                        await asyncio.to_thread(
+                            self.stalls.reconcile, self.client, session
+                        )
+                    except CdesktopError as exc:
+                        LOGGER.warning(
+                            "Cannot inspect session %s for stalls: %s", session["id"], exc
+                        )
+                if workspace["id"] not in enabled:
+                    continue
+                try:
+                    path = await asyncio.to_thread(_repo_path, self.client, workspace)
                 except CdesktopError as exc:
                     LOGGER.warning(
                         "Cannot bridge workspace %s: %s", workspace["id"], exc

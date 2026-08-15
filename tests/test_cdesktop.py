@@ -1,4 +1,6 @@
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
 
 import pytest
 
@@ -24,6 +26,53 @@ def test_register_repo_reuses_exact_path() -> None:
     repo = client.register_repo(Path("/tmp/repo"))
     assert repo["id"] == "existing"
     assert client.calls == []
+
+
+def test_success_false_is_a_typed_server_rejection(monkeypatch) -> None:
+    class Response:
+        status = 200
+
+        def read(self):
+            return b'{"success": false, "message": "stop rejected"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(cdesktop, "urlopen", lambda *_args, **_kwargs: Response())
+    client = CdesktopClient("http://127.0.0.1:1")
+
+    with pytest.raises(cdesktop.CdesktopRejectedError, match="stop rejected"):
+        client.stop_execution("process-a")
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [
+        (409, cdesktop.CdesktopRejectedError),
+        (424, cdesktop.CdesktopInterruptedError),
+        (425, cdesktop.CdesktopPendingError),
+    ],
+)
+def test_stop_operation_http_outcomes_are_typed(monkeypatch, status, error_type) -> None:
+    error = HTTPError(
+        "http://127.0.0.1:1/api/execution-processes/process-a/stop",
+        status,
+        "stop outcome",
+        None,
+        BytesIO(b"stop outcome"),
+    )
+    monkeypatch.setattr(
+        cdesktop, "urlopen", lambda *_args, **_kwargs: (_ for _ in ()).throw(error)
+    )
+    client = CdesktopClient("http://127.0.0.1:1")
+
+    with pytest.raises(error_type) as raised:
+        client.stop_execution("process-a", dedupe_key="stall:process-a:stop:1")
+
+    assert raised.value.status == status
 
 
 def test_failed_start_cleans_the_one_new_native_workspace() -> None:
@@ -232,6 +281,20 @@ def test_stop_execution_targets_one_process() -> None:
             "POST",
             "/execution-processes/process-a/stop",
             {},
+            None,
+            None,
+        )
+    ]
+
+
+def test_stop_execution_passes_process_scoped_dedupe_key() -> None:
+    client = FakeClient()
+    client.stop_execution("process-a", dedupe_key="stall:process-a:stop")
+    assert client.calls == [
+        (
+            "POST",
+            "/execution-processes/process-a/stop",
+            {"dedupe_key": "stall:process-a:stop"},
             None,
             None,
         )

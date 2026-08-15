@@ -12,6 +12,8 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
 
+from .stall_settings import THRESHOLD_ENV, threshold_minutes
+
 LABEL = "io.sightmesh.cdesktop"
 BRIDGE_LABEL = "io.sightmesh.bridge"
 OBSOLETE_UPDATER_LABEL = "io.sightmesh.updater"
@@ -166,6 +168,7 @@ def bridge_definition(port: int = DEFAULT_PORT) -> dict[str, Any]:
         "Umask": 0o077,
         "EnvironmentVariables": {
             "PATH": command_path(),
+            THRESHOLD_ENV: str(threshold_minutes()),
         },
         "StandardOutPath": str(logs / "bridge.stdout.log"),
         "StandardErrorPath": str(logs / "bridge.stderr.log"),

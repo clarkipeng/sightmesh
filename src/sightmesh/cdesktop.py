@@ -21,6 +21,22 @@ class CdesktopError(RuntimeError):
     pass
 
 
+class CdesktopRejectedError(CdesktopError):
+    """A cdesktop server response definitively rejected the requested action."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class CdesktopInterruptedError(CdesktopRejectedError):
+    """cdesktop cannot establish whether the keyed side effect ran (HTTP 424)."""
+
+
+class CdesktopPendingError(CdesktopRejectedError):
+    """A keyed operation is still owned by another cdesktop request (HTTP 425)."""
+
+
 class CdesktopClient:
     def __init__(self, base_url: str | None = None) -> None:
         configured = base_url or os.environ.get("SIGHTMESH_CDESKTOP_URL")
@@ -72,8 +88,16 @@ class CdesktopClient:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise CdesktopError(
-                f"{method} {path} failed: HTTP {exc.code}: {detail}"
+            error_type = {
+                409: CdesktopRejectedError,
+                424: CdesktopInterruptedError,
+                425: CdesktopPendingError,
+            }.get(exc.code)
+            message = f"{method} {path} failed: HTTP {exc.code}: {detail}"
+            if error_type is None:
+                raise CdesktopError(message) from exc
+            raise error_type(
+                message, status=exc.code
             ) from exc
         except URLError as exc:
             raise CdesktopError(
@@ -82,7 +106,7 @@ class CdesktopClient:
 
         data = json.loads(raw) if raw else None
         if isinstance(data, dict) and data.get("success") is False:
-            raise CdesktopError(str(data.get("message") or data))
+            raise CdesktopRejectedError(str(data.get("message") or data))
         if isinstance(data, dict) and "data" in data:
             return data["data"]
         return data
@@ -233,9 +257,14 @@ class CdesktopClient:
             raise CdesktopError("cdesktop normalized snapshot response is invalid")
         return result
 
-    def stop_execution(self, execution_process_id: str) -> Any:
+    def stop_execution(
+        self, execution_process_id: str, *, dedupe_key: str | None = None
+    ) -> Any:
+        """Stop one execution through cdesktop's process-scoped dedupe contract."""
         return self.request(
-            "POST", f"/execution-processes/{execution_process_id}/stop", {}
+            "POST",
+            f"/execution-processes/{execution_process_id}/stop",
+            {"dedupe_key": dedupe_key} if dedupe_key else {},
         )
 
     def wait_for_session_idle(

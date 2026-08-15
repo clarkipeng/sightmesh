@@ -37,6 +37,39 @@ def test_bridge_definition_targets_managed_local_cdesktop(
     assert definition["Label"] == "io.sightmesh.bridge"
 
 
+def test_bridge_definition_propagates_stall_threshold(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("SIGHTMESH_STALL_THRESHOLD_MINUTES", "17")
+    monkeypatch.setattr(service.shutil, "which", lambda _: "/tmp/sightmesh")
+    monkeypatch.setattr(service, "state_dir", lambda: tmp_path)
+    assert service.bridge_definition()["EnvironmentVariables"][
+        "SIGHTMESH_STALL_THRESHOLD_MINUTES"
+    ] == "17"
+
+
+def test_invalid_stall_threshold_safely_uses_default(monkeypatch, tmp_path, caplog) -> None:
+    monkeypatch.setenv("SIGHTMESH_STALL_THRESHOLD_MINUTES", "not-a-number")
+    monkeypatch.setattr(service.shutil, "which", lambda _: "/tmp/sightmesh")
+    monkeypatch.setattr(service, "state_dir", lambda: tmp_path)
+
+    definition = service.bridge_definition()
+
+    assert definition["EnvironmentVariables"]["SIGHTMESH_STALL_THRESHOLD_MINUTES"] == "30"
+    assert "using 30 minutes" in caplog.text
+
+
+def test_huge_stall_threshold_safely_constructs_managed_bridge(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    monkeypatch.setenv("SIGHTMESH_STALL_THRESHOLD_MINUTES", "999999999999999999999")
+    monkeypatch.setattr(service.shutil, "which", lambda _: "/tmp/sightmesh")
+    monkeypatch.setattr(service, "state_dir", lambda: tmp_path)
+
+    definition = service.bridge_definition()
+
+    assert definition["EnvironmentVariables"]["SIGHTMESH_STALL_THRESHOLD_MINUTES"] == "30"
+    assert "from 1 to 1440" in caplog.text
+
+
 def test_command_path_uses_login_shell_instead_of_launcher_path(monkeypatch) -> None:
     monkeypatch.setenv("SHELL", "/bin/zsh")
     monkeypatch.setenv("PATH", "/restricted/bin")
