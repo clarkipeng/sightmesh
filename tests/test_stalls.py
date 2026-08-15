@@ -409,8 +409,10 @@ def test_interrupted_stop_never_retries_and_wakes_parent(side_effect_happened):
         (
             (
                 "parent",
-                "STALL: child execution entered interrupted recovery; reconcile its "
-                "durable parent follow-up.",
+                (
+                    "STALL: child execution entered interrupted recovery; reconcile its "
+                    "durable parent follow-up."
+                ),
                 "child",
             ),
             {"dedupe_key": "stall:process-1:parent"},
