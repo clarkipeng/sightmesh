@@ -96,9 +96,7 @@ class CdesktopClient:
             message = f"{method} {path} failed: HTTP {exc.code}: {detail}"
             if error_type is None:
                 raise CdesktopError(message) from exc
-            raise error_type(
-                message, status=exc.code
-            ) from exc
+            raise error_type(message, status=exc.code) from exc
         except URLError as exc:
             raise CdesktopError(
                 f"Cannot reach cdesktop at {self.base_url}: {exc}"
@@ -247,6 +245,41 @@ class CdesktopClient:
         if not isinstance(result, dict):
             raise CdesktopError("cdesktop queue status response is invalid")
         return result
+
+    def probe_connectivity(self) -> bool:
+        """Bounded, side-effect-free gate used before native dispatch."""
+        try:
+            with urlopen(f"{self.base_url}/api/health", timeout=1) as response:
+                return response.status == 200
+        except (OSError, URLError):
+            return False
+
+    def session_commands(self, session_id: str) -> list[dict[str, Any]]:
+        result = self.request("GET", f"/sessions/{session_id}/commands")
+        if not isinstance(result, list):
+            raise CdesktopError("cdesktop command response is not a list")
+        return [dict(item) for item in result if isinstance(item, dict)]
+
+    def _command_transition(
+        self, command_id: str, transition: str, payload: dict[str, Any] | None = None
+    ) -> Any:
+        return self.request(
+            "POST", f"/commands/{command_id}/{transition}", payload or {}
+        )
+
+    def interrupt_command(self, command_id: str) -> Any:
+        return self._command_transition(command_id, "interrupt")
+
+    def requeue_command(self, command_id: str, *, dedupe_key: str | None = None) -> Any:
+        return self._command_transition(
+            command_id, "requeue", {"dedupe_key": dedupe_key}
+        )
+
+    def complete_command(self, command_id: str) -> Any:
+        return self._command_transition(command_id, "done")
+
+    def dispatch_queued(self, session_id: str) -> Any:
+        return self.request("POST", f"/sessions/{session_id}/queue/dispatch")
 
     def normalized_snapshot(self, execution_process_id: str) -> dict[str, Any]:
         result = self.request(

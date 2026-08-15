@@ -7,20 +7,26 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import websockets
 
 from . import leases
 from .cdesktop import CdesktopClient, CdesktopError
+from .durable import DurableExecutionReconciler
 from .routing import (
     clear_peer_identity,
     enabled_workspaces,
     peer_identity,
     set_peer_identity,
 )
-from .stalls import RecoveryIntentStore, StallDetector
+
+# Compatibility import for extensions that patched the interim PR #9 symbol;
+# the supervisor no longer constructs or consults this store.
+from .stalls import RecoveryIntentStore  # noqa: F401
 
 LOGGER = logging.getLogger("sightmesh.bridge")
 
@@ -224,11 +230,10 @@ class BridgeSupervisor:
         self.client = client
         self.repowire_url = repowire_url
         self.tasks: dict[str, asyncio.Task[None]] = {}
-        self.stalls = StallDetector(
-            recovery_store=RecoveryIntentStore(
-                Path.home() / ".local" / "state" / "sightmesh" / "stall-recovery.json"
-            )
-        )
+        self.reconciler = DurableExecutionReconciler(client)
+        # Read-only compatibility surface for callers that tuned PR #9's
+        # observation threshold; recovery itself belongs to the reconciler.
+        self.stalls = SimpleNamespace(threshold=timedelta(minutes=30))
 
     async def run(self) -> None:
         while True:
@@ -259,15 +264,7 @@ class BridgeSupervisor:
                         "Cannot inspect workspace %s sessions: %s", workspace["id"], exc
                     )
                     continue
-                for session in sessions:
-                    try:
-                        await asyncio.to_thread(
-                            self.stalls.reconcile, self.client, session
-                        )
-                    except CdesktopError as exc:
-                        LOGGER.warning(
-                            "Cannot inspect session %s for stalls: %s", session["id"], exc
-                        )
+                await asyncio.to_thread(self.reconciler.reconcile_sessions, sessions)
                 if workspace["id"] not in enabled:
                     continue
                 try:
