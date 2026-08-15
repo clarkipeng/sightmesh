@@ -7,9 +7,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import websockets
@@ -233,7 +231,7 @@ class BridgeSupervisor:
         self.reconciler = DurableExecutionReconciler(client)
         # Read-only compatibility surface for callers that tuned PR #9's
         # observation threshold; recovery itself belongs to the reconciler.
-        self.stalls = SimpleNamespace(threshold=timedelta(minutes=30))
+        self.stalls = self.reconciler.liveness
 
     async def run(self) -> None:
         while True:

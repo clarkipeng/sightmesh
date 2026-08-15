@@ -278,6 +278,9 @@ class CdesktopClient:
     def complete_command(self, command_id: str) -> Any:
         return self._command_transition(command_id, "done")
 
+    def update_command(self, command_id: str, payload: dict[str, Any]) -> Any:
+        return self._command_transition(command_id, "recovery", payload)
+
     def dispatch_queued(self, session_id: str) -> Any:
         return self.request("POST", f"/sessions/{session_id}/queue/dispatch")
 
