@@ -10,7 +10,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .cdesktop import CdesktopClient, CdesktopError, CdesktopRejectedError
+from .cdesktop import (
+    CdesktopClient,
+    CdesktopError,
+    CdesktopInterruptedError,
+    CdesktopPendingError,
+    CdesktopRejectedError,
+)
 from .stall_settings import threshold_minutes
 
 LOGGER = logging.getLogger("sightmesh.stalls")
@@ -87,24 +93,38 @@ class RecoveryIntentStore:
         state = self.intents.get(process_id)
         if state:
             return self.state(process_id), False
-        self.intents[process_id] = "intent"
+        self.intents[process_id] = "intent:1:0"
         self._write()
         return "intent", True
 
     def set(self, process_id: str, state: str) -> None:
-        self.intents[process_id] = f"{state}:0" if state in {"accepted", "uncertain"} else state
+        self.intents[process_id] = f"{state}:{self.attempt(process_id)}:0"
         self._write()
 
     def state(self, process_id: str) -> str:
         return self.intents[process_id].split(":", 1)[0]
 
-    def confirmation_poll(self, process_id: str) -> int:
-        state, _, raw_count = self.intents[process_id].partition(":")
+    def attempt(self, process_id: str) -> int:
+        parts = self.intents.get(process_id, "").split(":")
         try:
-            count = int(raw_count or 0) + 1
-        except ValueError:
+            return max(1, int(parts[1]))
+        except (IndexError, ValueError):
+            return 1
+
+    def fresh_attempt(self, process_id: str) -> int:
+        attempt = self.attempt(process_id) + 1
+        self.intents[process_id] = f"intent:{attempt}:0"
+        self._write()
+        return attempt
+
+    def confirmation_poll(self, process_id: str) -> int:
+        state = self.state(process_id)
+        parts = self.intents[process_id].split(":")
+        try:
+            count = int(parts[2]) + 1
+        except (IndexError, ValueError):
             count = 1
-        self.intents[process_id] = f"{state}:{count}"
+        self.intents[process_id] = f"{state}:{self.attempt(process_id)}:{count}"
         self._write()
         return count
 
@@ -129,7 +149,16 @@ class RecoveryIntentStore:
             if isinstance(key, str)
             and isinstance(value, str)
             and value.split(":", 1)[0]
-            in {"intent", "stopping", "accepted", "uncertain", "handoff", "notified", "escalated"}
+            in {
+                "intent",
+                "stopping",
+                "accepted",
+                "uncertain",
+                "interrupted",
+                "handoff",
+                "notified",
+                "escalated",
+            }
         } if isinstance(data, dict) else {}
 
     def _write(self) -> None:
@@ -184,7 +213,12 @@ class StallDetector:
                 client, session, parent_session_id, process_id, by_id[process_id]
             )
         for process_id in self.recovery_store.process_ids() - active_ids:
-            if self.recovery_store.state(process_id) == "notified":
+            state = self.recovery_store.state(process_id)
+            if state == "interrupted":
+                self._notify_parent(
+                    client, session, parent_session_id, process_id, interrupted=True
+                )
+            elif state == "notified":
                 self.recovery_store.discard(process_id)
 
         for process in processes:
@@ -240,6 +274,12 @@ class StallDetector:
         process_id: str,
         process: dict[str, Any],
     ) -> None:
+        state = self.recovery_store.state(process_id)
+        if state == "interrupted":
+            self._notify_parent(
+                client, session, parent_session_id, process_id, interrupted=True
+            )
+            return
         try:
             current = client.execution_process(process_id)
         except CdesktopError as exc:
@@ -275,10 +315,40 @@ class StallDetector:
         # that original outcome on a retry.
         self.recovery_store.set(process_id, "stopping")
         try:
-            client.stop_execution(process_id, dedupe_key=f"stall:{process_id}:stop")
+            client.stop_execution(
+                process_id,
+                dedupe_key=(
+                    f"stall:{process_id}:stop:{self.recovery_store.attempt(process_id)}"
+                ),
+            )
+        except CdesktopInterruptedError as exc:
+            # HTTP 424 is a durable unknown-causality result.  It may follow
+            # either side of the side effect, so never issue another stop.
+            self.recovery_store.set(process_id, "interrupted")
+            LOGGER.warning("Stop interrupted for execution %s: %s", process_id, exc)
+            self._notify_parent(
+                client, session, parent_session_id, process_id, interrupted=True
+            )
+            return
+        except CdesktopPendingError as exc:
+            # HTTP 425 means this exact keyed request is still in flight.
+            # Replay that key on the next reconciliation, never a new one.
+            self.recovery_store.set(process_id, "stopping")
+            LOGGER.warning("Stop pending for execution %s: %s", process_id, exc)
+            return
         except CdesktopRejectedError as exc:
-            self.recovery_store.set(process_id, "intent")
-            LOGGER.warning("Stop rejected for execution %s; it remains retryable: %s", process_id, exc)
+            # A durable rejection proves no stop side effect for this key.
+            # Rotate identity before the next recovery attempt.
+            if exc.status not in {None, 409}:
+                self.recovery_store.set(process_id, "uncertain")
+                LOGGER.warning(
+                    "Stop outcome for execution %s is not definitive: %s", process_id, exc
+                )
+                return
+            self.recovery_store.fresh_attempt(process_id)
+            LOGGER.warning(
+                "Stop rejected for execution %s; it remains retryable: %s", process_id, exc
+            )
             return
         except CdesktopError as exc:
             self.recovery_store.set(process_id, "uncertain")
@@ -316,6 +386,8 @@ class StallDetector:
         session: dict[str, Any],
         parent_session_id: str,
         process_id: str,
+        *,
+        interrupted: bool = False,
     ) -> None:
         if process_id in self.notified:
             return
@@ -323,8 +395,13 @@ class StallDetector:
         try:
             client.send(
                 parent_session_id,
-                "STALL: child execution produced no session events past the configured "
-                "threshold and was handed to native killed-child recovery.",
+                (
+                    "STALL: child execution entered interrupted recovery; reconcile its "
+                    "durable parent follow-up."
+                    if interrupted
+                    else "STALL: child execution produced no session events past the configured "
+                    "threshold and was handed to native killed-child recovery."
+                ),
                 str(session["id"]),
                 dedupe_key=dedupe_key,
             )

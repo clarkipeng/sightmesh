@@ -24,6 +24,18 @@ class CdesktopError(RuntimeError):
 class CdesktopRejectedError(CdesktopError):
     """A cdesktop server response definitively rejected the requested action."""
 
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class CdesktopInterruptedError(CdesktopRejectedError):
+    """cdesktop cannot establish whether the keyed side effect ran (HTTP 424)."""
+
+
+class CdesktopPendingError(CdesktopRejectedError):
+    """A keyed operation is still owned by another cdesktop request (HTTP 425)."""
+
 
 class CdesktopClient:
     def __init__(self, base_url: str | None = None) -> None:
@@ -76,8 +88,16 @@ class CdesktopClient:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise CdesktopRejectedError(
-                f"{method} {path} failed: HTTP {exc.code}: {detail}"
+            error_type = {
+                409: CdesktopRejectedError,
+                424: CdesktopInterruptedError,
+                425: CdesktopPendingError,
+            }.get(exc.code)
+            message = f"{method} {path} failed: HTTP {exc.code}: {detail}"
+            if error_type is None:
+                raise CdesktopError(message) from exc
+            raise error_type(
+                message, status=exc.code
             ) from exc
         except URLError as exc:
             raise CdesktopError(

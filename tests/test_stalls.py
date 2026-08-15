@@ -2,7 +2,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from sightmesh.cdesktop import CdesktopError, CdesktopRejectedError
+from sightmesh.cdesktop import (
+    CdesktopError,
+    CdesktopInterruptedError,
+    CdesktopPendingError,
+    CdesktopRejectedError,
+)
 from sightmesh.stalls import RecoveryIntentStore, StallDetector
 
 
@@ -209,7 +214,9 @@ def test_definitive_stop_failure_remains_retryable():
         def __init__(self):
             super().__init__([_process()], {"process-1": {"entries": []}})
             self.stop_responses = [
-                CdesktopRejectedError("POST /execution-processes/process-1/stop failed: HTTP 500")
+                CdesktopRejectedError(
+                    "POST /execution-processes/process-1/stop failed: HTTP 409", status=409
+                )
             ]
 
         def stop_execution(self, process_id, *, dedupe_key=None):
@@ -251,10 +258,12 @@ def test_definitive_server_rejection_retries_without_parent_wake():
     class RejectedStopClient(FakeClient):
         def __init__(self):
             super().__init__([_process()], {"process-1": {"entries": []}})
-            self.stop_responses = [CdesktopRejectedError("server rejected stop")]
+            self.stop_responses = [CdesktopRejectedError("server rejected stop", status=409)]
+            self.stop_keys = []
 
         def stop_execution(self, process_id, *, dedupe_key=None):
             self.stopped.append(process_id)
+            self.stop_keys.append(dedupe_key)
             if self.stop_responses:
                 raise self.stop_responses.pop()
             self.execution_process(process_id)["status"] = "killed"
@@ -274,6 +283,7 @@ def test_definitive_server_rejection_retries_without_parent_wake():
     detector.reconcile(client, session)
 
     assert client.stopped == ["process-1", "process-1"]
+    assert client.stop_keys == ["stall:process-1:stop:1", "stall:process-1:stop:2"]
     assert client.sent[0][0][0] == "parent"
 
 
@@ -330,7 +340,7 @@ def test_stopping_crash_window_uses_one_logical_cdesktop_stop(
         def __init__(self):
             super().__init__([_process()], {"process-1": {"entries": []}})
             self.accepted_keys = (
-                {"stall:process-1:stop"} if accepted_before_crash else set()
+                {"stall:process-1:stop:1"} if accepted_before_crash else set()
             )
             self.destructive_stop_calls = int(accepted_before_crash)
             self.stop_requests = []
@@ -353,19 +363,86 @@ def test_stopping_crash_window_uses_one_logical_cdesktop_stop(
 
     detector.reconcile(client, session)
 
-    assert client.stop_requests == ["stall:process-1:stop"]
+    assert client.stop_requests == ["stall:process-1:stop:1"]
     assert client.destructive_stop_calls == 1
     assert client.sent == []
 
     restarted = StallDetector(recovery_store=RecoveryIntentStore(store_path))
     restarted.reconcile(client, session)
 
-    assert client.stop_requests == ["stall:process-1:stop"]
+    assert client.stop_requests == ["stall:process-1:stop:1"]
     assert client.destructive_stop_calls == 1
 
     client.processes[0]["status"] = "killed"
     restarted.reconcile(client, session)
 
+    assert client.sent[0][0][0] == "parent"
+
+
+@pytest.mark.parametrize("side_effect_happened", [False, True])
+def test_interrupted_stop_never_retries_and_wakes_parent(side_effect_happened):
+    class InterruptedStopClient(FakeClient):
+        def __init__(self):
+            super().__init__([_process()], {"process-1": {"entries": []}})
+            self.stop_keys = []
+            self.side_effect_happened = side_effect_happened
+
+        def stop_execution(self, process_id, *, dedupe_key=None):
+            self.stop_keys.append(dedupe_key)
+            if self.side_effect_happened:
+                self.execution_process(process_id)["status"] = "killed"
+            raise CdesktopInterruptedError("stop operation interrupted", status=424)
+
+    client = InterruptedStopClient()
+    store = RecoveryIntentStore()
+    # A crash can leave this before cdesktop observes the POST, or after the
+    # side effect. HTTP 424 deliberately leaves those causes indistinguishable.
+    store.set("process-1", "stopping")
+    detector = StallDetector(recovery_store=store)
+    session = {"id": "child", "parent_session_id": "parent"}
+
+    detector.reconcile(client, session)
+    detector.reconcile(client, session)
+
+    assert client.stop_keys == ["stall:process-1:stop:1"]
+    assert client.sent == [
+        (
+            (
+                "parent",
+                "STALL: child execution entered interrupted recovery; reconcile its "
+                "durable parent follow-up.",
+                "child",
+            ),
+            {"dedupe_key": "stall:process-1:parent"},
+        )
+    ]
+    assert store.state("process-1") == "notified"
+
+
+def test_pending_stop_retries_the_same_attempt_key():
+    class PendingStopClient(FakeClient):
+        def __init__(self):
+            super().__init__([_process()], {"process-1": {"entries": []}})
+            self.stop_keys = []
+            self.pending = True
+
+        def stop_execution(self, process_id, *, dedupe_key=None):
+            self.stop_keys.append(dedupe_key)
+            if self.pending:
+                self.pending = False
+                raise CdesktopPendingError("stop operation pending", status=425)
+            self.execution_process(process_id)["status"] = "killed"
+
+    client = PendingStopClient()
+    store = RecoveryIntentStore()
+    store.set("process-1", "stopping")
+    detector = StallDetector(recovery_store=store)
+    session = {"id": "child", "parent_session_id": "parent"}
+
+    detector.reconcile(client, session)
+    detector.reconcile(client, session)
+
+    assert client.stop_keys == ["stall:process-1:stop:1", "stall:process-1:stop:1"]
     assert client.sent[0][0][0] == "parent"
 
 
