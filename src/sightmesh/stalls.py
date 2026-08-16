@@ -22,6 +22,7 @@ from .stall_settings import threshold_minutes
 LOGGER = logging.getLogger("sightmesh.stalls")
 MAX_CONFIRMATION_POLLS = 3
 
+
 def threshold_from_environment() -> timedelta:
     """Return the bounded, operator-configurable no-event threshold."""
     return timedelta(minutes=threshold_minutes())
@@ -62,9 +63,21 @@ def _has_active_child(value: object) -> bool:
         state = str(value.get("status") or value.get("state") or "").lower()
         is_process_like = any(
             key in value
-            for key in ("command", "tool", "tool_name", "process", "pid", "child_process")
+            for key in (
+                "command",
+                "tool",
+                "tool_name",
+                "process",
+                "pid",
+                "child_process",
+            )
         )
-        if is_process_like and state in {"running", "active", "in_progress", "executing"}:
+        if is_process_like and state in {
+            "running",
+            "active",
+            "in_progress",
+            "executing",
+        }:
             return True
         return any(_has_active_child(item) for item in value.values())
     if isinstance(value, list):
@@ -72,8 +85,15 @@ def _has_active_child(value: object) -> bool:
     return False
 
 
+def is_active_suite_work(snapshot: dict[str, Any]) -> bool:
+    """Return true when a live child/tool keeps a suite turn active."""
+    return _has_active_child(snapshot)
+
+
 def _event_signature(snapshot: dict[str, Any]) -> str:
-    return json.dumps(snapshot.get("entries", []), sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        snapshot.get("entries", []), sort_keys=True, separators=(",", ":")
+    )
 
 
 @dataclass
@@ -143,29 +163,35 @@ class RecoveryIntentStore:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return {}
-        return {
-            key: value
-            for key, value in data.items()
-            if isinstance(key, str)
-            and isinstance(value, str)
-            and value.split(":", 1)[0]
-            in {
-                "intent",
-                "stopping",
-                "accepted",
-                "uncertain",
-                "interrupted",
-                "handoff",
-                "notified",
-                "escalated",
+        return (
+            {
+                key: value
+                for key, value in data.items()
+                if isinstance(key, str)
+                and isinstance(value, str)
+                and value.split(":", 1)[0]
+                in {
+                    "intent",
+                    "stopping",
+                    "accepted",
+                    "uncertain",
+                    "interrupted",
+                    "handoff",
+                    "notified",
+                    "escalated",
+                }
             }
-        } if isinstance(data, dict) else {}
+            if isinstance(data, dict)
+            else {}
+        )
 
     def _write(self) -> None:
         if self.path is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        handle, temporary = tempfile.mkstemp(prefix=".stall-recovery.", dir=self.path.parent)
+        handle, temporary = tempfile.mkstemp(
+            prefix=".stall-recovery.", dir=self.path.parent
+        )
         temporary_path = Path(temporary)
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as stream:
@@ -223,7 +249,10 @@ class StallDetector:
 
         for process in processes:
             process_id = str(process.get("id"))
-            if process_id not in running_ids or process_id in self.recovery_store.process_ids():
+            if (
+                process_id not in running_ids
+                or process_id in self.recovery_store.process_ids()
+            ):
                 continue
             self._reconcile_process(client, session, parent_session_id, process)
 
@@ -238,7 +267,9 @@ class StallDetector:
         try:
             snapshot = client.normalized_snapshot(process_id)
         except CdesktopError as exc:
-            LOGGER.warning("Cannot inspect execution %s for stalls: %s", process_id, exc)
+            LOGGER.warning(
+                "Cannot inspect execution %s for stalls: %s", process_id, exc
+            )
             return
         now = self.now()
         signature = _event_signature(snapshot)
@@ -264,7 +295,9 @@ class StallDetector:
             return
 
         self.recovery_store.begin(process_id)
-        self._reconcile_recovery(client, session, parent_session_id, process_id, process)
+        self._reconcile_recovery(
+            client, session, parent_session_id, process_id, process
+        )
 
     def _reconcile_recovery(
         self,
@@ -342,24 +375,32 @@ class StallDetector:
             if exc.status not in {None, 409}:
                 self.recovery_store.set(process_id, "uncertain")
                 LOGGER.warning(
-                    "Stop outcome for execution %s is not definitive: %s", process_id, exc
+                    "Stop outcome for execution %s is not definitive: %s",
+                    process_id,
+                    exc,
                 )
                 return
             self.recovery_store.fresh_attempt(process_id)
             LOGGER.warning(
-                "Stop rejected for execution %s; it remains retryable: %s", process_id, exc
+                "Stop rejected for execution %s; it remains retryable: %s",
+                process_id,
+                exc,
             )
             return
         except CdesktopError as exc:
             self.recovery_store.set(process_id, "uncertain")
-            LOGGER.warning("Stop outcome for execution %s is ambiguous: %s", process_id, exc)
+            LOGGER.warning(
+                "Stop outcome for execution %s is ambiguous: %s", process_id, exc
+            )
             # A transport failure may have followed a successful side effect.
             # One authoritative read can establish recovery; otherwise retain
             # uncertainty and wait rather than retrying the destructive call.
             try:
                 confirmed = client.execution_process(process_id)
             except CdesktopError as confirm_exc:
-                LOGGER.warning("Cannot confirm stalled execution %s: %s", process_id, confirm_exc)
+                LOGGER.warning(
+                    "Cannot confirm stalled execution %s: %s", process_id, confirm_exc
+                )
                 return
             if confirmed.get("status") != "running":
                 self.recovery_store.set(process_id, "handoff")
@@ -406,7 +447,9 @@ class StallDetector:
                 dedupe_key=dedupe_key,
             )
         except CdesktopError as exc:
-            LOGGER.warning("Cannot notify parent for stalled execution %s: %s", process_id, exc)
+            LOGGER.warning(
+                "Cannot notify parent for stalled execution %s: %s", process_id, exc
+            )
             return
         self.notified.add(process_id)
         self.recovery_store.set(process_id, "notified")
