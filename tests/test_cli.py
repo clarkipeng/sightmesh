@@ -31,12 +31,20 @@ def test_read_text_requires_one_source(tmp_path) -> None:
     assert _read_text("inline", None, "prompt") == "inline"
 
 
-def test_sightmesh_cdesktop_version_accepts_compatible_releases() -> None:
-    assert _is_sightmesh_cdesktop_version("cdesktop 0.2.3-sightmesh.1")
-    assert _is_sightmesh_cdesktop_version("0.2.3-SIGHTMESH.1")
-    assert _is_sightmesh_cdesktop_version("cdesktop/0.2.4 darwin-arm64")
+def test_sightmesh_cdesktop_version_requires_safe_command_lifecycle() -> None:
+    assert _is_sightmesh_cdesktop_version("cdesktop/0.2.5-sightmesh.0")
+    assert _is_sightmesh_cdesktop_version("cdesktop/0.2.5 darwin-arm64")
+    assert not _is_sightmesh_cdesktop_version("cdesktop 0.2.3-sightmesh.1")
+    assert not _is_sightmesh_cdesktop_version("cdesktop/0.2.4 darwin-arm64")
     assert not _is_sightmesh_cdesktop_version("0.2.3")
     assert not _is_sightmesh_cdesktop_version(None)
+
+
+def test_bootstrap_installs_the_safe_cdesktop_release() -> None:
+    bootstrap = (Path(__file__).parents[1] / "scripts" / "bootstrap-local.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "v0.2.5-20260813115508/cdesktop-0.2.5.tgz" in bootstrap
 
 
 def test_coordination_contract_is_compact_and_idempotent() -> None:
@@ -511,6 +519,38 @@ def test_prompt_idle_sends_only_when_not_running(monkeypatch, capsys) -> None:
 
     assert cli.cmd_prompt_idle(args) == 0
     assert '"verified_idle": true' in capsys.readouterr().out
+
+
+def test_message_explicitly_queues_a_continue_command(monkeypatch, capsys) -> None:
+    class MessageClient(FakeSpawnClient):
+        def workspaces(self):
+            return [
+                {
+                    "id": "workspace-a",
+                    "name": "worker-a",
+                    "branch": "feature-a",
+                    "archived": False,
+                }
+            ]
+
+        def workspace_summaries(self, archived=False):
+            return [{"workspace_id": "workspace-a", "latest_process_status": "running"}]
+
+        def send(self, session_id, prompt, sender_session=None, *, intent="continue"):
+            return {"session_id": session_id, "prompt": prompt, "intent": intent}
+
+    monkeypatch.setattr(cli, "CdesktopClient", MessageClient)
+    args = argparse.Namespace(
+        session_id="session-a",
+        message="finish the review",
+        message_file=None,
+        sender_session="manager",
+        url=None,
+        json=True,
+    )
+
+    assert cli.cmd_message(args) == 0
+    assert '"intent": "continue"' in capsys.readouterr().out
 
 
 def test_prompt_idle_refuses_running_agent(monkeypatch) -> None:

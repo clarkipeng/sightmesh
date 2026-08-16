@@ -6,6 +6,8 @@
 
 Use `sightmesh prompt-idle @AGENT --message-file FILE` for automation that must not append work behind an active turn or bypass a pending approval. It reads that session's process state immediately before sending and fails closed unless the target is active and idle.
 
+`sightmesh message @AGENT` always appends a native `continue` command; cdesktop starts it only at that session's next safe boundary. `steer` is the explicit `replace` path.
+
 Use `sightmesh inbox` for one global view of pending questions, plans, and tool requests. A manager agent can copy the included response templates into one `sightmesh respond --responses JSON` call. The complete batch is structurally validated before any response is sent. Live timeout races are isolated per response, so one expired request does not prevent later valid responses from being attempted.
 
 Use `sightmesh steer @AGENT --message-file FILE` when the current turn must change immediately. SightMesh resolves an exact ambiguity-safe selector, refuses self-steering and pending interactions, stops only that session's active non-dev-server execution, verifies the persisted state left `running`, and sends a native follow-up. Peer sessions in the same worktree and the dev server remain running. The visible transcript and the session's executor, model, reasoning, permissions, and provider remain intact.
