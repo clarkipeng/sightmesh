@@ -51,6 +51,17 @@ def test_duplicate_selectors_are_stably_disambiguated():
     ]
 
 
+def test_native_session_identity_keeps_selector_stable_across_executions():
+    first = overview(
+        FleetFacts(executions=(execution("turn-1", session_id="session-a"),)), now=NOW
+    ).running[0]
+    second = overview(
+        FleetFacts(executions=(execution("turn-2", session_id="session-a"),)), now=NOW
+    ).running[0]
+    assert first.selector == second.selector == "fleet/ws/session-a"
+    assert (first.execution_id, second.execution_id) == ("turn-1", "turn-2")
+
+
 def test_optional_facts_are_absent_without_affecting_projection():
     item = overview(FleetFacts(executions=(execution("bare"),)), now=NOW).running[0]
     assert item.model is item.provider is item.account_id is item.quota is None

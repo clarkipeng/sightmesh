@@ -838,7 +838,7 @@ def test_overview_groups_native_processes_and_projects_private_fields(
 ) -> None:
     class OverviewClient:
         def __init__(self, _url=None) -> None:
-            pass
+            self.snapshots = []
 
         def workspaces(self):
             return [{"id": "workspace-a", "branch": "feature", "archived": False}]
@@ -848,32 +848,81 @@ def test_overview_groups_native_processes_and_projects_private_fields(
             return [{"workspace_id": "workspace-a"}]
 
         def sessions(self, _workspace_id):
-            return [{"id": "session-a", "created_at": "2026-08-18T00:00:00Z"}]
-
-        def execution_processes(self, _session_id):
             return [
-                {
-                    "id": "running-a",
-                    "status": "running",
-                    "started_at": "2026-08-18T00:00:00Z",
-                    "secret": "raw-capability-token",
-                },
-                {
-                    "id": "done-a",
-                    "status": "completed",
-                    "completed_at": "2026-08-18T01:00:00Z",
-                },
-                {
-                    "id": "failed-a",
-                    "status": "failed",
-                    "completed_at": "2026-08-18T02:00:00Z",
-                },
+                {"id": "session-running", "created_at": "1"},
+                {"id": "session-done", "created_at": "2"},
+                {"id": "session-failed", "created_at": "3"},
+                {"id": "session-historical", "created_at": "4"},
             ]
+
+        def execution_processes(self, session_id):
+            return {
+                "session-running": [
+                    {
+                        "id": "historical-failed",
+                        "status": "failed",
+                        "completed_at": "2020-08-18T02:00:00Z",
+                    },
+                    {
+                        "id": "running-a",
+                        "status": "running",
+                        "started_at": "2020-01-01T00:00:00Z",
+                        "executor_action": {
+                            "selected_model_id": "gpt-authoritative",
+                            "selected_provider_id": "provider-a",
+                        },
+                        "secret": "raw-capability-token",
+                    },
+                ],
+                "session-done": [
+                    {
+                        "id": "done-a",
+                        "status": "completed",
+                        "completed_at": "2099-08-18T01:00:00Z",
+                    }
+                ],
+                "session-failed": [
+                    {
+                        "id": "failed-a",
+                        "status": "failed",
+                        "completed_at": "2099-08-18T02:00:00Z",
+                    }
+                ],
+                "session-historical": [
+                    {
+                        "id": "historical-failed",
+                        "status": "failed",
+                        "completed_at": "2020-08-18T02:00:00Z",
+                    }
+                ],
+            }[session_id]
+
+        def providers(self):
+            return [{"id": "provider-a", "kind": "codex"}]
+
+        def normalized_snapshot(self, process_id):
+            self.snapshots.append(process_id)
+            return {
+                "complete": True,
+                "entries": [
+                    {
+                        "content": {
+                            "entry_type": {
+                                "type": "token_usage_info",
+                                "total_tokens": 120,
+                                "model_context_window": 1000,
+                                "secret": "snapshot-secret",
+                            }
+                        }
+                    }
+                ],
+            }
 
         def pending_approvals(self):
             return []
 
-    monkeypatch.setattr(cli, "CdesktopClient", OverviewClient)
+    client = OverviewClient()
+    monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
     args = argparse.Namespace(url=None, since=None, json=True)
 
     assert cli.cmd_overview(args) == 0
@@ -881,10 +930,40 @@ def test_overview_groups_native_processes_and_projects_private_fields(
     assert [item["execution_id"] for item in output["needs_attention"]] == ["failed-a"]
     assert [item["execution_id"] for item in output["running"]] == ["running-a"]
     assert [item["execution_id"] for item in output["done_since_view"]] == ["done-a"]
+    running = output["running"][0]
+    assert running["model"] == "gpt-authoritative"
+    assert running["selector"].endswith("/session-running")
+    assert running["provider"] == "codex"
+    assert running["account_id"] is None
+    assert running["token_usage"] == {
+        "total": 120,
+        "unit": "tokens",
+        "provenance": "cdesktop normalized snapshot",
+    }
+    assert running["context"] == {"used": 120, "limit": 1000}
+    assert running["quota"] is None
+    assert running["monetary_cost"] is None
+    assert "historical-failed" not in json.dumps(output)
     assert "raw-capability-token" not in json.dumps(output)
+    assert "snapshot-secret" not in json.dumps(output)
+    assert client.snapshots == [
+        "running-a",
+        "done-a",
+        "failed-a",
+    ]
     selectors = [item["selector"] for group in output.values() for item in group]
     assert len(selectors) == len(set(selectors))
 
+    args.since = "2019-01-01T00:00:00Z"
+    assert cli.cmd_overview(args) == 0
+    expanded = json.loads(capsys.readouterr().out)
+    assert {item["execution_id"] for item in expanded["needs_attention"]} == {
+        "failed-a",
+        "historical-failed",
+    }
+    assert client.snapshots[-1] == "historical-failed"
+
+    args.since = None
     args.json = False
     assert cli.cmd_overview(args) == 0
     default_output = capsys.readouterr().out

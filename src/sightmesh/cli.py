@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +45,7 @@ from .repowire import reply as repowire_reply
 
 CDESKTOP_FORK_MARKER = "sightmesh"
 CDESKTOP_MIN_VERSION = (0, 2, 5)
+DEFAULT_OVERVIEW_HOURS = 24
 COORDINATION_MARKER = "## Local agent coordination"
 COORDINATION_CONTRACT = """## Local agent coordination
 
@@ -2038,9 +2039,77 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _overview_event_time(process: dict[str, Any]) -> datetime | None:
+    raw = (
+        process.get("completed_at")
+        or process.get("updated_at")
+        or process.get("started_at")
+        or process.get("created_at")
+    )
+    if not isinstance(raw, str):
+        return None
+    try:
+        value = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def _overview_execution_facts(
+    client: CdesktopClient,
+    process: dict[str, Any],
+    provider_kinds: dict[str, str],
+) -> dict[str, Any]:
+    action = process.get("executor_action")
+    action = action if isinstance(action, dict) else {}
+    action_type = action.get("typ")
+    action_type = action_type if isinstance(action_type, dict) else {}
+    config = action_type.get("executor_config", {})
+    config = config if isinstance(config, dict) else {}
+    model = action.get("selected_model_id") or config.get("model_id")
+    provider_id = action.get("selected_provider_id")
+    token_usage = None
+    context = None
+    try:
+        snapshot = _normalized_snapshot_with_retry(client, str(process["id"]))
+    except CdesktopError:
+        snapshot = {}
+    entries = snapshot.get("entries") if isinstance(snapshot, dict) else []
+    for wrapped in entries if isinstance(entries, list) else []:
+        content = wrapped.get("content") if isinstance(wrapped, dict) else None
+        entry_type = content.get("entry_type") if isinstance(content, dict) else None
+        if (
+            not isinstance(entry_type, dict)
+            or entry_type.get("type") != "token_usage_info"
+        ):
+            continue
+        total = entry_type.get("total_tokens")
+        limit = entry_type.get("model_context_window")
+        if isinstance(total, (int, float)):
+            token_usage = {
+                "total": total,
+                "unit": "tokens",
+                "provenance": "cdesktop normalized snapshot",
+            }
+        if isinstance(total, (int, float)) and isinstance(limit, (int, float)):
+            context = {"used": total, "limit": limit}
+    return {
+        "model": str(model) if model else None,
+        "provider": provider_kinds.get(str(provider_id)) if provider_id else None,
+        "account_id": None,
+        "token_usage": token_usage,
+        "context": context,
+    }
+
+
 def _fleet_overview(
-    client: CdesktopClient, viewed_at: datetime | None
+    client: CdesktopClient,
+    viewed_at: datetime | None,
+    *,
+    now: datetime | None = None,
 ) -> fleet.FleetOverview:
+    current_time = now or datetime.now(UTC)
+    cutoff = viewed_at or current_time - timedelta(hours=DEFAULT_OVERVIEW_HOURS)
     workspaces = [
         {
             "id": str(workspace["id"]),
@@ -2051,37 +2120,43 @@ def _fleet_overview(
     ]
     executions: list[dict[str, Any]] = []
     relationships: list[dict[str, Any]] = []
+    try:
+        provider_kinds = {
+            str(provider["id"]): str(provider.get("kind") or provider.get("name"))
+            for provider in client.providers()
+            if provider.get("id") and (provider.get("kind") or provider.get("name"))
+        }
+    except (AttributeError, CdesktopError):
+        provider_kinds = {}
     for row in _fleet_sessions(client):
-        for process in _session_processes(client, row):
-            if process.get("dropped") or process.get("run_reason") == "devserver":
-                continue
-            event_at = (
-                process.get("completed_at")
-                or process.get("updated_at")
-                or process.get("started_at")
-                or process.get("created_at")
+        process = _latest_process(_session_processes(client, row))
+        if process is None:
+            continue
+        event_at = _overview_event_time(process)
+        status = str(process.get("status") or "")
+        if status not in fleet.RUNNING and (event_at is None or event_at < cutoff):
+            continue
+        native_facts = _overview_execution_facts(client, process, provider_kinds)
+        executions.append(
+            {
+                "id": str(process["id"]),
+                "session_id": row["session_id"],
+                "workspace_id": row["workspace_id"],
+                "status": status,
+                **native_facts,
+                "branch": row.get("branch"),
+                "last_event": {
+                    "at": event_at,
+                    "kind": "execution",
+                    "status": status,
+                },
+            }
+        )
+        parent = row.get("parent_session_id")
+        if parent:
+            relationships.append(
+                {"execution_id": str(process["id"]), "id": str(parent)}
             )
-            executions.append(
-                {
-                    "id": str(process["id"]),
-                    "workspace_id": row["workspace_id"],
-                    "status": process.get("status"),
-                    "model": process.get("model"),
-                    "provider": process.get("provider"),
-                    "account_id": process.get("provider_id"),
-                    "branch": row.get("branch"),
-                    "last_event": {
-                        "at": event_at,
-                        "kind": "execution",
-                        "status": process.get("status"),
-                    },
-                }
-            )
-            parent = row.get("parent_session_id")
-            if parent:
-                relationships.append(
-                    {"execution_id": str(process["id"]), "id": str(parent)}
-                )
     try:
         pending = client.pending_approvals()
     except (AttributeError, CdesktopError):
@@ -2100,7 +2175,7 @@ def _fleet_overview(
         approvals=tuple(approvals_rows),
         relationships=tuple(relationships),
     )
-    return fleet.overview(facts, now=datetime.now(UTC), viewed_at=viewed_at)
+    return fleet.overview(facts, now=current_time, viewed_at=cutoff)
 
 
 def cmd_overview(args: argparse.Namespace) -> int:
@@ -2712,7 +2787,8 @@ def parser() -> argparse.ArgumentParser:
         "overview", help="Group privacy-safe fleet activity by required attention"
     )
     overview.add_argument(
-        "--since", help="ISO-8601 lower bound for the Done since view group"
+        "--since",
+        help="ISO-8601 lower bound for inactive items; defaults to the last 24 hours",
     )
     overview.set_defaults(func=cmd_overview)
 

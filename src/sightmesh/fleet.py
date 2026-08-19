@@ -154,7 +154,9 @@ def _item(
     model = _text(execution.get("model"))
     provider = _text(execution.get("provider")) or _text(account.get("provider"))
     return FleetItem(
-        selector=_base_selector(workspace_id, execution_id),
+        selector=_base_selector(
+            workspace_id, _text(execution.get("session_id")) or execution_id
+        ),
         group=group,
         urgency=urgency,
         age_seconds=age,
