@@ -56,7 +56,7 @@ A resolved target carries an opaque `auth_binding_id`: a reference to the select
 
 Never place credential paths, headers, cookies, tokens, provider responses, or credential-shaped sample values in routing settings, selection traces, UI, logs, or examples. Route IDs and account aliases are safe operational labels, such as `codex-api-primary`; they are not authentication material.
 
-With `exposeAccountAlias=true`, the selected target includes that safe alias for operator diagnostics. With it disabled, the selected target returns `account_alias: null`; the opaque binding remains available to the launcher. Disabling the display alias does not change route order, eligibility, or which binding the selector chooses. Existing selector traces may still identify a safe account alias while explaining a skip or selection; they must never include a credential or its location.
+With `exposeAccountAlias=true`, the selected target includes that safe alias for operator diagnostics. With it disabled, the selected target returns `account_alias: null`; the opaque binding remains available to the launcher. Disabling the display alias does not change route order, eligibility, or which binding the selector chooses. In this mode, selection traces use the generic label `account` and do not identify account IDs or aliases; traces must never include credentials or their locations.
 
 ## Upgrade and compatibility
 
