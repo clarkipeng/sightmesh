@@ -40,6 +40,20 @@ class DurableCommand:
     recovery_attempt: int = 1
     recovery_state: str | None = None
 
+    def delivery_state(self, process: dict[str, Any] | None) -> str:
+        """Project cdesktop facts onto the delivery lifecycle without storing it."""
+        if self.state == "pending":
+            return "queued"
+        if self.state == "claimed":
+            if process is None:
+                return "claimed"
+            return "running" if process.get("status") == "running" else "observed"
+        if self.state in {"done", "failed"}:
+            return "terminal"
+        if self.state == "cancelled":
+            return "rejected"
+        return "observed"
+
 
 class NativeCommandQueue:
     """Thin adapter around cdesktop's already durable command machinery."""
@@ -53,11 +67,12 @@ class NativeCommandQueue:
         rows = self.client.session_commands(session_id)
         return [DurableCommand(**_command_fields(row, session_id)) for row in rows]
 
-    def interrupt(self, command: DurableCommand) -> None:
-        self.client.interrupt_command(command.id)
-
     def requeue(self, command: DurableCommand) -> None:
-        self.client.requeue_command(command.id, dedupe_key=command.dedupe_key)
+        if not command.execution_process_id:
+            raise CdesktopError(f"Command {command.id} has no execution to requeue")
+        self.client.requeue_execution_commands(
+            command.session_id, command.execution_process_id
+        )
 
     def recovery(self, command: DurableCommand, *, attempt: int, state: str) -> None:
         if not hasattr(self.client, "update_command"):
@@ -66,9 +81,6 @@ class NativeCommandQueue:
             command.id,
             {"recovery_attempt": attempt, "recovery_state": state},
         )
-
-    def done(self, command: DurableCommand) -> None:
-        self.client.complete_command(command.id)
 
     def notify_parent(
         self, parent_session_id: str, child_session_id: str, message: str, key: str
@@ -202,6 +214,7 @@ class DurableExecutionReconciler:
             for command in commands
             if command.state == "claimed" and command.execution_process_id
         }
+        self._wake_parent_for_terminal_commands(session, commands)
         for command in commands:
             if command.state != "claimed":
                 continue
@@ -209,7 +222,7 @@ class DurableExecutionReconciler:
             if process and process.get("status") == "running":
                 snapshot = self.client.normalized_snapshot(str(process["id"]))
                 if not snapshot.get("stream_alive", True):
-                    self._interrupt_and_requeue(command)
+                    self.recover_stalled_process(session, process, command)
                 elif is_active_suite_work(snapshot):
                     continue
                 elif self.liveness.stale(str(process["id"]), snapshot):
@@ -296,12 +309,31 @@ class DurableExecutionReconciler:
             key,
         )
 
+    def _wake_parent_for_terminal_commands(
+        self, child_session: dict[str, Any], commands: Iterable[DurableCommand]
+    ) -> None:
+        """Wake once per native terminal transition; cdesktop owns the dedupe fence."""
+        parent = child_session.get("parent_session_id")
+        if not parent:
+            return
+        child_id = str(child_session["id"])
+        for command in commands:
+            state = command.delivery_state(None)
+            if state not in {"terminal", "rejected"}:
+                continue
+            key = f"child-command:{command.id}:{command.state}"
+            self.queue.notify_parent(
+                str(parent),
+                child_id,
+                f"CHILD_DELIVERY: {child_id} {command.id} {command.state}",
+                key,
+            )
+
     def _interrupt_and_requeue(self, command: DurableCommand) -> None:
         # Lifecycle writes are idempotent in cdesktop; duplicate ticks cannot
         # manufacture a second command because requeue retains dedupe_key.
         if command.id in self._requeued:
             return
-        self.queue.interrupt(command)
         self.queue.requeue(command)
         self._requeued.add(command.id)
 
