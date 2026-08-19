@@ -740,7 +740,7 @@ def apply_plan(
                     "context_bundle": bundle,
                     "context_pointer": pointer,
                     "source_archived": source_archived,
-                    "lease": lease.to_dict() if lease else None,
+                    "lease": lease.to_public_dict() if lease else None,
                 }
                 existing[resolved_source] = created
             except Exception:

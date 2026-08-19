@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import sqlite3
 import subprocess
@@ -7,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from sightmesh import cli
 from sightmesh.conductor_migrate import (
     apply_plan,
     build_plan,
@@ -179,7 +181,7 @@ def _fixture(tmp_path: Path, *, dirty: bool = False, status: str = "idle"):
     return conductor, checkout, database
 
 
-def test_plan_apply_status_and_rollback(tmp_path: Path) -> None:
+def test_plan_apply_status_and_rollback(tmp_path: Path, capsys) -> None:
     conductor, checkout, database = _fixture(tmp_path)
     plan = build_plan(conductor_roots=[conductor], database=database)
     assert plan["workspace_count"] == 1
@@ -197,6 +199,10 @@ def test_plan_apply_status_and_rollback(tmp_path: Path) -> None:
     )
 
     application = result["applications"]["conductor-alpha"]
+    capability_token = leases.workspace_token("workspace-1")
+    assert capability_token
+    assert "token" not in application["lease"]
+    assert capability_token not in json.dumps(result)
     assert application["status"] == "created"
     assert client.workspace_rows[0]["name"] == "alpha"
     assert client.workspace_rows[0]["use_worktree"] is False
@@ -206,8 +212,17 @@ def test_plan_apply_status_and_rollback(tmp_path: Path) -> None:
     )
     assert Path(pointer["handoff"]).is_file()
     assert "Preserve this migration context" in Path(pointer["handoff"]).read_text()
-    assert migration_status(plan_path)["counts"] == {"created": 1}
-    assert leases.workspace_token("workspace-1")
+    persisted = json.loads((plan_path.parent / "run.json").read_text(encoding="utf-8"))
+    assert capability_token not in json.dumps(persisted)
+    status = migration_status(plan_path)
+    assert status["counts"] == {"created": 1}
+    assert capability_token not in json.dumps(status)
+
+    status_args = argparse.Namespace(
+        migrate_action="status", run=str(plan_path), json=True
+    )
+    assert cli.cmd_migrate(status_args) == 0
+    assert capability_token not in capsys.readouterr().out
 
     rolled_back = rollback_run(
         plan_path, confirm=True, client=client, lease_store=leases
