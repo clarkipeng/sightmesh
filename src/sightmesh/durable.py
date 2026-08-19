@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -27,6 +28,16 @@ from .stalls import is_active_suite_work, threshold_from_environment
 from .succession import COMMAND_TERMINAL_STATES, OwnershipStore, resolve_live_successor
 
 LOGGER = logging.getLogger("sightmesh.durable")
+DURABLE_RECOVERY_MIN_VERSION = (0, 2, 6)
+
+
+def supports_durable_recovery(version: object) -> bool:
+    """Return whether cdesktop exposes the process-scoped recovery API."""
+    match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", str(version or ""))
+    return bool(
+        match
+        and tuple(int(part) for part in match.groups()) >= DURABLE_RECOVERY_MIN_VERSION
+    )
 
 
 @dataclass(frozen=True)
@@ -186,9 +197,30 @@ class DurableExecutionReconciler:
         self.liveness = liveness or SuiteLiveness()
         self._offline_until = 0.0
         self._backoff = 1.0
+        self._durable_supported: bool | None = None
+
+    def _supports_durable_recovery(self) -> bool:
+        if self._durable_supported is not None:
+            return self._durable_supported
+        if not hasattr(self.client, "info"):
+            # Protocol test doubles and older embedders predate version discovery.
+            self._durable_supported = True
+            return True
+        info = self.client.info()
+        version = info.get("version") if isinstance(info, dict) else None
+        self._durable_supported = supports_durable_recovery(version)
+        if not self._durable_supported:
+            LOGGER.warning(
+                "Durable recovery is disabled: cdesktop 0.2.6 or newer is required "
+                "(found %s). Normal bridging remains available.",
+                version or "unknown version",
+            )
+        return self._durable_supported
 
     def reconcile_sessions(self, sessions: Iterable[dict[str, Any]]) -> None:
         """Reconcile all sessions in one writer, tolerating partial reads."""
+        if not self._supports_durable_recovery():
+            return
         for session in sessions:
             try:
                 self.reconcile_session(session)

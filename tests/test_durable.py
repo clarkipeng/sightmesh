@@ -5,7 +5,11 @@ from sightmesh.cdesktop import (
     CdesktopPendingError,
     CdesktopRejectedError,
 )
-from sightmesh.durable import DurableCommand, DurableExecutionReconciler
+from sightmesh.durable import (
+    DurableCommand,
+    DurableExecutionReconciler,
+    supports_durable_recovery,
+)
 
 
 class Queue:
@@ -62,6 +66,33 @@ def command(state="claimed"):
     return DurableCommand(
         "command-1", "session-1", "work", state, "same-key", "process-1"
     )
+
+
+def test_durable_recovery_version_boundary() -> None:
+    assert not supports_durable_recovery("cdesktop/0.2.5")
+    assert supports_durable_recovery("cdesktop/0.2.6")
+
+
+def test_025_gate_fails_closed_once_without_recovery_calls(caplog) -> None:
+    class LegacyClient:
+        def __init__(self) -> None:
+            self.info_calls = 0
+
+        def info(self):
+            self.info_calls += 1
+            return {"version": "cdesktop/0.2.5"}
+
+        def execution_processes(self, _session):
+            raise AssertionError("unsupported recovery API was called")
+
+    client = LegacyClient()
+    reconciler = DurableExecutionReconciler(client, Queue([command()]))
+
+    reconciler.reconcile_sessions([{"id": "session-1"}])
+    reconciler.reconcile_sessions([{"id": "session-1"}])
+
+    assert client.info_calls == 1
+    assert caplog.text.count("Durable recovery is disabled") == 1
 
 
 def test_restart_after_claim_interrupts_and_requeues_same_command():

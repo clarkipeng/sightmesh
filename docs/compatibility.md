@@ -8,6 +8,8 @@
 - Codex CLI 0.147.0
 - Claude Code 2.1.228
 
+The general CLI remains compatible with the bootstrap-pinned cdesktop 0.2.5. Durable manager reconciliation is feature-gated because its command-history, process-scoped requeue, and dispatch APIs require cdesktop 0.2.6. On 0.2.5 that feature disables itself after one bounded diagnostic; normal local bridging continues and unsupported recovery endpoints are not retried. The bootstrap remains pinned to the released 0.2.5 artifact.
+
 ## Passing behavior
 
 - local-only cdesktop configuration with analytics and relay disabled;

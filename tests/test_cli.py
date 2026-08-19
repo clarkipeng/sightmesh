@@ -41,9 +41,9 @@ def test_sightmesh_cdesktop_version_requires_safe_command_lifecycle() -> None:
 
 
 def test_bootstrap_installs_the_safe_cdesktop_release() -> None:
-    bootstrap = (Path(__file__).parents[1] / "scripts" / "bootstrap-local.sh").read_text(
-        encoding="utf-8"
-    )
+    bootstrap = (
+        Path(__file__).parents[1] / "scripts" / "bootstrap-local.sh"
+    ).read_text(encoding="utf-8")
     assert "v0.2.5-20260813115508/cdesktop-0.2.5.tgz" in bootstrap
 
 
@@ -134,6 +134,7 @@ def test_workspace_repository_paths_expose_source_and_checkout() -> None:
 
 
 def test_parser_registers_compact_fleet_commands() -> None:
+    assert parser().parse_args(["overview"]).func is cli.cmd_overview
     assert parser().parse_args(["peers"]).func is cli.cmd_peers
     assert parser().parse_args(["peek", "@reviewer"]).func is cli.cmd_peek
     assert parser().parse_args(["inbox"]).func is cli.cmd_inbox
@@ -743,7 +744,9 @@ def test_failover_starts_visible_successor_on_approved_profile(
         ownership.assert_deliverable("session-a")
 
 
-def test_spawn_direct_acquires_workspace_lease(monkeypatch, tmp_path: Path) -> None:
+def test_spawn_direct_acquires_workspace_lease(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     lease_dir = tmp_path / "leases"
@@ -774,12 +777,122 @@ def test_spawn_direct_acquires_workspace_lease(monkeypatch, tmp_path: Path) -> N
 
     assert cli.cmd_spawn(args) == 0
 
+    output = json.loads(capsys.readouterr().out)
+    assert "token" not in output["lease"]
+    assert output["lease"]["workspace_id"] == "workspace-a"
+
     leases = LeaseStore(lease_dir).list()
     assert len(leases) == 1
     assert leases[0].repo_path == str(repo.resolve())
     assert leases[0].worktree_path is None
     assert leases[0].workspace_id == "workspace-a"
     assert leases[0].session_id == "session-a"
+
+
+def test_lease_capability_boundary_redacts_inspection(tmp_path: Path, capsys) -> None:
+    store = LeaseStore(tmp_path / "leases")
+    lease = store.acquire("owner", tmp_path, ttl_seconds=60)
+    args = argparse.Namespace(
+        lease_dir=str(tmp_path / "leases"),
+        lease_action="list",
+        include_stale=True,
+        json=True,
+    )
+
+    assert cli.cmd_lease(args) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert "token" not in output[0]
+    assert lease.token not in json.dumps(output)
+
+
+def test_status_redacts_lease_capability(monkeypatch, tmp_path: Path, capsys) -> None:
+    lease_dir = tmp_path / "leases"
+    lease = LeaseStore(lease_dir).acquire("owner", tmp_path, ttl_seconds=60)
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
+    monkeypatch.setattr(cli.service, "status", lambda _port: {"running": True})
+    monkeypatch.setattr(cli.routing, "enabled_workspaces", lambda: set())
+    monkeypatch.setattr(cli.ProfileStore, "list", lambda _self: [])
+
+    class StatusClient:
+        def __init__(self, _url=None) -> None:
+            pass
+
+        def workspace_summaries(self, _archived=False):
+            return []
+
+        def workspaces(self):
+            return []
+
+        def providers(self):
+            return []
+
+    monkeypatch.setattr(cli, "CdesktopClient", StatusClient)
+    args = argparse.Namespace(url=None, port=8377, include_archived=False, json=True)
+
+    assert cli.cmd_status(args) == 0
+    assert lease.token not in capsys.readouterr().out
+
+
+def test_overview_groups_native_processes_and_projects_private_fields(
+    monkeypatch, capsys
+) -> None:
+    class OverviewClient:
+        def __init__(self, _url=None) -> None:
+            pass
+
+        def workspaces(self):
+            return [{"id": "workspace-a", "branch": "feature", "archived": False}]
+
+        def workspace_summaries(self, archived=False):
+            assert archived is False
+            return [{"workspace_id": "workspace-a"}]
+
+        def sessions(self, _workspace_id):
+            return [{"id": "session-a", "created_at": "2026-08-18T00:00:00Z"}]
+
+        def execution_processes(self, _session_id):
+            return [
+                {
+                    "id": "running-a",
+                    "status": "running",
+                    "started_at": "2026-08-18T00:00:00Z",
+                    "secret": "raw-capability-token",
+                },
+                {
+                    "id": "done-a",
+                    "status": "completed",
+                    "completed_at": "2026-08-18T01:00:00Z",
+                },
+                {
+                    "id": "failed-a",
+                    "status": "failed",
+                    "completed_at": "2026-08-18T02:00:00Z",
+                },
+            ]
+
+        def pending_approvals(self):
+            return []
+
+    monkeypatch.setattr(cli, "CdesktopClient", OverviewClient)
+    args = argparse.Namespace(url=None, since=None, json=True)
+
+    assert cli.cmd_overview(args) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert [item["execution_id"] for item in output["needs_attention"]] == ["failed-a"]
+    assert [item["execution_id"] for item in output["running"]] == ["running-a"]
+    assert [item["execution_id"] for item in output["done_since_view"]] == ["done-a"]
+    assert "raw-capability-token" not in json.dumps(output)
+    selectors = [item["selector"] for group in output.values() for item in group]
+    assert len(selectors) == len(set(selectors))
+
+    args.json = False
+    assert cli.cmd_overview(args) == 0
+    default_output = capsys.readouterr().out
+    assert "Needs attention\n" in default_output
+    assert "Running\n" in default_output
+    assert "Done since view\n" in default_output
+    assert "Next:" in default_output
+    assert "raw-capability-token" not in default_output
 
 
 def test_spawn_records_automatic_parent(monkeypatch, tmp_path: Path) -> None:
@@ -1103,7 +1216,7 @@ def test_worktree_setup_failure_propagates_without_a_lease(
 
 
 def test_close_archive_releases_only_workspace_lease(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, capsys
 ) -> None:
     repo_a = tmp_path / "repo-a"
     repo_b = tmp_path / "repo-b"
@@ -1111,7 +1224,9 @@ def test_close_archive_releases_only_workspace_lease(
     repo_b.mkdir()
     lease_dir = tmp_path / "leases"
     store = LeaseStore(lease_dir)
-    store.acquire("owner-a", repo_a, ttl_seconds=60, workspace_id="workspace-a")
+    archived_lease = store.acquire(
+        "owner-a", repo_a, ttl_seconds=60, workspace_id="workspace-a"
+    )
     other = store.acquire("owner-b", repo_b, ttl_seconds=60, workspace_id="workspace-b")
     monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
     monkeypatch.setattr(cli, "CdesktopClient", FakeSpawnClient)
@@ -1130,6 +1245,7 @@ def test_close_archive_releases_only_workspace_lease(
     )
 
     assert cli.cmd_close(args) == 0
+    assert archived_lease.token not in capsys.readouterr().out
 
     remaining = LeaseStore(lease_dir).list()
     assert [lease.token for lease in remaining] == [other.token]
@@ -1240,7 +1356,7 @@ def test_workspace_delete_can_preserve_dirty_direct_repo(monkeypatch) -> None:
 
 
 def test_workspace_restore_reactivates_route_and_lease(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, capsys
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -1269,6 +1385,7 @@ def test_workspace_restore_reactivates_route_and_lease(
     assert enabled == ["workspace-a"]
     lease = LeaseStore(lease_dir).list()[0]
     assert lease.workspace_id == "workspace-a"
+    assert lease.token not in capsys.readouterr().out
 
 
 def test_spawn_direct_fails_closed_when_repo_leased(

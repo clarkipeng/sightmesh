@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from . import (
     conductor_migrate,
     escalation,
     execution_routing,
+    fleet,
     leases,
     routing,
     service,
@@ -88,7 +90,9 @@ def _repowire_status_ok(returncode: int, detail: str) -> bool:
 
 def _is_sightmesh_cdesktop_version(detail: object) -> bool:
     normalized = str(detail or "").casefold()
-    if CDESKTOP_FORK_MARKER not in normalized and not normalized.startswith("cdesktop/"):
+    if CDESKTOP_FORK_MARKER not in normalized and not normalized.startswith(
+        "cdesktop/"
+    ):
         return False
     match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", normalized)
     if not match:
@@ -290,6 +294,7 @@ def _fleet_sessions(
                     "session": session_name
                     or ("lead" if index == 0 else f"peer-{index}"),
                     "session_name": session_name or None,
+                    "parent_session_id": session.get("parent_session_id"),
                     "is_lead": index == 0,
                     "executor": session.get("executor"),
                     "branch": workspace.get("branch"),
@@ -764,7 +769,7 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
     if not args.no_bridge:
         routing.enable(workspace_id)
     if lease:
-        result["lease"] = lease.to_dict()
+        result["lease"] = lease.to_public_dict()
     if selection.profile:
         result["profile"] = selection.profile
     if selection.route_id:
@@ -1119,7 +1124,9 @@ def cmd_failover(args: argparse.Namespace) -> int:
                 "action": "replacement-started-source-archived",
                 "source_archived": True,
                 "source_workspace": archived,
-                "released_source_lease": released.to_dict() if released else None,
+                "released_source_lease": released.to_public_dict()
+                if released
+                else None,
             }
         )
     _emit(result, args.json)
@@ -1697,7 +1704,7 @@ def _archive_workspace(args: argparse.Namespace, client: CdesktopClient) -> int:
             "workspace": archived,
             "action": "stopped-and-archived",
             "preserved_dirty": dirty,
-            "released_lease": released.to_dict() if released else None,
+            "released_lease": released.to_public_dict() if released else None,
         },
         args.json,
     )
@@ -1742,7 +1749,7 @@ def cmd_workspace(args: argparse.Namespace) -> int:
                 "workspace": restored,
                 "action": "restored",
                 "leases": [
-                    lease.to_dict()
+                    lease.to_public_dict()
                     for lease in synced
                     if lease.workspace_id == args.workspace_id
                 ],
@@ -1788,7 +1795,7 @@ def cmd_workspace(args: argparse.Namespace) -> int:
                 "missing_repositories": missing,
                 "preserved_dirty": substantive_dirty,
                 "cdesktop_result": result,
-                "released_lease": released.to_dict() if released else None,
+                "released_lease": released.to_public_dict() if released else None,
             },
             args.json,
         )
@@ -2022,12 +2029,99 @@ def cmd_status(args: argparse.Namespace) -> int:
                     item["has_pending_approval"] for item in workspaces
                 ),
             },
-            "leases": [lease.to_dict() for lease in leases.LeaseStore().list()],
+            "leases": [lease.to_public_dict() for lease in leases.LeaseStore().list()],
             "profiles": profile_rows,
             "providers": [provider_summary(provider) for provider in providers],
         },
         args.json,
     )
+    return 0
+
+
+def _fleet_overview(
+    client: CdesktopClient, viewed_at: datetime | None
+) -> fleet.FleetOverview:
+    workspaces = [
+        {
+            "id": str(workspace["id"]),
+            "branch": workspace.get("branch"),
+        }
+        for workspace in client.workspaces()
+        if not workspace.get("archived")
+    ]
+    executions: list[dict[str, Any]] = []
+    relationships: list[dict[str, Any]] = []
+    for row in _fleet_sessions(client):
+        for process in _session_processes(client, row):
+            if process.get("dropped") or process.get("run_reason") == "devserver":
+                continue
+            event_at = (
+                process.get("completed_at")
+                or process.get("updated_at")
+                or process.get("started_at")
+                or process.get("created_at")
+            )
+            executions.append(
+                {
+                    "id": str(process["id"]),
+                    "workspace_id": row["workspace_id"],
+                    "status": process.get("status"),
+                    "model": process.get("model"),
+                    "provider": process.get("provider"),
+                    "account_id": process.get("provider_id"),
+                    "branch": row.get("branch"),
+                    "last_event": {
+                        "at": event_at,
+                        "kind": "execution",
+                        "status": process.get("status"),
+                    },
+                }
+            )
+            parent = row.get("parent_session_id")
+            if parent:
+                relationships.append(
+                    {"execution_id": str(process["id"]), "id": str(parent)}
+                )
+    try:
+        pending = client.pending_approvals()
+    except (AttributeError, CdesktopError):
+        pending = []
+    approvals_rows = [
+        {
+            "execution_id": str(item["execution_process_id"]),
+            "status": "pending",
+        }
+        for item in pending
+        if item.get("execution_process_id")
+    ]
+    facts = fleet.FleetFacts(
+        workspaces=tuple(workspaces),
+        executions=tuple(executions),
+        approvals=tuple(approvals_rows),
+        relationships=tuple(relationships),
+    )
+    return fleet.overview(facts, now=datetime.now(UTC), viewed_at=viewed_at)
+
+
+def cmd_overview(args: argparse.Namespace) -> int:
+    viewed_at = datetime.fromisoformat(args.since) if args.since else None
+    if viewed_at and viewed_at.tzinfo is None:
+        viewed_at = viewed_at.replace(tzinfo=UTC)
+    projection = _fleet_overview(CdesktopClient(args.url), viewed_at)
+    if args.json:
+        _emit(projection.to_dict(), True)
+        return 0
+    groups = (
+        ("Needs attention", projection.needs_attention),
+        ("Running", projection.running),
+        ("Done since view", projection.done_since_view),
+    )
+    for label, items in groups:
+        print(label)
+        if not items:
+            print("  (none)")
+        for item in items:
+            print(f"  {item.selector} — {item.reason} Next: {item.next_action}")
     return 0
 
 
@@ -2051,7 +2145,10 @@ def cmd_lease(args: argparse.Namespace) -> int:
         _emit(lease.to_dict(), args.json)
     elif args.lease_action == "list":
         _emit(
-            [lease.to_dict() for lease in store.list(include_stale=args.include_stale)],
+            [
+                lease.to_public_dict()
+                for lease in store.list(include_stale=args.include_stale)
+            ],
             args.json,
         )
     elif args.lease_action == "release":
@@ -2072,7 +2169,7 @@ def cmd_lease(args: argparse.Namespace) -> int:
             args.json,
         )
     elif args.lease_action == "recover-stale":
-        _emit([lease.to_dict() for lease in store.recover_stale()], args.json)
+        _emit([lease.to_public_dict() for lease in store.recover_stale()], args.json)
     else:
         raise ValueError(f"Unknown lease action: {args.lease_action}")
     return 0
@@ -2611,6 +2708,14 @@ def parser() -> argparse.ArgumentParser:
     fleet_status.add_argument("--include-archived", action="store_true")
     fleet_status.set_defaults(func=cmd_status)
 
+    overview = sub.add_parser(
+        "overview", help="Group privacy-safe fleet activity by required attention"
+    )
+    overview.add_argument(
+        "--since", help="ISO-8601 lower bound for the Done since view group"
+    )
+    overview.set_defaults(func=cmd_overview)
+
     configure = sub.add_parser("configure", help="Enforce local-only cdesktop settings")
     configure.add_argument(
         "--workspace-root",
@@ -3148,7 +3253,7 @@ def parser() -> argparse.ArgumentParser:
     lease.add_argument("--lease-dir", help="Override lease state directory")
     lease_sub = lease.add_subparsers(dest="lease_action", required=True)
     lease_acquire = lease_sub.add_parser(
-        "acquire", help="Acquire an expiring ownership lease"
+        "acquire", help="Acquire a lease and return its capability token"
     )
     lease_acquire.add_argument("--owner", required=True)
     lease_acquire.add_argument("--repo", required=True)
@@ -3159,20 +3264,22 @@ def parser() -> argparse.ArgumentParser:
     lease_acquire.add_argument("--workspace-id")
     lease_acquire.add_argument("--session-id")
     lease_acquire.set_defaults(func=cmd_lease)
-    lease_list = lease_sub.add_parser("list", help="List local ownership leases")
+    lease_list = lease_sub.add_parser(
+        "list", help="List leases without capability tokens"
+    )
     lease_list.add_argument(
         "--include-stale", action=argparse.BooleanOptionalAction, default=True
     )
     lease_list.set_defaults(func=cmd_lease)
     lease_release = lease_sub.add_parser(
-        "release", help="Release an ownership lease by token"
+        "release", help="Release by capability token and return that capability"
     )
     lease_release.add_argument("token")
     lease_release.add_argument("--owner")
     lease_release.add_argument("--workspace-id")
     lease_release.set_defaults(func=cmd_lease)
     lease_renew = lease_sub.add_parser(
-        "renew", help="Renew an ownership lease by token"
+        "renew", help="Renew by capability token and return that capability"
     )
     lease_renew.add_argument("token")
     lease_renew.add_argument(
@@ -3182,7 +3289,7 @@ def parser() -> argparse.ArgumentParser:
     lease_renew.add_argument("--workspace-id")
     lease_renew.set_defaults(func=cmd_lease)
     lease_recover = lease_sub.add_parser(
-        "recover-stale", help="Remove expired or dead-owner leases"
+        "recover-stale", help="Remove stale leases without returning capability tokens"
     )
     lease_recover.set_defaults(func=cmd_lease)
 
