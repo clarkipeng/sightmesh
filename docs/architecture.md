@@ -1,79 +1,45 @@
-# SightMesh v0.9 architecture
+# Architecture
 
-SightMesh is a thin local control surface over cdesktop. It does not own a second scheduler, transcript, relationship graph, delivery queue, or worktree registry.
+SightMesh is a thin local policy layer over native owners. Its purpose is to make full Claude Code and Codex workers visible, interruptible, isolated, and recoverable without inventing a second agent runtime.
 
-## Design rule
+## Native ownership
 
-Encode semantics and invariants, not catalogs of edge cases. Prefer one general mechanism with a small example over several special commands or recovery paths.
+| Concern | Owner |
+| --- | --- |
+| Sessions, transcripts, processes, approvals, and durable commands | cdesktop |
+| Branches, checkouts, and worktrees | Git |
+| Workspace-local handoffs | Git-ignored `.context` files |
+| Cross-workspace request/reply transport | Repowire |
+| Credential-pool order, local leases, and lifecycle policy | SightMesh |
 
-## Ownership
+This boundary is intentional. SightMesh validates operator intent and calls the native owner; it does not mirror all transcripts, source state, or relationships into a global database.
 
-- cdesktop owns workspaces, sessions, commands, executions, relationships, archives, and resource admission.
-- Git owns source, branches, and worktrees.
-- Repowire transports cross-workspace messages.
-- `.context` holds ignored workspace-local handoffs.
-- SightMesh owns credential-pool order and quota-aware account selection.
-- SightMesh validates intent and calls those owners.
+## Visible sessions and isolation
 
-SightMesh keeps no long-running updater and no runtime SQLite databases.
+`sightmesh spawn` creates a cdesktop workspace and full provider session. The normal implementation path uses a dedicated Git worktree, allowing independent workers from one repository to coexist. Direct-checkout work is supported but conflicts with other ownership for that repository and cannot use unattended mode.
 
-## Command schema
+cdesktop remains the inspection surface: conversation, process output, changed-file diffs, browser preview, and interruption are visible to the operator. A session is not a background prompt hidden behind SightMesh.
 
-Every prompt source writes the same durable record:
+## Durable commands
 
-```sql
-session_commands (
-  id                    BLOB PRIMARY KEY,
-  session_id            BLOB NOT NULL REFERENCES sessions(id),
-  dedupe_key            TEXT,
-  intent                TEXT NOT NULL CHECK (intent IN ('continue', 'replace')),
-  body                  TEXT NOT NULL,
-  config                TEXT,
-  state                 TEXT NOT NULL CHECK (
-                          state IN ('pending', 'claimed', 'done', 'failed', 'cancelled')
-                        ),
-  execution_process_id  BLOB REFERENCES execution_processes(id),
-  created_at            TEXT NOT NULL,
-  finished_at           TEXT
-)
-```
+Prompts, follow-ups, UI actions, and bridged messages enter cdesktop's durable command path. A `continue` command waits for an idle boundary. A `replace` command requests cancellation of the active coding turn and then runs through the same dispatcher. Command state and execution ownership are recorded before more work is admitted for that session.
 
-`sessions.parent_session_id` stores optional spawn lineage. A partial unique index permits at most one running coding execution per session.
+Durability here means the command record survives a process boundary and can be reconciled. It does not yet prove that every manager wake and delivery is acknowledged during prolonged real-world load. That is the current experimental release gate.
 
-## Scheduler
+## Stall and recovery model
 
-The dispatcher is the only component that starts agent turns.
+The managed bridge watches spawned children for event-snapshot silence and surfaces stalls. Recovery preserves the native evidence first: the visible transcript, Git worktree and branch, durable command state, and optional `.context` handoff. Parent-session links provide a return address for status or escalation; they are not an authority hierarchy.
 
-1. Append a command and wake the dispatcher.
-2. Claim pending commands only when the session is idle and fleet capacity is available.
-3. Assign all commands claimed together to one execution, preserving order.
-4. Record terminal state before admitting more work for that session.
+Updates drain the fleet at a safe boundary rather than claiming to preserve an active model stream across a backend restart. Failover starts an explicit successor using a configured provider profile; it does not silently move credentials between accounts.
 
-The same path handles UI prompts, peer messages, resumed work, and Repowire delivery. A duplicate `dedupe_key` within one session returns the existing record. `replace` requests cancellation of the active turn, then runs through the same dispatcher. Restart recovery reads durable command and execution state; it never guesses from process timing.
+## Honest limitations
 
-The scheduler admits work under a configurable concurrency cap and pauses admission under operating-system memory pressure. Resource accounting includes the agent process group, so tools and builds count with their parent worker. Critical eviction preserves the command, transcript, Git state, and visible workspace for explicit retry.
+- SightMesh is experimental and has no production reliability or support SLA.
+- Durable manager wake and acknowledged delivery still need several weeks of proof under real load before active promotion.
+- Local agents can run arbitrary commands with the permissions granted to their provider CLI. Worktrees reduce source collisions; they are not a security sandbox.
+- The cdesktop fork, Repowire, provider CLIs, Git, and local machine are all part of the failure and trust boundary.
+- Provider quota visibility is incomplete. Claude setup tokens and API keys are reported as unknown rather than inferred.
+- Restarting the backend interrupts an active executor stream. Recovery resumes from preserved state; it is not transparent continuation.
+- Pooling is only for accounts the operator owns and authenticated through normal provider flows. SightMesh does not support credential extraction, session sharing, or rate-limit evasion.
 
-## Lifecycle
-
-- Spawn creates the workspace, session, optional parent link, and first command as one operation.
-- Archive and restore use cdesktop state directly. Clean worktree reclamation is scheduled for the exact expiry or checked at startup, not polled.
-- Updates are explicit: verify, require idle, replace, and health-check. No updater daemon or retry loop.
-- The UI uses event streams for fleet, command, approval, and update state.
-
-## Credential selection
-
-SightMesh keeps the pool's credentials under `~/.config/agent-pool/`; cdesktop profiles retain only provider mappings and non-secret defaults.
-
-- A profile names a cdesktop provider mapping for `spawn` and `failover`.
-- A pool is an ordered list of operator-owned accounts for one provider CLI.
-- `pool exec` takes the first account whose quota allows a launch.
-- An exhausted account is skipped until its provider reports capacity again.
-- Selection observes quota. It never prints, extracts, or replays credentials, or retries past a reported limit.
-
-## SightMesh surface
-
-Keep only high-value local verbs: service, open, status, spawn, message, steer, peers, peek, approvals, profiles, failover, workspace lifecycle, migrate, and explicit update. Prefer cdesktop or Git directly when they already express the operation.
-
-## Replacement boundary
-
-v0.9 requires the scheduler-capable cdesktop release. Remove the v0.8 delivery, relationship, lease, route, bridge, and updater stores instead of maintaining dual behavior. Migration imports only durable information that has no native owner, then archives the old private state for explicit deletion.
+Deep operational contracts live in [Operations](operations.md), [Storage and retention](storage.md), and [Compatibility](compatibility.md).
