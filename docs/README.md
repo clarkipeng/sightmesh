@@ -14,7 +14,7 @@ The README covers evaluation and the core workflow. Use these focused references
 
 - [Conductor migration](migration.md): read-only planning, apply, rollback, and preservation rules.
 - [Conductor parity](conductor-parity.md): supported product boundary and gaps.
-- [Competitive bake-off](competitive-bakeoff.md): source-derived comparison and methodology.
+- [Agent Deck competitive bake-off](competitive-bakeoff.md): source-derived comparison and methodology.
 
 ## Release
 
