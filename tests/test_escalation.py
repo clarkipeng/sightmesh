@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from sightmesh.cdesktop import CdesktopError
 from sightmesh.escalation import (
+    EscalationClass,
     EscalationStore,
     LauncherIdentity,
+    classify_escalation,
     detect_launcher,
     escalate,
 )
@@ -62,7 +64,21 @@ def test_launcher_identity_is_captured_and_survives_restart(tmp_path):
     assert reopened.get_launcher("unknown-session") is None
 
 
-def test_escalate_delivers_to_a_live_non_archived_parent(tmp_path):
+def test_classify_routine_status_and_completion_as_continue():
+    for message in ("STATUS: done", "STATUS: progress update", "Completed lane J merge"):
+        assert classify_escalation(message) == EscalationClass(
+            kind="routine", intent="continue"
+        )
+
+
+def test_classify_explicit_blocked_and_decision_as_replace():
+    for message in ("BLOCKED: need credentials", "DECISION: merge order?", "blocked on CI"):
+        assert classify_escalation(message) == EscalationClass(
+            kind="interrupt", intent="replace"
+        )
+
+
+def test_routine_status_queues_with_continue_and_never_interrupts(tmp_path):
     client = FakeClient(
         sessions={"parent-a": {"id": "parent-a", "workspace_id": "parent-workspace"}},
         workspaces={"parent-workspace": {"id": "parent-workspace", "archived": False}},
@@ -80,12 +96,89 @@ def test_escalate_delivers_to_a_live_non_archived_parent(tmp_path):
 
     assert result["delivered"] is True
     assert result["parent_session_id"] == "parent-a"
+    assert result["kind"] == "routine"
+    assert result["intent"] == "continue"
     assert len(client.sent) == 1
     assert client.sent[0]["session_id"] == "parent-a"
-    assert client.sent[0]["intent"] == "replace", (
-        "escalations must interrupt the parent's turn like the steer path did"
+    assert client.sent[0]["intent"] == "continue", (
+        "a routine progress report must never cancel and replace the "
+        "recipient's active turn"
     )
     assert store.pending() == []
+
+
+def test_routine_delivery_records_durable_acknowledgment(tmp_path):
+    path = tmp_path / "escalations.sqlite3"
+    client = FakeClient(
+        sessions={"parent-a": {"id": "parent-a", "workspace_id": "parent-workspace"}},
+        workspaces={"parent-workspace": {"id": "parent-workspace", "archived": False}},
+    )
+    store = EscalationStore(path)
+
+    result = escalate(
+        client,
+        child_session_id="child-a",
+        child_workspace_id="child-workspace",
+        parent_session_id="parent-a",
+        message="STATUS: lane complete",
+        store=store,
+    )
+
+    ack = result["acknowledgment"]
+    assert ack["kind"] == "routine"
+    assert ack["intent"] == "continue"
+    assert ack["parent_session_id"] == "parent-a"
+
+    reopened = EscalationStore(path)
+    acks = reopened.acknowledgments()
+    assert len(acks) == 1
+    assert acks[0].ack_id == ack["ack_id"]
+    assert acks[0].message == "STATUS: lane complete"
+
+
+def test_blocked_and_decision_escalations_replace_the_active_turn(tmp_path):
+    client = FakeClient(
+        sessions={"parent-a": {"id": "parent-a", "workspace_id": "parent-workspace"}},
+        workspaces={"parent-workspace": {"id": "parent-workspace", "archived": False}},
+    )
+    store = EscalationStore(tmp_path / "escalations.sqlite3")
+
+    for message in ("BLOCKED: need a decision on merge base", "DECISION: pick PR order"):
+        result = escalate(
+            client,
+            child_session_id="child-a",
+            child_workspace_id="child-workspace",
+            parent_session_id="parent-a",
+            message=message,
+            store=store,
+        )
+        assert result["delivered"] is True
+        assert result["kind"] == "interrupt"
+        assert result["intent"] == "replace"
+
+    assert [entry["intent"] for entry in client.sent] == ["replace", "replace"]
+    assert store.pending() == []
+
+
+def test_repeated_identical_routine_delivery_reuses_one_ack(tmp_path):
+    client = FakeClient(
+        sessions={"parent-a": {"id": "parent-a", "workspace_id": "parent-workspace"}},
+        workspaces={"parent-workspace": {"id": "parent-workspace", "archived": False}},
+    )
+    store = EscalationStore(tmp_path / "escalations.sqlite3")
+
+    kwargs = dict(
+        child_session_id="child-a",
+        child_workspace_id="child-workspace",
+        parent_session_id="parent-a",
+        message="STATUS: retry me",
+        store=store,
+    )
+    first = escalate(client, **kwargs)
+    second = escalate(client, **kwargs)
+
+    assert first["acknowledgment"]["ack_id"] == second["acknowledgment"]["ack_id"]
+    assert len(store.acknowledgments()) == 1
 
 
 def test_escalate_parks_durably_when_no_cdesktop_parent_exists(tmp_path):
