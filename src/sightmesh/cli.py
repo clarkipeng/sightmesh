@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
+import dataclasses
 import getpass
 import json
 import os
@@ -18,6 +19,7 @@ from . import (
     __version__,
     approvals,
     conductor_migrate,
+    execution_routing,
     leases,
     routing,
     service,
@@ -1744,6 +1746,99 @@ def cmd_profile(args: argparse.Namespace) -> int:
     raise ValueError(f"Unknown profile action: {args.profile_action}")
 
 
+def cmd_routing(args: argparse.Namespace) -> int:
+    store = execution_routing.ExecutionRoutingStore()
+    action = args.routing_action
+
+    if action == "show":
+        _emit(store.load().to_dict(), args.json)
+        return 0
+
+    if action == "validate":
+        settings = store.load()
+        _emit(
+            {"valid": True, "warnings": execution_routing.route_warnings(settings)},
+            args.json,
+        )
+        return 0
+
+    if action == "set-metered":
+        updated = store.save(dataclasses.replace(store.load(), metered_fallback=args.value))
+        _emit(updated.to_dict(), args.json)
+        return 0
+
+    if action == "routes":
+        return _cmd_routing_routes(args, store)
+
+    if action == "explain":
+        settings = store.load()
+        result = execution_routing.select_route(settings, preferred_model=args.model)
+        payload = {**result.to_dict(), "workspace_id": args.workspace}
+        _emit(payload, args.json)
+        return 0
+
+    raise ValueError(f"Unknown routing action: {action}")
+
+
+def _cmd_routing_routes(
+    args: argparse.Namespace, store: execution_routing.ExecutionRoutingStore
+) -> int:
+    settings = store.load()
+    action = args.routes_action
+
+    if action == "list":
+        _emit([route.to_dict() for route in settings.routes], args.json)
+        return 0
+
+    if action == "add":
+        if any(existing.id == args.id for existing in settings.routes):
+            raise execution_routing.ExecutionRoutingError(
+                f"Route already exists: {args.id}"
+            )
+        route = execution_routing.Route(
+            id=args.id,
+            executor=args.executor,
+            model=args.model,
+            billing_class=args.billing_class,
+            account_pool=args.account_pool,
+            account=args.account,
+        )
+        routes = [*settings.routes, route]
+        if args.before:
+            routes = [r for r in routes if r.id != route.id]
+            index = next((i for i, r in enumerate(routes) if r.id == args.before), None)
+            if index is None:
+                raise execution_routing.ExecutionRoutingError(
+                    f"Unknown route: {args.before}"
+                )
+            routes = [*routes[:index], route, *routes[index:]]
+        updated = store.save(dataclasses.replace(settings, routes=tuple(routes)))
+        _emit([r.to_dict() for r in updated.routes], args.json)
+        return 0
+
+    if action == "remove":
+        if not any(r.id == args.id for r in settings.routes):
+            raise execution_routing.ExecutionRoutingError(f"Unknown route: {args.id}")
+        routes = tuple(r for r in settings.routes if r.id != args.id)
+        updated = store.save(dataclasses.replace(settings, routes=routes))
+        _emit([r.to_dict() for r in updated.routes], args.json)
+        return 0
+
+    if action == "order":
+        current_ids = [r.id for r in settings.routes]
+        if sorted(args.ids) != sorted(current_ids):
+            raise execution_routing.ExecutionRoutingError(
+                f"must list every route exactly once (have: {' '.join(current_ids)})"
+            )
+        by_id = {r.id: r for r in settings.routes}
+        routes = tuple(by_id[i] for i in args.ids)
+        updated = store.save(dataclasses.replace(settings, routes=routes))
+        _emit([r.id for r in updated.routes], args.json)
+        return 0
+
+    raise ValueError(f"Unknown routes action: {action}")
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     client = CdesktopClient(args.url)
     services = service.status(args.port)
@@ -2625,6 +2720,70 @@ def parser() -> argparse.ArgumentParser:
     profile_remove.add_argument("name")
     profile_remove.set_defaults(func=cmd_profile)
 
+    routing_group = sub.add_parser(
+        "routing", help="Subscription-first execution routing policy"
+    )
+    routing_sub = routing_group.add_subparsers(dest="routing_action", required=True)
+
+    routing_show = routing_sub.add_parser("show", help="Show execution routing settings")
+    routing_show.set_defaults(func=cmd_routing)
+
+    routing_validate = routing_sub.add_parser(
+        "validate", help="Validate settings and report routes with no eligible account"
+    )
+    routing_validate.set_defaults(func=cmd_routing)
+
+    routing_set_metered = routing_sub.add_parser(
+        "set-metered", help="Set the metered fallback policy"
+    )
+    routing_set_metered.add_argument("value", choices=sorted(execution_routing.METERED_FALLBACK_VALUES))
+    routing_set_metered.set_defaults(func=cmd_routing)
+
+    routing_routes = routing_sub.add_parser("routes", help="Manage configured routes")
+    routing_routes_sub = routing_routes.add_subparsers(
+        dest="routes_action", required=True
+    )
+
+    routing_routes_list = routing_routes_sub.add_parser(
+        "list", help="List configured routes in order"
+    )
+    routing_routes_list.set_defaults(func=cmd_routing)
+
+    routing_routes_add = routing_routes_sub.add_parser("add", help="Add a route")
+    routing_routes_add.add_argument("--id", required=True)
+    routing_routes_add.add_argument(
+        "--executor", required=True, choices=sorted(execution_routing.EXECUTORS)
+    )
+    routing_routes_add.add_argument("--model", required=True)
+    routing_routes_add.add_argument(
+        "--billing-class", required=True, choices=sorted(execution_routing.BILLING_CLASSES)
+    )
+    routing_routes_add.add_argument(
+        "--account-pool", choices=pool_core.PROVIDERS, help="Ordered pool for a subscription route"
+    )
+    routing_routes_add.add_argument(
+        "--account", help="Fixed pool account id for a metered route"
+    )
+    routing_routes_add.add_argument("--before", help="Insert before this route id")
+    routing_routes_add.set_defaults(func=cmd_routing)
+
+    routing_routes_remove = routing_routes_sub.add_parser("remove", help="Remove a route")
+    routing_routes_remove.add_argument("id")
+    routing_routes_remove.set_defaults(func=cmd_routing)
+
+    routing_routes_order = routing_routes_sub.add_parser(
+        "order", help="Reorder every configured route"
+    )
+    routing_routes_order.add_argument("ids", nargs="+")
+    routing_routes_order.set_defaults(func=cmd_routing)
+
+    routing_explain = routing_sub.add_parser(
+        "explain", help="Safe selection trace for the current settings and pool"
+    )
+    routing_explain.add_argument("--workspace", help="Workspace id, echoed for traceability")
+    routing_explain.add_argument("--model", help="Preferred model override")
+    routing_explain.set_defaults(func=cmd_routing)
+
     pool = sub.add_parser(
         "pool",
         help="Order accounts the operator owns and select the first with quota",
@@ -2961,6 +3120,7 @@ def main() -> None:
         RepowireError,
         ProfileError,
         PoolError,
+        execution_routing.ExecutionRoutingError,
         RuntimeError,
         OSError,
         ValueError,
