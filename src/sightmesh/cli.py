@@ -19,6 +19,7 @@ from . import (
     __version__,
     approvals,
     conductor_migrate,
+    escalation,
     execution_routing,
     leases,
     routing,
@@ -731,6 +732,12 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
         raise
     workspace_id = _workspace_id(result)
     session_id = _primary_session_id(result)
+    if session_id:
+        escalation.EscalationStore().record_launcher(
+            session_id=session_id,
+            workspace_id=workspace_id,
+            identity=escalation.detect_launcher(),
+        )
     try:
         if args.worktree:
             container = _workspace_container(result, client, workspace_id)
@@ -855,28 +862,35 @@ def cmd_parent(args: argparse.Namespace) -> int:
     client = CdesktopClient(args.url)
     child = client.session(child_session)
     parent_session_id = child.get("parent_session_id")
-    if not parent_session_id:
+    message: str | None = None
+    if args.message or args.message_file:
+        message = _read_text(args.message, args.message_file, "message")
+        if not message.strip():
+            raise ValueError("Parent message must not be empty")
+
+    if not parent_session_id and message is None:
         raise ValueError(f"No recorded parent for session {child_session}")
 
-    target = _resolve_session(client, str(parent_session_id))
     result: dict[str, Any] = {
         "parent": {
             "child_session_id": child_session,
             "child_workspace_id": child["workspace_id"],
             "parent_session_id": parent_session_id,
-            "parent_workspace_id": target["workspace_id"],
         }
     }
-    if args.message or args.message_file:
-        message = _read_text(args.message, args.message_file, "message")
-        if not message.strip():
-            raise ValueError("Parent message must not be empty")
-        result["delivery"] = _steer_target(
+    if message is not None:
+        result["delivery"] = escalation.escalate(
             client,
-            target,
-            message,
-            caller_session=child_session,
+            child_session_id=child_session,
+            child_workspace_id=str(child["workspace_id"]),
+            parent_session_id=(
+                str(parent_session_id) if parent_session_id else None
+            ),
+            message=message,
         )
+    else:
+        target = _resolve_session(client, str(parent_session_id))
+        result["parent"]["parent_workspace_id"] = target["workspace_id"]
     _emit(result, args.json)
     return 0
 
@@ -898,6 +912,15 @@ def cmd_children(args: argparse.Namespace) -> int:
                     }
                 )
     _emit(children, args.json)
+    return 0
+
+
+def cmd_escalations(args: argparse.Namespace) -> int:
+    store = escalation.EscalationStore()
+    rows = [record.to_dict() for record in store.pending(limit=args.limit)]
+    if args.session:
+        rows = [row for row in rows if row["child_session_id"] == args.session]
+    _emit(rows, args.json)
     return 0
 
 
@@ -2652,6 +2675,14 @@ def parser() -> argparse.ArgumentParser:
         "--session", help="Parent session; defaults to CDESKTOP_SESSION_ID"
     )
     children.set_defaults(func=cmd_children)
+
+    escalations = sub.add_parser(
+        "escalations",
+        help="List parent escalations durably parked because no live parent could receive them",
+    )
+    escalations.add_argument("--session", help="Filter to one child session")
+    escalations.add_argument("--limit", type=int, default=100)
+    escalations.set_defaults(func=cmd_escalations)
 
     message = sub.add_parser(
         "message", help="Send a visible follow-up by agent name or session UUID"
