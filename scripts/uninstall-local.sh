@@ -26,7 +26,9 @@ remove_link() {
   skill_name=$1
   for skill_root in "$HOME/.claude/skills" "$HOME/.codex/skills"; do
     destination="$skill_root/$skill_name"
-    [ -L "$destination" ] && rm "$destination"
+    if [ -L "$destination" ]; then
+      rm "$destination"
+    fi
   done
 }
 
@@ -51,7 +53,17 @@ done
 remove_link orchestrate-visible-agents
 remove_link reconcile-agent-work
 
-uv tool uninstall sightmesh >/dev/null 2>&1 || true
+remove_owned_tool() {
+  tool_dir=$(uv tool dir 2>/dev/null || true)
+  metadata=$(find "$tool_dir/sightmesh" -type f -path '*/site-packages/sightmesh-*.dist-info/direct_url.json' -print -quit 2>/dev/null || true)
+  if [ -n "$metadata" ] && grep -F '"url":"file://'$repo_root'"' "$metadata" >/dev/null 2>&1; then
+    uv tool uninstall sightmesh
+  else
+    echo "Left uv tool sightmesh installed: ownership could not be verified."
+  fi
+}
+
+remove_owned_tool
 
 for label in io.sightmesh.cdesktop io.sightmesh.bridge io.sightmesh.updater; do
   plist="$HOME/Library/LaunchAgents/$label.plist"

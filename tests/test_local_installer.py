@@ -12,7 +12,12 @@ def fake_uv(tmp_path: Path) -> tuple[Path, Path]:
     bin_dir.mkdir()
     log = tmp_path / "uv.log"
     uv = bin_dir / "uv"
-    uv.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$UV_LOG"\n', encoding="utf-8")
+    uv.write_text(
+        '#!/bin/sh\n'
+        'if [ "$1 $2" = "tool dir" ]; then printf "%s\\n" "$UV_TOOL_DIR"; exit 0; fi\n'
+        'printf "%s\\n" "$*" >> "$UV_LOG"\n',
+        encoding="utf-8",
+    )
     uv.chmod(0o755)
     return bin_dir, log
 
@@ -24,6 +29,7 @@ def run_script(script: str, tmp_path: Path) -> tuple[subprocess.CompletedProcess
         "HOME": str(tmp_path / "home"),
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "UV_LOG": str(log),
+        "UV_TOOL_DIR": str(tmp_path / "uv-tools"),
     }
     return (
         subprocess.run(
@@ -75,7 +81,7 @@ def test_uninstall_refuses_unrelated_skill_links_without_running_uv(tmp_path: Pa
     assert not log.exists()
 
 
-def test_uninstall_removes_only_its_own_skill_links(tmp_path: Path) -> None:
+def test_uninstall_leaves_an_unverified_tool_installed(tmp_path: Path) -> None:
     home = tmp_path / "home"
     for skill_name in ("orchestrate-visible-agents", "reconcile-agent-work"):
         for root in (home / ".claude/skills", home / ".codex/skills"):
@@ -85,6 +91,21 @@ def test_uninstall_removes_only_its_own_skill_links(tmp_path: Path) -> None:
     result, log = run_script("uninstall-local.sh", tmp_path)
 
     assert result.returncode == 0, result.stderr
-    assert "tool uninstall sightmesh" in log.read_text(encoding="utf-8")
+    assert "Left uv tool sightmesh installed" in result.stdout
+    assert not log.exists()
     assert not list(home.glob(".claude/skills/*"))
     assert not list(home.glob(".codex/skills/*"))
+
+
+def test_uninstall_removes_a_tool_owned_by_this_repo(tmp_path: Path) -> None:
+    metadata = (
+        tmp_path
+        / "uv-tools/sightmesh/lib/python3.13/site-packages/sightmesh-0.9.3.dist-info/direct_url.json"
+    )
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(f'{{"url":"file://{ROOT}"}}', encoding="utf-8")
+
+    result, log = run_script("uninstall-local.sh", tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "tool uninstall sightmesh" in log.read_text(encoding="utf-8")
