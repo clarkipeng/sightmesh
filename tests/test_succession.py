@@ -66,6 +66,19 @@ class FakeCdesktop:
         row["state"] = "pending"
         row["execution_process_id"] = None
 
+    def requeue_execution_commands(self, session_id, execution_process_id):
+        # The real endpoint: one dead execution's command rows return to the
+        # queue in a single call.
+        for row in self.commands:
+            if (
+                row["session_id"] == session_id
+                and row.get("execution_process_id") == execution_process_id
+                and row["state"] == "claimed"
+            ):
+                self.requeues.append((row["id"], row.get("dedupe_key")))
+                row["state"] = "pending"
+                row["execution_process_id"] = None
+
     def complete_command(self, command_id):
         self._find(command_id)["state"] = "done"
 

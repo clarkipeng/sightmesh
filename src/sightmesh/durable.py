@@ -86,6 +86,21 @@ class NativeCommandQueue:
             command.session_id, command.execution_process_id
         )
 
+    def interrupt(self, command: DurableCommand) -> None:
+        # cdesktop has no per-command cancel endpoint yet. Prefer one when the
+        # runtime (or a test double) offers it; otherwise stop the command's
+        # execution, which is replay-safe, and rely on the reconciler never
+        # requeueing or dispatching for a quarantined session.
+        if hasattr(self.client, "interrupt_command"):
+            self.client.interrupt_command(command.id)
+            return
+        if command.execution_process_id:
+            self.client.stop_execution(
+                command.execution_process_id,
+                dedupe_key=f"quarantine:{command.id}",
+            )
+
+
     def recovery(self, command: DurableCommand, *, attempt: int, state: str) -> None:
         if not hasattr(self.client, "update_command"):
             return
