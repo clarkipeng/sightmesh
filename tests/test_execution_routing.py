@@ -32,6 +32,8 @@ def _codex_account(account_id: str, **overrides) -> dict:
         "codex_home": f"/tmp/{account_id}",
     }
     account.update(overrides)
+    if account.get("kind") == "apikey":
+        account.setdefault("token_fp", f"fp-{account_id}")
     return account
 
 
@@ -221,6 +223,60 @@ def test_cross_provider_fallback_preserves_the_logical_command_shape(
         "auth_binding_id",
         "account_alias",
     }
+
+
+def test_hidden_account_alias_redacts_selection_explanation(
+    pool_root: Path, monkeypatch
+) -> None:
+    pool_core.save_pool(
+        {
+            "accounts": [
+                _codex_account("private-disabled", disabled=True),
+                _codex_account("private-account-id"),
+            ]
+        }
+    )
+    monkeypatch.setattr(pool_core, "quota", _no_quota)
+
+    settings = ExecutionRoutingSettings(
+        routes=(_subscription_route("codex-subs", "CODEX", "luna", "codex"),),
+        expose_account_alias=False,
+    )
+
+    result = select_route(settings)
+
+    assert result.status == "resolved"
+    assert result.target.auth_binding_id == "private-account-id"
+    assert result.target.account_alias is None
+    explanation = json.dumps(result.to_dict())
+    assert "private-account-id" not in explanation
+    assert "private-disabled" not in explanation
+    assert "<redacted>" in explanation
+
+
+def test_selection_uses_only_non_secret_account_eligibility(
+    pool_root: Path, monkeypatch
+) -> None:
+    pool_core.save_pool(
+        {
+            "accounts": [
+                _codex_account("codex-sub1", codex_home=""),
+                _codex_account("codex-api", kind="apikey", token_fp="fp-codex-api"),
+            ]
+        }
+    )
+    monkeypatch.setattr(pool_core, "quota", lambda a: {"known": False, "metered": True})
+
+    def fail_secret_resolution(*_args, **_kwargs):
+        raise AssertionError("secret-bearing launch material was resolved")
+
+    monkeypatch.setattr(pool_core, "env_for", fail_secret_resolution)
+    monkeypatch.setattr(pool_core, "read_token", fail_secret_resolution)
+
+    result = select_route(_exhausted_subscription_and_metered_settings("ask"))
+
+    assert result.status == "approval_needed"
+    assert result.target.auth_binding_id == "codex-api"
 
 
 # ---------------------------------------------------------------- metered policy
@@ -494,3 +550,24 @@ def test_cli_routing_routes_add_list_and_explain(
     assert payload["status"] == "resolved"
     assert payload["target"]["auth_binding_id"] == "codex-sub1"
     assert payload["workspace_id"] == "workspace-a"
+
+
+def test_cli_routing_validate_reports_zero_eligible_accounts(
+    pool_root: Path, routing_settings_path: Path, monkeypatch, capsys
+) -> None:
+    pool_core.save_pool(
+        {"accounts": [_codex_account("disabled-account", disabled=True)]}
+    )
+    monkeypatch.setattr(pool_core, "quota", _no_quota)
+    ExecutionRoutingStore(routing_settings_path).save(
+        ExecutionRoutingSettings(
+            routes=(_subscription_route("codex-subs", "CODEX", "luna", "codex"),)
+        )
+    )
+
+    args = cli.parser().parse_args(["--json", "routing", "validate"])
+    assert args.func(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["valid"] is False
+    assert payload["warnings"] == ["route codex-subs: no eligible account"]

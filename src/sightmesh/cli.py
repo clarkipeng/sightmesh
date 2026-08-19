@@ -1756,10 +1756,8 @@ def cmd_routing(args: argparse.Namespace) -> int:
 
     if action == "validate":
         settings = store.load()
-        _emit(
-            {"valid": True, "warnings": execution_routing.route_warnings(settings)},
-            args.json,
-        )
+        warnings = execution_routing.route_warnings(settings)
+        _emit({"valid": not warnings, "warnings": warnings}, args.json)
         return 0
 
     if action == "set-metered":
