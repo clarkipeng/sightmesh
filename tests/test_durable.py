@@ -72,7 +72,7 @@ def test_restart_after_claim_interrupts_and_requeues_same_command():
     reconciler.reconcile_session({"id": "session-1"})
     reconciler.reconcile_session({"id": "session-1"})
 
-    assert queue.interrupted == ["command-1"]
+    assert queue.interrupted == []
     assert queue.requeued == [("command-1", "same-key")]
 
 
@@ -86,8 +86,52 @@ def test_stream_death_requeues_and_offline_gate_backoffs():
     reconciler = DurableExecutionReconciler(client, queue)
 
     reconciler.reconcile_session({"id": "session-1"})
-    assert queue.requeued == [("command-1", "same-key")]
+    assert client.stops == [("process-1", "durable:process-1:stop:1")]
+    assert queue.requeued == []
     assert client.dispatches == []
+
+
+def test_delivery_lifecycle_is_derived_only_from_native_records():
+    pending = command("pending")
+    claimed = command("claimed")
+    done = command("done")
+    cancelled = command("cancelled")
+
+    assert pending.delivery_state(None) == "queued"
+    assert claimed.delivery_state(None) == "claimed"
+    assert claimed.delivery_state({"status": "running"}) == "running"
+    assert claimed.delivery_state({"status": "killed"}) == "observed"
+    assert done.delivery_state(None) == "terminal"
+    assert cancelled.delivery_state(None) == "rejected"
+
+
+def test_restart_terminal_wake_uses_native_dedupe_and_does_not_loop():
+    class NativeDedupeQueue(Queue):
+        def __init__(self, rows):
+            super().__init__(rows)
+            self.keys = set()
+
+        def notify_parent(self, parent, child, message, key):
+            if key not in self.keys:
+                super().notify_parent(parent, child, message, key)
+                self.keys.add(key)
+
+    client = Client({"id": "process-1", "status": "completed"}, {})
+    queue = NativeDedupeQueue([command("done")])
+    session = {"id": "child", "parent_session_id": "parent"}
+
+    DurableExecutionReconciler(client, queue).reconcile_session(session)
+    DurableExecutionReconciler(client, queue).reconcile_session(session)
+    DurableExecutionReconciler(client, queue).reconcile_session({"id": "parent"})
+
+    assert queue.notifications == [
+        (
+            "parent",
+            "child",
+            "CHILD_DELIVERY: child command-1 done",
+            "child-command:command-1:done",
+        )
+    ]
 
 
 def test_suite_child_activity_prevents_recovery():

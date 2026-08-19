@@ -260,29 +260,18 @@ class CdesktopClient:
             raise CdesktopError("cdesktop command response is not a list")
         return [dict(item) for item in result if isinstance(item, dict)]
 
-    def _command_transition(
-        self, command_id: str, transition: str, payload: dict[str, Any] | None = None
+    def requeue_execution_commands(
+        self, session_id: str, execution_process_id: str
     ) -> Any:
+        """Return one dead execution's native command rows to the queue."""
         return self.request(
-            "POST", f"/commands/{command_id}/{transition}", payload or {}
+            "POST",
+            f"/sessions/{session_id}/commands/requeue",
+            {"execution_process_id": execution_process_id},
         )
-
-    def interrupt_command(self, command_id: str) -> Any:
-        return self._command_transition(command_id, "interrupt")
-
-    def requeue_command(self, command_id: str, *, dedupe_key: str | None = None) -> Any:
-        return self._command_transition(
-            command_id, "requeue", {"dedupe_key": dedupe_key}
-        )
-
-    def complete_command(self, command_id: str) -> Any:
-        return self._command_transition(command_id, "done")
-
-    def update_command(self, command_id: str, payload: dict[str, Any]) -> Any:
-        return self._command_transition(command_id, "recovery", payload)
 
     def dispatch_queued(self, session_id: str) -> Any:
-        return self.request("POST", f"/sessions/{session_id}/queue/dispatch")
+        return self.request("POST", f"/sessions/{session_id}/commands/dispatch")
 
     def normalized_snapshot(self, execution_process_id: str) -> dict[str, Any]:
         result = self.request(

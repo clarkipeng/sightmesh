@@ -301,6 +301,24 @@ def test_stop_execution_passes_process_scoped_dedupe_key() -> None:
     ]
 
 
+def test_native_command_requeue_and_dispatch_routes_are_process_scoped() -> None:
+    client = FakeClient()
+
+    client.requeue_execution_commands("session-a", "process-a")
+    client.dispatch_queued("session-a")
+
+    assert client.calls == [
+        (
+            "POST",
+            "/sessions/session-a/commands/requeue",
+            {"execution_process_id": "process-a"},
+            None,
+            None,
+        ),
+        ("POST", "/sessions/session-a/commands/dispatch", None, None, None),
+    ]
+
+
 def test_create_direct_workspace_record_and_attach_repo(tmp_path) -> None:
     client = FakeClient()
     client.repos = list
