@@ -39,7 +39,7 @@ Keep subscription routes before metered routes when subscription capacity should
 
 `auto` selects the first eligible metered route after earlier routes cannot resolve. `ask` returns an `approval_needed` outcome for the first eligible metered route. `never` skips every metered route and returns blocked when no subscription route resolves; it does not inspect the metered account credential.
 
-These are durable selector guarantees: the settings are persisted and each selection produces a resolved, approval-needed, or blocked result. The executor-launch handoff is not integrated yet. In particular, `ask` does not yet create a durable cdesktop approval, and neither `auto` nor `never` has cdesktop route-swap recovery behavior. Do not describe those integration behaviors as shipped.
+These are durable selector guarantees: the settings are persisted and each selection produces a resolved, approval-needed, or blocked result. SightMesh spawn and teammate launches route through the selector and carry the selected binding. The cdesktop side of the contract - durable metered approvals and route-swap recovery - requires a pinned cdesktop release that includes it; until the runtime lock references such a release, do not describe those cdesktop behaviors as active.
 
 Use the non-launching commands to review the policy:
 
@@ -52,7 +52,7 @@ sightmesh routing set-metered ask
 
 ## Authentication boundary and visibility
 
-A resolved target carries an opaque `auth_binding_id`: a reference to the selected pool account, not a credential. The reference is handed to the future executor launcher; only that launcher may resolve the account's normal provider credentials, immediately before the executor starts.
+A resolved target carries an opaque `auth_binding_id`: a reference to the selected pool account, not a credential. The reference is handed to the executor launcher; only that launcher may resolve the account's normal provider credentials, immediately before the executor starts.
 
 Never place credential paths, headers, cookies, tokens, provider responses, or credential-shaped sample values in routing settings, selection traces, UI, logs, or examples. Route IDs and account aliases are safe operational labels, such as `codex-api-primary`; they are not authentication material.
 
