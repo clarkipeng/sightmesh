@@ -940,7 +940,7 @@ def test_overview_groups_native_processes_and_projects_private_fields(
         "unit": "tokens",
         "provenance": "cdesktop normalized snapshot",
     }
-    assert running["context"] == {"used": 120, "limit": 1000}
+    assert running["context"] == {"used": 120, "limit": 1000, "pressure": 0.12}
     assert running["quota"] is None
     assert running["monetary_cost"] is None
     assert "historical-failed" not in json.dumps(output)

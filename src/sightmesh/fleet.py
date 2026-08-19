@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote
 
-TERMINAL = frozenset({"completed", "done", "failed", "cancelled", "stopped"})
+TERMINAL = frozenset({"completed", "done", "failed", "cancelled", "stopped", "killed"})
 RUNNING = frozenset({"queued", "claimed", "running", "active"})
 _QUOTA_FIELDS = ("known", "remaining", "resetsAt", "resetsIn", "reason")
 _EVENT_FIELDS = ("at", "kind", "status", "summary")

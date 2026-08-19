@@ -2091,8 +2091,16 @@ def _overview_execution_facts(
                 "unit": "tokens",
                 "provenance": "cdesktop normalized snapshot",
             }
-        if isinstance(total, (int, float)) and isinstance(limit, (int, float)):
-            context = {"used": total, "limit": limit}
+        if (
+            isinstance(total, (int, float))
+            and isinstance(limit, (int, float))
+            and limit
+        ):
+            context = {
+                "used": total,
+                "limit": limit,
+                "pressure": round(float(total) / float(limit), 3),
+            }
     return {
         "model": str(model) if model else None,
         "provider": provider_kinds.get(str(provider_id)) if provider_id else None,

@@ -41,6 +41,20 @@ def test_groups_deterministically_and_orders_attention_by_urgency_then_age():
     assert result.needs_attention[0].next_action == "Review the approval."
 
 
+def test_killed_is_terminal_while_failed_still_needs_attention():
+    result = overview(
+        FleetFacts(
+            executions=(
+                execution("killed", status="killed", last_event={"at": NOW}),
+                execution("failed", status="failed", last_event={"at": NOW}),
+            )
+        ),
+        now=NOW,
+    )
+    assert [item.execution_id for item in result.done_since_view] == ["killed"]
+    assert [item.execution_id for item in result.needs_attention] == ["failed"]
+
+
 def test_duplicate_selectors_are_stably_disambiguated():
     result = overview(
         FleetFacts(executions=(execution("same"), execution("same"))), now=NOW
