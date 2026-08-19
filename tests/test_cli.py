@@ -9,6 +9,7 @@ from sightmesh import __version__, approvals, cli, escalation, succession
 from sightmesh.cli import (
     _fleet_sessions,
     _is_sightmesh_cdesktop_version,
+    _latest_process,
     _normalized_snapshot_with_retry,
     _pending_request_from_snapshot,
     _primary_session_id,
@@ -111,6 +112,124 @@ def test_normalized_snapshot_retries_cold_partial_result() -> None:
     result = _normalized_snapshot_with_retry(SnapshotClient(), "process-a")
     assert result["complete"] is True
     assert result["patch_count"] == 41
+
+
+def test_latest_process_selects_maximum_event_time_from_unsorted_rows() -> None:
+    latest = _latest_process(
+        [
+            {"id": "newer", "completed_at": "2026-08-18T02:00:00Z"},
+            {"id": "older", "completed_at": "2026-08-18T01:00:00Z"},
+        ]
+    )
+    assert latest and latest["id"] == "newer"
+
+
+def test_latest_process_breaks_equal_time_ties_by_process_id() -> None:
+    latest = _latest_process(
+        [
+            {"id": "process-a", "updated_at": "2026-08-18T02:00:00Z"},
+            {"id": "process-b", "updated_at": "2026-08-18T02:00:00Z"},
+        ]
+    )
+    assert latest and latest["id"] == "process-b"
+
+
+def test_latest_process_excludes_dropped_and_devserver_rows() -> None:
+    latest = _latest_process(
+        [
+            {
+                "id": "dropped",
+                "updated_at": "2099-01-01T00:00:00Z",
+                "dropped": True,
+            },
+            {
+                "id": "devserver",
+                "updated_at": "2099-01-01T00:00:00Z",
+                "run_reason": "devserver",
+            },
+            {"id": "agent", "updated_at": "2026-08-18T00:00:00Z"},
+        ]
+    )
+    assert latest and latest["id"] == "agent"
+
+
+def test_latest_process_prefers_valid_time_and_deterministically_handles_missing() -> (
+    None
+):
+    timed = _latest_process(
+        [
+            {"id": "missing-z"},
+            {"id": "timed", "created_at": "2020-01-01T00:00:00Z"},
+        ]
+    )
+    missing = _latest_process([{"id": "missing-a"}, {"id": "missing-z"}])
+    assert timed and timed["id"] == "timed"
+    assert missing and missing["id"] == "missing-z"
+
+
+def test_peers_and_peek_share_time_based_latest_selection(monkeypatch, capsys) -> None:
+    class UnsortedClient:
+        def workspace_summaries(self, archived=False):
+            assert archived is False
+            return [{"workspace_id": "workspace-a", "latest_process_status": "done"}]
+
+        def workspaces(self):
+            return [{"id": "workspace-a", "name": "alpha", "archived": False}]
+
+        def sessions(self, _workspace_id):
+            return [{"id": "session-a", "created_at": "1", "executor": "CODEX"}]
+
+        def execution_processes(self, _session_id):
+            return [
+                {
+                    "id": "newer",
+                    "status": "completed",
+                    "completed_at": "2026-08-18T02:00:00Z",
+                },
+                {
+                    "id": "older",
+                    "status": "failed",
+                    "completed_at": "2026-08-18T01:00:00Z",
+                },
+            ]
+
+        def normalized_snapshot(self, process_id):
+            assert process_id == "newer"
+            return {"complete": True, "entries": []}
+
+        def workspace(self, _workspace_id):
+            return {"use_worktree": False}
+
+        def workspace_repos(self, _workspace_id):
+            return []
+
+    client = UnsortedClient()
+    monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
+
+    assert (
+        cli.cmd_peers(argparse.Namespace(url=None, include_archived=False, json=True))
+        == 0
+    )
+    peers = json.loads(capsys.readouterr().out)
+    assert peers[0]["execution_process_id"] == "newer"
+    assert peers[0]["status"] == "completed"
+
+    assert (
+        cli.cmd_peek(
+            argparse.Namespace(
+                url=None,
+                agent="@alpha",
+                include_archived=False,
+                tools=3,
+                max_chars=600,
+                json=True,
+            )
+        )
+        == 0
+    )
+    peek = json.loads(capsys.readouterr().out)
+    assert peek["execution_process_id"] == "newer"
+    assert peek["status"] == "completed"
 
 
 def test_workspace_repository_paths_expose_source_and_checkout() -> None:
@@ -861,7 +980,7 @@ def test_overview_groups_native_processes_and_projects_private_fields(
                     {
                         "id": "historical-failed",
                         "status": "failed",
-                        "completed_at": "2020-08-18T02:00:00Z",
+                        "completed_at": "2019-08-18T02:00:00Z",
                     },
                     {
                         "id": "running-a",

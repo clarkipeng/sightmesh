@@ -364,13 +364,39 @@ def _session_processes(
     return client.execution_processes(str(row["session_id"]))
 
 
+def _process_event_time(process: dict[str, Any]) -> datetime | None:
+    raw = (
+        process.get("completed_at")
+        or process.get("updated_at")
+        or process.get("started_at")
+        or process.get("created_at")
+    )
+    if not isinstance(raw, str):
+        return None
+    try:
+        value = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
 def _latest_process(processes: list[dict[str, Any]]) -> dict[str, Any] | None:
     eligible = [
         process
         for process in processes
         if not process.get("dropped") and process.get("run_reason") != "devserver"
     ]
-    return eligible[-1] if eligible else None
+    return (
+        max(
+            eligible,
+            key=lambda process: (
+                _process_event_time(process) or datetime.min.replace(tzinfo=UTC),
+                str(process.get("id") or ""),
+            ),
+        )
+        if eligible
+        else None
+    )
 
 
 def cmd_peers(args: argparse.Namespace) -> int:
@@ -2039,22 +2065,6 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def _overview_event_time(process: dict[str, Any]) -> datetime | None:
-    raw = (
-        process.get("completed_at")
-        or process.get("updated_at")
-        or process.get("started_at")
-        or process.get("created_at")
-    )
-    if not isinstance(raw, str):
-        return None
-    try:
-        value = datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
-
-
 def _overview_execution_facts(
     client: CdesktopClient,
     process: dict[str, Any],
@@ -2140,7 +2150,7 @@ def _fleet_overview(
         process = _latest_process(_session_processes(client, row))
         if process is None:
             continue
-        event_at = _overview_event_time(process)
+        event_at = _process_event_time(process)
         status = str(process.get("status") or "")
         if status not in fleet.RUNNING and (event_at is None or event_at < cutoff):
             continue
