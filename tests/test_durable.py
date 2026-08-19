@@ -10,8 +10,6 @@ from sightmesh.durable import (
     DurableExecutionReconciler,
     supports_durable_recovery,
 )
-from sightmesh.escalation import EscalationStore
-from sightmesh.succession import OwnershipStore
 from sightmesh.runtime_lock import RUNTIME_LOCK
 
 
@@ -227,57 +225,6 @@ def test_native_stale_child_stops_and_active_suite_suppresses():
         {"id": "session-1", "parent_session_id": "parent"}
     )
     assert active.stops == []
-
-
-def test_unacted_order_renudges_once_then_parks_once_across_restart(tmp_path):
-    path = tmp_path / "escalations.sqlite3"
-    orders = EscalationStore(path)
-    orders.expect_order(
-        order_id="order-1",
-        sender_session_id="manager-a",
-        recipient_session_id="worker-a",
-        body="Finish the migration",
-    )
-    client = Client({"id": "old", "status": "completed"}, {})
-    queue = Queue([])
-
-    DurableExecutionReconciler(
-        client, queue, escalation_store=orders, order_ack_seconds=0
-    ).reconcile_session({"id": "worker-a"})
-    DurableExecutionReconciler(
-        client, queue, escalation_store=EscalationStore(path), order_ack_seconds=0
-    ).reconcile_session({"id": "worker-a"})
-
-    assert queue.notifications == [
-        ("worker-a", "manager-a", "ORDER REMINDER (order-1):\n\nFinish the migration", "order-renudge:order-1")
-    ]
-    assert len(EscalationStore(path).pending()) == 1
-    assert EscalationStore(path).pending()[0].dedupe_key == "order-escalation:order-1"
-
-
-def test_quarantined_order_never_renudges_and_parks_sender_inbox(tmp_path):
-    orders = EscalationStore(tmp_path / "escalations.sqlite3")
-    orders.expect_order(
-        order_id="order-1",
-        sender_session_id="manager-a",
-        recipient_session_id="worker-a",
-        body="Finish the migration",
-    )
-    ownership = OwnershipStore(tmp_path / "ownership.sqlite3")
-    ownership.retire("worker-a", state="superseded", reason="failover")
-    queue = Queue([])
-
-    DurableExecutionReconciler(
-        Client({"id": "old", "status": "completed"}, {}),
-        queue,
-        ownership=ownership,
-        escalation_store=orders,
-        order_ack_seconds=0,
-    ).reconcile_session({"id": "worker-a"})
-
-    assert queue.notifications == []
-    assert len(orders.pending()) == 1
-    assert orders.pending()[0].reason == "parent_unreachable"
 
 
 def test_424_waits_for_native_terminal_observation_before_requeue_and_wake():

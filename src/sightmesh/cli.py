@@ -400,6 +400,41 @@ def _latest_process(processes: list[dict[str, Any]]) -> dict[str, Any] | None:
     )
 
 
+def _idle_unmet_orders(
+    client: CdesktopClient, rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Project durable, unmet orders only when their recipient is idle."""
+    active_ids = set()
+    for row in rows:
+        try:
+            processes = _session_processes(client, row)
+        except CdesktopError:
+            continue
+        if any(
+            process.get("status") == "running"
+            and process.get("run_reason") != "devserver"
+            for process in processes
+        ):
+            active_ids.add(str(row["session_id"]))
+    selectors = {str(row["session_id"]): f"@{row['selector']}" for row in rows}
+    return [
+        {
+            "type": "unmet_order_expectation",
+            "order_id": order.order_id,
+            "sender_session_id": order.sender_session_id,
+            "recipient_session_id": order.recipient_session_id,
+            "agent": selectors.get(order.recipient_session_id),
+            "body": order.body,
+            "body_digest": order.body_digest,
+            "created_at": order.created_at,
+            "next_action": "Review the order, then use prompt-idle or contact the agent.",
+        }
+        for order in escalation.EscalationStore().orders(unmet_only=True)
+        if order.recipient_session_id in selectors
+        and order.recipient_session_id not in active_ids
+    ]
+
+
 def cmd_peers(args: argparse.Namespace) -> int:
     client = CdesktopClient(args.url)
     rows = _fleet_sessions(client, include_archived=args.include_archived)
@@ -412,6 +447,12 @@ def cmd_peers(args: argparse.Namespace) -> int:
             latest.get("status") if latest else row.pop("workspace_status", None)
         )
         row["execution_process_id"] = latest.get("id") if latest else None
+    counts: dict[str, int] = {}
+    for order in _idle_unmet_orders(client, rows):
+        session_id = str(order["recipient_session_id"])
+        counts[session_id] = counts.get(session_id, 0) + 1
+    for row in rows:
+        row["unmet_order_expectations"] = counts.get(str(row["session_id"]), 0)
     if args.json:
         _emit(rows, True)
     else:
@@ -420,6 +461,7 @@ def cmd_peers(args: argparse.Namespace) -> int:
             print(
                 f"@{row['selector']}\t{row.get('status') or 'unknown'}\t"
                 f"{row.get('executor') or '-'}\t{row.get('branch') or '-'}"
+                f"{' [ORDER ACK]' if row['unmet_order_expectations'] else ''}"
             )
     return 0
 
@@ -1327,9 +1369,8 @@ def _approval_details_batch(
 
 def cmd_inbox(args: argparse.Namespace) -> int:
     client = CdesktopClient(args.url)
-    selectors = {
-        str(row["session_id"]): f"@{row['selector']}" for row in _fleet_sessions(client)
-    }
+    fleet_rows = _fleet_sessions(client)
+    selectors = {str(row["session_id"]): f"@{row['selector']}" for row in fleet_rows}
     rows = []
     for details in _approval_details_batch(client, client.pending_approvals()):
         details["agent"] = selectors.get(
@@ -1337,6 +1378,7 @@ def cmd_inbox(args: argparse.Namespace) -> int:
         )
         details["response_template"] = _approval_response_template(details)
         rows.append(details)
+    rows.extend(_idle_unmet_orders(client, fleet_rows))
     _emit(rows, args.json)
     return 0
 
@@ -2239,9 +2281,11 @@ def cmd_overview(args: argparse.Namespace) -> int:
     viewed_at = datetime.fromisoformat(args.since) if args.since else None
     if viewed_at and viewed_at.tzinfo is None:
         viewed_at = viewed_at.replace(tzinfo=UTC)
-    projection = _fleet_overview(CdesktopClient(args.url), viewed_at)
+    client = CdesktopClient(args.url)
+    projection = _fleet_overview(client, viewed_at)
+    orders = _idle_unmet_orders(client, _fleet_sessions(client))
     if args.json:
-        _emit(projection.to_dict(), True)
+        _emit({**projection.to_dict(), "unmet_order_expectations": orders}, True)
         return 0
     groups = (
         ("Needs attention", projection.needs_attention),
@@ -2254,6 +2298,11 @@ def cmd_overview(args: argparse.Namespace) -> int:
             print("  (none)")
         for item in items:
             print(f"  {item.selector} — {item.reason} Next: {item.next_action}")
+    print("Unmet order expectations")
+    if not orders:
+        print("  (none)")
+    for order in orders:
+        print(f"  {order['agent'] or order['recipient_session_id']} — {order['body']}")
     return 0
 
 

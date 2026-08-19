@@ -8,6 +8,7 @@ import pytest
 from sightmesh import __version__, approvals, cli, escalation, succession
 from sightmesh.cli import (
     _fleet_sessions,
+    _idle_unmet_orders,
     _is_sightmesh_cdesktop_version,
     _latest_process,
     _normalized_snapshot_with_retry,
@@ -31,6 +32,36 @@ def test_read_text_requires_one_source(tmp_path) -> None:
     prompt.write_text("from file", encoding="utf-8")
     assert _read_text(None, str(prompt), "prompt") == "from file"
     assert _read_text("inline", None, "prompt") == "inline"
+
+
+def test_idle_unmet_orders_are_visible_and_running_recipients_are_not(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(escalation, "escalation_db_path", lambda: tmp_path / "orders.sqlite3")
+    store = escalation.EscalationStore()
+    store.expect_order(
+        order_id="idle-order",
+        sender_session_id="manager",
+        recipient_session_id="idle-worker",
+        body="Report the result",
+    )
+    store.expect_order(
+        order_id="running-order",
+        sender_session_id="manager",
+        recipient_session_id="running-worker",
+        body="Keep working",
+    )
+
+    class Client:
+        def execution_processes(self, session_id):
+            return [{"status": "running"}] if session_id == "running-worker" else []
+
+    rows = [
+        {"session_id": "idle-worker", "selector": "idle"},
+        {"session_id": "running-worker", "selector": "running"},
+    ]
+    visible = _idle_unmet_orders(Client(), rows)
+
+    assert [item["order_id"] for item in visible] == ["idle-order"]
+    assert visible[0]["agent"] == "@idle"
 
 
 def test_sightmesh_cdesktop_version_requires_safe_command_lifecycle() -> None:

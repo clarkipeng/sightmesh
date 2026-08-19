@@ -146,9 +146,7 @@ class OrderExpectation:
     body: str
     body_digest: str
     created_at: float
-    renudged_at: float | None
     satisfied_at: float | None
-    escalated_at: float | None
 
 
 def _safe_order_body(message: str) -> str:
@@ -249,9 +247,7 @@ class EscalationStore:
                         body TEXT NOT NULL,
                         body_digest TEXT NOT NULL,
                         created_at REAL NOT NULL,
-                        renudged_at REAL,
-                        satisfied_at REAL,
-                        escalated_at REAL
+                        satisfied_at REAL
                     )
                     """
                 )
@@ -469,8 +465,8 @@ class EscalationStore:
                     """
                     INSERT OR IGNORE INTO order_expectations (
                         order_id, sender_session_id, recipient_session_id, body,
-                        body_digest, created_at, renudged_at, satisfied_at, escalated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                        body_digest, created_at, satisfied_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL)
                     """,
                     (key, sender_session_id, recipient_session_id, safe_body, digest, now),
                 )
@@ -499,60 +495,19 @@ class EscalationStore:
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(f"Cannot satisfy order expectation: {exc}") from exc
 
-    def due_orders(self, recipient_session_id: str, *, older_than: float, now: float | None = None) -> list[OrderExpectation]:
-        current = time.time() if now is None else now
-        try:
-            with self._connect() as conn:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM order_expectations
-                    WHERE recipient_session_id = ? AND satisfied_at IS NULL
-                      AND created_at <= ?
-                    ORDER BY created_at ASC
-                    """,
-                    (recipient_session_id, current - older_than),
-                ).fetchall()
-        except sqlite3.DatabaseError as exc:
-            raise EscalationStoreError(f"Cannot read order expectations: {exc}") from exc
-        return [_order_from_row(row) for row in rows]
-
-    def claim_renudge(self, order_id: str, *, now: float | None = None) -> OrderExpectation | None:
-        current = time.time() if now is None else now
-        return self._claim_order(order_id, "renudged_at", current, "renudged_at IS NULL")
-
-    def claim_escalation(self, order_id: str, *, now: float | None = None) -> OrderExpectation | None:
-        current = time.time() if now is None else now
-        return self._claim_order(
-            order_id, "escalated_at", current, "renudged_at IS NOT NULL AND escalated_at IS NULL"
-        )
-
-    def claim_retired_order(self, order_id: str, *, now: float | None = None) -> OrderExpectation | None:
-        current = time.time() if now is None else now
-        return self._claim_order(order_id, "escalated_at", current, "escalated_at IS NULL")
-
-    def _claim_order(self, order_id: str, column: str, value: float, condition: str) -> OrderExpectation | None:
-        try:
-            with self._connect() as conn:
-                cursor = conn.execute(
-                    f"UPDATE order_expectations SET {column} = ? WHERE order_id = ? "
-                    f"AND satisfied_at IS NULL AND {condition}",
-                    (value, order_id),
-                )
-                if cursor.rowcount != 1:
-                    return None
-                row = conn.execute(
-                    "SELECT * FROM order_expectations WHERE order_id = ?", (order_id,)
-                ).fetchone()
-        except sqlite3.DatabaseError as exc:
-            raise EscalationStoreError(f"Cannot claim order expectation: {exc}") from exc
-        return _order_from_row(row) if row is not None else None
-
-    def orders(self, *, recipient_session_id: str | None = None) -> list[OrderExpectation]:
+    def orders(
+        self, *, recipient_session_id: str | None = None, unmet_only: bool = False
+    ) -> list[OrderExpectation]:
         query = "SELECT * FROM order_expectations"
         values: tuple[str, ...] = ()
-        if recipient_session_id:
-            query += " WHERE recipient_session_id = ?"
+        where = []
+        if recipient_session_id is not None:
+            where.append("recipient_session_id = ?")
             values = (recipient_session_id,)
+        if unmet_only:
+            where.append("satisfied_at IS NULL")
+        if where:
+            query += " WHERE " + " AND ".join(where)
         try:
             with self._connect() as conn:
                 rows = conn.execute(query + " ORDER BY created_at ASC", values).fetchall()
@@ -615,9 +570,7 @@ def _order_from_row(row: sqlite3.Row) -> OrderExpectation:
         body=row["body"],
         body_digest=row["body_digest"],
         created_at=row["created_at"],
-        renudged_at=row["renudged_at"],
         satisfied_at=row["satisfied_at"],
-        escalated_at=row["escalated_at"],
     )
 
 
