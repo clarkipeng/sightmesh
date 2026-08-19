@@ -134,7 +134,7 @@ def test_quota_reset_is_carried_for_display_and_can_require_attention():
     assert item.next_action == "Wait for the reported reset window."
 
 
-def test_serialization_removes_private_values_at_any_depth():
+def test_serialization_projects_only_public_fields_from_arbitrary_native_facts():
     result = overview(
         FleetFacts(
             executions=(
@@ -142,11 +142,17 @@ def test_serialization_removes_private_values_at_any_depth():
                     "private",
                     token_usage={
                         "input": 7,
+                        "provenance": "provider",
                         "access_token": "never",
-                        "nested": {"secret": "never"},
+                        "client_secret": "never",
+                        "nested": {"cookie": "never"},
                     },
+                    context={"used": 7, "cookie": "never", "session": "never"},
                 ),
-            )
+            ),
+            deliveries=(
+                {"execution_id": "private", "pr": "#12", "authorization": "never"},
+            ),
         ),
         now=NOW,
     ).to_dict()
@@ -154,6 +160,24 @@ def test_serialization_removes_private_values_at_any_depth():
     assert "never" not in encoded
     assert result["running"][0]["token_usage"] == {
         "input": 7,
-        "nested": {},
-        "provenance": "reported_tokens",
+        "provenance": "provider",
     }
+    assert result["running"][0]["context"] == {"used": 7}
+    assert result["running"][0]["delivery"] == {"pr": "#12"}
+
+
+def test_usage_without_supplied_provenance_is_omitted_instead_of_relabelled():
+    item = overview(
+        FleetFacts(
+            executions=(
+                execution(
+                    "unproven",
+                    token_usage={"input": 7},
+                    monetary_cost={"amount": "0.03", "currency": "USD"},
+                ),
+            )
+        ),
+        now=NOW,
+    ).running[0]
+    assert item.token_usage is None
+    assert item.monetary_cost is None

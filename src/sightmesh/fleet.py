@@ -17,20 +17,21 @@ from urllib.parse import quote
 
 TERMINAL = frozenset({"completed", "done", "failed", "cancelled", "stopped"})
 RUNNING = frozenset({"queued", "claimed", "running", "active"})
-_PRIVATE_KEYS = frozenset(
-    {
-        "token",
-        "access_token",
-        "refresh_token",
-        "api_key",
-        "private_key",
-        "secret",
-        "password",
-        "authorization",
-        "credential",
-        "credentials",
-    }
+_QUOTA_FIELDS = ("known", "remaining", "resetsAt", "resetsIn", "reason")
+_EVENT_FIELDS = ("at", "kind", "status", "summary")
+_TOKEN_USAGE_FIELDS = (
+    "input",
+    "output",
+    "total",
+    "cached",
+    "reasoning",
+    "unit",
+    "provenance",
 )
+_COST_FIELDS = ("amount", "currency", "unit", "provenance")
+_CONTEXT_FIELDS = ("used", "limit", "pressure")
+_PARENT_FIELDS = ("id", "selector", "name", "status", "workspace_id")
+_DELIVERY_FIELDS = ("pr", "ci", "ref", "status", "url")
 
 
 @dataclass(frozen=True)
@@ -76,11 +77,11 @@ class FleetOverview:
     done_since_view: tuple[FleetItem, ...]
 
     def to_dict(self) -> dict[str, list[dict[str, Any]]]:
-        """Return a renderer-friendly projection with sensitive values removed."""
+        """Return only the fixed public schema intended for renderer input."""
         return {
-            "needs_attention": [_safe(asdict(item)) for item in self.needs_attention],
-            "running": [_safe(asdict(item)) for item in self.running],
-            "done_since_view": [_safe(asdict(item)) for item in self.done_since_view],
+            "needs_attention": [_public_item(item) for item in self.needs_attention],
+            "running": [_public_item(item) for item in self.running],
+            "done_since_view": [_public_item(item) for item in self.done_since_view],
         }
 
 
@@ -167,8 +168,8 @@ def _item(
         account_id=account_id,
         quota=_mapping(account.get("quota")) or _mapping(execution.get("quota")),
         last_event=last_event,
-        token_usage=_usage(execution.get("token_usage"), "reported_tokens"),
-        monetary_cost=_usage(execution.get("monetary_cost"), "external_cost"),
+        token_usage=_usage(execution.get("token_usage")),
+        monetary_cost=_usage(execution.get("monetary_cost")),
         context=_mapping(execution.get("context")),
         parent=relationships.get(execution_id),
         branch=_text(execution.get("branch")) or _text(workspace.get("branch")),
@@ -253,11 +254,15 @@ def _order(item: FleetItem) -> tuple[int, int, str]:
     return priority[item.urgency], -(item.age_seconds or 0), item.selector
 
 
-def _usage(value: Any, required_provenance: str) -> Mapping[str, Any] | None:
+def _usage(value: Any) -> Mapping[str, Any] | None:
     row = _mapping(value)
-    if not row:
+    if (
+        not row
+        or not isinstance(row.get("provenance"), str)
+        or not row["provenance"].strip()
+    ):
         return None
-    return {**row, "provenance": _text(row.get("provenance")) or required_provenance}
+    return row
 
 
 def _mapping(value: Any) -> Mapping[str, Any] | None:
@@ -292,15 +297,43 @@ def _utc(value: datetime) -> datetime:
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
-def _safe(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {
-            str(key): _safe(item)
-            for key, item in value.items()
-            if str(key).lower() not in _PRIVATE_KEYS
-        }
-    if isinstance(value, list):
-        return [_safe(item) for item in value]
-    if isinstance(value, tuple):
-        return [_safe(item) for item in value]
-    return value
+def _public_item(item: FleetItem) -> dict[str, Any]:
+    return {
+        "selector": item.selector,
+        "group": item.group,
+        "urgency": item.urgency,
+        "age_seconds": item.age_seconds,
+        "reason": item.reason,
+        "next_action": item.next_action,
+        "workspace_id": item.workspace_id,
+        "execution_id": item.execution_id,
+        "status": item.status,
+        "model": item.model,
+        "provider": item.provider,
+        "account_id": item.account_id,
+        "quota": _project(item.quota, _QUOTA_FIELDS),
+        "last_event": _project(item.last_event, _EVENT_FIELDS),
+        "token_usage": _project(item.token_usage, _TOKEN_USAGE_FIELDS),
+        "monetary_cost": _project(item.monetary_cost, _COST_FIELDS),
+        "context": _project(item.context, _CONTEXT_FIELDS),
+        "parent": _project(item.parent, _PARENT_FIELDS),
+        "branch": item.branch,
+        "delivery": _project(item.delivery, _DELIVERY_FIELDS),
+    }
+
+
+def _project(
+    value: Mapping[str, Any] | None, fields: tuple[str, ...]
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    projected = {key: _public_scalar(value[key]) for key in fields if key in value}
+    return {key: item for key, item in projected.items() if item is not None}
+
+
+def _public_scalar(value: Any) -> str | int | float | bool | None:
+    if isinstance(value, datetime):
+        return _utc(value).isoformat().replace("+00:00", "Z")
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return None
