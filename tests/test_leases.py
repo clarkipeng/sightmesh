@@ -229,6 +229,45 @@ def test_sync_active_workspaces_can_isolate_invalid_workspace(
     assert errors == ["Active worktree workspace has no container: broken"]
 
 
+def test_sync_active_workspaces_isolates_failure_without_on_error(
+    monkeypatch, tmp_path: Path, caplog
+) -> None:
+    repo_a = tmp_path / "repo-a"
+    repo_a.mkdir()
+    repo_b = tmp_path / "repo-b"
+    repo_b.mkdir()
+    broken_repo = tmp_path / "repo-broken"
+    broken_repo.mkdir()
+    lease_dir = tmp_path / "leases"
+    monkeypatch.setattr("sightmesh.leases.default_lease_dir", lambda: lease_dir)
+    repos_by_workspace = {
+        "healthy-a": repo_a,
+        "broken": broken_repo,
+        "healthy-b": repo_b,
+    }
+
+    class Client:
+        def workspaces(self):
+            return [
+                {"id": "healthy-a", "archived": False, "use_worktree": False},
+                {"id": "broken", "archived": False, "use_worktree": True},
+                {"id": "healthy-b", "archived": False, "use_worktree": False},
+            ]
+
+        def workspace_repos(self, workspace_id):
+            repo = repos_by_workspace[workspace_id]
+            return [{"path": str(repo), "name": repo.name}]
+
+        def sessions(self, workspace_id):
+            return [{"id": f"session-{workspace_id}"}]
+
+    with caplog.at_level("WARNING", logger="sightmesh.leases"):
+        synced = sync_active_workspaces(Client(), ttl_seconds=60)
+
+    assert sorted(lease.workspace_id for lease in synced) == ["healthy-a", "healthy-b"]
+    assert "Active worktree workspace has no container: broken" in caplog.text
+
+
 def test_migration_git_status_parsing() -> None:
     assert migration.parse_porcelain_paths(
         " M a.txt\nR  old.txt -> new.txt\n?? scratch\n"
