@@ -1,0 +1,47 @@
+name: Bug report
+description: Report a reproducible SightMesh defect
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: SightMesh is experimental. Remove credentials, private transcripts, and identifying paths.
+  - type: input
+    id: version
+    attributes:
+      label: SightMesh version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: macOS, Python, cdesktop, Repowire, and provider CLI versions that matter.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include redacted commands and the smallest safe sequence that reproduces the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, tokens, auth headers, private transcripts, and unrelated personal data.
+          required: true

@@ -3,10 +3,18 @@
 ## Tested local stack
 
 - macOS 26.5.1 arm64
-- cdesktop 0.2.3 and local fork package 0.2.3-sightmesh.1
+- cdesktop's released artifact, checksum, and compatibility floors are pinned in the versioned [runtime lock](../src/sightmesh/runtime-lock.json); the live behavior evidence below was recorded on cdesktop 0.2.3 and local fork packages 0.2.3-sightmesh.1 through 0.2.3-sightmesh.3
 - Repowire 0.17.0
 - Codex CLI 0.147.0
 - Claude Code 2.1.228
+
+The general CLI and durable manager reconciliation read their separate compatibility floors from that lock. When the durable APIs are unavailable, reconciliation disables itself after one bounded diagnostic; normal local bridging continues and unsupported recovery endpoints are not retried.
+
+## Runtime dependency contract
+
+SightMesh does not vendor cdesktop or track it as a Git submodule. cdesktop publishes a release first; SightMesh then updates repository identity, tag, exact package URL, SHA-256, and compatibility floors together in one reviewed runtime-lock change. Bootstrap, updater defaults, CLI checks, durable feature detection, package tests, and compatibility CI all consume that file. Until a future release artifact exists, the lock remains on the current released package rather than naming an unpublished build.
+
+The blocking pinned-artifact CI downloads the public package, verifies its checksum, installs it without lifecycle scripts, and checks the real executable version. The advisory cdesktop-main edge checks only public source/package shape and is deliberately non-blocking; it is not presented as live binary or credentialed API compatibility.
 
 ## Passing behavior
 

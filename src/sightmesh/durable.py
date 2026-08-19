@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -23,10 +24,21 @@ from .cdesktop import (
     CdesktopPendingError,
     CdesktopRejectedError,
 )
+from .runtime_lock import RUNTIME_LOCK
 from .stalls import is_active_suite_work, threshold_from_environment
 from .succession import COMMAND_TERMINAL_STATES, OwnershipStore, resolve_live_successor
 
 LOGGER = logging.getLogger("sightmesh.durable")
+
+
+def supports_durable_recovery(version: object) -> bool:
+    """Return whether cdesktop exposes the process-scoped recovery API."""
+    match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", str(version or ""))
+    return bool(
+        match
+        and tuple(int(part) for part in match.groups())
+        >= RUNTIME_LOCK.cdesktop.compatibility.durable_recovery_tuple
+    )
 
 
 @dataclass(frozen=True)
@@ -39,6 +51,20 @@ class DurableCommand:
     execution_process_id: str | None = None
     recovery_attempt: int = 1
     recovery_state: str | None = None
+
+    def delivery_state(self, process: dict[str, Any] | None) -> str:
+        """Project cdesktop facts onto the delivery lifecycle without storing it."""
+        if self.state == "pending":
+            return "queued"
+        if self.state == "claimed":
+            if process is None:
+                return "claimed"
+            return "running" if process.get("status") == "running" else "observed"
+        if self.state in {"done", "failed"}:
+            return "terminal"
+        if self.state == "cancelled":
+            return "rejected"
+        return "observed"
 
 
 class NativeCommandQueue:
@@ -53,11 +79,27 @@ class NativeCommandQueue:
         rows = self.client.session_commands(session_id)
         return [DurableCommand(**_command_fields(row, session_id)) for row in rows]
 
-    def interrupt(self, command: DurableCommand) -> None:
-        self.client.interrupt_command(command.id)
-
     def requeue(self, command: DurableCommand) -> None:
-        self.client.requeue_command(command.id, dedupe_key=command.dedupe_key)
+        if not command.execution_process_id:
+            raise CdesktopError(f"Command {command.id} has no execution to requeue")
+        self.client.requeue_execution_commands(
+            command.session_id, command.execution_process_id
+        )
+
+    def interrupt(self, command: DurableCommand) -> None:
+        # cdesktop has no per-command cancel endpoint yet. Prefer one when the
+        # runtime (or a test double) offers it; otherwise stop the command's
+        # execution, which is replay-safe, and rely on the reconciler never
+        # requeueing or dispatching for a quarantined session.
+        if hasattr(self.client, "interrupt_command"):
+            self.client.interrupt_command(command.id)
+            return
+        if command.execution_process_id:
+            self.client.stop_execution(
+                command.execution_process_id,
+                dedupe_key=f"quarantine:{command.id}",
+            )
+
 
     def recovery(self, command: DurableCommand, *, attempt: int, state: str) -> None:
         if not hasattr(self.client, "update_command"):
@@ -66,9 +108,6 @@ class NativeCommandQueue:
             command.id,
             {"recovery_attempt": attempt, "recovery_state": state},
         )
-
-    def done(self, command: DurableCommand) -> None:
-        self.client.complete_command(command.id)
 
     def notify_parent(
         self, parent_session_id: str, child_session_id: str, message: str, key: str
@@ -170,12 +209,36 @@ class DurableExecutionReconciler:
         self._stopped: set[str] = set()
         self._requeued: set[str] = set()
         self._cancelled: set[str] = set()
+        self._notified: set[str] = set()
         self.liveness = liveness or SuiteLiveness()
         self._offline_until = 0.0
         self._backoff = 1.0
+        self._durable_supported: bool | None = None
+
+    def _supports_durable_recovery(self) -> bool:
+        if self._durable_supported is not None:
+            return self._durable_supported
+        if not hasattr(self.client, "info"):
+            # Protocol test doubles and older embedders predate version discovery.
+            self._durable_supported = True
+            return True
+        info = self.client.info()
+        version = info.get("version") if isinstance(info, dict) else None
+        self._durable_supported = supports_durable_recovery(version)
+        if not self._durable_supported:
+            minimum = RUNTIME_LOCK.cdesktop.compatibility.durable_recovery
+            LOGGER.warning(
+                "Durable recovery is disabled: cdesktop %s or newer is required "
+                "(found %s). Normal bridging remains available.",
+                minimum,
+                version or "unknown version",
+            )
+        return self._durable_supported
 
     def reconcile_sessions(self, sessions: Iterable[dict[str, Any]]) -> None:
         """Reconcile all sessions in one writer, tolerating partial reads."""
+        if not self._supports_durable_recovery():
+            return
         for session in sessions:
             try:
                 self.reconcile_session(session)
@@ -202,23 +265,27 @@ class DurableExecutionReconciler:
             for command in commands
             if command.state == "claimed" and command.execution_process_id
         }
+        self._wake_parent_for_terminal_commands(session, commands)
         for command in commands:
             if command.state != "claimed":
                 continue
             process = by_process.get(str(command.execution_process_id))
+            if process is None:
+                # Absence is not terminal evidence. A partial read must never
+                # release a claim while its execution may still be running.
+                continue
             if process and process.get("status") == "running":
                 snapshot = self.client.normalized_snapshot(str(process["id"]))
                 if not snapshot.get("stream_alive", True):
-                    self._interrupt_and_requeue(command)
+                    self.recover_stalled_process(session, process, command)
                 elif is_active_suite_work(snapshot):
                     continue
                 elif self.liveness.stale(str(process["id"]), snapshot):
                     self.recover_stalled_process(session, process, command)
                 continue
-            if command.recovery_state == "stop_accepted":
-                self._interrupt_and_requeue(command)
-                self.reconcile_child_terminal(session, status="interrupted")
-                continue
+            self.reconcile_child_terminal(
+                session, status=str(process.get("status") or "terminal")
+            )
             self._interrupt_and_requeue(command)
 
         # A running child can be observed before the command list is visible;
@@ -289,19 +356,44 @@ class DurableExecutionReconciler:
         # The key stays bound to the child and status, not the destination, so
         # a redirected notification is still one logical command.
         key = f"child-terminal:{child_session['id']}:{status}"
+        if key in self._notified:
+            return
         self.queue.notify_parent(
             destination,
             str(child_session["id"]),
             f"CHILD_TERMINAL: {child_session['id']} {status}",
             key,
         )
+        self._notified.add(key)
+
+    def _wake_parent_for_terminal_commands(
+        self, child_session: dict[str, Any], commands: Iterable[DurableCommand]
+    ) -> None:
+        """Wake once per native terminal transition; cdesktop owns the dedupe fence."""
+        parent = child_session.get("parent_session_id")
+        if not parent:
+            return
+        child_id = str(child_session["id"])
+        for command in commands:
+            state = command.delivery_state(None)
+            if state not in {"terminal", "rejected"}:
+                continue
+            key = f"child-command:{command.id}:{command.state}"
+            if key in self._notified:
+                continue
+            self.queue.notify_parent(
+                str(parent),
+                child_id,
+                f"CHILD_DELIVERY: {child_id} {command.id} {command.state}",
+                key,
+            )
+            self._notified.add(key)
 
     def _interrupt_and_requeue(self, command: DurableCommand) -> None:
         # Lifecycle writes are idempotent in cdesktop; duplicate ticks cannot
         # manufacture a second command because requeue retains dedupe_key.
         if command.id in self._requeued:
             return
-        self.queue.interrupt(command)
         self.queue.requeue(command)
         self._requeued.add(command.id)
 
@@ -319,12 +411,12 @@ class DurableExecutionReconciler:
         try:
             self.client.stop_execution(str(process["id"]), dedupe_key=key)
         except CdesktopInterruptedError:
+            # HTTP 424 is not terminal evidence: the keyed stop may or may not
+            # have run. Do not release the claim or wake its parent until the
+            # native process row proves a terminal status. On restart the same
+            # key replays this cdesktop-owned outcome without a second stop.
             self._stopped.add(str(process["id"]))
-            self.queue.recovery(
-                command, attempt=command.recovery_attempt, state="interrupted"
-            )
-            self._interrupt_and_requeue(command)
-            self.reconcile_child_terminal(session, status="interrupted")
+            return
         except CdesktopPendingError:
             return
         except CdesktopRejectedError as exc:

@@ -17,6 +17,7 @@ from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import core
 
@@ -27,7 +28,24 @@ JOBS_LOCK = threading.Lock()
 
 # The UI mutates credentials, so only loopback names may address it. Without
 # this a hostile page could reach the server by rebinding DNS to 127.0.0.1.
-ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
+MAX_REQUEST_BODY_BYTES = 64 * 1024
+
+
+def _is_loopback_authority(value: str) -> bool:
+    parsed = urlsplit(f"//{value}")
+    try:
+        _ = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.hostname in ALLOWED_HOSTS
+        and not parsed.username
+        and not parsed.password
+        and not parsed.path
+        and not parsed.query
+        and not parsed.fragment
+    )
 
 
 def start_job(fn: Callable[[], str | None]) -> str:
@@ -39,8 +57,8 @@ def start_job(fn: Callable[[], str | None]) -> str:
         try:
             message = fn() or "done"
             result = {"done": True, "ok": True, "message": message}
-        except Exception as exc:  # noqa: BLE001 - surfaced to the page verbatim
-            result = {"done": True, "ok": False, "message": str(exc)}
+        except Exception:  # noqa: BLE001 - never expose credentials in UI errors
+            result = {"done": True, "ok": False, "message": "operation failed"}
         with JOBS_LOCK:
             JOBS[job_id] = result
 
@@ -60,7 +78,7 @@ def job_refresh() -> str:
 
 def job_verify() -> str:
     pool = core.load_pool()
-    problems = []
+    has_problem = False
     seen: dict[str, str] = {}
     for account in pool.get("accounts", []):
         if account.get("provider") == "codex":
@@ -71,15 +89,15 @@ def job_verify() -> str:
                 account["identity"] = fresh
         key = core.identity_key(account)
         if key and key in seen:
-            problems.append(f"{account['id']} duplicates {seen[key]}")
+            has_problem = True
         elif key:
             seen[key] = account["id"]
         ok, reason = core.probe(account)
         core.quota_cached(account, force=True)
         if not ok and reason != "usage limit":
-            problems.append(f"{account['id']}: {reason}")
+            has_problem = True
     core.save_pool(pool)
-    return "; ".join(problems) if problems else "all accounts distinct and usable"
+    return "verification found problems" if has_problem else "all accounts distinct and usable"
 
 
 def job_add_claude(body: dict[str, Any]) -> str:
@@ -246,8 +264,21 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _host_allowed(self) -> bool:
-        host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
-        return host in ALLOWED_HOSTS
+        host = self.headers.get("Host")
+        if not host:
+            return False
+        return _is_loopback_authority(host)
+
+    def _origin_allowed(self) -> bool:
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        parsed = urlsplit(origin)
+        try:
+            port = parsed.port
+        except ValueError:
+            return False
+        return parsed.scheme == "http" and _is_loopback_authority(parsed.netloc) and port == self.server.server_port
 
     def _send(self, code: int, body: bytes, content_type: str) -> None:
         self.send_response(code)
@@ -279,12 +310,22 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
     def do_POST(self) -> None:
-        if not self._host_allowed():
+        if not self._host_allowed() or not self._origin_allowed():
             return self._json({"error": "forbidden host"}, 403)
-        length = int(self.headers.get("Content-Length") or 0)
+        content_type = self.headers.get_content_type()
+        if content_type != "application/json":
+            return self._json({"ok": False, "message": "unsupported media type"}, 415)
+        try:
+            length = int(self.headers["Content-Length"])
+        except (KeyError, TypeError, ValueError):
+            return self._json({"ok": False, "message": "content length required"}, 411)
+        if length < 0 or length > MAX_REQUEST_BODY_BYTES:
+            return self._json({"ok": False, "message": "request too large"}, 413)
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError:
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return self._json({"ok": False, "message": "bad json"}, 400)
+        if not isinstance(body, dict):
             return self._json({"ok": False, "message": "bad json"}, 400)
 
         if self.path in JOB_ROUTES:
@@ -293,8 +334,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ROUTES:
             try:
                 return self._json(ROUTES[self.path](body))
-            except Exception as exc:  # noqa: BLE001 - surfaced to the page verbatim
-                return self._json({"ok": False, "message": str(exc)}, 400)
+            except Exception:  # noqa: BLE001 - never expose credentials in UI errors
+                return self._json({"ok": False, "message": "operation failed"}, 400)
         self._json({"error": "not found"}, 404)
 
 

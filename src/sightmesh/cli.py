@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from . import (
     conductor_migrate,
     escalation,
     execution_routing,
+    fleet,
     leases,
     routing,
     service,
@@ -40,9 +42,10 @@ from .profiles import (
 )
 from .repowire import RepowireError
 from .repowire import reply as repowire_reply
+from .runtime_lock import RUNTIME_LOCK
 
 CDESKTOP_FORK_MARKER = "sightmesh"
-CDESKTOP_MIN_VERSION = (0, 2, 5)
+DEFAULT_OVERVIEW_HOURS = 24
 COORDINATION_MARKER = "## Local agent coordination"
 COORDINATION_CONTRACT = """## Local agent coordination
 
@@ -88,13 +91,15 @@ def _repowire_status_ok(returncode: int, detail: str) -> bool:
 
 def _is_sightmesh_cdesktop_version(detail: object) -> bool:
     normalized = str(detail or "").casefold()
-    if CDESKTOP_FORK_MARKER not in normalized and not normalized.startswith("cdesktop/"):
+    if CDESKTOP_FORK_MARKER not in normalized and not normalized.startswith(
+        "cdesktop/"
+    ):
         return False
     match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", normalized)
     if not match:
         return False
     version = tuple(int(part) for part in match.groups())
-    return version >= CDESKTOP_MIN_VERSION
+    return version >= RUNTIME_LOCK.cdesktop.compatibility.minimum_tuple
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -290,6 +295,7 @@ def _fleet_sessions(
                     "session": session_name
                     or ("lead" if index == 0 else f"peer-{index}"),
                     "session_name": session_name or None,
+                    "parent_session_id": session.get("parent_session_id"),
                     "is_lead": index == 0,
                     "executor": session.get("executor"),
                     "branch": workspace.get("branch"),
@@ -358,13 +364,39 @@ def _session_processes(
     return client.execution_processes(str(row["session_id"]))
 
 
+def _process_event_time(process: dict[str, Any]) -> datetime | None:
+    raw = (
+        process.get("completed_at")
+        or process.get("updated_at")
+        or process.get("started_at")
+        or process.get("created_at")
+    )
+    if not isinstance(raw, str):
+        return None
+    try:
+        value = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
 def _latest_process(processes: list[dict[str, Any]]) -> dict[str, Any] | None:
     eligible = [
         process
         for process in processes
         if not process.get("dropped") and process.get("run_reason") != "devserver"
     ]
-    return eligible[-1] if eligible else None
+    return (
+        max(
+            eligible,
+            key=lambda process: (
+                _process_event_time(process) or datetime.min.replace(tzinfo=UTC),
+                str(process.get("id") or ""),
+            ),
+        )
+        if eligible
+        else None
+    )
 
 
 def cmd_peers(args: argparse.Namespace) -> int:
@@ -764,7 +796,7 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
     if not args.no_bridge:
         routing.enable(workspace_id)
     if lease:
-        result["lease"] = lease.to_dict()
+        result["lease"] = lease.to_public_dict()
     if selection.profile:
         result["profile"] = selection.profile
     if selection.route_id:
@@ -1119,7 +1151,9 @@ def cmd_failover(args: argparse.Namespace) -> int:
                 "action": "replacement-started-source-archived",
                 "source_archived": True,
                 "source_workspace": archived,
-                "released_source_lease": released.to_dict() if released else None,
+                "released_source_lease": released.to_public_dict()
+                if released
+                else None,
             }
         )
     _emit(result, args.json)
@@ -1620,10 +1654,20 @@ def cmd_service(args: argparse.Namespace) -> int:
 
 def cmd_update(args: argparse.Namespace) -> int:
     if args.update_action == "stage":
+        pinned = RUNTIME_LOCK.cdesktop
+        package = args.package or pinned.package.url
+        version = args.version or pinned.version
+        sha256 = args.sha256
+        if args.package is None:
+            sha256 = sha256 or pinned.package.sha256
+        elif sha256 is None and not args.local_development:
+            raise ValueError(
+                "Package overrides require --sha256 or explicit --local-development"
+            )
         result = updates.stage(
-            args.package,
-            args.version,
-            expected_sha256=args.sha256,
+            package,
+            version,
+            expected_sha256=sha256,
         )
     elif args.update_action == "activate":
         result = updates.activate_if_idle(
@@ -1697,7 +1741,7 @@ def _archive_workspace(args: argparse.Namespace, client: CdesktopClient) -> int:
             "workspace": archived,
             "action": "stopped-and-archived",
             "preserved_dirty": dirty,
-            "released_lease": released.to_dict() if released else None,
+            "released_lease": released.to_public_dict() if released else None,
         },
         args.json,
     )
@@ -1742,7 +1786,7 @@ def cmd_workspace(args: argparse.Namespace) -> int:
                 "workspace": restored,
                 "action": "restored",
                 "leases": [
-                    lease.to_dict()
+                    lease.to_public_dict()
                     for lease in synced
                     if lease.workspace_id == args.workspace_id
                 ],
@@ -1788,7 +1832,7 @@ def cmd_workspace(args: argparse.Namespace) -> int:
                 "missing_repositories": missing,
                 "preserved_dirty": substantive_dirty,
                 "cdesktop_result": result,
-                "released_lease": released.to_dict() if released else None,
+                "released_lease": released.to_public_dict() if released else None,
             },
             args.json,
         )
@@ -2022,12 +2066,165 @@ def cmd_status(args: argparse.Namespace) -> int:
                     item["has_pending_approval"] for item in workspaces
                 ),
             },
-            "leases": [lease.to_dict() for lease in leases.LeaseStore().list()],
+            "leases": [lease.to_public_dict() for lease in leases.LeaseStore().list()],
             "profiles": profile_rows,
             "providers": [provider_summary(provider) for provider in providers],
         },
         args.json,
     )
+    return 0
+
+
+def _overview_execution_facts(
+    client: CdesktopClient,
+    process: dict[str, Any],
+    provider_kinds: dict[str, str],
+) -> dict[str, Any]:
+    action = process.get("executor_action")
+    action = action if isinstance(action, dict) else {}
+    action_type = action.get("typ")
+    action_type = action_type if isinstance(action_type, dict) else {}
+    config = action_type.get("executor_config", {})
+    config = config if isinstance(config, dict) else {}
+    model = action.get("selected_model_id") or config.get("model_id")
+    provider_id = action.get("selected_provider_id")
+    token_usage = None
+    context = None
+    try:
+        snapshot = _normalized_snapshot_with_retry(client, str(process["id"]))
+    except CdesktopError:
+        snapshot = {}
+    entries = snapshot.get("entries") if isinstance(snapshot, dict) else []
+    for wrapped in entries if isinstance(entries, list) else []:
+        content = wrapped.get("content") if isinstance(wrapped, dict) else None
+        entry_type = content.get("entry_type") if isinstance(content, dict) else None
+        if (
+            not isinstance(entry_type, dict)
+            or entry_type.get("type") != "token_usage_info"
+        ):
+            continue
+        total = entry_type.get("total_tokens")
+        limit = entry_type.get("model_context_window")
+        if isinstance(total, (int, float)):
+            token_usage = {
+                "total": total,
+                "unit": "tokens",
+                "provenance": "cdesktop normalized snapshot",
+            }
+        if (
+            isinstance(total, (int, float))
+            and isinstance(limit, (int, float))
+            and limit
+        ):
+            context = {
+                "used": total,
+                "limit": limit,
+                "pressure": round(float(total) / float(limit), 3),
+            }
+    return {
+        "model": str(model) if model else None,
+        "provider": provider_kinds.get(str(provider_id)) if provider_id else None,
+        "account_id": None,
+        "token_usage": token_usage,
+        "context": context,
+    }
+
+
+def _fleet_overview(
+    client: CdesktopClient,
+    viewed_at: datetime | None,
+    *,
+    now: datetime | None = None,
+) -> fleet.FleetOverview:
+    current_time = now or datetime.now(UTC)
+    cutoff = viewed_at or current_time - timedelta(hours=DEFAULT_OVERVIEW_HOURS)
+    workspaces = [
+        {
+            "id": str(workspace["id"]),
+            "branch": workspace.get("branch"),
+        }
+        for workspace in client.workspaces()
+        if not workspace.get("archived")
+    ]
+    executions: list[dict[str, Any]] = []
+    relationships: list[dict[str, Any]] = []
+    try:
+        provider_kinds = {
+            str(provider["id"]): str(provider.get("kind") or provider.get("name"))
+            for provider in client.providers()
+            if provider.get("id") and (provider.get("kind") or provider.get("name"))
+        }
+    except (AttributeError, CdesktopError):
+        provider_kinds = {}
+    for row in _fleet_sessions(client):
+        process = _latest_process(_session_processes(client, row))
+        if process is None:
+            continue
+        event_at = _process_event_time(process)
+        status = str(process.get("status") or "")
+        if status not in fleet.RUNNING and (event_at is None or event_at < cutoff):
+            continue
+        native_facts = _overview_execution_facts(client, process, provider_kinds)
+        executions.append(
+            {
+                "id": str(process["id"]),
+                "session_id": row["session_id"],
+                "workspace_id": row["workspace_id"],
+                "status": status,
+                **native_facts,
+                "branch": row.get("branch"),
+                "last_event": {
+                    "at": event_at,
+                    "kind": "execution",
+                    "status": status,
+                },
+            }
+        )
+        parent = row.get("parent_session_id")
+        if parent:
+            relationships.append(
+                {"execution_id": str(process["id"]), "id": str(parent)}
+            )
+    try:
+        pending = client.pending_approvals()
+    except (AttributeError, CdesktopError):
+        pending = []
+    approvals_rows = [
+        {
+            "execution_id": str(item["execution_process_id"]),
+            "status": "pending",
+        }
+        for item in pending
+        if item.get("execution_process_id")
+    ]
+    facts = fleet.FleetFacts(
+        workspaces=tuple(workspaces),
+        executions=tuple(executions),
+        approvals=tuple(approvals_rows),
+        relationships=tuple(relationships),
+    )
+    return fleet.overview(facts, now=current_time, viewed_at=cutoff)
+
+
+def cmd_overview(args: argparse.Namespace) -> int:
+    viewed_at = datetime.fromisoformat(args.since) if args.since else None
+    if viewed_at and viewed_at.tzinfo is None:
+        viewed_at = viewed_at.replace(tzinfo=UTC)
+    projection = _fleet_overview(CdesktopClient(args.url), viewed_at)
+    if args.json:
+        _emit(projection.to_dict(), True)
+        return 0
+    groups = (
+        ("Needs attention", projection.needs_attention),
+        ("Running", projection.running),
+        ("Done since view", projection.done_since_view),
+    )
+    for label, items in groups:
+        print(label)
+        if not items:
+            print("  (none)")
+        for item in items:
+            print(f"  {item.selector} — {item.reason} Next: {item.next_action}")
     return 0
 
 
@@ -2051,7 +2248,10 @@ def cmd_lease(args: argparse.Namespace) -> int:
         _emit(lease.to_dict(), args.json)
     elif args.lease_action == "list":
         _emit(
-            [lease.to_dict() for lease in store.list(include_stale=args.include_stale)],
+            [
+                lease.to_public_dict()
+                for lease in store.list(include_stale=args.include_stale)
+            ],
             args.json,
         )
     elif args.lease_action == "release":
@@ -2072,7 +2272,7 @@ def cmd_lease(args: argparse.Namespace) -> int:
             args.json,
         )
     elif args.lease_action == "recover-stale":
-        _emit([lease.to_dict() for lease in store.recover_stale()], args.json)
+        _emit([lease.to_public_dict() for lease in store.recover_stale()], args.json)
     else:
         raise ValueError(f"Unknown lease action: {args.lease_action}")
     return 0
@@ -2611,6 +2811,15 @@ def parser() -> argparse.ArgumentParser:
     fleet_status.add_argument("--include-archived", action="store_true")
     fleet_status.set_defaults(func=cmd_status)
 
+    overview = sub.add_parser(
+        "overview", help="Group privacy-safe fleet activity by required attention"
+    )
+    overview.add_argument(
+        "--since",
+        help="ISO-8601 lower bound for inactive items; defaults to the last 24 hours",
+    )
+    overview.set_defaults(func=cmd_overview)
+
     configure = sub.add_parser("configure", help="Enforce local-only cdesktop settings")
     configure.add_argument(
         "--workspace-root",
@@ -3085,10 +3294,17 @@ def parser() -> argparse.ArgumentParser:
         "stage",
         help="Verify and install a release without interrupting active workers",
     )
-    update_stage.add_argument("--package", required=True, help="Local tgz or HTTPS URL")
-    update_stage.add_argument("--version", required=True)
+    update_stage.add_argument(
+        "--package", help="Local tgz or HTTPS URL; defaults to the runtime lock"
+    )
+    update_stage.add_argument("--version", help="Defaults to the runtime lock")
     update_stage.add_argument(
         "--sha256", help="Required SHA-256 digest for remote packages"
+    )
+    update_stage.add_argument(
+        "--local-development",
+        action="store_true",
+        help="Explicitly allow an unverified local package override",
     )
     update_stage.set_defaults(func=cmd_update)
     update_activate = update_sub.add_parser(
@@ -3148,7 +3364,7 @@ def parser() -> argparse.ArgumentParser:
     lease.add_argument("--lease-dir", help="Override lease state directory")
     lease_sub = lease.add_subparsers(dest="lease_action", required=True)
     lease_acquire = lease_sub.add_parser(
-        "acquire", help="Acquire an expiring ownership lease"
+        "acquire", help="Acquire a lease and return its capability token"
     )
     lease_acquire.add_argument("--owner", required=True)
     lease_acquire.add_argument("--repo", required=True)
@@ -3159,20 +3375,22 @@ def parser() -> argparse.ArgumentParser:
     lease_acquire.add_argument("--workspace-id")
     lease_acquire.add_argument("--session-id")
     lease_acquire.set_defaults(func=cmd_lease)
-    lease_list = lease_sub.add_parser("list", help="List local ownership leases")
+    lease_list = lease_sub.add_parser(
+        "list", help="List leases without capability tokens"
+    )
     lease_list.add_argument(
         "--include-stale", action=argparse.BooleanOptionalAction, default=True
     )
     lease_list.set_defaults(func=cmd_lease)
     lease_release = lease_sub.add_parser(
-        "release", help="Release an ownership lease by token"
+        "release", help="Release by capability token and return that capability"
     )
     lease_release.add_argument("token")
     lease_release.add_argument("--owner")
     lease_release.add_argument("--workspace-id")
     lease_release.set_defaults(func=cmd_lease)
     lease_renew = lease_sub.add_parser(
-        "renew", help="Renew an ownership lease by token"
+        "renew", help="Renew by capability token and return that capability"
     )
     lease_renew.add_argument("token")
     lease_renew.add_argument(
@@ -3182,7 +3400,7 @@ def parser() -> argparse.ArgumentParser:
     lease_renew.add_argument("--workspace-id")
     lease_renew.set_defaults(func=cmd_lease)
     lease_recover = lease_sub.add_parser(
-        "recover-stale", help="Remove expired or dead-owner leases"
+        "recover-stale", help="Remove stale leases without returning capability tokens"
     )
     lease_recover.set_defaults(func=cmd_lease)
 

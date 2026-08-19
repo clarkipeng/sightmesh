@@ -4,6 +4,10 @@
 
 `sightmesh status` joins managed service state, active cdesktop workspaces, latest process state, pending approvals, unseen turns, Repowire route policy, ownership leases, redacted cdesktop providers, and named SightMesh profiles. Add `--include-archived` only when historical workspaces are relevant. Use `sightmesh peers` for the compact agent-facing roster and `sightmesh peek @AGENT` for a coalesced current-activity snapshot.
 
+`sightmesh overview` is the human fleet view. It selects the latest non-dropped, non-dev-server process for each visible session, then groups those agent cards into **Needs attention**, **Running**, and **Done since view**, with a stable selector, one reason, and one safe next action. The default retains every latest active process plus latest inactive processes updated or completed in the last 24 hours; pass `--since ISO_TIME` to choose another inactive-history boundary. This bound is derived at read time and adds no view-state persistence.
+
+`sightmesh --json overview` uses the fixed privacy-safe fleet projection and does not copy transcripts. Model comes from the native execution action. Its selected cdesktop provider ID is used only to join the native provider kind; it is not reported as a SightMesh subscription account. Token usage, context limit, and derived context pressure appear only when cdesktop supplies numeric values in a normalized `token_usage_info` entry for the selected process, with that provenance recorded. Account, quota, monetary cost, and any other unavailable fact remain `null`; SightMesh does not infer them.
+
 Use `sightmesh prompt-idle @AGENT --message-file FILE` for automation that must not append work behind an active turn or bypass a pending approval. It reads that session's process state immediately before sending and fails closed unless the target is active and idle.
 
 `sightmesh message @AGENT` always appends a native `continue` command; cdesktop starts it only at that session's next safe boundary. `steer` is the explicit `replace` path.
@@ -22,16 +26,16 @@ cdesktop remains the viewing surface. Use its repository-grouped sidebar, conver
 
 ## Staged cdesktop updates
 
-Use a release archive and its independently published SHA-256 digest:
+With no arguments, staging uses the exact released package, version, and SHA-256 in the [runtime lock](../src/sightmesh/runtime-lock.json):
 
 ```sh
-sightmesh update stage --package URL_OR_LOCAL_TGZ --version VERSION --sha256 SHA256
+sightmesh update stage
 sightmesh update status
 sightmesh update prune --dry-run
 sightmesh update cancel
 ```
 
-Remote packages require a digest. Staging downloads and verifies the archive, installs
+An override requires explicit verification: `sightmesh update stage --package URL_OR_LOCAL_TGZ --version VERSION --sha256 SHA256`. An unverified local archive is accepted only with the explicit `--local-development` flag; remote packages always require a digest. Staging downloads and verifies the archive, installs
 it under `~/.local/share/sightmesh/updates`, runs the staged executable's version check,
 checks the platform-specific backend ZIP and every member without executing the raw
 backend, and records pending state atomically under `~/.local/state/sightmesh/update.json`. It
@@ -123,7 +127,7 @@ Archive, restore, and delete use cdesktop's native workspace lifecycle. Archive 
 
 `sightmesh workspace restore WORKSPACE_ID` makes an archive active, reacquires its ownership lease, and re-enables its Repowire bridge route. It rolls the workspace back to archived if lease synchronization fails. `sightmesh workspace delete WORKSPACE_ID --confirm-delete` requires an already archived workspace. It deletes the cdesktop record, transcript, process logs, and owned managed worktree while deliberately preserving the Git branch. Dirty managed worktrees are always refused. A dirty direct repository is never deleted and requires `--preserve-dirty` before only its cdesktop history is removed. If a direct workspace's repository has already disappeared, deletion requires the additional `--allow-missing-repo` acknowledgement because its branch can no longer be verified locally. Branch deletion remains an explicit native Git operation after reconciliation.
 
-Use `sightmesh --json lease list` for inspection. Workspace-to-token mappings are stored separately under the lease state directory so archival can release only the owning workspace.
+Use `sightmesh --json lease list` for token-free inspection. Normal status, spawn, restore, archive, recovery, and diagnostic output also uses the public lease representation. Only the explicit `lease acquire`, `lease renew`, and `lease release` capability commands return the raw token needed for the next capability operation. Workspace-to-token mappings are stored separately under the lease state directory so archival can release only the owning workspace.
 
 ## Recovery smoke boundary
 

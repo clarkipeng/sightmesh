@@ -9,6 +9,7 @@ from sightmesh import __version__, approvals, cli, escalation, succession
 from sightmesh.cli import (
     _fleet_sessions,
     _is_sightmesh_cdesktop_version,
+    _latest_process,
     _normalized_snapshot_with_retry,
     _pending_request_from_snapshot,
     _primary_session_id,
@@ -22,6 +23,7 @@ from sightmesh.cli import (
 )
 from sightmesh.leases import LeaseStore
 from sightmesh.profiles import Profile, ProfileStore
+from sightmesh.runtime_lock import RUNTIME_LOCK
 
 
 def test_read_text_requires_one_source(tmp_path) -> None:
@@ -32,19 +34,66 @@ def test_read_text_requires_one_source(tmp_path) -> None:
 
 
 def test_sightmesh_cdesktop_version_requires_safe_command_lifecycle() -> None:
-    assert _is_sightmesh_cdesktop_version("cdesktop/0.2.5-sightmesh.0")
-    assert _is_sightmesh_cdesktop_version("cdesktop/0.2.5 darwin-arm64")
-    assert not _is_sightmesh_cdesktop_version("cdesktop 0.2.3-sightmesh.1")
-    assert not _is_sightmesh_cdesktop_version("cdesktop/0.2.4 darwin-arm64")
-    assert not _is_sightmesh_cdesktop_version("0.2.3")
+    minimum = RUNTIME_LOCK.cdesktop.compatibility.minimum
+    major, minor, patch = RUNTIME_LOCK.cdesktop.compatibility.minimum_tuple
+    older = f"{major}.{minor}.{patch - 1}"
+    assert _is_sightmesh_cdesktop_version(f"cdesktop/{minimum}-sightmesh.0")
+    assert _is_sightmesh_cdesktop_version(f"cdesktop/{minimum} darwin-arm64")
+    assert not _is_sightmesh_cdesktop_version(f"cdesktop {older}-sightmesh.1")
+    assert not _is_sightmesh_cdesktop_version(f"cdesktop/{older} darwin-arm64")
+    assert not _is_sightmesh_cdesktop_version(older)
     assert not _is_sightmesh_cdesktop_version(None)
 
 
-def test_bootstrap_installs_the_safe_cdesktop_release() -> None:
-    bootstrap = (Path(__file__).parents[1] / "scripts" / "bootstrap-local.sh").read_text(
-        encoding="utf-8"
+def test_bootstrap_derives_and_verifies_the_locked_cdesktop_release() -> None:
+    bootstrap = (
+        Path(__file__).parents[1] / "scripts" / "bootstrap-local.sh"
+    ).read_text(encoding="utf-8")
+    assert "from sightmesh.runtime_lock import RUNTIME_LOCK" in bootstrap
+    assert "verify_file_sha256" in bootstrap
+    assert RUNTIME_LOCK.cdesktop.package.url not in bootstrap
+
+
+def test_update_stage_defaults_to_verified_runtime_lock(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        cli.updates,
+        "stage",
+        lambda package, version, *, expected_sha256: calls.append(
+            (package, version, expected_sha256)
+        )
+        or {"status": "staged"},
     )
-    assert "v0.2.5-20260813115508/cdesktop-0.2.5.tgz" in bootstrap
+    args = parser().parse_args(["update", "stage"])
+    args.quiet = True
+
+    assert cli.cmd_update(args) == 0
+    runtime = RUNTIME_LOCK.cdesktop
+    assert calls == [(runtime.package.url, runtime.version, runtime.package.sha256)]
+
+
+def test_update_stage_override_requires_verification_or_local_mode(
+    monkeypatch, tmp_path
+) -> None:
+    package = tmp_path / "cdesktop.tgz"
+    package.write_bytes(b"development package")
+    args = parser().parse_args(["update", "stage", "--package", str(package)])
+    args.quiet = True
+    with pytest.raises(ValueError, match="require --sha256"):
+        cli.cmd_update(args)
+
+    calls = []
+    monkeypatch.setattr(
+        cli.updates,
+        "stage",
+        lambda source, version, *, expected_sha256: calls.append(
+            (source, version, expected_sha256)
+        )
+        or {"status": "staged"},
+    )
+    args.local_development = True
+    cli.cmd_update(args)
+    assert calls == [(str(package), RUNTIME_LOCK.cdesktop.version, None)]
 
 
 def test_coordination_contract_is_compact_and_idempotent() -> None:
@@ -113,6 +162,124 @@ def test_normalized_snapshot_retries_cold_partial_result() -> None:
     assert result["patch_count"] == 41
 
 
+def test_latest_process_selects_maximum_event_time_from_unsorted_rows() -> None:
+    latest = _latest_process(
+        [
+            {"id": "newer", "completed_at": "2026-08-18T02:00:00Z"},
+            {"id": "older", "completed_at": "2026-08-18T01:00:00Z"},
+        ]
+    )
+    assert latest and latest["id"] == "newer"
+
+
+def test_latest_process_breaks_equal_time_ties_by_process_id() -> None:
+    latest = _latest_process(
+        [
+            {"id": "process-a", "updated_at": "2026-08-18T02:00:00Z"},
+            {"id": "process-b", "updated_at": "2026-08-18T02:00:00Z"},
+        ]
+    )
+    assert latest and latest["id"] == "process-b"
+
+
+def test_latest_process_excludes_dropped_and_devserver_rows() -> None:
+    latest = _latest_process(
+        [
+            {
+                "id": "dropped",
+                "updated_at": "2099-01-01T00:00:00Z",
+                "dropped": True,
+            },
+            {
+                "id": "devserver",
+                "updated_at": "2099-01-01T00:00:00Z",
+                "run_reason": "devserver",
+            },
+            {"id": "agent", "updated_at": "2026-08-18T00:00:00Z"},
+        ]
+    )
+    assert latest and latest["id"] == "agent"
+
+
+def test_latest_process_prefers_valid_time_and_deterministically_handles_missing() -> (
+    None
+):
+    timed = _latest_process(
+        [
+            {"id": "missing-z"},
+            {"id": "timed", "created_at": "2020-01-01T00:00:00Z"},
+        ]
+    )
+    missing = _latest_process([{"id": "missing-a"}, {"id": "missing-z"}])
+    assert timed and timed["id"] == "timed"
+    assert missing and missing["id"] == "missing-z"
+
+
+def test_peers_and_peek_share_time_based_latest_selection(monkeypatch, capsys) -> None:
+    class UnsortedClient:
+        def workspace_summaries(self, archived=False):
+            assert archived is False
+            return [{"workspace_id": "workspace-a", "latest_process_status": "done"}]
+
+        def workspaces(self):
+            return [{"id": "workspace-a", "name": "alpha", "archived": False}]
+
+        def sessions(self, _workspace_id):
+            return [{"id": "session-a", "created_at": "1", "executor": "CODEX"}]
+
+        def execution_processes(self, _session_id):
+            return [
+                {
+                    "id": "newer",
+                    "status": "completed",
+                    "completed_at": "2026-08-18T02:00:00Z",
+                },
+                {
+                    "id": "older",
+                    "status": "failed",
+                    "completed_at": "2026-08-18T01:00:00Z",
+                },
+            ]
+
+        def normalized_snapshot(self, process_id):
+            assert process_id == "newer"
+            return {"complete": True, "entries": []}
+
+        def workspace(self, _workspace_id):
+            return {"use_worktree": False}
+
+        def workspace_repos(self, _workspace_id):
+            return []
+
+    client = UnsortedClient()
+    monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
+
+    assert (
+        cli.cmd_peers(argparse.Namespace(url=None, include_archived=False, json=True))
+        == 0
+    )
+    peers = json.loads(capsys.readouterr().out)
+    assert peers[0]["execution_process_id"] == "newer"
+    assert peers[0]["status"] == "completed"
+
+    assert (
+        cli.cmd_peek(
+            argparse.Namespace(
+                url=None,
+                agent="@alpha",
+                include_archived=False,
+                tools=3,
+                max_chars=600,
+                json=True,
+            )
+        )
+        == 0
+    )
+    peek = json.loads(capsys.readouterr().out)
+    assert peek["execution_process_id"] == "newer"
+    assert peek["status"] == "completed"
+
+
 def test_workspace_repository_paths_expose_source_and_checkout() -> None:
     class WorkspaceClient:
         def workspace(self, _workspace_id):
@@ -134,6 +301,7 @@ def test_workspace_repository_paths_expose_source_and_checkout() -> None:
 
 
 def test_parser_registers_compact_fleet_commands() -> None:
+    assert parser().parse_args(["overview"]).func is cli.cmd_overview
     assert parser().parse_args(["peers"]).func is cli.cmd_peers
     assert parser().parse_args(["peek", "@reviewer"]).func is cli.cmd_peek
     assert parser().parse_args(["inbox"]).func is cli.cmd_inbox
@@ -743,7 +911,9 @@ def test_failover_starts_visible_successor_on_approved_profile(
         ownership.assert_deliverable("session-a")
 
 
-def test_spawn_direct_acquires_workspace_lease(monkeypatch, tmp_path: Path) -> None:
+def test_spawn_direct_acquires_workspace_lease(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     lease_dir = tmp_path / "leases"
@@ -774,12 +944,201 @@ def test_spawn_direct_acquires_workspace_lease(monkeypatch, tmp_path: Path) -> N
 
     assert cli.cmd_spawn(args) == 0
 
+    output = json.loads(capsys.readouterr().out)
+    assert "token" not in output["lease"]
+    assert output["lease"]["workspace_id"] == "workspace-a"
+
     leases = LeaseStore(lease_dir).list()
     assert len(leases) == 1
     assert leases[0].repo_path == str(repo.resolve())
     assert leases[0].worktree_path is None
     assert leases[0].workspace_id == "workspace-a"
     assert leases[0].session_id == "session-a"
+
+
+def test_lease_capability_boundary_redacts_inspection(tmp_path: Path, capsys) -> None:
+    store = LeaseStore(tmp_path / "leases")
+    lease = store.acquire("owner", tmp_path, ttl_seconds=60)
+    args = argparse.Namespace(
+        lease_dir=str(tmp_path / "leases"),
+        lease_action="list",
+        include_stale=True,
+        json=True,
+    )
+
+    assert cli.cmd_lease(args) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert "token" not in output[0]
+    assert lease.token not in json.dumps(output)
+
+
+def test_status_redacts_lease_capability(monkeypatch, tmp_path: Path, capsys) -> None:
+    lease_dir = tmp_path / "leases"
+    lease = LeaseStore(lease_dir).acquire("owner", tmp_path, ttl_seconds=60)
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
+    monkeypatch.setattr(cli.service, "status", lambda _port: {"running": True})
+    monkeypatch.setattr(cli.routing, "enabled_workspaces", lambda: set())
+    monkeypatch.setattr(cli.ProfileStore, "list", lambda _self: [])
+
+    class StatusClient:
+        def __init__(self, _url=None) -> None:
+            pass
+
+        def workspace_summaries(self, _archived=False):
+            return []
+
+        def workspaces(self):
+            return []
+
+        def providers(self):
+            return []
+
+    monkeypatch.setattr(cli, "CdesktopClient", StatusClient)
+    args = argparse.Namespace(url=None, port=8377, include_archived=False, json=True)
+
+    assert cli.cmd_status(args) == 0
+    assert lease.token not in capsys.readouterr().out
+
+
+def test_overview_groups_native_processes_and_projects_private_fields(
+    monkeypatch, capsys
+) -> None:
+    class OverviewClient:
+        def __init__(self, _url=None) -> None:
+            self.snapshots = []
+
+        def workspaces(self):
+            return [{"id": "workspace-a", "branch": "feature", "archived": False}]
+
+        def workspace_summaries(self, archived=False):
+            assert archived is False
+            return [{"workspace_id": "workspace-a"}]
+
+        def sessions(self, _workspace_id):
+            return [
+                {"id": "session-running", "created_at": "1"},
+                {"id": "session-done", "created_at": "2"},
+                {"id": "session-failed", "created_at": "3"},
+                {"id": "session-historical", "created_at": "4"},
+            ]
+
+        def execution_processes(self, session_id):
+            return {
+                "session-running": [
+                    {
+                        "id": "historical-failed",
+                        "status": "failed",
+                        "completed_at": "2019-08-18T02:00:00Z",
+                    },
+                    {
+                        "id": "running-a",
+                        "status": "running",
+                        "started_at": "2020-01-01T00:00:00Z",
+                        "executor_action": {
+                            "selected_model_id": "gpt-authoritative",
+                            "selected_provider_id": "provider-a",
+                        },
+                        "secret": "raw-capability-token",
+                    },
+                ],
+                "session-done": [
+                    {
+                        "id": "done-a",
+                        "status": "completed",
+                        "completed_at": "2099-08-18T01:00:00Z",
+                    }
+                ],
+                "session-failed": [
+                    {
+                        "id": "failed-a",
+                        "status": "failed",
+                        "completed_at": "2099-08-18T02:00:00Z",
+                    }
+                ],
+                "session-historical": [
+                    {
+                        "id": "historical-failed",
+                        "status": "failed",
+                        "completed_at": "2020-08-18T02:00:00Z",
+                    }
+                ],
+            }[session_id]
+
+        def providers(self):
+            return [{"id": "provider-a", "kind": "codex"}]
+
+        def normalized_snapshot(self, process_id):
+            self.snapshots.append(process_id)
+            return {
+                "complete": True,
+                "entries": [
+                    {
+                        "content": {
+                            "entry_type": {
+                                "type": "token_usage_info",
+                                "total_tokens": 120,
+                                "model_context_window": 1000,
+                                "secret": "snapshot-secret",
+                            }
+                        }
+                    }
+                ],
+            }
+
+        def pending_approvals(self):
+            return []
+
+    client = OverviewClient()
+    monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
+    args = argparse.Namespace(url=None, since=None, json=True)
+
+    assert cli.cmd_overview(args) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert [item["execution_id"] for item in output["needs_attention"]] == ["failed-a"]
+    assert [item["execution_id"] for item in output["running"]] == ["running-a"]
+    assert [item["execution_id"] for item in output["done_since_view"]] == ["done-a"]
+    running = output["running"][0]
+    assert running["model"] == "gpt-authoritative"
+    assert running["selector"].endswith("/session-running")
+    assert running["provider"] == "codex"
+    assert running["account_id"] is None
+    assert running["token_usage"] == {
+        "total": 120,
+        "unit": "tokens",
+        "provenance": "cdesktop normalized snapshot",
+    }
+    assert running["context"] == {"used": 120, "limit": 1000, "pressure": 0.12}
+    assert running["quota"] is None
+    assert running["monetary_cost"] is None
+    assert "historical-failed" not in json.dumps(output)
+    assert "raw-capability-token" not in json.dumps(output)
+    assert "snapshot-secret" not in json.dumps(output)
+    assert client.snapshots == [
+        "running-a",
+        "done-a",
+        "failed-a",
+    ]
+    selectors = [item["selector"] for group in output.values() for item in group]
+    assert len(selectors) == len(set(selectors))
+
+    args.since = "2019-01-01T00:00:00Z"
+    assert cli.cmd_overview(args) == 0
+    expanded = json.loads(capsys.readouterr().out)
+    assert {item["execution_id"] for item in expanded["needs_attention"]} == {
+        "failed-a",
+        "historical-failed",
+    }
+    assert client.snapshots[-1] == "historical-failed"
+
+    args.since = None
+    args.json = False
+    assert cli.cmd_overview(args) == 0
+    default_output = capsys.readouterr().out
+    assert "Needs attention\n" in default_output
+    assert "Running\n" in default_output
+    assert "Done since view\n" in default_output
+    assert "Next:" in default_output
+    assert "raw-capability-token" not in default_output
 
 
 def test_spawn_records_automatic_parent(monkeypatch, tmp_path: Path) -> None:
@@ -1103,7 +1462,7 @@ def test_worktree_setup_failure_propagates_without_a_lease(
 
 
 def test_close_archive_releases_only_workspace_lease(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, capsys
 ) -> None:
     repo_a = tmp_path / "repo-a"
     repo_b = tmp_path / "repo-b"
@@ -1111,7 +1470,9 @@ def test_close_archive_releases_only_workspace_lease(
     repo_b.mkdir()
     lease_dir = tmp_path / "leases"
     store = LeaseStore(lease_dir)
-    store.acquire("owner-a", repo_a, ttl_seconds=60, workspace_id="workspace-a")
+    archived_lease = store.acquire(
+        "owner-a", repo_a, ttl_seconds=60, workspace_id="workspace-a"
+    )
     other = store.acquire("owner-b", repo_b, ttl_seconds=60, workspace_id="workspace-b")
     monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
     monkeypatch.setattr(cli, "CdesktopClient", FakeSpawnClient)
@@ -1130,6 +1491,7 @@ def test_close_archive_releases_only_workspace_lease(
     )
 
     assert cli.cmd_close(args) == 0
+    assert archived_lease.token not in capsys.readouterr().out
 
     remaining = LeaseStore(lease_dir).list()
     assert [lease.token for lease in remaining] == [other.token]
@@ -1240,7 +1602,7 @@ def test_workspace_delete_can_preserve_dirty_direct_repo(monkeypatch) -> None:
 
 
 def test_workspace_restore_reactivates_route_and_lease(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, capsys
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -1269,6 +1631,7 @@ def test_workspace_restore_reactivates_route_and_lease(
     assert enabled == ["workspace-a"]
     lease = LeaseStore(lease_dir).list()[0]
     assert lease.workspace_id == "workspace-a"
+    assert lease.token not in capsys.readouterr().out
 
 
 def test_spawn_direct_fails_closed_when_repo_leased(

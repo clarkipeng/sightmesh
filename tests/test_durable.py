@@ -5,7 +5,12 @@ from sightmesh.cdesktop import (
     CdesktopPendingError,
     CdesktopRejectedError,
 )
-from sightmesh.durable import DurableCommand, DurableExecutionReconciler
+from sightmesh.durable import (
+    DurableCommand,
+    DurableExecutionReconciler,
+    supports_durable_recovery,
+)
+from sightmesh.runtime_lock import RUNTIME_LOCK
 
 
 class Queue:
@@ -64,6 +69,39 @@ def command(state="claimed"):
     )
 
 
+def test_durable_recovery_version_boundary() -> None:
+    minimum = RUNTIME_LOCK.cdesktop.compatibility.durable_recovery
+    major, minor, patch = RUNTIME_LOCK.cdesktop.compatibility.durable_recovery_tuple
+    previous = f"{major}.{minor}.{patch - 1}"
+    assert not supports_durable_recovery(f"cdesktop/{previous}")
+    assert supports_durable_recovery(f"cdesktop/{minimum}")
+
+
+def test_025_gate_fails_closed_once_without_recovery_calls(caplog) -> None:
+    class LegacyClient:
+        def __init__(self) -> None:
+            self.info_calls = 0
+
+        def info(self):
+            self.info_calls += 1
+            return {
+                "version": "cdesktop/"
+                + RUNTIME_LOCK.cdesktop.compatibility.minimum
+            }
+
+        def execution_processes(self, _session):
+            raise AssertionError("unsupported recovery API was called")
+
+    client = LegacyClient()
+    reconciler = DurableExecutionReconciler(client, Queue([command()]))
+
+    reconciler.reconcile_sessions([{"id": "session-1"}])
+    reconciler.reconcile_sessions([{"id": "session-1"}])
+
+    assert client.info_calls == 1
+    assert caplog.text.count("Durable recovery is disabled") == 1
+
+
 def test_restart_after_claim_interrupts_and_requeues_same_command():
     client = Client({"id": "process-1", "status": "killed"}, {})
     queue = Queue([command()])
@@ -72,7 +110,7 @@ def test_restart_after_claim_interrupts_and_requeues_same_command():
     reconciler.reconcile_session({"id": "session-1"})
     reconciler.reconcile_session({"id": "session-1"})
 
-    assert queue.interrupted == ["command-1"]
+    assert queue.interrupted == []
     assert queue.requeued == [("command-1", "same-key")]
 
 
@@ -86,8 +124,52 @@ def test_stream_death_requeues_and_offline_gate_backoffs():
     reconciler = DurableExecutionReconciler(client, queue)
 
     reconciler.reconcile_session({"id": "session-1"})
-    assert queue.requeued == [("command-1", "same-key")]
+    assert client.stops == [("process-1", "durable:process-1:stop:1")]
+    assert queue.requeued == []
     assert client.dispatches == []
+
+
+def test_delivery_lifecycle_is_derived_only_from_native_records():
+    pending = command("pending")
+    claimed = command("claimed")
+    done = command("done")
+    cancelled = command("cancelled")
+
+    assert pending.delivery_state(None) == "queued"
+    assert claimed.delivery_state(None) == "claimed"
+    assert claimed.delivery_state({"status": "running"}) == "running"
+    assert claimed.delivery_state({"status": "killed"}) == "observed"
+    assert done.delivery_state(None) == "terminal"
+    assert cancelled.delivery_state(None) == "rejected"
+
+
+def test_restart_terminal_wake_uses_native_dedupe_and_does_not_loop():
+    class NativeDedupeQueue(Queue):
+        def __init__(self, rows):
+            super().__init__(rows)
+            self.keys = set()
+
+        def notify_parent(self, parent, child, message, key):
+            if key not in self.keys:
+                super().notify_parent(parent, child, message, key)
+                self.keys.add(key)
+
+    client = Client({"id": "process-1", "status": "completed"}, {})
+    queue = NativeDedupeQueue([command("done")])
+    session = {"id": "child", "parent_session_id": "parent"}
+
+    DurableExecutionReconciler(client, queue).reconcile_session(session)
+    DurableExecutionReconciler(client, queue).reconcile_session(session)
+    DurableExecutionReconciler(client, queue).reconcile_session({"id": "parent"})
+
+    assert queue.notifications == [
+        (
+            "parent",
+            "child",
+            "CHILD_DELIVERY: child command-1 done",
+            "child-command:command-1:done",
+        )
+    ]
 
 
 def test_suite_child_activity_prevents_recovery():
@@ -145,7 +227,7 @@ def test_native_stale_child_stops_and_active_suite_suppresses():
     assert active.stops == []
 
 
-def test_424_stop_interrupts_without_repeated_stop():
+def test_424_waits_for_native_terminal_observation_before_requeue_and_wake():
     class Interrupted(Client):
         def stop_execution(self, process, *, dedupe_key=None):
             super().stop_execution(process, dedupe_key=dedupe_key)
@@ -162,8 +244,23 @@ def test_424_stop_interrupts_without_repeated_stop():
     )
 
     assert len(client.stops) == 1
+    assert queue.requeued == []
+    assert queue.notifications == []
+
+    client.process["status"] = "killed"
+    child = {"id": "child", "parent_session_id": "parent"}
+    reconciler.reconcile_session(child)
+    reconciler.reconcile_session(child)
+
     assert queue.requeued == [("command-1", "same-key")]
-    assert queue.notifications[0][0] == "parent"
+    assert queue.notifications == [
+        (
+            "parent",
+            "child",
+            "CHILD_TERMINAL: child killed",
+            "child-terminal:child:killed",
+        )
+    ]
 
 
 def test_425_retries_same_key_and_409_rotates_attempt():
