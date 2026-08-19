@@ -78,7 +78,7 @@ def job_refresh() -> str:
 
 def job_verify() -> str:
     pool = core.load_pool()
-    problems = []
+    has_problem = False
     seen: dict[str, str] = {}
     for account in pool.get("accounts", []):
         if account.get("provider") == "codex":
@@ -89,15 +89,15 @@ def job_verify() -> str:
                 account["identity"] = fresh
         key = core.identity_key(account)
         if key and key in seen:
-            problems.append(f"{account['id']} duplicates {seen[key]}")
+            has_problem = True
         elif key:
             seen[key] = account["id"]
         ok, reason = core.probe(account)
         core.quota_cached(account, force=True)
         if not ok and reason != "usage limit":
-            problems.append(f"{account['id']}: {reason}")
+            has_problem = True
     core.save_pool(pool)
-    return "; ".join(problems) if problems else "all accounts distinct and usable"
+    return "verification found problems" if has_problem else "all accounts distinct and usable"
 
 
 def job_add_claude(body: dict[str, Any]) -> str:

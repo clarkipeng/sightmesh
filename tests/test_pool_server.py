@@ -84,3 +84,21 @@ def test_server_errors_do_not_echo_secrets(pool_server: int, monkeypatch) -> Non
     assert status == 400
     assert b"top-secret" not in body
     assert b"operation failed" in body
+
+
+def test_verify_result_does_not_echo_probe_output(monkeypatch) -> None:
+    token = "token=top-secret"
+    monkeypatch.setattr(
+        server.core,
+        "load_pool",
+        lambda: {"accounts": [{"id": "account", "provider": "claude"}]},
+    )
+    monkeypatch.setattr(server.core, "identity_key", lambda _account: None)
+    monkeypatch.setattr(server.core, "probe", lambda _account: (False, token))
+    monkeypatch.setattr(server.core, "quota_cached", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server.core, "save_pool", lambda _pool: None)
+
+    result = server.job_verify()
+
+    assert result == "verification found problems"
+    assert token not in result
