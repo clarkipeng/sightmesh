@@ -38,6 +38,10 @@ The isolated bridge run on 2026-08-12 proved both transports. A blocking `repowi
 
 ## Current constraints
 
+### Execution-routing integration boundary
+
+The Lane C routing selector persists and validates the frozen settings contract, walks subscription-first routes in order, and returns a safe target or a blocked/approval-needed outcome. It does not yet launch an executor, resolve a credential, or turn `approval_needed` into a durable cdesktop approval. Consequently, cdesktop recovery and approval handling for a route swap are planned integration work, not a shipped behavior. See [execution routing](execution-routing.md) for the contract and safe operating guidance.
+
 ### Codex protocol boundary
 
 Upstream cdesktop 0.2.3 uses Codex app-server protocol types from Codex 0.121. An explicit `service_tier = "default"` in current Codex configuration causes that build to reject the thread-start response because its older enum understands only `fast` and `flex`.

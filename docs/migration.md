@@ -84,3 +84,9 @@ Rollback archives only cdesktop workspaces created by that run and releases thei
 Open cdesktop with `sightmesh service open`, select the migrated workspace, and create a Claude Code or Codex session. Before writing, read `.context/sightmesh-migration.json` when present and then read the referenced handoff. Context-only archived workspaces open their archived directory directly.
 
 Because the imported workspace uses the original checkout, do not resume the corresponding Conductor session after cutover. Keep one visible owner and one active tool per checkout.
+
+## Execution-routing upgrade note
+
+After migration, keep launching and supervising work in cdesktop. The execution-routing settings introduced with the subscription hot-swap train are separate, local policy and do not migrate provider credentials or alter existing cdesktop sessions. Configure routes only after the operator-owned account pool is healthy, then use `sightmesh routing validate` and `sightmesh routing explain` to inspect the selector without launching work. The current selector does not yet execute a selected route or recover/approve a route swap in cdesktop; retain the existing cdesktop workflow until that integration lands.
+
+`sightmesh pool serve` remains a loopback recovery/compatibility view for account-pool diagnostics. It is not the primary session UI and should not be used as an alternative to cdesktop for active work.

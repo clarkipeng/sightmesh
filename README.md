@@ -6,7 +6,7 @@ Delegated work remains visible and interruptible in cdesktop. SightMesh does not
 
 The interface is deliberately native-first. `.context` remains a normal workspace-local, Git-ignored directory. cdesktop remains the source of truth for sessions and transcripts, Git remains the source of truth for worktrees and changes, and Repowire remains the cross-workspace contact layer. SightMesh does not build a global context mirror or copy every conversation into another agent-specific format.
 
-See [compatibility](docs/compatibility.md), [operations](docs/operations.md), the [trace-efficiency audit](docs/trace-efficiency.md), and the [source-derived competitive bake-off](docs/competitive-bakeoff.md) for tested versions, limitations, and alternatives.
+See [execution routing](docs/execution-routing.md), [compatibility](docs/compatibility.md), [operations](docs/operations.md), the [trace-efficiency audit](docs/trace-efficiency.md), and the [source-derived competitive bake-off](docs/competitive-bakeoff.md) for tested versions, limitations, and alternatives.
 
 The replacement v0.9 contract is defined in [architecture](docs/architecture.md).
 
@@ -218,6 +218,8 @@ sightmesh failover WORKSPACE_ID \
 Use `--new-worktree` only for a clean committed handoff that needs a separate workspace. The source is preserved unless `--archive-source --confirm-reconciled` is explicit.
 
 Every account in a pool is one the operator owns and logged into through the provider's own interface, and each worker runs on that account's own normal credentials. SightMesh observes quota and selects the next owned account. It does not print, extract, or replay credentials; copy cookies or tokens; share one account's session with another worker; or evade rate limits.
+
+The frozen subscription-first execution-routing settings and their current integration boundary are documented in [execution routing](docs/execution-routing.md). cdesktop remains the primary workspace and session UI. `sightmesh pool serve` is a local, recovery/compatibility view of pool health only; it is not the execution-routing UI or a replacement for cdesktop.
 
 ## Conductor comparison
 
