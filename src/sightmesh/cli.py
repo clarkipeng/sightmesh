@@ -23,6 +23,7 @@ from . import (
     leases,
     routing,
     service,
+    succession,
     updates,
 )
 from .bridge import run_bridge
@@ -484,22 +485,68 @@ def cmd_peek(args: argparse.Namespace) -> int:
     return 0
 
 
+@dataclasses.dataclass(frozen=True)
+class LaunchSelection:
+    executor: str
+    provider_id: str | None
+    model: str | None
+    reasoning: str | None
+    profile: str | None
+    route_id: str | None = None
+    auth_binding_id: str | None = None
+
+
+def _routed_selection(args: argparse.Namespace) -> LaunchSelection:
+    """Resolve executor and model through the routing selector.
+
+    Only the opaque route id and pool binding id leave here; credential
+    resolution stays inside the executor launcher.
+    """
+    settings = execution_routing.ExecutionRoutingStore().load()
+    result = execution_routing.select_route(
+        settings, preferred_model=getattr(args, "model", None)
+    )
+    if result.status == "approval_needed":
+        raise ValueError(
+            "Execution routing reached a metered route that requires approval; "
+            "pass --executor or --profile to launch explicitly"
+        )
+    if result.status != "resolved" or result.target is None:
+        detail = "; ".join(result.trace)
+        raise ValueError(
+            f"Execution routing could not resolve a route ({result.reason}); "
+            f"pass --executor or --profile. Trace: {detail}"
+        )
+    target = result.target
+    reasoning = getattr(args, "reasoning", None)
+    _validate_reasoning(target.executor, reasoning)
+    return LaunchSelection(
+        executor=target.executor,
+        provider_id=getattr(args, "provider", None),
+        model=target.model,
+        reasoning=reasoning,
+        profile=None,
+        route_id=target.route_id,
+        auth_binding_id=target.auth_binding_id,
+    )
+
+
 def _profile_selection(
     args: argparse.Namespace, client: CdesktopClient
-) -> tuple[str, str | None, str | None, str | None, str | None]:
+) -> LaunchSelection:
     profile_name = getattr(args, "profile_name", None)
     if not profile_name:
         executor = getattr(args, "executor", None)
         if not executor:
-            raise ValueError("Provide --executor or --profile")
-        selection = (
+            return _routed_selection(args)
+        selection = LaunchSelection(
             executor,
             getattr(args, "provider", None),
             getattr(args, "model", None),
             getattr(args, "reasoning", None),
             None,
         )
-        _validate_reasoning(selection[0], selection[3])
+        _validate_reasoning(selection.executor, selection.reasoning)
         return selection
 
     profile = ProfileStore().get(profile_name)
@@ -510,14 +557,14 @@ def _profile_selection(
         raise ValueError("--executor cannot override a profile's executor")
     if provider_override and provider_override != profile.provider_id:
         raise ValueError("--provider cannot override a profile's provider")
-    selection = (
+    selection = LaunchSelection(
         profile.executor,
         profile.provider_id,
         getattr(args, "model", None) or profile.model,
         getattr(args, "reasoning", None) or profile.reasoning,
         profile.name,
     )
-    _validate_reasoning(selection[0], selection[3])
+    _validate_reasoning(selection.executor, selection.reasoning)
     return selection
 
 
@@ -652,9 +699,7 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
     lease_store.assert_spawn_allowed(repo_path, use_worktree=args.worktree)
     client = CdesktopClient(args.url)
     leases.sync_active_workspaces(client)
-    executor, provider_id, model, reasoning, profile_name = _profile_selection(
-        args, client
-    )
+    selection = _profile_selection(args, client)
     lease_owner = f"cdesktop-spawn:{args.name}"
     pending_lease: leases.Lease | None = None
     if args.worktree:
@@ -670,14 +715,15 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
             name=args.name,
             repo_path=repo_path,
             target_branch=args.base,
-            executor=executor,
+            executor=selection.executor,
             prompt=prompt,
             use_worktree=args.worktree,
             permission_policy=permission_policy,
-            model=model,
-            reasoning=reasoning,
-            provider_id=provider_id,
+            model=selection.model,
+            reasoning=selection.reasoning,
+            provider_id=selection.provider_id,
             setup_script=setup_script,
+            auth_binding_id=selection.auth_binding_id,
         )
     except Exception:
         if pending_lease:
@@ -712,8 +758,13 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
         routing.enable(workspace_id)
     if lease:
         result["lease"] = lease.to_dict()
-    if profile_name:
-        result["profile"] = profile_name
+    if selection.profile:
+        result["profile"] = selection.profile
+    if selection.route_id:
+        result["routing"] = {
+            "route_id": selection.route_id,
+            "auth_binding_id": selection.auth_binding_id,
+        }
     parent_selector = getattr(args, "parent_session", None) or os.environ.get(
         "CDESKTOP_SESSION_ID"
     )
@@ -739,6 +790,7 @@ def cmd_message(args: argparse.Namespace) -> int:
     message = _read_text(args.message, args.message_file, "message")
     client = CdesktopClient(args.url)
     target = _resolve_session(client, args.session_id)
+    succession.OwnershipStore().assert_deliverable(str(target["session_id"]))
     sender = args.sender_session or os.environ.get("CDESKTOP_SESSION_ID")
     result = client.send(str(target["session_id"]), message, sender)
     _emit(result, args.json)
@@ -770,6 +822,7 @@ def _steer_target(
     caller_session: str | None,
 ) -> dict[str, Any]:
     session_id = str(target["session_id"])
+    succession.OwnershipStore().assert_deliverable(session_id)
     if caller_session == session_id:
         raise ValueError("An agent cannot steer itself")
     workspace_id = str(target["workspace_id"])
@@ -853,6 +906,7 @@ def cmd_prompt_idle(args: argparse.Namespace) -> int:
     client = CdesktopClient(args.url)
     target = _resolve_session(client, args.session_id)
     session_id = str(target["session_id"])
+    succession.OwnershipStore().assert_deliverable(session_id)
     workspace_id = str(target["workspace_id"])
     processes = _session_processes(client, target)
     if any(
@@ -907,7 +961,8 @@ def cmd_failover(args: argparse.Namespace) -> int:
     if not sessions:
         raise ValueError("Source workspace has no session to hand off")
     lead_session_id = sessions[0]["id"]
-    source_session_id = sessions[-1]["id"]
+    source_session_id = str(sessions[-1]["id"])
+    ownership = succession.OwnershipStore()
     if not args.new_worktree:
         prompt = (
             "Take over this visible workspace after a checkpointed capacity or provider "
@@ -918,15 +973,36 @@ def cmd_failover(args: argparse.Namespace) -> int:
             "Checkpoint:\n"
             f"{checkpoint.rstrip()}\n"
         )
-        replacement = client.spawn_teammate(
-            caller_session=lead_session_id,
-            name=args.name or f"successor-{profile.name}",
-            prompt=prompt,
-            executor=profile.executor,
-            permission_policy="BYPASS_PERMISSIONS" if args.unattended else "SUPERVISED",
-            model=profile.model,
-            reasoning=profile.reasoning,
-            provider_id=profile.provider_id,
+        spawned: dict[str, Any] = {}
+
+        def spawn_successor() -> str:
+            replacement = client.spawn_teammate(
+                caller_session=lead_session_id,
+                name=args.name or f"successor-{profile.name}",
+                prompt=prompt,
+                executor=profile.executor,
+                permission_policy=(
+                    "BYPASS_PERMISSIONS" if args.unattended else "SUPERVISED"
+                ),
+                model=profile.model,
+                reasoning=profile.reasoning,
+                provider_id=profile.provider_id,
+            )
+            spawned["replacement"] = replacement
+            successor_id = _primary_session_id(replacement)
+            if not successor_id:
+                raise ValueError("cdesktop did not return a successor session id")
+            return successor_id
+
+        # The source session shares this worktree with its successor, so it is
+        # quarantined before the successor starts: terminal ownership recorded,
+        # pending commands cancelled, later delivery rejected.
+        handoff = succession.transfer_ownership(
+            client,
+            ownership,
+            source_session_id=source_session_id,
+            spawn=spawn_successor,
+            reason=f"failover:{profile.name}",
         )
         _emit(
             {
@@ -935,7 +1011,8 @@ def cmd_failover(args: argparse.Namespace) -> int:
                 "source_session_id": source_session_id,
                 "source_preserved": True,
                 "profile": profile.name,
-                "replacement": replacement,
+                "replacement": spawned.get("replacement"),
+                "handoff": handoff.to_dict(),
             },
             args.json,
         )
@@ -984,13 +1061,30 @@ def cmd_failover(args: argparse.Namespace) -> int:
         no_bridge=args.no_bridge,
         json=args.json,
     )
-    replacement = _spawn_workspace(spawn_args)
+    spawned_workspace: dict[str, Any] = {}
+
+    def spawn_replacement() -> str:
+        replacement = _spawn_workspace(spawn_args)
+        spawned_workspace["replacement"] = replacement
+        successor_id = _primary_session_id(replacement)
+        if not successor_id:
+            raise ValueError("cdesktop did not return a successor session id")
+        return successor_id
+
+    handoff = succession.transfer_ownership(
+        client,
+        ownership,
+        source_session_id=source_session_id,
+        spawn=spawn_replacement,
+        reason=f"failover:{profile.name}",
+    )
     result: dict[str, Any] = {
         "action": "replacement-started",
         "source_workspace_id": args.workspace_id,
         "source_archived": False,
         "profile": profile.name,
-        "replacement": replacement,
+        "replacement": spawned_workspace.get("replacement"),
+        "handoff": handoff.to_dict(),
     }
     if args.archive_source:
         client.stop_workspace(args.workspace_id)
@@ -1021,22 +1115,26 @@ def cmd_teammate_spawn(args: argparse.Namespace) -> int:
         _read_text(args.prompt, args.prompt_file, "prompt")
     )
     client = CdesktopClient(args.url)
-    executor, provider_id, model, reasoning, profile_name = _profile_selection(
-        args, client
-    )
+    selection = _profile_selection(args, client)
     caller_session = _caller_session(args.caller)
     result = client.spawn_teammate(
         caller_session=caller_session,
         name=args.name,
         prompt=prompt,
-        executor=executor,
+        executor=selection.executor,
         permission_policy=args.permission,
-        model=model,
-        reasoning=reasoning,
-        provider_id=provider_id,
+        model=selection.model,
+        reasoning=selection.reasoning,
+        provider_id=selection.provider_id,
+        auth_binding_id=selection.auth_binding_id,
     )
-    if profile_name and isinstance(result, dict):
-        result["profile"] = profile_name
+    if selection.profile and isinstance(result, dict):
+        result["profile"] = selection.profile
+    if selection.route_id and isinstance(result, dict):
+        result["routing"] = {
+            "route_id": selection.route_id,
+            "auth_binding_id": selection.auth_binding_id,
+        }
     child_session = _primary_session_id(result)
     if child_session:
         child = client.session(child_session)

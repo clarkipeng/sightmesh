@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from sightmesh import __version__, approvals, cli
+from sightmesh import __version__, approvals, cli, succession
 from sightmesh.cli import (
     _fleet_sessions,
     _is_sightmesh_cdesktop_version,
@@ -463,6 +463,18 @@ class FakeSpawnClient:
     def providers(self):
         return []
 
+    def session_commands(self, _session_id):
+        return []
+
+    def interrupt_command(self, command_id):
+        self.interrupted_commands = getattr(self, "interrupted_commands", [])
+        self.interrupted_commands.append(command_id)
+
+    def send(self, session_id, prompt, sender=None, *, dedupe_key=None, intent="continue"):
+        self.sent = getattr(self, "sent", [])
+        self.sent.append((session_id, prompt, dedupe_key, intent))
+        return {"queued": True}
+
 
 def test_prompt_idle_sends_only_when_not_running(monkeypatch, capsys) -> None:
     class IdleClient(FakeSpawnClient):
@@ -686,6 +698,18 @@ def test_failover_starts_visible_successor_on_approved_profile(
             type(self).spawned = kwargs
             return {"session": {"id": "session-b"}}
 
+        def session_commands(self, session_id):
+            assert session_id == "session-a"
+            return [
+                {
+                    "id": "command-1",
+                    "session_id": session_id,
+                    "body": "finish the review",
+                    "state": "pending",
+                    "dedupe_key": "logical-1",
+                }
+            ]
+
     monkeypatch.setattr(cli, "CdesktopClient", FailoverClient)
     monkeypatch.setattr(cli, "ProfileStore", lambda: profile_store)
     args = argparse.Namespace(
@@ -709,6 +733,14 @@ def test_failover_starts_visible_successor_on_approved_profile(
     assert FailoverClient.spawned["provider_id"] == "provider-a"
     assert FailoverClient.spawned["permission_policy"] == "BYPASS_PERMISSIONS"
     assert '"action": "visible-successor-started"' in capsys.readouterr().out
+
+    # The superseded source is quarantined: its open command moved to the
+    # successor as the same logical command and later delivery is rejected.
+    ownership = succession.OwnershipStore()
+    record = ownership.get("session-a")
+    assert record is not None and record.successor_session_id == "session-b"
+    with pytest.raises(succession.QuarantinedSessionError):
+        ownership.assert_deliverable("session-a")
 
 
 def test_spawn_direct_acquires_workspace_lease(monkeypatch, tmp_path: Path) -> None:

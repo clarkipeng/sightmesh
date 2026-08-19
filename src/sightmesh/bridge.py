@@ -273,6 +273,11 @@ class BridgeSupervisor:
                     )
                     continue
                 for session in sessions:
+                    # A quarantined (retired/superseded) session never gets a
+                    # peer bridge; injected follow-ups would auto-resume it
+                    # into a worktree its successor now owns.
+                    if self.reconciler.ownership.is_quarantined(session["id"]):
+                        continue
                     desired[session["id"]] = BridgedSession(workspace, session, path)
         except (CdesktopError, leases.LeaseError) as exc:
             LOGGER.warning("Cannot reconcile cdesktop ownership: %s", exc)

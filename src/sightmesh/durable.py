@@ -24,6 +24,7 @@ from .cdesktop import (
     CdesktopRejectedError,
 )
 from .stalls import is_active_suite_work, threshold_from_environment
+from .succession import COMMAND_TERMINAL_STATES, OwnershipStore, resolve_live_successor
 
 LOGGER = logging.getLogger("sightmesh.durable")
 
@@ -160,12 +161,15 @@ class DurableExecutionReconciler:
         *,
         probe: Callable[[], bool] | None = None,
         liveness: SuiteLiveness | None = None,
+        ownership: OwnershipStore | None = None,
     ) -> None:
         self.client = client
         self.queue = queue or NativeCommandQueue(client)
         self.probe = probe or getattr(client, "probe_connectivity", lambda: True)
+        self.ownership = ownership or OwnershipStore()
         self._stopped: set[str] = set()
         self._requeued: set[str] = set()
+        self._cancelled: set[str] = set()
         self.liveness = liveness or SuiteLiveness()
         self._offline_until = 0.0
         self._backoff = 1.0
@@ -183,6 +187,14 @@ class DurableExecutionReconciler:
     def reconcile_session(self, session: dict[str, Any]) -> None:
         session_id = str(session["id"])
         commands = self.queue.commands(session_id)
+        if self.ownership.is_quarantined(session_id):
+            # An explicit retired/superseded ownership transition is the only
+            # quarantine trigger.  Queued delivery must never auto-resume the
+            # session into a shared worktree: cancel, never requeue, never
+            # dispatch.  Ordinary completed or failed turns take the normal
+            # path below and stay resumable.
+            self._cancel_quarantined(commands)
+            return
         processes = self.client.execution_processes(session_id)
         by_process = {str(item.get("id")): item for item in processes}
         command_by_process = {
@@ -248,6 +260,15 @@ class DurableExecutionReconciler:
         self._backoff = min(self._backoff * 2.0, 30.0)
         return False
 
+    def _cancel_quarantined(self, commands: Iterable[DurableCommand]) -> None:
+        for command in commands:
+            if command.state in COMMAND_TERMINAL_STATES:
+                continue
+            if command.id in self._cancelled:
+                continue
+            self.queue.interrupt(command)
+            self._cancelled.add(command.id)
+
     def reconcile_child_terminal(
         self,
         child_session: dict[str, Any],
@@ -257,9 +278,19 @@ class DurableExecutionReconciler:
         parent = child_session.get("parent_session_id")
         if not parent:
             return
+        destination = resolve_live_successor(self.ownership, str(parent))
+        if destination is None:
+            LOGGER.warning(
+                "Dropping child-terminal notification for quarantined parent %s "
+                "with no live successor",
+                parent,
+            )
+            return
+        # The key stays bound to the child and status, not the destination, so
+        # a redirected notification is still one logical command.
         key = f"child-terminal:{child_session['id']}:{status}"
         self.queue.notify_parent(
-            str(parent),
+            destination,
             str(child_session["id"]),
             f"CHILD_TERMINAL: {child_session['id']} {status}",
             key,
