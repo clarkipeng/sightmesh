@@ -10,6 +10,7 @@ from sightmesh.durable import (
     DurableExecutionReconciler,
     supports_durable_recovery,
 )
+from sightmesh.runtime_lock import RUNTIME_LOCK
 
 
 class Queue:
@@ -69,8 +70,11 @@ def command(state="claimed"):
 
 
 def test_durable_recovery_version_boundary() -> None:
-    assert not supports_durable_recovery("cdesktop/0.2.5")
-    assert supports_durable_recovery("cdesktop/0.2.6")
+    minimum = RUNTIME_LOCK.cdesktop.compatibility.durable_recovery
+    major, minor, patch = RUNTIME_LOCK.cdesktop.compatibility.durable_recovery_tuple
+    previous = f"{major}.{minor}.{patch - 1}"
+    assert not supports_durable_recovery(f"cdesktop/{previous}")
+    assert supports_durable_recovery(f"cdesktop/{minimum}")
 
 
 def test_025_gate_fails_closed_once_without_recovery_calls(caplog) -> None:
@@ -80,7 +84,10 @@ def test_025_gate_fails_closed_once_without_recovery_calls(caplog) -> None:
 
         def info(self):
             self.info_calls += 1
-            return {"version": "cdesktop/0.2.5"}
+            return {
+                "version": "cdesktop/"
+                + RUNTIME_LOCK.cdesktop.compatibility.minimum
+            }
 
         def execution_processes(self, _session):
             raise AssertionError("unsupported recovery API was called")

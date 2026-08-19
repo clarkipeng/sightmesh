@@ -24,11 +24,11 @@ from .cdesktop import (
     CdesktopPendingError,
     CdesktopRejectedError,
 )
+from .runtime_lock import RUNTIME_LOCK
 from .stalls import is_active_suite_work, threshold_from_environment
 from .succession import COMMAND_TERMINAL_STATES, OwnershipStore, resolve_live_successor
 
 LOGGER = logging.getLogger("sightmesh.durable")
-DURABLE_RECOVERY_MIN_VERSION = (0, 2, 6)
 
 
 def supports_durable_recovery(version: object) -> bool:
@@ -36,7 +36,8 @@ def supports_durable_recovery(version: object) -> bool:
     match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", str(version or ""))
     return bool(
         match
-        and tuple(int(part) for part in match.groups()) >= DURABLE_RECOVERY_MIN_VERSION
+        and tuple(int(part) for part in match.groups())
+        >= RUNTIME_LOCK.cdesktop.compatibility.durable_recovery_tuple
     )
 
 
@@ -210,9 +211,11 @@ class DurableExecutionReconciler:
         version = info.get("version") if isinstance(info, dict) else None
         self._durable_supported = supports_durable_recovery(version)
         if not self._durable_supported:
+            minimum = RUNTIME_LOCK.cdesktop.compatibility.durable_recovery
             LOGGER.warning(
-                "Durable recovery is disabled: cdesktop 0.2.6 or newer is required "
+                "Durable recovery is disabled: cdesktop %s or newer is required "
                 "(found %s). Normal bridging remains available.",
+                minimum,
                 version or "unknown version",
             )
         return self._durable_supported

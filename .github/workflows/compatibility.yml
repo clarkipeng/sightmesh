@@ -5,6 +5,42 @@ on:
   push:
 
 jobs:
+  pinned-runtime:
+    name: pinned cdesktop artifact
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Verify locked artifact and executable
+        run: ./scripts/check-cdesktop-runtime.sh
+
+  cdesktop-main-edge:
+    name: cdesktop main source/package edge (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Inspect public main package contract
+        run: |
+          repository=$(PYTHONPATH=src python -c 'from sightmesh.runtime_lock import RUNTIME_LOCK; print(RUNTIME_LOCK.cdesktop.repository)')
+          git clone --depth 1 "https://github.com/${repository}.git" ../cdesktop-main
+          PYTHONPATH=src python - <<'PY'
+          import json
+          from pathlib import Path
+          from sightmesh.runtime_lock import RUNTIME_LOCK
+
+          package = json.loads(Path("../cdesktop-main/package.json").read_text())
+          assert package["bin"]["cdesktop"] == "npx-cli/bin/cli.js"
+          version = tuple(int(part) for part in package["version"].split("."))
+          assert version >= RUNTIME_LOCK.cdesktop.compatibility.minimum_tuple
+          PY
+          echo "Advisory only: this checks public source/package shape, not live API compatibility."
+
   test:
     runs-on: macos-latest
     strategy:

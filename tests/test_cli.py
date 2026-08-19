@@ -23,6 +23,7 @@ from sightmesh.cli import (
 )
 from sightmesh.leases import LeaseStore
 from sightmesh.profiles import Profile, ProfileStore
+from sightmesh.runtime_lock import RUNTIME_LOCK
 
 
 def test_read_text_requires_one_source(tmp_path) -> None:
@@ -33,19 +34,66 @@ def test_read_text_requires_one_source(tmp_path) -> None:
 
 
 def test_sightmesh_cdesktop_version_requires_safe_command_lifecycle() -> None:
-    assert _is_sightmesh_cdesktop_version("cdesktop/0.2.5-sightmesh.0")
-    assert _is_sightmesh_cdesktop_version("cdesktop/0.2.5 darwin-arm64")
-    assert not _is_sightmesh_cdesktop_version("cdesktop 0.2.3-sightmesh.1")
-    assert not _is_sightmesh_cdesktop_version("cdesktop/0.2.4 darwin-arm64")
-    assert not _is_sightmesh_cdesktop_version("0.2.3")
+    minimum = RUNTIME_LOCK.cdesktop.compatibility.minimum
+    major, minor, patch = RUNTIME_LOCK.cdesktop.compatibility.minimum_tuple
+    older = f"{major}.{minor}.{patch - 1}"
+    assert _is_sightmesh_cdesktop_version(f"cdesktop/{minimum}-sightmesh.0")
+    assert _is_sightmesh_cdesktop_version(f"cdesktop/{minimum} darwin-arm64")
+    assert not _is_sightmesh_cdesktop_version(f"cdesktop {older}-sightmesh.1")
+    assert not _is_sightmesh_cdesktop_version(f"cdesktop/{older} darwin-arm64")
+    assert not _is_sightmesh_cdesktop_version(older)
     assert not _is_sightmesh_cdesktop_version(None)
 
 
-def test_bootstrap_installs_the_safe_cdesktop_release() -> None:
+def test_bootstrap_derives_and_verifies_the_locked_cdesktop_release() -> None:
     bootstrap = (
         Path(__file__).parents[1] / "scripts" / "bootstrap-local.sh"
     ).read_text(encoding="utf-8")
-    assert "v0.2.5-20260813115508/cdesktop-0.2.5.tgz" in bootstrap
+    assert "from sightmesh.runtime_lock import RUNTIME_LOCK" in bootstrap
+    assert "verify_file_sha256" in bootstrap
+    assert RUNTIME_LOCK.cdesktop.package.url not in bootstrap
+
+
+def test_update_stage_defaults_to_verified_runtime_lock(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        cli.updates,
+        "stage",
+        lambda package, version, *, expected_sha256: calls.append(
+            (package, version, expected_sha256)
+        )
+        or {"status": "staged"},
+    )
+    args = parser().parse_args(["update", "stage"])
+    args.quiet = True
+
+    assert cli.cmd_update(args) == 0
+    runtime = RUNTIME_LOCK.cdesktop
+    assert calls == [(runtime.package.url, runtime.version, runtime.package.sha256)]
+
+
+def test_update_stage_override_requires_verification_or_local_mode(
+    monkeypatch, tmp_path
+) -> None:
+    package = tmp_path / "cdesktop.tgz"
+    package.write_bytes(b"development package")
+    args = parser().parse_args(["update", "stage", "--package", str(package)])
+    args.quiet = True
+    with pytest.raises(ValueError, match="require --sha256"):
+        cli.cmd_update(args)
+
+    calls = []
+    monkeypatch.setattr(
+        cli.updates,
+        "stage",
+        lambda source, version, *, expected_sha256: calls.append(
+            (source, version, expected_sha256)
+        )
+        or {"status": "staged"},
+    )
+    args.local_development = True
+    cli.cmd_update(args)
+    assert calls == [(str(package), RUNTIME_LOCK.cdesktop.version, None)]
 
 
 def test_coordination_contract_is_compact_and_idempotent() -> None:

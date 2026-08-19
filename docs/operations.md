@@ -26,16 +26,16 @@ cdesktop remains the viewing surface. Use its repository-grouped sidebar, conver
 
 ## Staged cdesktop updates
 
-Use a release archive and its independently published SHA-256 digest:
+With no arguments, staging uses the exact released package, version, and SHA-256 in the [runtime lock](../src/sightmesh/runtime-lock.json):
 
 ```sh
-sightmesh update stage --package URL_OR_LOCAL_TGZ --version VERSION --sha256 SHA256
+sightmesh update stage
 sightmesh update status
 sightmesh update prune --dry-run
 sightmesh update cancel
 ```
 
-Remote packages require a digest. Staging downloads and verifies the archive, installs
+An override requires explicit verification: `sightmesh update stage --package URL_OR_LOCAL_TGZ --version VERSION --sha256 SHA256`. An unverified local archive is accepted only with the explicit `--local-development` flag; remote packages always require a digest. Staging downloads and verifies the archive, installs
 it under `~/.local/share/sightmesh/updates`, runs the staged executable's version check,
 checks the platform-specific backend ZIP and every member without executing the raw
 backend, and records pending state atomically under `~/.local/state/sightmesh/update.json`. It

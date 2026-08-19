@@ -34,6 +34,6 @@ test "$("${venv}/bin/sightmesh" --version)" = "$("${venv}/bin/python" -c 'import
 "${venv}/bin/sightmesh" migrate --help >/dev/null
 "${venv}/bin/sightmesh" --json migration-dry-run \
   --conductor-root "${venv}/empty-conductor-root" >/dev/null
-"${venv}/bin/python" -c "import sightmesh, sightmesh.cli, sightmesh.conductor_migrate, sightmesh.leases"
+"${venv}/bin/python" -c "import sightmesh, sightmesh.cli, sightmesh.conductor_migrate, sightmesh.leases; from sightmesh.runtime_lock import RUNTIME_LOCK; assert RUNTIME_LOCK.cdesktop.package.sha256"
 "${PYTHON_BIN}" -m twine check "${DIST_DIR}"/*
 echo "package-smoke: artifacts install and metadata validation passed"

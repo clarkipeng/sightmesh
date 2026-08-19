@@ -45,7 +45,7 @@ Pool state is local under `~/.config/agent-pool` by default. Do not add accounts
 
 ## Full visible fleet
 
-The full setup additionally installs the bootstrap-pinned SightMesh cdesktop fork (`0.2.5`), Repowire (`0.17.0`), local LaunchAgents, and shared Claude/Codex skills. The CLI and tests require cdesktop 0.2.5 or newer; the live behavior record in [Compatibility](docs/compatibility.md) identifies the older fork on which those scenarios were exercised.
+The full setup additionally installs the cdesktop release and checksum recorded in the authoritative [runtime lock](src/sightmesh/runtime-lock.json), Repowire (`0.17.0`), local LaunchAgents, and shared Claude/Codex skills. The live behavior record and feature boundary are documented in [Compatibility](docs/compatibility.md).
 
 ```sh
 ./scripts/bootstrap-local.sh

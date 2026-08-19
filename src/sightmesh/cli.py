@@ -42,9 +42,9 @@ from .profiles import (
 )
 from .repowire import RepowireError
 from .repowire import reply as repowire_reply
+from .runtime_lock import RUNTIME_LOCK
 
 CDESKTOP_FORK_MARKER = "sightmesh"
-CDESKTOP_MIN_VERSION = (0, 2, 5)
 DEFAULT_OVERVIEW_HOURS = 24
 COORDINATION_MARKER = "## Local agent coordination"
 COORDINATION_CONTRACT = """## Local agent coordination
@@ -99,7 +99,7 @@ def _is_sightmesh_cdesktop_version(detail: object) -> bool:
     if not match:
         return False
     version = tuple(int(part) for part in match.groups())
-    return version >= CDESKTOP_MIN_VERSION
+    return version >= RUNTIME_LOCK.cdesktop.compatibility.minimum_tuple
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -1654,10 +1654,20 @@ def cmd_service(args: argparse.Namespace) -> int:
 
 def cmd_update(args: argparse.Namespace) -> int:
     if args.update_action == "stage":
+        pinned = RUNTIME_LOCK.cdesktop
+        package = args.package or pinned.package.url
+        version = args.version or pinned.version
+        sha256 = args.sha256
+        if args.package is None:
+            sha256 = sha256 or pinned.package.sha256
+        elif sha256 is None and not args.local_development:
+            raise ValueError(
+                "Package overrides require --sha256 or explicit --local-development"
+            )
         result = updates.stage(
-            args.package,
-            args.version,
-            expected_sha256=args.sha256,
+            package,
+            version,
+            expected_sha256=sha256,
         )
     elif args.update_action == "activate":
         result = updates.activate_if_idle(
@@ -3284,10 +3294,17 @@ def parser() -> argparse.ArgumentParser:
         "stage",
         help="Verify and install a release without interrupting active workers",
     )
-    update_stage.add_argument("--package", required=True, help="Local tgz or HTTPS URL")
-    update_stage.add_argument("--version", required=True)
+    update_stage.add_argument(
+        "--package", help="Local tgz or HTTPS URL; defaults to the runtime lock"
+    )
+    update_stage.add_argument("--version", help="Defaults to the runtime lock")
     update_stage.add_argument(
         "--sha256", help="Required SHA-256 digest for remote packages"
+    )
+    update_stage.add_argument(
+        "--local-development",
+        action="store_true",
+        help="Explicitly allow an unverified local package override",
     )
     update_stage.set_defaults(func=cmd_update)
     update_activate = update_sub.add_parser(
