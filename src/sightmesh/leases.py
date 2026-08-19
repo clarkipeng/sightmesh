@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import socket
 import time
@@ -11,6 +12,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self
+
+LOGGER = logging.getLogger(__name__)
 
 DEFAULT_TTL_SECONDS = 4 * 60 * 60
 
@@ -452,7 +455,12 @@ def sync_active_workspaces(
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     on_error: Callable[[str], None] | None = None,
 ) -> list[Lease]:
-    """Renew or backfill leases for every valid active cdesktop workspace."""
+    """Renew or backfill leases for every valid active cdesktop workspace.
+
+    A workspace that fails to sync (malformed record, missing repo/container,
+    etc.) is isolated: its error is reported via ``on_error`` (or logged, if
+    no callback was given) and the remaining workspaces still sync normally.
+    """
     store = LeaseStore()
     synced: list[Lease] = []
     for workspace in client.workspaces():
@@ -462,6 +470,7 @@ def sync_active_workspaces(
             synced.append(_sync_active_workspace(store, client, workspace, ttl_seconds))
         except LeaseError as exc:
             if on_error is None:
-                raise
-            on_error(str(exc))
+                LOGGER.warning("Cannot sync cdesktop workspace: %s", exc)
+            else:
+                on_error(str(exc))
     return synced
