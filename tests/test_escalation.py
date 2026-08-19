@@ -181,6 +181,35 @@ def test_repeated_identical_routine_delivery_reuses_one_ack(tmp_path):
     assert len(store.acknowledgments()) == 1
 
 
+def test_order_expectation_is_durable_and_any_recipient_report_satisfies_it(tmp_path):
+    path = tmp_path / "escalations.sqlite3"
+    store = EscalationStore(path)
+    order = store.expect_order(
+        order_id="order-1",
+        sender_session_id="manager-a",
+        recipient_session_id="worker-a",
+        body="Run the focused tests",
+    )
+
+    assert order.body_digest
+    assert EscalationStore(path).orders()[0].satisfied_at is None
+    assert store.satisfy_orders("worker-a") == 1
+    assert EscalationStore(path).orders()[0].satisfied_at is not None
+
+
+def test_order_expectations_redact_obvious_secret_values(tmp_path):
+    store = EscalationStore(tmp_path / "escalations.sqlite3")
+    order = store.expect_order(
+        order_id="order-secret",
+        sender_session_id="manager-a",
+        recipient_session_id="worker-a",
+        body="Use token=super-secret-value for this task",
+    )
+
+    assert "super-secret-value" not in order.body
+    assert "[REDACTED]" in order.body
+
+
 def test_escalate_parks_durably_when_no_cdesktop_parent_exists(tmp_path):
     client = FakeClient()
     store = EscalationStore(tmp_path / "escalations.sqlite3")

@@ -8,6 +8,7 @@ import pytest
 from sightmesh import __version__, approvals, cli, escalation, succession
 from sightmesh.cli import (
     _fleet_sessions,
+    _idle_unmet_orders,
     _is_sightmesh_cdesktop_version,
     _latest_process,
     _normalized_snapshot_with_retry,
@@ -31,6 +32,36 @@ def test_read_text_requires_one_source(tmp_path) -> None:
     prompt.write_text("from file", encoding="utf-8")
     assert _read_text(None, str(prompt), "prompt") == "from file"
     assert _read_text("inline", None, "prompt") == "inline"
+
+
+def test_idle_unmet_orders_are_visible_and_running_recipients_are_not(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(escalation, "escalation_db_path", lambda: tmp_path / "orders.sqlite3")
+    store = escalation.EscalationStore()
+    store.expect_order(
+        order_id="idle-order",
+        sender_session_id="manager",
+        recipient_session_id="idle-worker",
+        body="Report the result",
+    )
+    store.expect_order(
+        order_id="running-order",
+        sender_session_id="manager",
+        recipient_session_id="running-worker",
+        body="Keep working",
+    )
+
+    class Client:
+        def execution_processes(self, session_id):
+            return [{"status": "running"}] if session_id == "running-worker" else []
+
+    rows = [
+        {"session_id": "idle-worker", "selector": "idle"},
+        {"session_id": "running-worker", "selector": "running"},
+    ]
+    visible = _idle_unmet_orders(Client(), rows)
+
+    assert [item["order_id"] for item in visible] == ["idle-order"]
+    assert visible[0]["agent"] == "@idle"
 
 
 def test_sightmesh_cdesktop_version_requires_safe_command_lifecycle() -> None:
@@ -701,7 +732,9 @@ def test_prompt_idle_sends_only_when_not_running(monkeypatch, capsys) -> None:
     assert '"verified_idle": true' in capsys.readouterr().out
 
 
-def test_message_explicitly_queues_a_continue_command(monkeypatch, capsys) -> None:
+def test_message_creates_a_durable_expectation_and_queues_continue(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
     class MessageClient(FakeSpawnClient):
         def workspaces(self):
             return [
@@ -716,10 +749,13 @@ def test_message_explicitly_queues_a_continue_command(monkeypatch, capsys) -> No
         def workspace_summaries(self, archived=False):
             return [{"workspace_id": "workspace-a", "latest_process_status": "running"}]
 
-        def send(self, session_id, prompt, sender_session=None, *, intent="continue"):
+        def send(
+            self, session_id, prompt, sender_session=None, *, dedupe_key=None, intent="continue"
+        ):
             return {"session_id": session_id, "prompt": prompt, "intent": intent}
 
     monkeypatch.setattr(cli, "CdesktopClient", MessageClient)
+    monkeypatch.setattr(escalation, "escalation_db_path", lambda: tmp_path / "orders.sqlite3")
     args = argparse.Namespace(
         session_id="session-a",
         message="finish the review",
@@ -731,6 +767,32 @@ def test_message_explicitly_queues_a_continue_command(monkeypatch, capsys) -> No
 
     assert cli.cmd_message(args) == 0
     assert '"intent": "continue"' in capsys.readouterr().out
+    orders = escalation.EscalationStore(tmp_path / "orders.sqlite3").orders()
+    assert len(orders) == 1
+    assert orders[0].sender_session_id == "manager"
+    assert orders[0].recipient_session_id == "session-a"
+
+
+def test_message_no_expect_ack_creates_no_expectation(monkeypatch, tmp_path: Path) -> None:
+    class MessageClient(FakeSpawnClient):
+        def workspaces(self):
+            return [{"id": "workspace-a", "name": "worker-a", "branch": "x", "archived": False}]
+
+        def workspace_summaries(self, archived=False):
+            return [{"workspace_id": "workspace-a", "latest_process_status": "running"}]
+
+        def send(self, session_id, prompt, sender_session=None, *, dedupe_key=None, intent="continue"):
+            return {"session_id": session_id}
+
+    monkeypatch.setattr(cli, "CdesktopClient", MessageClient)
+    monkeypatch.setattr(escalation, "escalation_db_path", lambda: tmp_path / "orders.sqlite3")
+    args = argparse.Namespace(
+        session_id="session-a", message="finish", message_file=None,
+        sender_session="manager", no_expect_ack=True, url=None, json=True,
+    )
+
+    assert cli.cmd_message(args) == 0
+    assert escalation.EscalationStore(tmp_path / "orders.sqlite3").orders() == []
 
 
 def test_prompt_idle_refuses_running_agent(monkeypatch) -> None:
@@ -1909,8 +1971,15 @@ def test_cmd_parent_delivers_normally_when_parent_is_live(
         workspaces={"parent-workspace": {"id": "parent-workspace", "archived": False}},
     )
     monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
+    escalation.EscalationStore(escalation_db).expect_order(
+        order_id="order-1",
+        sender_session_id="parent-a",
+        recipient_session_id="child-a",
+        body="Report your status",
+    )
 
     assert cli.cmd_parent(_parent_args(message="STATUS: done")) == 0
+    assert escalation.EscalationStore(escalation_db).orders()[0].satisfied_at is not None
 
     assert len(client.sent) == 1
     assert client.sent[0]["session_id"] == "parent-a"
