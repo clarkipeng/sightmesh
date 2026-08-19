@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from sightmesh import __version__, approvals, cli, succession
+from sightmesh import __version__, approvals, cli, escalation, succession
 from sightmesh.cli import (
     _fleet_sessions,
     _is_sightmesh_cdesktop_version,
@@ -845,6 +845,94 @@ def test_spawn_records_automatic_parent(monkeypatch, tmp_path: Path) -> None:
     assert parents == [("session-a", "parent-session")]
 
 
+def _spawn_args(repo: Path, **overrides) -> argparse.Namespace:
+    base = dict(
+        prompt="start",
+        prompt_file=None,
+        repo=str(repo),
+        url=None,
+        name="child",
+        base="main",
+        executor="CODEX",
+        worktree=False,
+        permission="SUPERVISED",
+        unattended=False,
+        model=None,
+        reasoning=None,
+        provider=None,
+        parent_session=None,
+        lease_ttl_seconds=60,
+        no_bridge=False,
+        json=True,
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_spawn_captures_external_launcher_identity_and_it_survives_restart(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    escalation_db = tmp_path / "escalations.sqlite3"
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: tmp_path / "leases")
+    monkeypatch.setattr(cli.routing, "enable", lambda _workspace_id: None)
+    monkeypatch.setattr(cli.leases, "sync_active_workspaces", lambda _client: [])
+    monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
+    monkeypatch.setattr(escalation, "escalation_db_path", lambda: escalation_db)
+    monkeypatch.delenv("CDESKTOP_SESSION_ID", raising=False)
+    monkeypatch.setenv("CONDUCTOR_WORKSPACE_NAME", "my-workspace")
+    monkeypatch.setattr(cli, "CdesktopClient", FakeSpawnClient)
+
+    assert cli.cmd_spawn(_spawn_args(repo)) == 0
+
+    identity = escalation.EscalationStore(escalation_db).get_launcher("session-a")
+    assert identity == escalation.LauncherIdentity(launcher="external", detail="conductor")
+
+    reopened = escalation.EscalationStore(escalation_db).get_launcher("session-a")
+    assert reopened == identity
+
+
+def test_spawn_records_cdesktop_launcher_when_run_inside_a_cdesktop_session(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    escalation_db = tmp_path / "escalations.sqlite3"
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: tmp_path / "leases")
+    monkeypatch.setattr(cli.routing, "enable", lambda _workspace_id: None)
+    monkeypatch.setattr(cli.leases, "sync_active_workspaces", lambda _client: [])
+    monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
+    monkeypatch.setattr(escalation, "escalation_db_path", lambda: escalation_db)
+    monkeypatch.setenv("CDESKTOP_SESSION_ID", "some-cdesktop-session")
+
+    class CdesktopLaunchedClient(FakeSpawnClient):
+        def workspaces(self):
+            return [{"id": "parent-workspace", "name": "parent", "archived": False}]
+
+        def workspace_summaries(self, _archived=False):
+            return []
+
+        def sessions(self, workspace_id):
+            return [
+                {
+                    "id": "some-cdesktop-session",
+                    "name": "lead",
+                    "created_at": "2026-08-13T00:00:00Z",
+                }
+            ]
+
+        def set_parent(self, session_id, parent_session_id):
+            return {"id": session_id, "parent_session_id": parent_session_id}
+
+    monkeypatch.setattr(cli, "CdesktopClient", CdesktopLaunchedClient)
+
+    assert cli.cmd_spawn(_spawn_args(repo)) == 0
+
+    identity = escalation.EscalationStore(escalation_db).get_launcher("session-a")
+    assert identity == escalation.LauncherIdentity(launcher="cdesktop", detail=None)
+
+
 def test_spawn_worktree_acquires_container_lease(monkeypatch, tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     container = tmp_path / "container"
@@ -1353,3 +1441,114 @@ def test_unattended_worktree_selects_bypass(monkeypatch, tmp_path: Path) -> None
     )
     assert cli.cmd_spawn(args) == 0
     assert instances[0].last_spawn["permission_policy"] == "BYPASS_PERMISSIONS"
+
+
+class ParentTestClient:
+    def __init__(self, *, sessions, workspaces):
+        self.sessions_by_id = sessions
+        self.workspaces_by_id = workspaces
+        self.sent = []
+
+    def session(self, session_id):
+        return self.sessions_by_id[session_id]
+
+    def workspace(self, workspace_id):
+        return self.workspaces_by_id[workspace_id]
+
+    def send(self, session_id, prompt, sender_session=None, *, dedupe_key=None, intent="continue"):
+        self.sent.append({"session_id": session_id, "prompt": prompt})
+        return {"ok": True}
+
+
+def _parent_args(**overrides) -> argparse.Namespace:
+    base = dict(session="child-a", url=None, message=None, message_file=None, json=True)
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_cmd_parent_raises_without_recorded_parent_and_no_message(monkeypatch) -> None:
+    client = ParentTestClient(
+        sessions={"child-a": {"id": "child-a", "workspace_id": "child-workspace"}},
+        workspaces={},
+    )
+    monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
+
+    with pytest.raises(ValueError, match="No recorded parent"):
+        cli.cmd_parent(_parent_args())
+
+
+def test_cmd_parent_parks_escalation_durably_when_no_parent_exists(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    escalation_db = tmp_path / "escalations.sqlite3"
+    monkeypatch.setattr(escalation, "escalation_db_path", lambda: escalation_db)
+    client = ParentTestClient(
+        sessions={"child-a": {"id": "child-a", "workspace_id": "child-workspace"}},
+        workspaces={},
+    )
+    monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
+
+    assert cli.cmd_parent(_parent_args(message="STATUS: blocked, no parent")) == 0
+
+    assert client.sent == []
+    out = capsys.readouterr().out
+    assert '"delivered": false' in out
+    assert '"reason": "no_parent"' in out
+    pending = escalation.EscalationStore(escalation_db).pending()
+    assert len(pending) == 1
+    assert pending[0].child_session_id == "child-a"
+    assert pending[0].reason == "no_parent"
+
+
+def test_cmd_parent_never_delivers_into_an_archived_parent_session(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    escalation_db = tmp_path / "escalations.sqlite3"
+    monkeypatch.setattr(escalation, "escalation_db_path", lambda: escalation_db)
+    client = ParentTestClient(
+        sessions={
+            "child-a": {
+                "id": "child-a",
+                "workspace_id": "child-workspace",
+                "parent_session_id": "parent-a",
+            },
+            "parent-a": {"id": "parent-a", "workspace_id": "parent-workspace"},
+        },
+        workspaces={"parent-workspace": {"id": "parent-workspace", "archived": True}},
+    )
+    monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
+
+    assert cli.cmd_parent(_parent_args(message="STATUS: parent retired mid-flight")) == 0
+
+    assert client.sent == [], "must never deliver into an archived/retired session"
+    out = capsys.readouterr().out
+    assert '"reason": "parent_archived"' in out
+    pending = escalation.EscalationStore(escalation_db).pending()
+    assert len(pending) == 1
+    assert pending[0].reason == "parent_archived"
+    assert pending[0].recorded_parent_session_id == "parent-a"
+
+
+def test_cmd_parent_delivers_normally_when_parent_is_live(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    escalation_db = tmp_path / "escalations.sqlite3"
+    monkeypatch.setattr(escalation, "escalation_db_path", lambda: escalation_db)
+    client = ParentTestClient(
+        sessions={
+            "child-a": {
+                "id": "child-a",
+                "workspace_id": "child-workspace",
+                "parent_session_id": "parent-a",
+            },
+            "parent-a": {"id": "parent-a", "workspace_id": "parent-workspace"},
+        },
+        workspaces={"parent-workspace": {"id": "parent-workspace", "archived": False}},
+    )
+    monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
+
+    assert cli.cmd_parent(_parent_args(message="STATUS: done")) == 0
+
+    assert len(client.sent) == 1
+    assert client.sent[0]["session_id"] == "parent-a"
+    assert escalation.EscalationStore(escalation_db).pending() == []
