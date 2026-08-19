@@ -136,6 +136,27 @@ def test_cooling_missing_disabled_and_zero_quota_accounts_are_skipped_in_stable_
     assert "zero-quota: zero quota" in joined
 
 
+def test_hidden_account_aliases_are_absent_from_selection_traces(
+    pool_root: Path, monkeypatch
+) -> None:
+    pool_core.save_pool(
+        {"accounts": [_codex_account("private-account-alias")]}
+    )
+    monkeypatch.setattr(pool_core, "quota", _no_quota)
+
+    result = select_route(
+        ExecutionRoutingSettings(
+            routes=(_subscription_route("codex-subs", "CODEX", "luna", "codex"),),
+            expose_account_alias=False,
+        )
+    )
+
+    assert result.target is not None
+    assert result.target.auth_binding_id == "private-account-alias"
+    assert result.target.account_alias is None
+    assert "private-account-alias" not in "\n".join(result.trace)
+
+
 def test_new_auth_entry_is_discovered_without_any_code_change(
     pool_root: Path, monkeypatch
 ) -> None:
@@ -278,6 +299,37 @@ def test_ask_produces_a_request_for_approval_outcome_rather_than_a_resolved_targ
     assert result.reason == "approval_needed"
     assert result.target is not None
     assert result.target.route_id == "codex-metered-api"
+
+
+def test_selection_never_reads_launch_material_even_for_metered_ask(
+    pool_root: Path, monkeypatch
+) -> None:
+    pool_core.save_pool(
+        {
+            "accounts": [
+                _codex_account("codex-sub1", codex_home=""),
+                _codex_account("codex-api", kind="apikey"),
+            ]
+        }
+    )
+    pool_core.write_token("codex-api", "sk-secret")
+    monkeypatch.setattr(pool_core, "quota", lambda _account: {"known": False})
+    monkeypatch.setattr(
+        pool_core,
+        "env_for",
+        lambda _account: pytest.fail("selection must not resolve launch material"),
+    )
+    monkeypatch.setattr(
+        pool_core,
+        "read_token",
+        lambda _account_id: pytest.fail("selection must not read launch material"),
+    )
+
+    result = select_route(_exhausted_subscription_and_metered_settings("ask"))
+
+    assert result.status == "approval_needed"
+    assert result.target is not None
+    assert result.target.auth_binding_id == "codex-api"
 
 
 def test_never_returns_blocked_without_touching_any_metered_account(
@@ -456,6 +508,43 @@ def test_cli_routing_set_metered_persists_and_rejects_an_invalid_value(
 
     with pytest.raises(SystemExit):
         cli.parser().parse_args(["--json", "routing", "set-metered", "sometimes"])
+
+
+def test_cli_routing_validate_reports_routes_without_an_eligible_account(
+    pool_root: Path, routing_settings_path: Path, monkeypatch, capsys
+) -> None:
+    pool_core.save_pool(
+        {
+            "accounts": [
+                _codex_account("disabled", disabled=True),
+                _codex_account("cooling"),
+                _codex_account("missing-credential", codex_home=""),
+                _codex_account("zero-quota"),
+                _codex_account("api-key-only", kind="apikey"),
+            ]
+        }
+    )
+    pool_core.set_cooldown("cooling", 3600)
+    monkeypatch.setattr(
+        pool_core,
+        "quota",
+        lambda account: {"known": True, "remaining": 0}
+        if account["id"] == "zero-quota"
+        else {"known": False},
+    )
+    ExecutionRoutingStore(routing_settings_path).save(
+        ExecutionRoutingSettings(
+            routes=(_subscription_route("codex-subs", "CODEX", "luna", "codex"),)
+        )
+    )
+
+    args = cli.parser().parse_args(["--json", "routing", "validate"])
+
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "valid": False,
+        "warnings": ["route codex-subs: no eligible account"],
+    }
 
 
 def test_cli_routing_routes_add_list_and_explain(
