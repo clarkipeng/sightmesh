@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from collections.abc import Callable, Iterable
@@ -24,11 +25,13 @@ from .cdesktop import (
     CdesktopPendingError,
     CdesktopRejectedError,
 )
+from .escalation import EscalationStore, OrderExpectation
 from .runtime_lock import RUNTIME_LOCK
 from .stalls import is_active_suite_work, threshold_from_environment
 from .succession import COMMAND_TERMINAL_STATES, OwnershipStore, resolve_live_successor
 
 LOGGER = logging.getLogger("sightmesh.durable")
+DEFAULT_ORDER_ACK_SECONDS = 5 * 60
 
 
 def supports_durable_recovery(version: object) -> bool:
@@ -201,11 +204,21 @@ class DurableExecutionReconciler:
         probe: Callable[[], bool] | None = None,
         liveness: SuiteLiveness | None = None,
         ownership: OwnershipStore | None = None,
+        escalation_store: EscalationStore | None = None,
+        order_ack_seconds: float | None = None,
     ) -> None:
         self.client = client
         self.queue = queue or NativeCommandQueue(client)
         self.probe = probe or getattr(client, "probe_connectivity", lambda: True)
         self.ownership = ownership or OwnershipStore()
+        self.escalation_store = escalation_store or EscalationStore()
+        self.order_ack_seconds = (
+            order_ack_seconds
+            if order_ack_seconds is not None
+            else float(
+                os.environ.get("SIGHTMESH_ORDER_ACK_SECONDS", DEFAULT_ORDER_ACK_SECONDS)
+            )
+        )
         self._stopped: set[str] = set()
         self._requeued: set[str] = set()
         self._cancelled: set[str] = set()
@@ -257,6 +270,7 @@ class DurableExecutionReconciler:
             # dispatch.  Ordinary completed or failed turns take the normal
             # path below and stay resumable.
             self._cancel_quarantined(commands)
+            self._park_quarantined_orders(session)
             return
         processes = self.client.execution_processes(session_id)
         by_process = {str(item.get("id")): item for item in processes}
@@ -310,10 +324,56 @@ class DurableExecutionReconciler:
                 if process.get("status") != "running":
                     self.reconcile_child_terminal(session, status="interrupted")
 
+        if not any(
+            process.get("status") == "running" and process.get("run_reason") != "devserver"
+            for process in processes
+        ):
+            self._reconcile_order_expectations(session)
+
         # The native dispatcher remains the only claimant.  The gate prevents
         # a reconnect storm when cdesktop is reachable but the model is not.
         if hasattr(self.client, "dispatch_queued") and self._online():
             self.client.dispatch_queued(session_id)
+
+    def _reconcile_order_expectations(self, session: dict[str, Any]) -> None:
+        """One idle miss earns one continue nudge; the next is a sender decision."""
+        recipient = str(session["id"])
+        for expectation in self.escalation_store.due_orders(
+            recipient, older_than=self.order_ack_seconds
+        ):
+            if expectation.renudged_at is None:
+                claimed = self.escalation_store.claim_renudge(expectation.order_id)
+                if claimed is not None:
+                    self.queue.notify_parent(
+                        recipient,
+                        claimed.sender_session_id or "",
+                        f"ORDER REMINDER ({claimed.order_id}):\n\n{claimed.body}",
+                        f"order-renudge:{claimed.order_id}",
+                    )
+            else:
+                claimed = self.escalation_store.claim_escalation(expectation.order_id)
+                if claimed is not None:
+                    self._park_unacted_order(claimed, reason="parent_unreachable")
+
+    def _park_quarantined_orders(self, session: dict[str, Any]) -> None:
+        recipient = str(session["id"])
+        for expectation in self.escalation_store.due_orders(recipient, older_than=0):
+            claimed = self.escalation_store.claim_retired_order(expectation.order_id)
+            if claimed is not None:
+                self._park_unacted_order(claimed, reason="parent_unreachable")
+
+    def _park_unacted_order(self, expectation: OrderExpectation, *, reason: str) -> None:
+        self.escalation_store.park(
+            child_session_id=expectation.recipient_session_id,
+            child_workspace_id=None,
+            recorded_parent_session_id=expectation.sender_session_id,
+            reason=reason,
+            message=(
+                f"ORDER UNACKNOWLEDGED ({expectation.order_id}) by "
+                f"{expectation.recipient_session_id}:\n\n{expectation.body}"
+            ),
+            dedupe_key=f"order-escalation:{expectation.order_id}",
+        )
 
     def _online(self) -> bool:
         now = time.monotonic()

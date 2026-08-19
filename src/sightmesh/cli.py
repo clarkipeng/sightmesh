@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -831,7 +832,15 @@ def cmd_message(args: argparse.Namespace) -> int:
     target = _resolve_session(client, args.session_id)
     succession.OwnershipStore().assert_deliverable(str(target["session_id"]))
     sender = args.sender_session or os.environ.get("CDESKTOP_SESSION_ID")
-    result = client.send(str(target["session_id"]), message, sender)
+    order_id = f"order:{uuid.uuid4()}"
+    if not getattr(args, "no_expect_ack", False):
+        escalation.EscalationStore().expect_order(
+            order_id=order_id,
+            sender_session_id=sender,
+            recipient_session_id=str(target["session_id"]),
+            body=message,
+        )
+    result = client.send(str(target["session_id"]), message, sender, dedupe_key=order_id)
     _emit(result, args.json)
     return 0
 
@@ -920,10 +929,24 @@ def cmd_parent(args: argparse.Namespace) -> int:
             ),
             message=message,
         )
+        escalation.EscalationStore().satisfy_orders(child_session)
     else:
         target = _resolve_session(client, str(parent_session_id))
         result["parent"]["parent_workspace_id"] = target["workspace_id"]
     _emit(result, args.json)
+    return 0
+
+
+def cmd_ack(args: argparse.Namespace) -> int:
+    recipient = args.session or os.environ.get("CDESKTOP_SESSION_ID")
+    if not recipient:
+        raise ValueError("Provide --session or run inside a cdesktop session")
+    satisfied = escalation.EscalationStore().satisfy_orders(
+        recipient, order_id=args.order_id
+    )
+    if not satisfied:
+        raise ValueError(f"No outstanding order expectation: {args.order_id}")
+    _emit({"order_id": args.order_id, "satisfied": satisfied}, args.json)
     return 0
 
 
@@ -1509,6 +1532,9 @@ def cmd_respond(args: argparse.Namespace) -> int:
                     "error": str(exc),
                 }
             )
+    reporter = args.reviewer_session or os.environ.get("CDESKTOP_SESSION_ID")
+    if reporter and failures == 0:
+        escalation.EscalationStore().satisfy_orders(reporter)
     _emit({"results": results, "failed": failures}, args.json)
     return int(failures > 0)
 
@@ -1876,6 +1902,9 @@ def cmd_bridge_reply(args: argparse.Namespace) -> int:
         question=args.question,
         base_url=args.repowire_http_url,
     )
+    reporter = os.environ.get("CDESKTOP_SESSION_ID")
+    if reporter:
+        escalation.EscalationStore().satisfy_orders(reporter)
     _emit(result or {"ok": True}, args.json)
     return 0
 
@@ -2901,7 +2930,15 @@ def parser() -> argparse.ArgumentParser:
     message_group.add_argument("--message")
     message_group.add_argument("--message-file")
     message.add_argument("--sender-session")
+    message.add_argument(
+        "--no-expect-ack", action="store_true", help="Do not require an outbound acknowledgment"
+    )
     message.set_defaults(func=cmd_message)
+
+    ack = sub.add_parser("ack", help="Explicitly acknowledge one ordered follow-up")
+    ack.add_argument("order_id")
+    ack.add_argument("--session", help="Recipient session; defaults to CDESKTOP_SESSION_ID")
+    ack.set_defaults(func=cmd_ack)
 
     steer = sub.add_parser(
         "steer",

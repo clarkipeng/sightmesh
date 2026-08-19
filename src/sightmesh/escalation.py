@@ -138,6 +138,29 @@ class ParkedEscalation:
         }
 
 
+@dataclass(frozen=True)
+class OrderExpectation:
+    order_id: str
+    sender_session_id: str | None
+    recipient_session_id: str
+    body: str
+    body_digest: str
+    created_at: float
+    renudged_at: float | None
+    satisfied_at: float | None
+    escalated_at: float | None
+
+
+def _safe_order_body(message: str) -> str:
+    """Keep operational records useful without retaining obvious credentials."""
+    return re.sub(
+        r"(?im)\b(token|secret|password|authorization|cookie|credential|api[_-]?key)"
+        r"\s*([:=])\s*[^\s]+",
+        r"\1\2 [REDACTED]",
+        message,
+    )
+
+
 class EscalationStore:
     """Durable, restart-proof home for launcher identity and parked escalations."""
 
@@ -216,6 +239,25 @@ class EscalationStore:
                         delivered_at REAL NOT NULL
                     )
                     """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS order_expectations (
+                        order_id TEXT PRIMARY KEY,
+                        sender_session_id TEXT,
+                        recipient_session_id TEXT NOT NULL,
+                        body TEXT NOT NULL,
+                        body_digest TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        renudged_at REAL,
+                        satisfied_at REAL,
+                        escalated_at REAL
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_order_expectations_recipient "
+                    "ON order_expectations(recipient_session_id, satisfied_at, created_at)"
                 )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_escalations_status "
@@ -408,6 +450,116 @@ class EscalationStore:
             raise EscalationStoreError(f"Cannot read acknowledgments: {exc}") from exc
         return [_ack_from_row(row) for row in rows]
 
+    def expect_order(
+        self,
+        *,
+        order_id: str | None,
+        sender_session_id: str | None,
+        recipient_session_id: str,
+        body: str,
+    ) -> OrderExpectation:
+        """Record the one durable promise made by an ordered follow-up."""
+        safe_body = _safe_order_body(body)
+        key = order_id or f"order:{uuid.uuid4()}"
+        now = time.time()
+        digest = hashlib.sha256(safe_body.encode("utf-8")).hexdigest()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO order_expectations (
+                        order_id, sender_session_id, recipient_session_id, body,
+                        body_digest, created_at, renudged_at, satisfied_at, escalated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                    """,
+                    (key, sender_session_id, recipient_session_id, safe_body, digest, now),
+                )
+                row = conn.execute(
+                    "SELECT * FROM order_expectations WHERE order_id = ?", (key,)
+                ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise EscalationStoreError(f"Cannot record order expectation: {exc}") from exc
+        if row is None:
+            raise EscalationStoreError(f"Order expectation is missing after record: {key}")
+        return _order_from_row(row)
+
+    def satisfy_orders(self, recipient_session_id: str, *, order_id: str | None = None) -> int:
+        """Any later outbound report closes the recipient's outstanding orders."""
+        now = time.time()
+        where = "recipient_session_id = ? AND satisfied_at IS NULL"
+        values: list[object] = [now, recipient_session_id]
+        if order_id is not None:
+            where += " AND order_id = ?"
+            values.append(order_id)
+        try:
+            with self._connect() as conn:
+                return conn.execute(
+                    f"UPDATE order_expectations SET satisfied_at = ? WHERE {where}", values
+                ).rowcount
+        except sqlite3.DatabaseError as exc:
+            raise EscalationStoreError(f"Cannot satisfy order expectation: {exc}") from exc
+
+    def due_orders(self, recipient_session_id: str, *, older_than: float, now: float | None = None) -> list[OrderExpectation]:
+        current = time.time() if now is None else now
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM order_expectations
+                    WHERE recipient_session_id = ? AND satisfied_at IS NULL
+                      AND created_at <= ?
+                    ORDER BY created_at ASC
+                    """,
+                    (recipient_session_id, current - older_than),
+                ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise EscalationStoreError(f"Cannot read order expectations: {exc}") from exc
+        return [_order_from_row(row) for row in rows]
+
+    def claim_renudge(self, order_id: str, *, now: float | None = None) -> OrderExpectation | None:
+        current = time.time() if now is None else now
+        return self._claim_order(order_id, "renudged_at", current, "renudged_at IS NULL")
+
+    def claim_escalation(self, order_id: str, *, now: float | None = None) -> OrderExpectation | None:
+        current = time.time() if now is None else now
+        return self._claim_order(
+            order_id, "escalated_at", current, "renudged_at IS NOT NULL AND escalated_at IS NULL"
+        )
+
+    def claim_retired_order(self, order_id: str, *, now: float | None = None) -> OrderExpectation | None:
+        current = time.time() if now is None else now
+        return self._claim_order(order_id, "escalated_at", current, "escalated_at IS NULL")
+
+    def _claim_order(self, order_id: str, column: str, value: float, condition: str) -> OrderExpectation | None:
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    f"UPDATE order_expectations SET {column} = ? WHERE order_id = ? "
+                    f"AND satisfied_at IS NULL AND {condition}",
+                    (value, order_id),
+                )
+                if cursor.rowcount != 1:
+                    return None
+                row = conn.execute(
+                    "SELECT * FROM order_expectations WHERE order_id = ?", (order_id,)
+                ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise EscalationStoreError(f"Cannot claim order expectation: {exc}") from exc
+        return _order_from_row(row) if row is not None else None
+
+    def orders(self, *, recipient_session_id: str | None = None) -> list[OrderExpectation]:
+        query = "SELECT * FROM order_expectations"
+        values: tuple[str, ...] = ()
+        if recipient_session_id:
+            query += " WHERE recipient_session_id = ?"
+            values = (recipient_session_id,)
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(query + " ORDER BY created_at ASC", values).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise EscalationStoreError(f"Cannot read order expectations: {exc}") from exc
+        return [_order_from_row(row) for row in rows]
+
     def pending(self, *, limit: int = 100) -> list[ParkedEscalation]:
         if limit < 1 or limit > 1000:
             raise ValueError("Escalation pending limit must be between 1 and 1000")
@@ -452,6 +604,20 @@ def _from_row(row: sqlite3.Row) -> ParkedEscalation:
         status=row["status"],
         created_at=row["created_at"],
         resolved_at=row["resolved_at"],
+    )
+
+
+def _order_from_row(row: sqlite3.Row) -> OrderExpectation:
+    return OrderExpectation(
+        order_id=row["order_id"],
+        sender_session_id=row["sender_session_id"],
+        recipient_session_id=row["recipient_session_id"],
+        body=row["body"],
+        body_digest=row["body_digest"],
+        created_at=row["created_at"],
+        renudged_at=row["renudged_at"],
+        satisfied_at=row["satisfied_at"],
+        escalated_at=row["escalated_at"],
     )
 
 
