@@ -1756,8 +1756,9 @@ def cmd_routing(args: argparse.Namespace) -> int:
 
     if action == "validate":
         settings = store.load()
+        warnings = execution_routing.route_warnings(settings)
         _emit(
-            {"valid": True, "warnings": execution_routing.route_warnings(settings)},
+            {"valid": not warnings, "warnings": warnings},
             args.json,
         )
         return 0

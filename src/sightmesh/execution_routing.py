@@ -271,16 +271,14 @@ class ExecutionRoutingStore:
 def route_warnings(settings: ExecutionRoutingSettings) -> list[str]:
     """Routes that cannot currently resolve to any pool account. Advisory only."""
     pool = pool_core.load_pool()
+    state = pool_core.load_state()
     warnings: list[str] = []
     for route in settings.routes:
-        if route.billing_class == "subscription":
-            if not pool_core.accounts_for(pool, route.account_pool):
-                warnings.append(
-                    f"route {route.id}: no accounts configured for pool "
-                    f"'{route.account_pool}'"
-                )
-        elif not pool_core.find(pool, route.account):
-            warnings.append(f"route {route.id}: account '{route.account}' not in pool")
+        if not any(
+            _account_eligibility(account, state, frozenset())[0]
+            for account in _route_candidates(route, pool)
+        ):
+            warnings.append(f"route {route.id}: no eligible account")
     return warnings
 
 
@@ -326,7 +324,7 @@ def _account_eligibility(
         return False, "excluded: prior failed binding"
     if account.get("disabled"):
         return False, "account disabled"
-    if not pool_core.env_for(account):
+    if not _has_launch_credential(account):
         return False, "no credential stored"
     until = pool_core.cooling_until(state, aid)
     if until:
@@ -335,6 +333,30 @@ def _account_eligibility(
     if usage.get("known") and usage.get("remaining") == 0:
         return False, "zero quota"
     return True, "eligible"
+
+
+def _has_launch_credential(account: dict[str, Any]) -> bool:
+    """Check launch-material presence without reading secret-bearing material."""
+    if account.get("provider") == "codex":
+        return bool(account.get("codex_home"))
+    return pool_core.token_path(account.get("id", "")).exists()
+
+
+def _route_candidates(route: Route, pool: dict[str, Any]) -> list[dict[str, Any]]:
+    if route.billing_class == "subscription":
+        # A provider pool may contain API-key entries; they are never valid for
+        # a subscription route even when they share its provider.
+        return [
+            account
+            for account in pool_core.accounts_for(pool, route.account_pool)
+            if account.get("kind") != "apikey"
+        ]
+    found = pool_core.find(pool, route.account)
+    return [found] if found else []
+
+
+def _trace_account(account: dict[str, Any], settings: ExecutionRoutingSettings) -> str:
+    return account.get("id", "account") if settings.expose_account_alias else "account"
 
 
 def _target(
@@ -390,31 +412,21 @@ def select_route(
             )
             continue
 
-        if route.billing_class == "subscription":
-            # A provider's account list mixes subscription and metered-kind
-            # entries; a subscription route must never surface an apikey
-            # account just because it shares the same accountPool.
-            candidates = [
-                account
-                for account in pool_core.accounts_for(pool, route.account_pool)
-                if account.get("kind") != "apikey"
-            ]
-        else:
-            found = pool_core.find(pool, route.account)
-            candidates = [found] if found else []
-            if not found:
-                trace.append(
-                    f"route {route.id}: account '{route.account}' not in pool"
-                )
+        candidates = _route_candidates(route, pool)
+        if route.billing_class == "metered" and not candidates:
+            account = route.account if settings.expose_account_alias else "account"
+            trace.append(f"route {route.id}: {account} not in pool")
 
         eligible_account: dict[str, Any] | None = None
         for account in candidates:
             ok, note = _account_eligibility(account, state, exclude_account_ids)
             if not ok:
-                trace.append(f"route {route.id}: skip {account.get('id')}: {note}")
+                trace.append(
+                    f"route {route.id}: skip {_trace_account(account, settings)}: {note}"
+                )
                 continue
             eligible_account = account
-            trace.append(f"route {route.id}: {account.get('id')} eligible")
+            trace.append(f"route {route.id}: {_trace_account(account, settings)} eligible")
             break
 
         if eligible_account is None:
@@ -432,7 +444,7 @@ def select_route(
             )
 
         target = _target(route, eligible_account, settings)
-        trace.append(f"selected route {route.id} account {eligible_account['id']}")
+        trace.append(f"selected route {route.id}")
         return SelectionResult("resolved", target, tuple(trace), None)
 
     trace.append("all configured routes exhausted")
