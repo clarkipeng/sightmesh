@@ -9,12 +9,18 @@ non-archived parent session, or durably parked in a decision inbox so it is
 never silently dropped. Parked escalations are never auto-delivered into a
 session that has since been archived -- that delivery path stays closed
 forever for that record; an operator resolves it explicitly instead.
+
+Delivered escalations carry classified intent: routine STATUS/completion
+callbacks queue with ``intent=continue`` and a durable acknowledgment record,
+preserving the recipient's active turn. Only explicit BLOCKED/DECISION
+escalations replace it.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -29,6 +35,9 @@ CDESKTOP_SESSION_ENV = "CDESKTOP_SESSION_ID"
 CONDUCTOR_ENV_HINTS = ("CONDUCTOR_WORKSPACE_NAME", "CONDUCTOR_ROOT_PATH")
 
 PARK_REASONS = frozenset({"no_parent", "parent_archived", "parent_unreachable"})
+INTERRUPT_TAGS = frozenset({"BLOCKED", "DECISION"})
+ESCALATION_KINDS = frozenset({"routine", "interrupt"})
+DELIVERY_INTENTS = frozenset({"continue", "replace"})
 
 
 class EscalationStoreError(RuntimeError):
@@ -58,6 +67,47 @@ def detect_launcher(env: dict[str, str] | None = None) -> LauncherIdentity:
     if any(source.get(name) for name in CONDUCTOR_ENV_HINTS):
         return LauncherIdentity(launcher="external", detail="conductor")
     return LauncherIdentity(launcher="external", detail="unknown")
+
+
+@dataclass(frozen=True)
+class EscalationClass:
+    kind: str  # "routine" | "interrupt"
+    intent: str  # "continue" | "replace"
+
+
+def classify_escalation(message: str) -> EscalationClass:
+    """Routine STATUS/completion callbacks must preserve the recipient's
+    active turn; only messages that open with an explicit BLOCKED or
+    DECISION tag may interrupt and replace it."""
+    match = re.match(r"\s*([A-Za-z]+)", message)
+    tag = match.group(1).upper() if match else ""
+    if tag in INTERRUPT_TAGS:
+        return EscalationClass(kind="interrupt", intent="replace")
+    return EscalationClass(kind="routine", intent="continue")
+
+
+@dataclass(frozen=True)
+class DeliveryAck:
+    ack_id: str
+    dedupe_key: str
+    child_session_id: str
+    parent_session_id: str
+    kind: str
+    intent: str
+    message: str
+    delivered_at: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ack_id": self.ack_id,
+            "dedupe_key": self.dedupe_key,
+            "child_session_id": self.child_session_id,
+            "parent_session_id": self.parent_session_id,
+            "kind": self.kind,
+            "intent": self.intent,
+            "message": self.message,
+            "delivered_at": self.delivered_at,
+        }
 
 
 @dataclass(frozen=True)
@@ -152,6 +202,20 @@ class EscalationStore:
                 conn.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_escalations_dedupe "
                     "ON escalations(dedupe_key)"
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS acknowledgments (
+                        ack_id TEXT PRIMARY KEY,
+                        dedupe_key TEXT NOT NULL UNIQUE,
+                        child_session_id TEXT NOT NULL,
+                        parent_session_id TEXT NOT NULL,
+                        kind TEXT NOT NULL CHECK (kind IN ('routine', 'interrupt')),
+                        intent TEXT NOT NULL CHECK (intent IN ('continue', 'replace')),
+                        message TEXT NOT NULL,
+                        delivered_at REAL NOT NULL
+                    )
+                    """
                 )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_escalations_status "
@@ -280,6 +344,70 @@ class EscalationStore:
             raise EscalationStoreError(f"Escalation is missing: {escalation_id}")
         return _from_row(row)
 
+    def acknowledge(
+        self,
+        *,
+        child_session_id: str,
+        parent_session_id: str,
+        kind: str,
+        intent: str,
+        message: str,
+        dedupe_key: str,
+    ) -> DeliveryAck:
+        if kind not in ESCALATION_KINDS:
+            raise ValueError(f"Unknown escalation kind: {kind}")
+        if intent not in DELIVERY_INTENTS:
+            raise ValueError(f"Unknown delivery intent: {intent}")
+        now = time.time()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO acknowledgments (
+                        ack_id, dedupe_key, child_session_id, parent_session_id,
+                        kind, intent, message, delivered_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        dedupe_key,
+                        child_session_id,
+                        parent_session_id,
+                        kind,
+                        intent,
+                        message,
+                        now,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT * FROM acknowledgments WHERE dedupe_key = ?",
+                    (dedupe_key,),
+                ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise EscalationStoreError(f"Cannot record acknowledgment: {exc}") from exc
+        if row is None:
+            raise EscalationStoreError(
+                f"Acknowledgment is missing after record: {dedupe_key}"
+            )
+        return _ack_from_row(row)
+
+    def acknowledgments(self, *, limit: int = 100) -> list[DeliveryAck]:
+        if limit < 1 or limit > 1000:
+            raise ValueError("Acknowledgment limit must be between 1 and 1000")
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM acknowledgments
+                    ORDER BY delivered_at ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise EscalationStoreError(f"Cannot read acknowledgments: {exc}") from exc
+        return [_ack_from_row(row) for row in rows]
+
     def pending(self, *, limit: int = 100) -> list[ParkedEscalation]:
         if limit < 1 or limit > 1000:
             raise ValueError("Escalation pending limit must be between 1 and 1000")
@@ -297,6 +425,19 @@ class EscalationStore:
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(f"Cannot read parked escalations: {exc}") from exc
         return [_from_row(row) for row in rows]
+
+
+def _ack_from_row(row: sqlite3.Row) -> DeliveryAck:
+    return DeliveryAck(
+        ack_id=row["ack_id"],
+        dedupe_key=row["dedupe_key"],
+        child_session_id=row["child_session_id"],
+        parent_session_id=row["parent_session_id"],
+        kind=row["kind"],
+        intent=row["intent"],
+        message=row["message"],
+        delivered_at=row["delivered_at"],
+    )
 
 
 def _from_row(row: sqlite3.Row) -> ParkedEscalation:
@@ -336,9 +477,15 @@ def escalate(
     never re-targeted automatically once that parent's workspace is
     archived -- superseded or completed sessions must never be auto-resumed
     by queued delivery.
+
+    Delivery intent follows :func:`classify_escalation`: routine
+    STATUS/completion callbacks queue with ``intent=continue`` and a durable
+    acknowledgment, preserving the recipient's active turn; explicit
+    BLOCKED/DECISION escalations replace it.
     """
     store = store or EscalationStore()
     key = dedupe_key or default_dedupe_key(child_session_id, message)
+    classification = classify_escalation(message)
     reason: str
     if parent_session_id:
         try:
@@ -355,12 +502,23 @@ def escalate(
                     message,
                     child_session_id,
                     dedupe_key=key,
-                    intent="replace",
+                    intent=classification.intent,
+                )
+                ack = store.acknowledge(
+                    child_session_id=child_session_id,
+                    parent_session_id=parent_session_id,
+                    kind=classification.kind,
+                    intent=classification.intent,
+                    message=message,
+                    dedupe_key=key,
                 )
                 return {
                     "delivered": True,
+                    "kind": classification.kind,
+                    "intent": classification.intent,
                     "parent_session_id": parent_session_id,
                     "parent_workspace_id": str(workspace["id"]),
+                    "acknowledgment": ack.to_dict(),
                     "follow_up": follow_up,
                 }
     else:
