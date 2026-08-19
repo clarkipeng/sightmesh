@@ -101,6 +101,19 @@ def test_one_shot_cli_style_lease_lives_until_ttl(tmp_path: Path) -> None:
     assert store.list(include_stale=False)[0].token == lease.token
 
 
+def test_public_lease_representation_never_exposes_token(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lease = LeaseStore(tmp_path / "leases").acquire("owner", repo, ttl_seconds=60)
+
+    public = lease.to_public_dict(now=lease.created_at + 12.9)
+
+    assert "token" not in public
+    assert public["owner"] == "owner"
+    assert public["age_seconds"] == 12
+    assert public["expired"] is False
+
+
 def test_release_checks_token_and_owner(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()

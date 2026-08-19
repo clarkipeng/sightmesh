@@ -3,7 +3,6 @@ set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
-uv tool uninstall agent-deck >/dev/null 2>&1 || true
 uv tool install --editable "$repo_root" --force
 
 link_skill() {
@@ -18,7 +17,7 @@ link_skill() {
     if [ -L "$destination" ]; then
       previous_source=$(readlink "$destination")
       case "$previous_source" in
-        */agent-deck/skills/"$skill_name")
+        "$HOME/.local/share/agent-deck/skills/$skill_name")
           rm "$destination"
           ;;
       esac

@@ -83,6 +83,22 @@ class Lease:
             "session_id": self.session_id,
         }
 
+    def to_public_dict(self, now: float | None = None) -> dict[str, Any]:
+        """Return lease identity and age without its bearer token."""
+        current_time = _now() if now is None else now
+        return {
+            "owner": self.owner,
+            "repo_path": self.repo_path,
+            "worktree_path": self.worktree_path,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "age_seconds": max(0, int(current_time - self.created_at)),
+            "expired": self.expires_at <= current_time,
+            "hostname": self.hostname,
+            "workspace_id": self.workspace_id,
+            "session_id": self.session_id,
+        }
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Lease:
         return cls(
