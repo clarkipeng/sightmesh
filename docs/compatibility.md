@@ -3,7 +3,7 @@
 ## Tested local stack
 
 - macOS 26.5.1 arm64
-- cdesktop 0.2.3 and local fork package 0.2.3-sightmesh.1
+- cdesktop 0.2.5 is pinned by bootstrap and enforced by the automated CLI compatibility gate; the live behavior evidence below was recorded on cdesktop 0.2.3 and local fork packages 0.2.3-sightmesh.1 through 0.2.3-sightmesh.3
 - Repowire 0.17.0
 - Codex CLI 0.147.0
 - Claude Code 2.1.228

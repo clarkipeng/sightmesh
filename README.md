@@ -43,7 +43,7 @@ Pool state is local under `~/.config/agent-pool` by default. Do not add accounts
 
 ## Full visible fleet
 
-The full setup additionally installs the tested SightMesh cdesktop fork (`0.2.5`), Repowire (`0.17.0`), local LaunchAgents, and shared Claude/Codex skills:
+The full setup additionally installs the bootstrap-pinned SightMesh cdesktop fork (`0.2.5`), Repowire (`0.17.0`), local LaunchAgents, and shared Claude/Codex skills. The CLI and tests require cdesktop 0.2.5 or newer; the live behavior record in [Compatibility](docs/compatibility.md) identifies the older fork on which those scenarios were exercised.
 
 ```sh
 ./scripts/bootstrap-local.sh
@@ -73,7 +73,7 @@ sightmesh message @docs-review --message "Check the installation claims"
 sightmesh steer @docs-review --message "Stop implementation and report findings"
 ```
 
-`message` waits for the next safe turn boundary. `steer` interrupts only the selected coding turn and refuses unsafe cases such as a pending approval or question.
+`message` waits for the next safe turn boundary. `steer` sends a native `replace` command scoped to the selected session; on this release it does not independently guard against a pending approval or question, so inspect the target before steering.
 
 ## How ownership stays native
 
