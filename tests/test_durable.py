@@ -189,7 +189,7 @@ def test_native_stale_child_stops_and_active_suite_suppresses():
     assert active.stops == []
 
 
-def test_424_stop_interrupts_without_repeated_stop():
+def test_424_waits_for_native_terminal_observation_before_requeue_and_wake():
     class Interrupted(Client):
         def stop_execution(self, process, *, dedupe_key=None):
             super().stop_execution(process, dedupe_key=dedupe_key)
@@ -206,8 +206,23 @@ def test_424_stop_interrupts_without_repeated_stop():
     )
 
     assert len(client.stops) == 1
+    assert queue.requeued == []
+    assert queue.notifications == []
+
+    client.process["status"] = "killed"
+    child = {"id": "child", "parent_session_id": "parent"}
+    reconciler.reconcile_session(child)
+    reconciler.reconcile_session(child)
+
     assert queue.requeued == [("command-1", "same-key")]
-    assert queue.notifications[0][0] == "parent"
+    assert queue.notifications == [
+        (
+            "parent",
+            "child",
+            "CHILD_TERMINAL: child killed",
+            "child-terminal:child:killed",
+        )
+    ]
 
 
 def test_425_retries_same_key_and_409_rotates_attempt():

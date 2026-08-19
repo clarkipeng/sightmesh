@@ -178,6 +178,7 @@ class DurableExecutionReconciler:
         self.probe = probe or getattr(client, "probe_connectivity", lambda: True)
         self._stopped: set[str] = set()
         self._requeued: set[str] = set()
+        self._notified: set[str] = set()
         self.liveness = liveness or SuiteLiveness()
         self._offline_until = 0.0
         self._backoff = 1.0
@@ -207,6 +208,10 @@ class DurableExecutionReconciler:
             if command.state != "claimed":
                 continue
             process = by_process.get(str(command.execution_process_id))
+            if process is None:
+                # Absence is not terminal evidence. A partial read must never
+                # release a claim while its execution may still be running.
+                continue
             if process and process.get("status") == "running":
                 snapshot = self.client.normalized_snapshot(str(process["id"]))
                 if not snapshot.get("stream_alive", True):
@@ -216,10 +221,9 @@ class DurableExecutionReconciler:
                 elif self.liveness.stale(str(process["id"]), snapshot):
                     self.recover_stalled_process(session, process, command)
                 continue
-            if command.recovery_state == "stop_accepted":
-                self._interrupt_and_requeue(command)
-                self.reconcile_child_terminal(session, status="interrupted")
-                continue
+            self.reconcile_child_terminal(
+                session, status=str(process.get("status") or "terminal")
+            )
             self._interrupt_and_requeue(command)
 
         # A running child can be observed before the command list is visible;
@@ -271,12 +275,15 @@ class DurableExecutionReconciler:
         if not parent:
             return
         key = f"child-terminal:{child_session['id']}:{status}"
+        if key in self._notified:
+            return
         self.queue.notify_parent(
             str(parent),
             str(child_session["id"]),
             f"CHILD_TERMINAL: {child_session['id']} {status}",
             key,
         )
+        self._notified.add(key)
 
     def _wake_parent_for_terminal_commands(
         self, child_session: dict[str, Any], commands: Iterable[DurableCommand]
@@ -291,12 +298,15 @@ class DurableExecutionReconciler:
             if state not in {"terminal", "rejected"}:
                 continue
             key = f"child-command:{command.id}:{command.state}"
+            if key in self._notified:
+                continue
             self.queue.notify_parent(
                 str(parent),
                 child_id,
                 f"CHILD_DELIVERY: {child_id} {command.id} {command.state}",
                 key,
             )
+            self._notified.add(key)
 
     def _interrupt_and_requeue(self, command: DurableCommand) -> None:
         # Lifecycle writes are idempotent in cdesktop; duplicate ticks cannot
@@ -320,12 +330,12 @@ class DurableExecutionReconciler:
         try:
             self.client.stop_execution(str(process["id"]), dedupe_key=key)
         except CdesktopInterruptedError:
+            # HTTP 424 is not terminal evidence: the keyed stop may or may not
+            # have run. Do not release the claim or wake its parent until the
+            # native process row proves a terminal status. On restart the same
+            # key replays this cdesktop-owned outcome without a second stop.
             self._stopped.add(str(process["id"]))
-            self.queue.recovery(
-                command, attempt=command.recovery_attempt, state="interrupted"
-            )
-            self._interrupt_and_requeue(command)
-            self.reconcile_child_terminal(session, status="interrupted")
+            return
         except CdesktopPendingError:
             return
         except CdesktopRejectedError as exc:
