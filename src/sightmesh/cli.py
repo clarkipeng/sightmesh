@@ -103,6 +103,23 @@ def _is_sightmesh_cdesktop_version(detail: object) -> bool:
     return version >= RUNTIME_LOCK.cdesktop.compatibility.minimum_tuple
 
 
+def _active_runtime_matches_lock(reported_version: object) -> bool:
+    """Checksum-verified provenance for servers whose /info version is bare.
+
+    The server never announces fork identity in its version string; the
+    updater already proves provenance by verifying the runtime lock's
+    SHA-256 at stage time. Trust that verified activation when the running
+    server reports the exact locked version.
+    """
+    try:
+        active = updates.read_state().get("active") or {}
+    except (RuntimeError, OSError, ValueError, json.JSONDecodeError):
+        return False
+    if active.get("sha256") != RUNTIME_LOCK.cdesktop.package.sha256:
+        return False
+    return str(reported_version or "") == RUNTIME_LOCK.cdesktop.version
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     checks: list[dict[str, Any]] = []
     failures = 0
@@ -114,7 +131,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             config.get("analytics_enabled") is False
             and config.get("relay_enabled") is False
         )
-        runtime_fork_ok = _is_sightmesh_cdesktop_version(info.get("version"))
+        runtime_fork_ok = _is_sightmesh_cdesktop_version(
+            info.get("version")
+        ) or _active_runtime_matches_lock(info.get("version"))
         checks.append(
             {
                 "check": "cdesktop-local-only",
