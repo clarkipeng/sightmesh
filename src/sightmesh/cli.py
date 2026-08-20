@@ -1040,6 +1040,26 @@ def cmd_escalations(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_policy(args: argparse.Namespace) -> int:
+    """Edit an opt-in policy for any currently live, resolved session."""
+    client = CdesktopClient(args.url)
+    target = _resolve_session(client, args.session_id)
+    session_id = str(target["session_id"])
+    store = escalation.EscalationStore()
+    if args.policy_action == "set":
+        policy = store.set_signal_policy(
+            session_id, escalation.parse_signal_conditions(args.signal_on)
+        )
+        result = policy.to_dict()
+    elif args.policy_action == "clear":
+        result = {"session_id": session_id, "cleared": store.clear_signal_policy(session_id)}
+    else:
+        result = store.signal_policy(session_id).to_dict()
+    result["agent"] = f"@{target['selector']}"
+    _emit(result, args.json)
+    return 0
+
+
 def cmd_prompt_idle(args: argparse.Namespace) -> int:
     message = _read_text(args.message, args.message_file, "message")
     client = CdesktopClient(args.url)
@@ -2989,6 +3009,19 @@ def parser() -> argparse.ArgumentParser:
     escalations.add_argument("--session", help="Filter to one child session")
     escalations.add_argument("--limit", type=int, default=100)
     escalations.set_defaults(func=cmd_escalations)
+
+    policy = sub.add_parser("policy", help="Show or edit a session's opt-in signal policy")
+    policy_sub = policy.add_subparsers(dest="policy_action", required=True)
+    policy_show = policy_sub.add_parser("show", help="Show one session's signal policy")
+    policy_show.add_argument("session_id", help="Agent name from `sightmesh peers` or UUID")
+    policy_show.set_defaults(func=cmd_policy)
+    policy_set = policy_sub.add_parser("set", help="Replace one session's signal policy")
+    policy_set.add_argument("session_id", help="Agent name from `sightmesh peers` or UUID")
+    policy_set.add_argument("--signal-on", required=True)
+    policy_set.set_defaults(func=cmd_policy)
+    policy_clear = policy_sub.add_parser("clear", help="Clear one session's signal policy")
+    policy_clear.add_argument("session_id", help="Agent name from `sightmesh peers` or UUID")
+    policy_clear.set_defaults(func=cmd_policy)
 
     message = sub.add_parser(
         "message", help="Send a visible follow-up by agent name or session UUID"
