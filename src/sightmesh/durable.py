@@ -24,6 +24,7 @@ from .cdesktop import (
     CdesktopPendingError,
     CdesktopRejectedError,
 )
+from .escalation import EscalationStore, escalate
 from .runtime_lock import RUNTIME_LOCK
 from .stalls import is_active_suite_work, threshold_from_environment
 from .succession import COMMAND_TERMINAL_STATES, OwnershipStore, resolve_live_successor
@@ -190,6 +191,39 @@ class SuiteLiveness:
         return now - previous[1] >= self.threshold
 
 
+def _context_pressure(snapshot: dict[str, Any]) -> float | None:
+    for wrapped in snapshot.get("entries", []):
+        content = wrapped.get("content") if isinstance(wrapped, dict) else None
+        entry = content.get("entry_type") if isinstance(content, dict) else None
+        if isinstance(entry, dict) and entry.get("type") == "token_usage_info":
+            used, window = entry.get("total_tokens"), entry.get("model_context_window")
+            if isinstance(used, (int, float)) and isinstance(window, (int, float)) and window:
+                return float(used) / float(window)
+    return None
+
+
+def _idle_seconds(processes: Iterable[dict[str, Any]], now: float) -> float | None:
+    timestamps: list[float] = []
+    for process in processes:
+        for name in ("updated_at", "started_at", "created_at"):
+            value = process.get(name)
+            if isinstance(value, (int, float)):
+                timestamps.append(float(value))
+                break
+            if isinstance(value, str):
+                try:
+                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                timestamps.append(
+                    parsed.replace(tzinfo=UTC).timestamp()
+                    if parsed.tzinfo is None
+                    else parsed.timestamp()
+                )
+                break
+    return now - max(timestamps) if timestamps else None
+
+
 class DurableExecutionReconciler:
     """Reconcile durable intent and live processes; safe to run repeatedly."""
 
@@ -201,11 +235,15 @@ class DurableExecutionReconciler:
         probe: Callable[[], bool] | None = None,
         liveness: SuiteLiveness | None = None,
         ownership: OwnershipStore | None = None,
+        signal_store: EscalationStore | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.client = client
         self.queue = queue or NativeCommandQueue(client)
         self.probe = probe or getattr(client, "probe_connectivity", lambda: True)
         self.ownership = ownership or OwnershipStore()
+        self.signal_store = signal_store or EscalationStore()
+        self.clock = clock or time.time
         self._stopped: set[str] = set()
         self._requeued: set[str] = set()
         self._cancelled: set[str] = set()
@@ -266,6 +304,7 @@ class DurableExecutionReconciler:
             if command.state == "claimed" and command.execution_process_id
         }
         self._wake_parent_for_terminal_commands(session, commands)
+        self._reconcile_signal_policy(session, commands, processes)
         for command in commands:
             if command.state != "claimed":
                 continue
@@ -314,6 +353,63 @@ class DurableExecutionReconciler:
         # a reconnect storm when cdesktop is reachable but the model is not.
         if hasattr(self.client, "dispatch_queued") and self._online():
             self.client.dispatch_queued(session_id)
+
+    def _reconcile_signal_policy(
+        self,
+        session: dict[str, Any],
+        commands: Iterable[DurableCommand],
+        processes: Iterable[dict[str, Any]],
+    ) -> None:
+        """Turn opt-in observable conditions into one durable parent follow-up."""
+        policy = self.signal_store.signal_policy(str(session["id"]))
+        if not policy.conditions:
+            return
+        process_rows = list(processes)
+        command_rows = list(commands)
+        terminal = any(
+            process.get("status") not in {None, "running"} for process in process_rows
+        )
+        pressure = max(
+            (
+                value
+                for process in process_rows
+                for value in [
+                    _context_pressure(self.client.normalized_snapshot(str(process["id"])))
+                ]
+                if value is not None
+            ),
+            default=None,
+        )
+        active = any(
+            command.delivery_state(None) not in {"terminal", "rejected"}
+            for command in command_rows
+        )
+        idle_seconds = _idle_seconds(process_rows, self.clock()) if active else None
+        for condition in policy.conditions:
+            triggered = condition == "terminal" and terminal
+            if condition.startswith("context-pressure:") and pressure is not None:
+                triggered = pressure >= float(condition.split(":", 1)[1])
+            if condition.startswith("idle:") and idle_seconds is not None:
+                triggered = idle_seconds > int(condition.split(":", 1)[1])
+            if not triggered:
+                continue
+            session_id = str(session["id"])
+            key = f"signal-policy:{session_id}:{condition}"
+            if self.signal_store.has_dedupe_key(key):
+                continue
+            escalate(
+                self.client,
+                child_session_id=session_id,
+                child_workspace_id=str(session.get("workspace_id") or "") or None,
+                parent_session_id=(
+                    str(session["parent_session_id"])
+                    if session.get("parent_session_id")
+                    else None
+                ),
+                message=f"STATUS: signal policy triggered: {condition}",
+                store=self.signal_store,
+                dedupe_key=key,
+            )
 
     def _online(self) -> bool:
         now = time.monotonic()

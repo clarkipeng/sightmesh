@@ -19,6 +19,7 @@ escalations replace it.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -38,10 +39,52 @@ PARK_REASONS = frozenset({"no_parent", "parent_archived", "parent_unreachable"})
 INTERRUPT_TAGS = frozenset({"BLOCKED", "DECISION"})
 ESCALATION_KINDS = frozenset({"routine", "interrupt"})
 DELIVERY_INTENTS = frozenset({"continue", "replace"})
+SIGNAL_CONDITION_RE = re.compile(
+    r"^(?:terminal|context-pressure:(0(?:\.\d+)?|1(?:\.0+)?)|idle:(\d+))$"
+)
 
 
 class EscalationStoreError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class SignalPolicy:
+    """The opt-in, per-session conditions the durable sweep may signal."""
+
+    session_id: str
+    conditions: tuple[str, ...]
+    updated_at: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "signal_on": list(self.conditions),
+            "updated_at": self.updated_at,
+        }
+
+
+def parse_signal_conditions(value: str) -> tuple[str, ...]:
+    """Validate and canonicalize the deliberately small v1 condition language."""
+    parts = [part.strip() for part in value.split(",")]
+    if not parts or any(not part for part in parts):
+        raise ValueError("--signal-on requires one or more comma-separated conditions")
+    conditions: set[str] = set()
+    for part in parts:
+        match = SIGNAL_CONDITION_RE.fullmatch(part)
+        if not match:
+            raise ValueError(
+                "Unknown signal condition %r; use terminal, context-pressure:<0..1>, "
+                "or idle:<seconds>" % part
+            )
+        if part.startswith("context-pressure:"):
+            condition = f"context-pressure:{float(match.group(1)):g}"
+        elif part.startswith("idle:"):
+            condition = f"idle:{int(match.group(2))}"
+        else:
+            condition = part
+        conditions.add(condition)
+    return tuple(sorted(conditions))
 
 
 def escalation_db_path() -> Path:
@@ -259,6 +302,15 @@ class EscalationStore:
                     "CREATE INDEX IF NOT EXISTS idx_escalations_status "
                     "ON escalations(status, created_at DESC)"
                 )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS signal_policies (
+                        session_id TEXT PRIMARY KEY,
+                        conditions_json TEXT NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(
                 f"Cannot initialize escalation store {self.path}: {exc}"
@@ -311,6 +363,67 @@ class EscalationStore:
         if row is None:
             return None
         return LauncherIdentity(launcher=row["launcher"], detail=row["detail"])
+
+    def signal_policy(self, session_id: str) -> SignalPolicy:
+        """Return the empty default when this session has no policy row."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT conditions_json, updated_at FROM signal_policies WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise EscalationStoreError(f"Cannot read signal policy: {exc}") from exc
+        if row is None:
+            return SignalPolicy(session_id, (), 0.0)
+        try:
+            conditions = tuple(str(item) for item in json.loads(row["conditions_json"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise EscalationStoreError("Signal policy record is invalid") from exc
+        return SignalPolicy(session_id, conditions, float(row["updated_at"]))
+
+    def set_signal_policy(
+        self, session_id: str, conditions: tuple[str, ...]
+    ) -> SignalPolicy:
+        """Replace a session policy atomically after validating every condition."""
+        canonical = parse_signal_conditions(",".join(conditions))
+        now = time.time()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """INSERT INTO signal_policies (session_id, conditions_json, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET conditions_json = excluded.conditions_json,
+                    updated_at = excluded.updated_at""",
+                    (session_id, json.dumps(canonical), now),
+                )
+        except sqlite3.DatabaseError as exc:
+            raise EscalationStoreError(f"Cannot set signal policy: {exc}") from exc
+        return SignalPolicy(session_id, canonical, now)
+
+    def clear_signal_policy(self, session_id: str) -> bool:
+        try:
+            with self._connect() as conn:
+                return bool(
+                    conn.execute(
+                        "DELETE FROM signal_policies WHERE session_id = ?", (session_id,)
+                    ).rowcount
+                )
+        except sqlite3.DatabaseError as exc:
+            raise EscalationStoreError(f"Cannot clear signal policy: {exc}") from exc
+
+    def has_dedupe_key(self, dedupe_key: str) -> bool:
+        """Whether a policy signal was already delivered or parked durably."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM acknowledgments WHERE dedupe_key = ? "
+                    "UNION SELECT 1 FROM escalations WHERE dedupe_key = ? LIMIT 1",
+                    (dedupe_key, dedupe_key),
+                ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise EscalationStoreError(f"Cannot read delivery dedupe state: {exc}") from exc
+        return row is not None
 
     def park(
         self,
