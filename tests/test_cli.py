@@ -76,6 +76,36 @@ def test_sightmesh_cdesktop_version_requires_safe_command_lifecycle() -> None:
     assert not _is_sightmesh_cdesktop_version(None)
 
 
+def test_checksum_verified_activation_passes_bare_version_runtime(monkeypatch, tmp_path) -> None:
+    """Real cdesktop servers report a bare semver in /info, so string matching
+    alone can never prove fork provenance. The updater verifies the runtime
+    lock's SHA-256 at stage time; doctor must trust that verified activation
+    for the exact locked version and nothing else (regression for the
+    always-failing cdesktop-runtime-sightmesh-fork check)."""
+    from sightmesh import updates as updates_module
+    from sightmesh.cli import _active_runtime_matches_lock
+
+    locked_version = RUNTIME_LOCK.cdesktop.version
+    locked_sha = RUNTIME_LOCK.cdesktop.package.sha256
+
+    def fake_state():
+        return {"active": {"sha256": locked_sha, "version": locked_version}}
+
+    monkeypatch.setattr(updates_module, "read_state", fake_state)
+    assert _active_runtime_matches_lock(locked_version)
+    assert not _active_runtime_matches_lock("9.9.9")
+
+    monkeypatch.setattr(
+        updates_module,
+        "read_state",
+        lambda: {"active": {"sha256": "not-the-lock", "version": locked_version}},
+    )
+    assert not _active_runtime_matches_lock(locked_version)
+
+    monkeypatch.setattr(updates_module, "read_state", lambda: {})
+    assert not _active_runtime_matches_lock(locked_version)
+
+
 def test_bootstrap_derives_and_verifies_the_locked_cdesktop_release() -> None:
     bootstrap = (
         Path(__file__).parents[1] / "scripts" / "bootstrap-local.sh"
