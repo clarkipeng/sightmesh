@@ -399,26 +399,15 @@ class DurableExecutionReconciler:
         parent = child_session.get("parent_session_id")
         if not parent:
             return
-        destination = resolve_live_successor(self.ownership, str(parent))
-        if destination is None:
-            LOGGER.warning(
-                "Dropping child-terminal notification for quarantined parent %s "
-                "with no live successor",
-                parent,
-            )
-            return
         # The key stays bound to the child and status, not the destination, so
         # a redirected notification is still one logical command.
         key = f"child-terminal:{child_session['id']}:{status}"
-        if key in self._notified:
-            return
-        self.queue.notify_parent(
-            destination,
-            str(child_session["id"]),
-            f"CHILD_TERMINAL: {child_session['id']} {status}",
-            key,
+        self._notify_live_parent(
+            parent_session_id=str(parent),
+            child_session_id=str(child_session["id"]),
+            message=f"CHILD_TERMINAL: {child_session['id']} {status}",
+            key=key,
         )
-        self._notified.add(key)
 
     def _wake_parent_for_terminal_commands(
         self, child_session: dict[str, Any], commands: Iterable[DurableCommand]
@@ -433,15 +422,34 @@ class DurableExecutionReconciler:
             if state not in {"terminal", "rejected"}:
                 continue
             key = f"child-command:{command.id}:{command.state}"
-            if key in self._notified:
-                continue
-            self.queue.notify_parent(
-                str(parent),
-                child_id,
-                f"CHILD_DELIVERY: {child_id} {command.id} {command.state}",
-                key,
+            self._notify_live_parent(
+                parent_session_id=str(parent),
+                child_session_id=child_id,
+                message=f"CHILD_DELIVERY: {child_id} {command.id} {command.state}",
+                key=key,
             )
-            self._notified.add(key)
+
+    def _notify_live_parent(
+        self,
+        *,
+        parent_session_id: str,
+        child_session_id: str,
+        message: str,
+        key: str,
+    ) -> None:
+        """Deliver once to a live successor, or leave the wake parked for retry."""
+        if key in self._notified:
+            return
+        destination = resolve_live_successor(self.ownership, parent_session_id)
+        if destination is None:
+            LOGGER.warning(
+                "Parking child notification for quarantined parent %s with no live "
+                "successor",
+                parent_session_id,
+            )
+            return
+        self.queue.notify_parent(destination, child_session_id, message, key)
+        self._notified.add(key)
 
     def _interrupt_and_requeue(self, command: DurableCommand) -> None:
         # Lifecycle writes are idempotent in cdesktop; duplicate ticks cannot

@@ -216,6 +216,42 @@ def test_child_terminal_notification_follows_successor_and_never_retired(
     assert intent == "continue"
 
 
+def test_terminal_command_wake_never_targets_retired_parent_and_delivers_once(
+    tmp_path,
+) -> None:
+    """Why: terminal-command wakes use the same successor quarantine as child terminals."""
+    ownership = store(tmp_path)
+    ownership.retire("parent-1", state="superseded", reason="failover")
+    client = FakeCdesktop(
+        commands=[
+            {
+                "id": "command-1",
+                "session_id": "child-1",
+                "body": "done work",
+                "state": "done",
+            }
+        ]
+    )
+    reconciler = DurableExecutionReconciler(client, ownership=ownership)
+    child = {"id": "child-1", "parent_session_id": "parent-1"}
+
+    reconciler.reconcile_session(child)
+    assert client.sent == []  # parked until the retired parent's successor exists
+
+    ownership.link_successor("parent-1", "parent-2")
+    reconciler.reconcile_session(child)
+    reconciler.reconcile_session(child)
+
+    assert client.sent == [
+        (
+            "parent-2",
+            "CHILD_DELIVERY: child-1 command-1 done",
+            "child-command:command-1:done",
+            "continue",
+        )
+    ]
+
+
 # ---------------------------------------------------------------- restart
 
 
