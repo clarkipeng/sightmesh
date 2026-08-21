@@ -212,9 +212,9 @@ def test_stage_downloads_and_verifies_missing_backend_archive(monkeypatch, tmp_p
             executable = prefix / "node_modules" / ".bin" / "cdesktop"
             executable.parent.mkdir(parents=True)
             executable.write_text("fixture", encoding="utf-8")
-            (prefix / "node_modules" / "cdesktop" / "dist" / "macos-arm64").mkdir(
-                parents=True
-            )
+            # Deliberately no dist/ tree: the real wrapper-only package
+            # ships none, and staging must create the platform directory.
+            (prefix / "node_modules" / "cdesktop").mkdir(parents=True)
         return Result()
 
     downloads = []
@@ -258,9 +258,9 @@ def test_stage_refuses_mismatched_downloaded_backend_archive(monkeypatch, tmp_pa
             executable = prefix / "node_modules" / ".bin" / "cdesktop"
             executable.parent.mkdir(parents=True)
             executable.write_text("fixture", encoding="utf-8")
-            (prefix / "node_modules" / "cdesktop" / "dist" / "macos-arm64").mkdir(
-                parents=True
-            )
+            # Deliberately no dist/ tree: the real wrapper-only package
+            # ships none, and staging must create the platform directory.
+            (prefix / "node_modules" / "cdesktop").mkdir(parents=True)
         return Result()
 
     asset_name = "cdesktop-macos-arm64.zip"

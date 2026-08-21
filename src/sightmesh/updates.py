@@ -318,6 +318,8 @@ def _download_backend_archive(archive: Path, temporary: Path) -> None:
             f"Staged cdesktop backend archive checksum mismatch: got {digest}, "
             f"expected {expected}"
         )
+    # A wrapper-only package ships no dist/ tree at all.
+    archive.parent.mkdir(parents=True, exist_ok=True)
     downloaded.replace(archive)
 
 
