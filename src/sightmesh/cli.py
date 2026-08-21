@@ -730,7 +730,17 @@ def _workspace_container(
 def _validate_base_branch(
     repo_path: Path, base: str, local_only: bool = False
 ) -> str:
-    """Resolve a named base, preferring the freshly fetched origin branch."""
+    """Resolve a named base, preferring origin after a best-effort fetch."""
+    if not local_only:
+        # Refresh the tracking ref when the network allows; a stale local
+        # checkout must not silently define a lane's base (issue #37).
+        subprocess.run(
+            ["git", "fetch", "origin", base, "--quiet"],
+            cwd=repo_path,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
     candidates = [f"refs/heads/{base}"] if local_only else [
         f"refs/remotes/origin/{base}",
         f"refs/heads/{base}",
