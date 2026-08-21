@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -114,6 +116,65 @@ def test_terminal_ownership_is_atomic_durable_and_first_write_wins(tmp_path) -> 
     with pytest.raises(QuarantinedSessionError):
         restarted.assert_deliverable("session-1")
     assert restarted.assert_deliverable("session-2") is None
+
+
+def test_concurrent_retirement_keeps_the_first_terminal_record(tmp_path) -> None:
+    """Why: failover workers may retire the same session at once, but quarantine
+    must preserve one irreversible history rather than whichever JSON rewrite won."""
+    path = tmp_path / "ownership.json"
+
+    def retire(state: str, reason: str):
+        return OwnershipStore(path).retire("session-1", state=state, reason=reason)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        records = list(
+            workers.map(
+                lambda args: retire(*args),
+                (("retired", "operator"), ("superseded", "failover")),
+            )
+        )
+
+    assert records[0] == records[1]
+    assert OwnershipStore(path).get("session-1") == records[0]
+
+
+def test_legacy_ownership_json_migrates_once_without_changing_quarantine(tmp_path) -> None:
+    """Why: upgrade must preserve the delivery fence, even if opened again after
+    the JSON file has been retired, so a formerly quarantined session stays shut."""
+    path = tmp_path / "ownership.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "sessions": {
+                    "session-1": {
+                        "session_id": "session-1",
+                        "state": "superseded",
+                        "reason": "failover",
+                        "retired_at": "2026-01-01T00:00:00+00:00",
+                        "logical_key": "handoff:session-1",
+                        "successor_session_id": "session-2",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    migrated = OwnershipStore(path)
+    record = migrated.get("session-1")
+    assert record is not None and record.successor_session_id == "session-2"
+    assert not path.exists()
+    assert path.with_name("ownership.json.migrated").exists()
+    with pytest.raises(QuarantinedSessionError):
+        migrated.assert_deliverable("session-1")
+
+    # A later opener sees SQLite only; it cannot import a second copy.
+    migrated.link_successor("session-1", "session-2")
+    reopened = OwnershipStore(path)
+    assert reopened.get("session-1") == record
+    with pytest.raises(QuarantinedSessionError):
+        reopened.assert_deliverable("session-1")
 
 
 def test_successor_linkage_is_single_and_conflict_rejected(tmp_path) -> None:
