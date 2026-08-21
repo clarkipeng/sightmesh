@@ -22,7 +22,6 @@ from .cdesktop import (
     CdesktopError,
     CdesktopInterruptedError,
     CdesktopPendingError,
-    CdesktopRejectedError,
 )
 from .escalation import EscalationStore, escalate
 from .runtime_lock import RUNTIME_LOCK
@@ -50,8 +49,6 @@ class DurableCommand:
     state: str
     dedupe_key: str | None = None
     execution_process_id: str | None = None
-    recovery_attempt: int = 1
-    recovery_state: str | None = None
 
     def delivery_state(self, process: dict[str, Any] | None) -> str:
         """Project cdesktop facts onto the delivery lifecycle without storing it."""
@@ -101,15 +98,6 @@ class NativeCommandQueue:
                 dedupe_key=f"quarantine:{command.id}",
             )
 
-
-    def recovery(self, command: DurableCommand, *, attempt: int, state: str) -> None:
-        if not hasattr(self.client, "update_command"):
-            return
-        self.client.update_command(
-            command.id,
-            {"recovery_attempt": attempt, "recovery_state": state},
-        )
-
     def notify_parent(
         self, parent_session_id: str, child_session_id: str, message: str, key: str
     ) -> None:
@@ -130,37 +118,7 @@ def _command_fields(row: dict[str, Any], session_id: str) -> dict[str, Any]:
         "state": str(row.get("state") or row.get("status") or "queued"),
         "dedupe_key": row.get("dedupe_key"),
         "execution_process_id": row.get("execution_process_id"),
-        "recovery_attempt": _recovery_attempt(row),
-        "recovery_state": _recovery_state(row),
     }
-
-
-def _recovery_config(row: dict[str, Any]) -> dict[str, Any]:
-    config = row.get("config")
-    if isinstance(config, dict):
-        return config
-    if isinstance(config, str):
-        try:
-            parsed = json.loads(config)
-        except json.JSONDecodeError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
-
-
-def _recovery_attempt(row: dict[str, Any]) -> int:
-    value = row.get(
-        "recovery_attempt", _recovery_config(row).get("recovery_attempt", 1)
-    )
-    try:
-        return max(1, int(value))
-    except (TypeError, ValueError):
-        return 1
-
-
-def _recovery_state(row: dict[str, Any]) -> str | None:
-    value = row.get("recovery_state", _recovery_config(row).get("recovery_state"))
-    return str(value) if value else None
 
 
 class SuiteLiveness:
@@ -501,9 +459,7 @@ class DurableExecutionReconciler:
     ) -> None:
         if command is None or str(process["id"]) in self._stopped:
             return
-        if command.recovery_state in {"interrupted", "stop_accepted"}:
-            return
-        key = f"durable:{process['id']}:stop:{command.recovery_attempt}"
+        key = f"durable:{command.id}:stop"
         try:
             self.client.stop_execution(str(process["id"]), dedupe_key=key)
         except CdesktopInterruptedError:
@@ -515,17 +471,5 @@ class DurableExecutionReconciler:
             return
         except CdesktopPendingError:
             return
-        except CdesktopRejectedError as exc:
-            if exc.status == 409:
-                self.queue.recovery(
-                    command,
-                    attempt=command.recovery_attempt + 1,
-                    state="retryable",
-                )
-                return
-            raise
         else:
             self._stopped.add(str(process["id"]))
-            self.queue.recovery(
-                command, attempt=command.recovery_attempt, state="stop_accepted"
-            )

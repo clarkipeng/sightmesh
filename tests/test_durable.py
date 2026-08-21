@@ -3,7 +3,6 @@ from __future__ import annotations
 from sightmesh.cdesktop import (
     CdesktopInterruptedError,
     CdesktopPendingError,
-    CdesktopRejectedError,
 )
 from sightmesh.durable import (
     DurableCommand,
@@ -19,7 +18,6 @@ class Queue:
         self.interrupted = []
         self.requeued = []
         self.notifications = []
-        self.recoveries = []
 
     def commands(self, _session):
         return list(self.rows)
@@ -29,9 +27,6 @@ class Queue:
 
     def requeue(self, command):
         self.requeued.append((command.id, command.dedupe_key))
-
-    def recovery(self, command, *, attempt, state):
-        self.recoveries.append((command.id, attempt, state))
 
     def notify_parent(self, parent, child, message, key):
         self.notifications.append((parent, child, message, key))
@@ -59,6 +54,21 @@ class Client:
 
     def stop_execution(self, process, *, dedupe_key=None):
         self.stops.append((process, dedupe_key))
+
+
+class KeyedStopClient(Client):
+    """cdesktop's keyed-stop contract: one outcome per key."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.stop_outcomes = []
+        self.keys = set()
+
+    def stop_execution(self, process, *, dedupe_key=None):
+        super().stop_execution(process, dedupe_key=dedupe_key)
+        if dedupe_key not in self.keys:
+            self.keys.add(dedupe_key)
+            self.stop_outcomes.append((process, dedupe_key))
 
 
 def command(state="claimed"):
@@ -124,7 +134,7 @@ def test_stream_death_requeues_and_offline_gate_backoffs():
     reconciler = DurableExecutionReconciler(client, queue)
 
     reconciler.reconcile_session({"id": "session-1"})
-    assert client.stops == [("process-1", "durable:process-1:stop:1")]
+    assert client.stops == [("process-1", "durable:command-1:stop")]
     assert queue.requeued == []
     assert client.dispatches == []
 
@@ -196,6 +206,32 @@ def test_child_terminal_notification_is_a_durable_parent_command():
     assert queue.notifications[0][3] == "child-terminal:child:interrupted"
 
 
+def test_keyed_stop_is_exactly_once_across_repeated_sweeps():
+    """Why: cdesktop's keyed stop fence makes repeated sweep observations one stop."""
+    client = KeyedStopClient({"id": "process-1", "status": "running"}, {})
+    reconciler = DurableExecutionReconciler(client, Queue([command()]))
+
+    reconciler.recover_stalled_process({}, client.process, command())
+    reconciler.recover_stalled_process({}, client.process, command())
+
+    assert client.stop_outcomes == [("process-1", "durable:command-1:stop")]
+
+
+def test_keyed_stop_is_exactly_once_after_reconciler_restart():
+    """Why: a restarted reconciler replays the command key, never a new stop."""
+    client = KeyedStopClient({"id": "process-1", "status": "running"}, {})
+    for _ in range(2):
+        DurableExecutionReconciler(client, Queue([command()])).recover_stalled_process(
+            {}, client.process, command()
+        )
+
+    assert client.stops == [
+        ("process-1", "durable:command-1:stop"),
+        ("process-1", "durable:command-1:stop"),
+    ]
+    assert client.stop_outcomes == [("process-1", "durable:command-1:stop")]
+
+
 def test_native_stale_child_stops_and_active_suite_suppresses():
     from datetime import timedelta
 
@@ -208,7 +244,7 @@ def test_native_stale_child_stops_and_active_suite_suppresses():
     )
     reconciler.reconcile_session({"id": "session-1", "parent_session_id": "parent"})
     reconciler.reconcile_session({"id": "session-1", "parent_session_id": "parent"})
-    assert client.stops == [("process-1", "durable:process-1:stop:1")]
+    assert client.stops == [("process-1", "durable:command-1:stop")]
 
     active = Client(
         {"id": "process-1", "status": "running"},
@@ -263,7 +299,7 @@ def test_424_waits_for_native_terminal_observation_before_requeue_and_wake():
     ]
 
 
-def test_425_retries_same_key_and_409_rotates_attempt():
+def test_425_retries_the_same_command_key():
     class Pending(Client):
         def __init__(self, *args):
             super().__init__(*args)
@@ -281,36 +317,6 @@ def test_425_retries_same_key_and_409_rotates_attempt():
     reconciler.recover_stalled_process({}, client.process, command())
     reconciler.recover_stalled_process({}, client.process, command())
     assert client.stops == [
-        ("process-1", "durable:process-1:stop:1"),
-        ("process-1", "durable:process-1:stop:1"),
-    ]
-
-    class Rejected(Client):
-        def stop_execution(self, process, *, dedupe_key=None):
-            super().stop_execution(process, dedupe_key=dedupe_key)
-            if len(self.stops) == 1:
-                raise CdesktopRejectedError("fresh attempt required", status=409)
-
-    rejected = Rejected({"id": "process-1", "status": "running"}, {})
-    rejected_queue = Queue([])
-    rejected_reconciler = DurableExecutionReconciler(rejected, rejected_queue)
-    first = command()
-    rejected_reconciler.recover_stalled_process({}, rejected.process, first)
-    second = DurableCommand(
-        first.id,
-        first.session_id,
-        first.body,
-        first.state,
-        first.dedupe_key,
-        first.execution_process_id,
-        recovery_attempt=2,
-    )
-    rejected_reconciler.recover_stalled_process({}, rejected.process, second)
-    assert rejected.stops == [
-        ("process-1", "durable:process-1:stop:1"),
-        ("process-1", "durable:process-1:stop:2"),
-    ]
-    assert rejected_queue.recoveries == [
-        ("command-1", 2, "retryable"),
-        ("command-1", 2, "stop_accepted"),
+        ("process-1", "durable:command-1:stop"),
+        ("process-1", "durable:command-1:stop"),
     ]
