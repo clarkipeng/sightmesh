@@ -22,10 +22,6 @@ from .routing import (
     set_peer_identity,
 )
 
-# Compatibility import for extensions that patched the interim PR #9 symbol;
-# the supervisor no longer constructs or consults this store.
-from .stalls import RecoveryIntentStore  # noqa: F401
-
 LOGGER = logging.getLogger("sightmesh.bridge")
 
 
