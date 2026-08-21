@@ -16,15 +16,16 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
+import sqlite3
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from . import execution_routing
+from .escalation import EscalationStore
 from .pool import core as pool_core
 
 OWNERSHIP_VERSION = 1
@@ -80,17 +81,31 @@ class TerminalOwnership:
 
 
 class OwnershipStore:
-    """Durable, atomically written record of terminal session ownership."""
+    """Durable terminal ownership in the escalation SQLite store.
+
+    ``path`` remains the legacy JSON location solely so an existing install is
+    migrated on first open; new ownership records never write JSON.
+    """
 
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or default_ownership_path()
+        self._store = EscalationStore()
+        self._migrate_legacy_file()
 
     def get(self, session_id: str) -> TerminalOwnership | None:
-        row = self._read().get(str(session_id))
-        if not isinstance(row, dict):
+        try:
+            with self._store._connect() as conn:
+                row = conn.execute(
+                    "SELECT session_id, state, reason, retired_at, logical_key, "
+                    "successor_session_id FROM terminal_ownerships WHERE session_id = ?",
+                    (str(session_id),),
+                ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise SuccessionError(f"Cannot read ownership record: {exc}") from exc
+        if row is None:
             return None
         try:
-            return TerminalOwnership(**row)
+            return TerminalOwnership(**dict(row))
         except (TypeError, SuccessionError) as exc:
             raise SuccessionError(
                 f"Corrupt ownership record for session {session_id}: {exc}"
@@ -123,8 +138,28 @@ class OwnershipStore:
             retired_at=datetime.now(UTC).isoformat(),
             logical_key=logical_key,
         )
-        self._put(record)
-        return record
+        try:
+            with self._store._connect() as conn:
+                conn.execute(
+                    """INSERT OR IGNORE INTO terminal_ownerships
+                    (session_id, state, reason, retired_at, logical_key, successor_session_id)
+                    VALUES (?, ?, ?, ?, ?, NULL)""",
+                    (
+                        record.session_id,
+                        record.state,
+                        record.reason,
+                        record.retired_at,
+                        record.logical_key,
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT session_id, state, reason, retired_at, logical_key, "
+                    "successor_session_id FROM terminal_ownerships WHERE session_id = ?",
+                    (record.session_id,),
+                ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise SuccessionError(f"Cannot retire session {session_id}: {exc}") from exc
+        return self._record_from_row(row, session_id)
 
     def link_successor(
         self, session_id: str, successor_session_id: str
@@ -141,18 +176,32 @@ class OwnershipStore:
                 f"Session {session_id} already has successor "
                 f"{record.successor_session_id}; refusing {successor_session_id}"
             )
-        updated = replace(record, successor_session_id=str(successor_session_id))
-        self._put(updated)
+        try:
+            with self._store._connect() as conn:
+                conn.execute(
+                    """UPDATE terminal_ownerships SET successor_session_id = ?
+                    WHERE session_id = ? AND successor_session_id IS NULL""",
+                    (str(successor_session_id), str(session_id)),
+                )
+                row = conn.execute(
+                    "SELECT session_id, state, reason, retired_at, logical_key, "
+                    "successor_session_id FROM terminal_ownerships WHERE session_id = ?",
+                    (str(session_id),),
+                ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise SuccessionError(f"Cannot link successor for {session_id}: {exc}") from exc
+        updated = self._record_from_row(row, session_id)
+        if updated.successor_session_id != str(successor_session_id):
+            raise SuccessionError(
+                f"Session {session_id} already has successor "
+                f"{updated.successor_session_id}; refusing {successor_session_id}"
+            )
         return updated
 
-    def _put(self, record: TerminalOwnership) -> None:
-        sessions = self._read()
-        sessions[record.session_id] = record.to_dict()
-        self._write(sessions)
-
-    def _read(self) -> dict[str, Any]:
+    def _migrate_legacy_file(self) -> None:
+        """Import a v1 JSON store before retiring it, so recovery is repeatable."""
         if not self.path.exists():
-            return {}
+            return
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -162,27 +211,60 @@ class OwnershipStore:
         if not isinstance(payload, dict) or payload.get("version") != OWNERSHIP_VERSION:
             raise SuccessionError(f"Unsupported ownership state version: {self.path}")
         sessions = payload.get("sessions")
-        return dict(sessions) if isinstance(sessions, dict) else {}
-
-    def _write(self, sessions: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle, temp_name = tempfile.mkstemp(
-            prefix=".ownership.", dir=self.path.parent
-        )
-        temp_path = Path(temp_name)
+        if not isinstance(sessions, dict):
+            raise SuccessionError(f"Unsupported ownership state version: {self.path}")
         try:
-            with os.fdopen(handle, "w", encoding="utf-8") as stream:
-                json.dump(
-                    {"version": OWNERSHIP_VERSION, "sessions": sessions},
-                    stream,
-                    indent=2,
-                    sort_keys=True,
+            records = [
+                TerminalOwnership(**row)
+                for row in sessions.values()
+                if isinstance(row, dict)
+            ]
+        except (TypeError, SuccessionError) as exc:
+            raise SuccessionError(f"Corrupt ownership state {self.path}: {exc}") from exc
+        if len(records) != len(sessions):
+            raise SuccessionError(f"Corrupt ownership state {self.path}")
+        try:
+            with self._store._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.executemany(
+                    """INSERT OR IGNORE INTO terminal_ownerships
+                    (session_id, state, reason, retired_at, logical_key, successor_session_id)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    [
+                        (
+                            record.session_id,
+                            record.state,
+                            record.reason,
+                            record.retired_at,
+                            record.logical_key,
+                            record.successor_session_id,
+                        )
+                        for record in records
+                    ],
                 )
-                stream.write("\n")
-            os.chmod(temp_path, 0o600)
-            os.replace(temp_path, self.path)
-        finally:
-            temp_path.unlink(missing_ok=True)
+                conn.execute("COMMIT")
+        except sqlite3.DatabaseError as exc:
+            raise SuccessionError(f"Cannot migrate ownership state {self.path}: {exc}") from exc
+        try:
+            os.replace(self.path, self.path.with_name(f"{self.path.name}.migrated"))
+        except FileNotFoundError:
+            # Another opener completed the same idempotent migration.
+            pass
+        except OSError as exc:
+            raise SuccessionError(f"Cannot retire ownership state {self.path}: {exc}") from exc
+
+    @staticmethod
+    def _record_from_row(
+        row: sqlite3.Row | None, session_id: str
+    ) -> TerminalOwnership:
+        if row is None:
+            raise SuccessionError(f"Ownership record disappeared for session {session_id}")
+        try:
+            return TerminalOwnership(**dict(row))
+        except (TypeError, SuccessionError) as exc:
+            raise SuccessionError(
+                f"Corrupt ownership record for session {session_id}: {exc}"
+            ) from exc
 
 
 def resolve_live_successor(store: OwnershipStore, session_id: str) -> str | None:

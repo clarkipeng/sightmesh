@@ -311,6 +311,18 @@ class EscalationStore:
                     )
                     """
                 )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS terminal_ownerships (
+                        session_id TEXT PRIMARY KEY,
+                        state TEXT NOT NULL CHECK (state IN ('retired', 'superseded')),
+                        reason TEXT NOT NULL,
+                        retired_at TEXT NOT NULL,
+                        logical_key TEXT,
+                        successor_session_id TEXT
+                    )
+                    """
+                )
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(
                 f"Cannot initialize escalation store {self.path}: {exc}"
