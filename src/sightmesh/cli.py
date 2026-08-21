@@ -727,8 +727,14 @@ def _workspace_container(
     return Path(str(container)).expanduser().resolve()
 
 
-def _validate_base_branch(repo_path: Path, base: str) -> None:
-    candidates = [f"refs/heads/{base}", f"refs/remotes/{base}"]
+def _validate_base_branch(
+    repo_path: Path, base: str, local_only: bool = False
+) -> str:
+    """Resolve a named base, preferring the freshly fetched origin branch."""
+    candidates = [f"refs/heads/{base}"] if local_only else [
+        f"refs/remotes/origin/{base}",
+        f"refs/heads/{base}",
+    ]
     for candidate in candidates:
         result = subprocess.run(
             ["git", "show-ref", "--verify", "--quiet", candidate],
@@ -738,9 +744,10 @@ def _validate_base_branch(repo_path: Path, base: str) -> None:
             check=False,
         )
         if result.returncode == 0:
-            return
+            return candidate.removeprefix("refs/remotes/").removeprefix("refs/heads/")
+    preference = "local" if local_only else "origin or local"
     raise ValueError(
-        f"--base must name an existing local or remote branch, not a raw commit: {base}"
+        f"--base must name an existing {preference} branch, not a raw commit: {base}"
     )
 
 
@@ -774,9 +781,11 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
     repo_path = Path(args.repo).expanduser().resolve()
     if not repo_path.is_dir():
         raise ValueError(f"Repository path does not exist: {repo_path}")
-    _validate_base_branch(repo_path, args.base)
+    base_ref = _validate_base_branch(
+        repo_path, args.base, getattr(args, "local_base", False)
+    ) or args.base
     setup_script = (
-        _repository_setup_script(repo_path, args.base) if args.worktree else None
+        _repository_setup_script(repo_path, base_ref) if args.worktree else None
     )
     if args.unattended and not args.worktree:
         raise ValueError("--unattended requires --worktree")
@@ -809,7 +818,7 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
         result = client.spawn_workspace(
             name=args.name,
             repo_path=repo_path,
-            target_branch=args.base,
+            target_branch=base_ref,
             executor=selection.executor,
             prompt=prompt,
             use_worktree=args.worktree,
@@ -866,6 +875,7 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
             "route_id": selection.route_id,
             "auth_binding_id": selection.auth_binding_id,
         }
+    result["base_ref"] = base_ref
     parent_selector = getattr(args, "parent_session", None) or os.environ.get(
         "CDESKTOP_SESSION_ID"
     )
@@ -1839,6 +1849,15 @@ def _archive_workspace(args: argparse.Namespace, client: CdesktopClient) -> int:
             "Refusing to archive a dirty direct workspace. Reconcile it or pass "
             f"--preserve-dirty explicitly. Dirty state: {json.dumps(dirty)}"
         )
+    sessions = client.sessions(args.workspace_id)
+    ownership = succession.OwnershipStore()
+    retired_sessions = [
+        ownership.retire(
+            str(session["id"]), state=succession.SUPERSEDED, reason="archive"
+        ).session_id
+        for session in sessions
+        if session.get("id")
+    ]
     client.stop_workspace(args.workspace_id)
     archived = client.archive_workspace(args.workspace_id)
     routing.disable(args.workspace_id)
@@ -1848,6 +1867,7 @@ def _archive_workspace(args: argparse.Namespace, client: CdesktopClient) -> int:
             "workspace": archived,
             "action": "stopped-and-archived",
             "preserved_dirty": dirty,
+            "retired_sessions": retired_sessions,
             "released_lease": released.to_public_dict() if released else None,
         },
         args.json,
@@ -2948,7 +2968,12 @@ def parser() -> argparse.ArgumentParser:
     spawn.add_argument("--name", required=True)
     spawn.add_argument("--repo", required=True)
     spawn.add_argument(
-        "--base", required=True, help="Existing local or remote Git branch"
+        "--base", required=True, help="Existing Git branch; origin/<base> is preferred"
+    )
+    spawn.add_argument(
+        "--local-base",
+        action="store_true",
+        help="Use the local branch ref even when origin/<base> exists",
     )
     spawn.add_argument("--executor", choices=["CLAUDE_CODE", "CODEX"])
     spawn.add_argument(

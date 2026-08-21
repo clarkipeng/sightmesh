@@ -1553,9 +1553,15 @@ def test_worktree_setup_failure_propagates_without_a_lease(
     assert LeaseStore(lease_dir).list() == []
 
 
-def test_close_archive_releases_only_workspace_lease(
+def test_archive_quarantines_all_sessions_before_returning_and_releases_its_lease(
     monkeypatch, tmp_path: Path, capsys
 ) -> None:
+    """Archiving is an ownership transition, so stale agents cannot be contacted.
+
+    The ownership record is written before cdesktop's archive call returns; all
+    three delivery entrances must reject it immediately rather than racing an
+    archived worktree.
+    """
     repo_a = tmp_path / "repo-a"
     repo_b = tmp_path / "repo-b"
     repo_a.mkdir()
@@ -1566,8 +1572,18 @@ def test_close_archive_releases_only_workspace_lease(
         "owner-a", repo_a, ttl_seconds=60, workspace_id="workspace-a"
     )
     other = store.acquire("owner-b", repo_b, ttl_seconds=60, workspace_id="workspace-b")
+    monkeypatch.setattr(
+        succession, "default_ownership_path", lambda: tmp_path / "ownership.json"
+    )
+
+    class ArchiveClient(FakeSpawnClient):
+        def archive_workspace(self, workspace_id):
+            record = succession.OwnershipStore().get("session-a")
+            assert record is not None and record.reason == "archive"
+            return super().archive_workspace(workspace_id)
+
     monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
-    monkeypatch.setattr(cli, "CdesktopClient", FakeSpawnClient)
+    monkeypatch.setattr(cli, "CdesktopClient", ArchiveClient)
     monkeypatch.setattr(cli.routing, "disable", lambda _workspace_id: None)
 
     args = argparse.Namespace(
@@ -1587,6 +1603,40 @@ def test_close_archive_releases_only_workspace_lease(
 
     remaining = LeaseStore(lease_dir).list()
     assert [lease.token for lease in remaining] == [other.token]
+    record = succession.OwnershipStore().get("session-a")
+    assert record is not None
+    assert (record.state, record.reason) == (succession.SUPERSEDED, "archive")
+
+    monkeypatch.setattr(
+        cli,
+        "_resolve_session",
+        lambda *_args, **_kwargs: {"session_id": "session-a", "workspace_id": "workspace-a"},
+    )
+    for command, command_args in (
+        (
+            cli.cmd_message,
+            argparse.Namespace(
+                session_id="session-a", message="message", message_file=None,
+                sender_session=None, no_expect_ack=True, url=None, json=True,
+            ),
+        ),
+        (
+            cli.cmd_steer,
+            argparse.Namespace(
+                session_id="session-a", message="steer", message_file=None,
+                sender_session=None, url=None, json=True,
+            ),
+        ),
+        (
+            cli.cmd_prompt_idle,
+            argparse.Namespace(
+                session_id="session-a", message="prompt", message_file=None,
+                sender_session=None, url=None, json=True,
+            ),
+        ),
+    ):
+        with pytest.raises(succession.QuarantinedSessionError, match="archive"):
+            command(command_args)
 
 
 def test_archive_refuses_dirty_managed_worktree_even_when_preserve_requested(
@@ -1798,7 +1848,8 @@ def test_spawn_direct_releases_pending_lease_when_cdesktop_start_fails(
     assert LeaseStore(lease_dir).list() == []
 
 
-def test_validate_base_branch_rejects_raw_commit(tmp_path: Path) -> None:
+def test_spawn_base_resolution_prefers_origin_and_honors_local_base(tmp_path: Path) -> None:
+    """A stale local branch cannot silently seed a new worktree when origin exists."""
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(
@@ -1820,7 +1871,23 @@ def test_validate_base_branch_rejects_raw_commit(tmp_path: Path) -> None:
         check=True,
         capture_output=True,
     )
-    cli._validate_base_branch(repo, "main")
+    local = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    (repo / "new.txt").write_text("origin is newer", encoding="utf-8")
+    subprocess.run(["git", "add", "new.txt"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "newer"],
+        cwd=repo, check=True, capture_output=True,
+    )
+    origin = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/main", origin], cwd=repo, check=True)
+    subprocess.run(["git", "update-ref", "refs/heads/main", local], cwd=repo, check=True)
+
+    assert cli._validate_base_branch(repo, "main") == "origin/main"
+    assert cli._validate_base_branch(repo, "main", local_only=True) == "main"
     head = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=repo,
@@ -1830,6 +1897,16 @@ def test_validate_base_branch_rejects_raw_commit(tmp_path: Path) -> None:
     ).stdout.strip()
     with pytest.raises(ValueError, match="raw commit"):
         cli._validate_base_branch(repo, head)
+
+
+def test_spawn_base_resolution_refuses_an_absent_branch(tmp_path: Path) -> None:
+    """A missing local and origin base fails before a worktree can be created."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+
+    with pytest.raises(ValueError, match="origin or local branch"):
+        cli._validate_base_branch(repo, "missing")
 
 
 def test_unattended_requires_worktree(monkeypatch, tmp_path: Path) -> None:
