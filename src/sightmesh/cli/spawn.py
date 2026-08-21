@@ -1,0 +1,557 @@
+from __future__ import annotations
+
+from .common import *
+from .fleet import _resolve_session
+
+
+@dataclasses.dataclass(frozen=True)
+class LaunchSelection:
+    executor: str
+    provider_id: str | None
+    model: str | None
+    reasoning: str | None
+    profile: str | None
+    route_id: str | None = None
+    auth_binding_id: str | None = None
+
+
+def _routed_selection(args: argparse.Namespace) -> LaunchSelection:
+    """Resolve executor and model through the routing selector.
+
+    Only the opaque route id and pool binding id leave here; credential
+    resolution stays inside the executor launcher.
+    """
+    settings = execution_routing.ExecutionRoutingStore().load()
+    result = execution_routing.select_route(
+        settings, preferred_model=getattr(args, "model", None)
+    )
+    if result.status == "approval_needed":
+        raise ValueError(
+            "Execution routing reached a metered route that requires approval; "
+            "pass --executor or --profile to launch explicitly"
+        )
+    if result.status != "resolved" or result.target is None:
+        detail = "; ".join(result.trace)
+        raise ValueError(
+            f"Execution routing could not resolve a route ({result.reason}); "
+            f"pass --executor or --profile. Trace: {detail}"
+        )
+    target = result.target
+    reasoning = getattr(args, "reasoning", None)
+    _validate_reasoning(target.executor, reasoning)
+    return LaunchSelection(
+        executor=target.executor,
+        provider_id=getattr(args, "provider", None),
+        model=target.model,
+        reasoning=reasoning,
+        profile=None,
+        route_id=target.route_id,
+        auth_binding_id=target.auth_binding_id,
+    )
+
+
+def _profile_selection(
+    args: argparse.Namespace, client: CdesktopClient
+) -> LaunchSelection:
+    profile_name = getattr(args, "profile_name", None)
+    if not profile_name:
+        executor = getattr(args, "executor", None)
+        if not executor:
+            return _routed_selection(args)
+        selection = LaunchSelection(
+            executor,
+            getattr(args, "provider", None),
+            getattr(args, "model", None),
+            getattr(args, "reasoning", None),
+            None,
+        )
+        _validate_reasoning(selection.executor, selection.reasoning)
+        return selection
+
+    profile = ProfileStore().get(profile_name)
+    validate_provider(profile, client.providers())
+    executor_override = getattr(args, "executor", None)
+    provider_override = getattr(args, "provider", None)
+    if executor_override and executor_override != profile.executor:
+        raise ValueError("--executor cannot override a profile's executor")
+    if provider_override and provider_override != profile.provider_id:
+        raise ValueError("--provider cannot override a profile's provider")
+    selection = LaunchSelection(
+        profile.executor,
+        profile.provider_id,
+        getattr(args, "model", None) or profile.model,
+        getattr(args, "reasoning", None) or profile.reasoning,
+        profile.name,
+    )
+    _validate_reasoning(selection.executor, selection.reasoning)
+    return selection
+
+
+def _validate_reasoning(executor: str, reasoning: str | None) -> None:
+    if reasoning is None:
+        return
+    allowed = {"low", "medium", "high", "xhigh", "max"}
+    if reasoning not in allowed:
+        raise ValueError(
+            f"Reasoning {reasoning!r} is unsupported by {executor}; "
+            f"choose one of {', '.join(sorted(allowed))}"
+        )
+
+
+def _workspace_id(result: dict[str, Any]) -> str:
+    workspace = result.get("workspace") if isinstance(result, dict) else None
+    if isinstance(workspace, dict) and workspace.get("id"):
+        return str(workspace["id"])
+    if isinstance(result, dict) and result.get("workspace_id"):
+        return str(result["workspace_id"])
+    raise ValueError("cdesktop did not return a workspace id")
+
+
+def _primary_session_id(result: dict[str, Any]) -> str | None:
+    if isinstance(result, dict) and result.get("session_id"):
+        return str(result["session_id"])
+    sessions = result.get("sessions") if isinstance(result, dict) else None
+    if isinstance(sessions, list) and sessions and isinstance(sessions[0], dict):
+        return str(sessions[0].get("id")) if sessions[0].get("id") else None
+    session = result.get("session") if isinstance(result, dict) else None
+    if isinstance(session, dict) and session.get("id"):
+        return str(session["id"])
+    execution = result.get("execution_process") if isinstance(result, dict) else None
+    if isinstance(execution, dict) and execution.get("session_id"):
+        return str(execution["session_id"])
+    return None
+
+
+def _workspace_container(
+    result: dict[str, Any], client: CdesktopClient, workspace_id: str
+) -> Path:
+    workspace = result.get("workspace") if isinstance(result, dict) else None
+    container = workspace.get("container_ref") if isinstance(workspace, dict) else None
+    if not container:
+        container = client.workspace(workspace_id).get("container_ref")
+    if not container:
+        raise ValueError("cdesktop did not return a worktree container path")
+    return Path(str(container)).expanduser().resolve()
+
+
+def _validate_base_branch(
+    repo_path: Path, base: str, local_only: bool = False
+) -> str:
+    """Resolve a named base, preferring origin after a best-effort fetch."""
+    if not local_only:
+        # Refresh the tracking ref when the network allows; a stale local
+        # checkout must not silently define a lane's base (issue #37).
+        subprocess.run(
+            ["git", "fetch", "origin", base, "--quiet"],
+            cwd=repo_path,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+    candidates = [f"refs/heads/{base}"] if local_only else [
+        f"refs/remotes/origin/{base}",
+        f"refs/heads/{base}",
+    ]
+    for candidate in candidates:
+        result = subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", candidate],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return candidate.removeprefix("refs/remotes/").removeprefix("refs/heads/")
+    preference = "local" if local_only else "origin or local"
+    raise ValueError(
+        f"--base must name an existing {preference} branch, not a raw commit: {base}"
+    )
+
+
+def _repository_setup_script(repo_path: Path, base: str) -> str | None:
+    settings = ".conductor/settings.toml"
+    result = subprocess.run(
+        ["git", "show", f"{base}:{settings}"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        return None
+    data = tomllib.loads(result.stdout)
+    scripts = data.get("scripts")
+    setup = scripts.get("setup") if isinstance(scripts, dict) else None
+    if setup is None:
+        return None
+    if not isinstance(setup, str):
+        raise ValueError(f"{settings}: scripts.setup must be a string")  # noqa: TRY004
+    return setup.strip() or None
+
+
+def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
+    prompt = _with_coordination_contract(
+        _read_text(args.prompt, args.prompt_file, "prompt")
+    )
+    if not prompt.strip():
+        raise ValueError("Prompt must not be empty")
+    repo_path = Path(args.repo).expanduser().resolve()
+    if not repo_path.is_dir():
+        raise ValueError(f"Repository path does not exist: {repo_path}")
+    base_ref = _validate_base_branch(
+        repo_path, args.base, getattr(args, "local_base", False)
+    ) or args.base
+    setup_script = (
+        _repository_setup_script(repo_path, base_ref) if args.worktree else None
+    )
+    if args.unattended and not args.worktree:
+        raise ValueError("--unattended requires --worktree")
+    if args.unattended:
+        if args.permission not in {None, "BYPASS_PERMISSIONS"}:
+            raise ValueError(
+                "--unattended cannot be combined with a supervised permission policy"
+            )
+        permission_policy = "BYPASS_PERMISSIONS"
+    else:
+        permission_policy = args.permission or "SUPERVISED"
+        if permission_policy == "BYPASS_PERMISSIONS":
+            raise ValueError("BYPASS_PERMISSIONS requires explicit --unattended")
+    lease_store = leases.LeaseStore()
+    lease_store.assert_spawn_allowed(repo_path, use_worktree=args.worktree)
+    client = CdesktopClient(args.url)
+    leases.sync_active_workspaces(client)
+    selection = _profile_selection(args, client)
+    lease_owner = f"cdesktop-spawn:{args.name}"
+    pending_lease: leases.Lease | None = None
+    if args.worktree:
+        lease_store.assert_spawn_allowed(repo_path, use_worktree=True)
+    else:
+        pending_lease = lease_store.acquire(
+            lease_owner,
+            repo_path,
+            ttl_seconds=args.lease_ttl_seconds,
+        )
+    try:
+        result = client.spawn_workspace(
+            name=args.name,
+            repo_path=repo_path,
+            target_branch=base_ref,
+            executor=selection.executor,
+            prompt=prompt,
+            use_worktree=args.worktree,
+            permission_policy=permission_policy,
+            model=selection.model,
+            reasoning=selection.reasoning,
+            provider_id=selection.provider_id,
+            setup_script=setup_script,
+            auth_binding_id=selection.auth_binding_id,
+        )
+    except Exception:
+        if pending_lease:
+            lease_store.release(pending_lease.token)
+        raise
+    workspace_id = _workspace_id(result)
+    session_id = _primary_session_id(result)
+    if session_id:
+        escalation.EscalationStore().record_launcher(
+            session_id=session_id,
+            workspace_id=workspace_id,
+            identity=escalation.detect_launcher(),
+        )
+    try:
+        if args.worktree:
+            container = _workspace_container(result, client, workspace_id)
+            lease = lease_store.acquire(
+                lease_owner,
+                repo_path,
+                container / repo_path.name,
+                ttl_seconds=args.lease_ttl_seconds,
+                workspace_id=workspace_id,
+                session_id=session_id,
+            )
+        elif pending_lease:
+            lease = lease_store.attach_workspace(
+                pending_lease.token, workspace_id, session_id
+            )
+        else:
+            lease = None
+    except Exception:
+        if args.worktree:
+            client.stop_workspace(workspace_id)
+        elif pending_lease:
+            lease_store.release(pending_lease.token)
+        raise
+    if not args.no_bridge:
+        routing.enable(workspace_id)
+    if lease:
+        result["lease"] = lease.to_public_dict()
+    if selection.profile:
+        result["profile"] = selection.profile
+    if selection.route_id:
+        result["routing"] = {
+            "route_id": selection.route_id,
+            "auth_binding_id": selection.auth_binding_id,
+        }
+    result["base_ref"] = base_ref
+    parent_selector = getattr(args, "parent_session", None) or os.environ.get(
+        "CDESKTOP_SESSION_ID"
+    )
+    if parent_selector and session_id:
+        parent = _resolve_session(client, parent_selector)
+        child = client.set_parent(session_id, str(parent["session_id"]))
+        result["parent"] = {
+            "child_session_id": session_id,
+            "child_workspace_id": workspace_id,
+            "parent_session_id": child["parent_session_id"],
+            "parent_workspace_id": str(parent["workspace_id"]),
+        }
+    return result
+
+
+def cmd_spawn(args: argparse.Namespace) -> int:
+    result = _spawn_workspace(args)
+    _emit(result, args.json)
+    return 0
+
+
+def cmd_failover(args: argparse.Namespace) -> int:
+    checkpoint = _read_text(args.checkpoint, args.checkpoint_file, "checkpoint")
+    if not checkpoint.strip():
+        raise ValueError("Checkpoint must not be empty")
+    if args.archive_source and not args.confirm_reconciled:
+        raise ValueError("--archive-source requires --confirm-reconciled")
+    if args.archive_source and not args.new_worktree:
+        raise ValueError("--archive-source requires --new-worktree")
+    client = CdesktopClient(args.url)
+    source = client.workspace(args.workspace_id)
+    if source.get("archived"):
+        raise ValueError("Cannot fail over an archived workspace")
+    profile = ProfileStore().get(args.profile_name)
+    if not profile.automatic_failover:
+        raise ValueError(
+            f"Profile {profile.name} is not approved for automatic failover"
+        )
+    validate_provider(profile, client.providers())
+    sessions = sorted(
+        client.sessions(args.workspace_id), key=lambda item: item["created_at"]
+    )
+    if not sessions:
+        raise ValueError("Source workspace has no session to hand off")
+    lead_session_id = sessions[0]["id"]
+    source_session_id = str(sessions[-1]["id"])
+    ownership = succession.OwnershipStore()
+    if not args.new_worktree:
+        prompt = (
+            "Take over this visible workspace after a checkpointed capacity or provider "
+            "handoff. The prior session remains in the cdesktop transcript. First inspect "
+            "the branch, HEAD, working tree, and remaining scope before writing.\n\n"
+            f"Source cdesktop session: {source_session_id}\n"
+            f"Destination profile: {profile.name}\n\n"
+            "Checkpoint:\n"
+            f"{checkpoint.rstrip()}\n"
+        )
+        spawned: dict[str, Any] = {}
+
+        def spawn_successor() -> str:
+            replacement = client.spawn_teammate(
+                caller_session=lead_session_id,
+                name=args.name or f"successor-{profile.name}",
+                prompt=prompt,
+                executor=profile.executor,
+                permission_policy=(
+                    "BYPASS_PERMISSIONS" if args.unattended else "SUPERVISED"
+                ),
+                model=profile.model,
+                reasoning=profile.reasoning,
+                provider_id=profile.provider_id,
+            )
+            spawned["replacement"] = replacement
+            successor_id = _primary_session_id(replacement)
+            if not successor_id:
+                raise ValueError("cdesktop did not return a successor session id")
+            return successor_id
+
+        # The source session shares this worktree with its successor, so it is
+        # quarantined before the successor starts: terminal ownership recorded,
+        # pending commands cancelled, later delivery rejected.
+        handoff = succession.transfer_ownership(
+            client,
+            ownership,
+            source_session_id=source_session_id,
+            spawn=spawn_successor,
+            reason=f"failover:{profile.name}",
+        )
+        _emit(
+            {
+                "action": "visible-successor-started",
+                "workspace_id": args.workspace_id,
+                "source_session_id": source_session_id,
+                "source_preserved": True,
+                "profile": profile.name,
+                "replacement": spawned.get("replacement"),
+                "handoff": handoff.to_dict(),
+            },
+            args.json,
+        )
+        return 0
+
+    repos = client.workspace_repos(args.workspace_id)
+    if len(repos) != 1:
+        raise ValueError(
+            "New-worktree failover currently requires exactly one repository"
+        )
+    dirty = client.dirty_repositories(args.workspace_id)
+    if dirty:
+        raise ValueError(
+            "New-worktree failover requires a clean checkpointed source workspace. "
+            f"Dirty state: {json.dumps(dirty)}"
+        )
+    repo = repos[0]
+    source_branch = source.get("branch") or repo.get("target_branch")
+    if not source_branch:
+        raise ValueError("Source workspace has no branch for failover")
+    prompt = (
+        "Resume a checkpointed visible-agent handoff. First verify the branch, HEAD, "
+        "working tree, and remaining scope before writing.\n\n"
+        f"Source cdesktop workspace: {args.workspace_id}\n"
+        f"Source branch: {source_branch}\n"
+        f"Destination profile: {profile.name}\n\n"
+        "Checkpoint:\n"
+        f"{checkpoint.rstrip()}\n"
+    )
+    spawn_args = argparse.Namespace(
+        prompt=prompt,
+        prompt_file=None,
+        repo=repo["path"],
+        url=args.url,
+        name=args.name or f"{source.get('name') or 'worker'}-{profile.name}",
+        base=source_branch,
+        executor=None,
+        profile_name=profile.name,
+        worktree=True,
+        permission=None,
+        unattended=args.unattended,
+        model=None,
+        reasoning=None,
+        provider=None,
+        lease_ttl_seconds=args.lease_ttl_seconds,
+        no_bridge=args.no_bridge,
+        json=args.json,
+    )
+    spawned_workspace: dict[str, Any] = {}
+
+    def spawn_replacement() -> str:
+        replacement = _spawn_workspace(spawn_args)
+        spawned_workspace["replacement"] = replacement
+        successor_id = _primary_session_id(replacement)
+        if not successor_id:
+            raise ValueError("cdesktop did not return a successor session id")
+        return successor_id
+
+    handoff = succession.transfer_ownership(
+        client,
+        ownership,
+        source_session_id=source_session_id,
+        spawn=spawn_replacement,
+        reason=f"failover:{profile.name}",
+    )
+    result: dict[str, Any] = {
+        "action": "replacement-started",
+        "source_workspace_id": args.workspace_id,
+        "source_archived": False,
+        "profile": profile.name,
+        "replacement": spawned_workspace.get("replacement"),
+        "handoff": handoff.to_dict(),
+    }
+    if args.archive_source:
+        client.stop_workspace(args.workspace_id)
+        archived = client.archive_workspace(args.workspace_id)
+        routing.disable(args.workspace_id)
+        released = leases.LeaseStore().release_workspace_if_present(args.workspace_id)
+        result.update(
+            {
+                "action": "replacement-started-source-archived",
+                "source_archived": True,
+                "source_workspace": archived,
+                "released_source_lease": released.to_public_dict()
+                if released
+                else None,
+            }
+        )
+    _emit(result, args.json)
+    return 0
+
+
+
+def add_spawn_parser(sub: argparse._SubParsersAction[Any]) -> None:
+    spawn = sub.add_parser("spawn", help="Launch a full visible cdesktop workspace")
+    spawn.add_argument("--name", required=True)
+    spawn.add_argument("--repo", required=True)
+    spawn.add_argument(
+        "--base", required=True, help="Existing Git branch; origin/<base> is preferred"
+    )
+    spawn.add_argument(
+        "--local-base",
+        action="store_true",
+        help="Use the local branch ref even when origin/<base> exists",
+    )
+    spawn.add_argument("--executor", choices=["CLAUDE_CODE", "CODEX"])
+    spawn.add_argument(
+        "--profile", dest="profile_name", help="Named SightMesh provider profile"
+    )
+    prompt_group = spawn.add_mutually_exclusive_group(required=True)
+    prompt_group.add_argument("--prompt")
+    prompt_group.add_argument("--prompt-file")
+    topology = spawn.add_mutually_exclusive_group(required=True)
+    topology.add_argument("--worktree", action="store_true")
+    topology.add_argument("--direct", action="store_false", dest="worktree")
+    spawn.add_argument(
+        "--permission",
+        choices=["SUPERVISED", "PLAN", "ACCEPT_EDITS", "BYPASS_PERMISSIONS"],
+        default=None,
+    )
+    spawn.add_argument(
+        "--unattended",
+        action="store_true",
+        help="Run a worktree-isolated worker without approval prompts",
+    )
+    spawn.add_argument("--model")
+    spawn.add_argument("--reasoning", choices=["low", "medium", "high", "xhigh", "max"])
+    spawn.add_argument("--provider", help="Configured cdesktop provider UUID")
+    spawn.add_argument(
+        "--parent-session",
+        help="Launching cdesktop session; defaults to CDESKTOP_SESSION_ID",
+    )
+    spawn.add_argument(
+        "--lease-ttl-seconds", type=int, default=leases.DEFAULT_TTL_SECONDS
+    )
+    spawn.add_argument("--no-bridge", action="store_true")
+    spawn.set_defaults(func=cmd_spawn)
+
+
+
+
+def add_failover_parser(sub: argparse._SubParsersAction[Any]) -> None:
+    failover = sub.add_parser(
+        "failover",
+        help="Start a visible checkpointed replacement on an approved profile",
+    )
+    failover.add_argument("workspace_id")
+    failover.add_argument("--profile", dest="profile_name", required=True)
+    checkpoint_group = failover.add_mutually_exclusive_group(required=True)
+    checkpoint_group.add_argument("--checkpoint")
+    checkpoint_group.add_argument("--checkpoint-file")
+    failover.add_argument("--name")
+    failover.add_argument("--unattended", action="store_true")
+    failover.add_argument(
+        "--new-worktree",
+        action="store_true",
+        help="Start the successor in a new isolated workspace instead of this workspace",
+    )
+    failover.add_argument("--archive-source", action="store_true")
+    failover.add_argument("--confirm-reconciled", action="store_true")
+    failover.add_argument("--no-bridge", action="store_true")
+    failover.add_argument(
+        "--lease-ttl-seconds", type=int, default=leases.DEFAULT_TTL_SECONDS
+    )
+    failover.set_defaults(func=cmd_failover)
