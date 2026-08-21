@@ -1,4 +1,6 @@
 import hashlib
+import io
+import json
 import os
 import sqlite3
 import time
@@ -185,7 +187,62 @@ def test_stage_keeps_active_release_metadata(monkeypatch, tmp_path) -> None:
     assert "previous_plist" not in state
 
 
-def test_stage_refuses_package_without_backend_archive(monkeypatch, tmp_path) -> None:
+def test_stage_downloads_and_verifies_missing_backend_archive(monkeypatch, tmp_path) -> None:
+    """Wrapper-only packages recover their backend from the locked release assets."""
+    isolated_state(monkeypatch, tmp_path)
+    package = tmp_path / "cdesktop.tgz"
+    package.write_bytes(b"wrapper-only")
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as bundle:
+        bundle.writestr("cdesktop", b"backend")
+    archive_bytes = payload.getvalue()
+    asset_name = "cdesktop-macos-arm64.zip"
+    manifest = json.dumps(
+        {"assets": {asset_name: {"sha256": hashlib.sha256(archive_bytes).hexdigest()}}}
+    )
+
+    class Result:
+        returncode = 0
+        stdout = "cdesktop/0.2.4-sightmesh.1 darwin-arm64"
+        stderr = ""
+
+    def run(command, **_kwargs):
+        if command[0] == "npm":
+            prefix = Path(command[command.index("--prefix") + 1])
+            executable = prefix / "node_modules" / ".bin" / "cdesktop"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("fixture", encoding="utf-8")
+            # Deliberately no dist/ tree: the real wrapper-only package
+            # ships none, and staging must create the platform directory.
+            (prefix / "node_modules" / "cdesktop").mkdir(parents=True)
+        return Result()
+
+    downloads = []
+    original_download = updates._download
+
+    def download(source, destination):
+        downloads.append(source)
+        if source.endswith("/manifest.json"):
+            destination.write_text(manifest, encoding="utf-8")
+        elif source.endswith(f"/{asset_name}"):
+            destination.write_bytes(archive_bytes)
+        else:
+            original_download(source, destination)
+
+    monkeypatch.setattr(updates.subprocess, "run", run)
+    monkeypatch.setattr(updates, "_platform_directory", lambda: "macos-arm64")
+    monkeypatch.setattr(updates, "_download", download)
+
+    state = updates.stage(str(package), "0.2.4-sightmesh.1")
+
+    runtime = updates.RUNTIME_LOCK.cdesktop
+    base_url = f"https://github.com/{runtime.repository}/releases/download/{runtime.tag}"
+    assert downloads[-2:] == [f"{base_url}/manifest.json", f"{base_url}/{asset_name}"]
+    assert Path(state["pending"]["backend_archive"]).read_bytes() == archive_bytes
+
+
+def test_stage_refuses_mismatched_downloaded_backend_archive(monkeypatch, tmp_path) -> None:
+    """A release asset with a manifest checksum mismatch is never placed in the stage."""
     isolated_state(monkeypatch, tmp_path)
     package = tmp_path / "cdesktop.tgz"
     package.write_bytes(b"wrapper-only")
@@ -201,13 +258,41 @@ def test_stage_refuses_package_without_backend_archive(monkeypatch, tmp_path) ->
             executable = prefix / "node_modules" / ".bin" / "cdesktop"
             executable.parent.mkdir(parents=True)
             executable.write_text("fixture", encoding="utf-8")
+            # Deliberately no dist/ tree: the real wrapper-only package
+            # ships none, and staging must create the platform directory.
+            (prefix / "node_modules" / "cdesktop").mkdir(parents=True)
         return Result()
+
+    asset_name = "cdesktop-macos-arm64.zip"
+    original_download = updates._download
+
+    def download(source, destination):
+        if source.endswith("/manifest.json"):
+            destination.write_text(
+                json.dumps({"assets": {asset_name: {"sha256": "0" * 64}}}),
+                encoding="utf-8",
+            )
+        elif source.endswith(f"/{asset_name}"):
+            destination.write_bytes(b"untrusted archive")
+        else:
+            original_download(source, destination)
 
     monkeypatch.setattr(updates.subprocess, "run", run)
     monkeypatch.setattr(updates, "_platform_directory", lambda: "macos-arm64")
+    monkeypatch.setattr(updates, "_download", download)
 
-    with pytest.raises(RuntimeError, match="backend archive is missing"):
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
         updates.stage(str(package), "0.2.4-sightmesh.1")
+    releases = list((tmp_path / "releases").glob("cdesktop-*"))
+    assert len(releases) == 1
+    assert not (
+        releases[0]
+        / "node_modules"
+        / "cdesktop"
+        / "dist"
+        / "macos-arm64"
+        / "cdesktop.zip"
+    ).exists()
 
 
 def test_activity_ignores_devservers_and_reports_agent_work() -> None:
