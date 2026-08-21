@@ -21,6 +21,7 @@ from urllib.request import urlopen
 
 from . import service
 from .cdesktop import CdesktopClient, CdesktopError
+from .runtime_lock import RUNTIME_LOCK
 
 SCHEMA_VERSION = 1
 QUIET_SECONDS = 2.0
@@ -283,10 +284,47 @@ def _platform_directory() -> str:
     return f"{operating_system}-{architecture}"
 
 
-def _validate_package_payload(package_root: Path) -> str:
+def _release_asset_url(name: str) -> str:
+    runtime = RUNTIME_LOCK.cdesktop
+    return (
+        f"https://github.com/{runtime.repository}/releases/download/"
+        f"{runtime.tag}/{name}"
+    )
+
+
+def _download_backend_archive(archive: Path, temporary: Path) -> None:
+    platform_name = _platform_directory()
+    asset_name = f"cdesktop-{platform_name}.zip"
+    manifest = temporary / "manifest.json"
+    downloaded = temporary / asset_name
+    _download(_release_asset_url("manifest.json"), manifest)
+    try:
+        assets = json.loads(manifest.read_text(encoding="utf-8"))["assets"]
+        expected = assets[asset_name]["sha256"]
+    except (KeyError, TypeError, json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError(
+            f"Staged cdesktop release manifest lacks {asset_name}"
+        ) from exc
+    if not isinstance(expected, str) or len(expected) != 64 or any(
+        character not in "0123456789abcdefABCDEF" for character in expected
+    ):
+        raise RuntimeError(
+            f"Staged cdesktop release manifest has an invalid checksum for {asset_name}"
+        )
+    _download(_release_asset_url(asset_name), downloaded)
+    digest = _sha256(downloaded)
+    if digest.casefold() != expected.casefold():
+        raise RuntimeError(
+            f"Staged cdesktop backend archive checksum mismatch: got {digest}, "
+            f"expected {expected}"
+        )
+    downloaded.replace(archive)
+
+
+def _validate_package_payload(package_root: Path, temporary: Path) -> str:
     archive = package_root / "dist" / _platform_directory() / "cdesktop.zip"
     if not archive.is_file():
-        raise RuntimeError(f"Staged cdesktop backend archive is missing: {archive}")
+        _download_backend_archive(archive, temporary)
     try:
         with zipfile.ZipFile(archive) as bundle:
             expected = "cdesktop.exe" if platform.system() == "Windows" else "cdesktop"
@@ -363,7 +401,7 @@ def stage(
         executable = release / "node_modules" / ".bin" / "cdesktop"
         reported_version = _validate_executable(executable, version)
         backend_archive = _validate_package_payload(
-            release / "node_modules" / "cdesktop"
+            release / "node_modules" / "cdesktop", temporary
         )
         now = time.time()
         state = {
