@@ -369,7 +369,7 @@ def add_teammate_parser(sub: argparse._SubParsersAction[Any]) -> None:
     teammate_prompt = teammate_spawn.add_mutually_exclusive_group(required=True)
     teammate_prompt.add_argument("--prompt")
     teammate_prompt.add_argument("--prompt-file")
-    teammate_spawn.add_argument("--executor", choices=["CLAUDE_CODE", "CODEX"])
+    teammate_spawn.add_argument("--executor", choices=["CLAUDE_CODE", "CODEX", "OPENCODE"])
     teammate_spawn.add_argument("--profile", dest="profile_name")
     teammate_spawn.add_argument(
         "--permission",

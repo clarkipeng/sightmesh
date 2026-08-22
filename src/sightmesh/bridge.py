@@ -32,8 +32,11 @@ def _peer_name(workspace: dict[str, Any], session: dict[str, Any]) -> str:
     return normalized[:48] or f"cd-session-{session['id'][:6]}"
 
 
+_BACKENDS = {"CLAUDE_CODE": "claude-code", "CODEX": "codex", "OPENCODE": "opencode"}
+
+
 def _backend(executor: str | None) -> str:
-    return "claude-code" if executor == "CLAUDE_CODE" else "codex"
+    return _BACKENDS.get(executor or "", "codex")
 
 
 def _repo_path(client: CdesktopClient, workspace: dict[str, Any]) -> str:

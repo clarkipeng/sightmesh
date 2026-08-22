@@ -495,7 +495,7 @@ def add_spawn_parser(sub: argparse._SubParsersAction[Any]) -> None:
         action="store_true",
         help="Use the local branch ref even when origin/<base> exists",
     )
-    spawn.add_argument("--executor", choices=["CLAUDE_CODE", "CODEX"])
+    spawn.add_argument("--executor", choices=["CLAUDE_CODE", "CODEX", "OPENCODE"])
     spawn.add_argument(
         "--profile", dest="profile_name", help="Named SightMesh provider profile"
     )

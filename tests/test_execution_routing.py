@@ -59,6 +59,10 @@ def _subscription_route(route_id: str, executor: str, model: str, pool: str) -> 
     )
 
 
+def _free_route(route_id: str, executor: str, model: str) -> Route:
+    return Route(id=route_id, executor=executor, model=model, billing_class="free")
+
+
 def _metered_route(route_id: str, executor: str, model: str, account: str) -> Route:
     return Route(
         id=route_id,
@@ -583,3 +587,104 @@ def test_cli_routing_routes_add_list_and_explain(
     assert payload["status"] == "resolved"
     assert payload["target"]["auth_binding_id"] == "codex-sub1"
     assert payload["workspace_id"] == "workspace-a"
+
+
+# ---------------------------------------------------------------- free routes
+
+
+OPENCODE_FREE_MODEL = "opencode/x-preview-f-free"
+
+
+def test_free_route_resolves_without_consulting_the_pool(
+    pool_root: Path, monkeypatch
+) -> None:
+    # A free tier owns no account, so nothing about the pool - not eligibility,
+    # not cooldowns, and above all not credentials - may gate it.
+    for name in ("load_pool", "load_state"):
+        monkeypatch.setattr(
+            pool_core,
+            name,
+            lambda name=name: pytest.fail(f"free route read pool {name}"),
+        )
+    monkeypatch.setattr(
+        pool_core,
+        "env_for",
+        lambda _account: pytest.fail("free route resolved launch material"),
+    )
+    monkeypatch.setattr(
+        pool_core,
+        "read_token",
+        lambda _account_id: pytest.fail("free route read launch material"),
+    )
+
+    result = select_route(
+        ExecutionRoutingSettings(
+            routes=(_free_route("opencode-ox-free", "OPENCODE", OPENCODE_FREE_MODEL),)
+        )
+    )
+
+    assert result.status == "resolved"
+    assert result.target is not None
+    assert result.target.executor == "OPENCODE"
+    assert result.target.model == OPENCODE_FREE_MODEL
+    assert result.target.billing_class == "free"
+
+
+def test_free_route_binds_to_no_account(pool_root: Path) -> None:
+    result = select_route(
+        ExecutionRoutingSettings(
+            routes=(_free_route("opencode-ox-free", "OPENCODE", OPENCODE_FREE_MODEL),)
+        )
+    )
+
+    assert result.target is not None
+    assert result.target.auth_binding_id == execution_routing.FREE_AUTH_BINDING
+    assert result.target.account_alias is None
+
+
+def test_free_route_is_skipped_when_another_model_is_preferred(
+    pool_root: Path,
+) -> None:
+    result = select_route(
+        ExecutionRoutingSettings(
+            routes=(_free_route("opencode-ox-free", "OPENCODE", OPENCODE_FREE_MODEL),)
+        ),
+        preferred_model="opus",
+    )
+
+    assert result.status == "blocked"
+    assert result.reason == "routes_exhausted"
+
+
+def test_free_route_may_not_claim_an_account_or_pool() -> None:
+    for extra in ({"account": "codex-api"}, {"account_pool": "codex"}):
+        with pytest.raises(ExecutionRoutingError, match="free route"):
+            Route(
+                id="opencode-ox-free",
+                executor="OPENCODE",
+                model=OPENCODE_FREE_MODEL,
+                billing_class="free",
+                **extra,
+            )
+
+
+def test_free_route_never_warns_about_missing_accounts(pool_root: Path) -> None:
+    settings = ExecutionRoutingSettings(
+        routes=(_free_route("opencode-ox-free", "OPENCODE", OPENCODE_FREE_MODEL),)
+    )
+
+    assert execution_routing.route_warnings(settings) == []
+
+
+def test_free_route_survives_a_store_round_trip(tmp_path: Path) -> None:
+    store = ExecutionRoutingStore(tmp_path / "execution_routing.json")
+    saved = store.save(
+        ExecutionRoutingSettings(
+            routes=(_free_route("opencode-ox-free", "OPENCODE", OPENCODE_FREE_MODEL),)
+        )
+    )
+
+    assert store.load() == saved
+    assert "account" not in json.loads(
+        (tmp_path / "execution_routing.json").read_text(encoding="utf-8")
+    )["executionRouting"]["routes"][0]

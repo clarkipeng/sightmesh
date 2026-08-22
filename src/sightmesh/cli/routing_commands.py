@@ -143,7 +143,7 @@ def add_parser(sub: argparse._SubParsersAction[Any]) -> None:
     profile_set = profile_sub.add_parser("set", help="Create or update a named profile")
     profile_set.add_argument("name")
     profile_set.add_argument(
-        "--executor", choices=["CLAUDE_CODE", "CODEX"], required=True
+        "--executor", choices=["CLAUDE_CODE", "CODEX", "OPENCODE"], required=True
     )
     profile_set.add_argument(
         "--provider", required=True, help="Configured cdesktop provider UUID"
