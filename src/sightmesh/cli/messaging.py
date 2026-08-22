@@ -3,12 +3,14 @@ from __future__ import annotations
 from .common import *
 from .fleet import (
     _compact_text,
+    _fleet_sessions,
+    _idle_unmet_orders,
     _latest_process,
     _normalized_snapshot_with_retry,
     _resolve_session,
     _session_processes,
 )
-from .spawn import _primary_session_id
+from .spawn import _primary_session_id, _profile_selection
 
 def cmd_message(args: argparse.Namespace) -> int:
     message = _read_text(args.message, args.message_file, "message")
