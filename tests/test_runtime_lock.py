@@ -75,7 +75,7 @@ def test_runtime_artifact_checksum_succeeds_and_fails_closed(tmp_path: Path) -> 
 
 def test_built_wheel_contains_loadable_runtime_lock(tmp_path: Path) -> None:
     subprocess.run(
-        [sys.executable, "-m", "build", "--wheel", "--outdir", str(tmp_path)],
+        ["uv", "build", "--wheel", "--out-dir", str(tmp_path)],
         cwd=ROOT,
         check=True,
         capture_output=True,
