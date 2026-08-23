@@ -20,13 +20,17 @@ def _approval_details(
     workspace = client.workspace(workspace_id)
     tool_name = str(approval.get("tool_name") or "")
     request = None
+    # A snapshot read that failed and an approval that genuinely carries no
+    # request both leave `request` null. Say which, so the inbox never reads
+    # as "nothing to show" when it actually means "could not look".
+    request_error = None
     try:
         snapshot = _normalized_snapshot_with_retry(
             client, str(approval["execution_process_id"])
         )
         request = _pending_request_from_snapshot(snapshot, str(approval["approval_id"]))
-    except CdesktopError:
-        pass
+    except CdesktopError as exc:
+        request_error = str(exc)
     details.update(
         {
             "session_id": session_id,
@@ -36,6 +40,7 @@ def _approval_details(
             "workspace_name": workspace.get("name"),
             "workspace_archived": bool(workspace.get("archived")),
             "request": request,
+            "request_error": request_error,
             "request_kind": (
                 "question"
                 if approval.get("is_question")

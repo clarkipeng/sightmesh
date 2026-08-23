@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import time
 from dataclasses import asdict, dataclass, replace
@@ -39,6 +40,22 @@ ALL_ROUTES_EXHAUSTED_VALUES = {"block"}
 MAX_SAME_ROUTE_RETRIES = 3
 MAX_BACKOFF_SECONDS = 3600
 MAX_BACKOFF_STEPS = 10
+
+# How a free route's terminal failure is described to a human. This is a
+# report, never routing truth: nothing here is persisted, and no selection
+# consults it. Only the explicit `fallbackOnFreeFailure` policy may change
+# which route runs next, so a misread outcome can cost visibility at worst -
+# it can never silently move work onto a billed account.
+MODEL_UNAVAILABLE = "model_unavailable"
+PROVIDER_REJECTED = "provider_rejected"
+UNKNOWN_FAILURE = "unknown"
+FREE_FAILURE_OUTCOMES = (MODEL_UNAVAILABLE, PROVIDER_REJECTED, UNKNOWN_FAILURE)
+
+_MODEL_UNAVAILABLE_RE = re.compile(
+    r"model not found|unknown model|no such model"
+    r"|model .* (?:is )?(?:not available|unavailable)",
+    re.IGNORECASE,
+)
 
 
 class ExecutionRoutingError(RuntimeError):
@@ -141,6 +158,10 @@ class ExecutionRoutingSettings:
     all_routes_exhausted: str = "block"
     notify_on_swap: bool = True
     expose_account_alias: bool = True
+    # A free route that fails terminally is always reported. Moving that work
+    # onto an account that bills is a separate, explicit decision, so this
+    # stays off unless the operator opts in.
+    fallback_on_free_failure: bool = False
 
     def __post_init__(self) -> None:
         if self.metered_fallback not in METERED_FALLBACK_VALUES:
@@ -194,6 +215,7 @@ def _settings_to_dict(settings: ExecutionRoutingSettings) -> dict[str, Any]:
         "allRoutesExhausted": settings.all_routes_exhausted,
         "notifyOnSwap": settings.notify_on_swap,
         "exposeAccountAlias": settings.expose_account_alias,
+        "fallbackOnFreeFailure": settings.fallback_on_free_failure,
     }
 
 
@@ -224,6 +246,9 @@ def _settings_from_dict(data: Any) -> ExecutionRoutingSettings:
             notify_on_swap=data.get("notifyOnSwap", defaults.notify_on_swap),
             expose_account_alias=data.get(
                 "exposeAccountAlias", defaults.expose_account_alias
+            ),
+            fallback_on_free_failure=data.get(
+                "fallbackOnFreeFailure", defaults.fallback_on_free_failure
             ),
         )
     except ExecutionRoutingError:
@@ -293,6 +318,23 @@ def route_warnings(settings: ExecutionRoutingSettings) -> list[str]:
         ):
             warnings.append(f"route {route.id}: no eligible account")
     return warnings
+
+
+def classify_free_failure(output: str) -> str:
+    """Name what a free route's terminal failure looked like, for a human.
+
+    The caller passes whatever the executor printed. A recognisable
+    "model not found" is reported as ``model_unavailable``; any other
+    non-empty failure text is a ``provider_rejected`` report; nothing at all
+    is ``unknown``. The result is only ever carried in an escalation message,
+    so it never becomes routing state - see FREE_FAILURE_OUTCOMES.
+    """
+    text = str(output or "").strip()
+    if not text:
+        return UNKNOWN_FAILURE
+    if _MODEL_UNAVAILABLE_RE.search(text):
+        return MODEL_UNAVAILABLE
+    return PROVIDER_REJECTED
 
 
 # ---------------------------------------------------------------- selection
@@ -391,12 +433,17 @@ def select_route(
     *,
     preferred_model: str | None = None,
     exclude_account_ids: frozenset[str] = frozenset(),
+    exclude_route_ids: frozenset[str] = frozenset(),
 ) -> SelectionResult:
     """Walk configured routes in order and return a safe selection outcome.
 
     Only ever produces an opaque `auth_binding_id` (the pool account id) - never
     a resolved credential. That resolution boundary belongs to the executor
     launcher, not this selector.
+
+    A route that just failed is excluded by id, not by binding: every free
+    route shares the FREE_AUTH_BINDING sentinel, so account exclusion cannot
+    name one of them without naming them all.
     """
     trace: list[str] = []
 
@@ -418,6 +465,9 @@ def select_route(
         return pool_state
 
     for route in settings.routes:
+        if route.id in exclude_route_ids:
+            trace.append(f"route {route.id}: skip, excluded by caller")
+            continue
         if preferred_model and route.model != preferred_model:
             trace.append(
                 f"route {route.id}: skip, model {route.model} != "
