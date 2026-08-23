@@ -9,9 +9,11 @@ Settings live at `~/.config/sightmesh/execution_routing.json` with owner-only pe
 - routes are ordered. The selector evaluates them from first to last;
 - a `subscription` route names an `accountPool` (`claude` or `codex`) and considers its non-API accounts in their existing pool order;
 - a `metered` route names one fixed `account` alias;
+- a `free` route names neither, because it bills nothing and owns no account;
 - each route also names the executor and exact model to launch later;
 - `meteredFallback` defaults to `auto` and accepts only `auto`, `ask`, or `never`;
-- `exposeAccountAlias` defaults to `true`.
+- `exposeAccountAlias` defaults to `true`;
+- `fallbackOnFreeFailure` defaults to `false`.
 
 The selector skips disabled, cooling, credential-unavailable, exhausted, and previously failed bindings. A model preference filters routes before selection. It rereads the pool for every selection, so account ordering and health changes take effect without a settings rewrite.
 
@@ -48,7 +50,34 @@ sightmesh routing show
 sightmesh routing validate
 sightmesh routing explain --workspace workspace-demo
 sightmesh routing set-metered ask
+sightmesh routing set-free-fallback off
 ```
+
+## Free routes and their failure
+
+A `free` route bills nothing, so it owns no account and may name neither an `account` nor an `accountPool`.
+Selection resolves it without reading pool state at all, and hands the launcher a fixed `free` binding sentinel that resolves to no credential anywhere.
+That keeps "a free turn never spends" true by construction rather than by remembering to check.
+
+Because a free route owns no binding, a terminal failure has nothing to cool and nothing to reroute.
+Quota exhaustion on a subscription route cools the binding and moves on; the same failure on a free route would simply leave the worker blocked with no signal.
+`escalate_free_route_failure` closes that gap: every terminal free-route failure produces exactly one escalation carrying the route id and an outcome class, delivered to a live parent or parked in the decision inbox.
+There is no third outcome, and no silent block.
+
+The outcome class is one of `model_unavailable`, `provider_rejected`, or `unknown`.
+It is a report for a human, read from whatever the executor printed.
+It is never persisted and no selection consults it, so a misread class costs clarity at worst - it can never move work onto an account that bills.
+
+Degrading a failed free route onto a paid route is a separate decision, and it is off by default:
+
+```sh
+sightmesh routing set-free-fallback on    # allow it
+sightmesh routing set-free-fallback off   # default
+```
+
+With the opt-in off, no other route is even considered and pool state is never read.
+With it on, selection retries with the failed route excluded by id - every free route shares the binding sentinel, so excluding by account could not name one free route without naming them all.
+Either way the escalation names where the work went, so a fallback onto a billed account is never something the operator discovers after the fact.
 
 ## Authentication boundary and visibility
 

@@ -25,6 +25,8 @@ import re
 import sqlite3
 import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,6 +41,7 @@ PARK_REASONS = frozenset({"no_parent", "parent_archived", "parent_unreachable"})
 INTERRUPT_TAGS = frozenset({"BLOCKED", "DECISION"})
 ESCALATION_KINDS = frozenset({"routine", "interrupt"})
 DELIVERY_INTENTS = frozenset({"continue", "replace"})
+WAL_ADOPTION_TIMEOUT_SECONDS = 30.0
 SIGNAL_CONDITION_RE = re.compile(
     r"^(?:terminal|context-pressure:(0(?:\.\d+)?|1(?:\.0+)?)|idle:(\d+))$"
 )
@@ -192,7 +195,7 @@ class OrderExpectation:
     satisfied_at: float | None
 
 
-def _safe_order_body(message: str) -> str:
+def redact_credentials(message: str) -> str:
     """Keep operational records useful without retaining obvious credentials."""
     return re.sub(
         r"(?im)\b(token|secret|password|authorization|cookie|credential|api[_-]?key)"
@@ -211,12 +214,34 @@ class EscalationStore:
         self.path.parent.chmod(0o700)
         self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Open one connection, commit or roll back, and always close it.
+
+        Closing matters beyond hygiene: SQLite refuses a journal-mode switch
+        while any other connection is open, so a leaked connection would keep
+        :func:`_adopt_wal` failing for the life of the process.
+        """
+        conn = self._open()
+        try:
+            # Statement errors from the body stay raw so each caller keeps
+            # raising its own specific EscalationStoreError message.
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    def _open(self) -> sqlite3.Connection:
+        """Connect with the store's fixed pragmas and owner-only file modes."""
         try:
             conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        except sqlite3.Error as exc:
+            raise EscalationStoreError(
+                f"Cannot open escalation store {self.path}: {exc}"
+            ) from exc
+        try:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout = 30000")
-            conn.execute("PRAGMA journal_mode = WAL")
             for path in (
                 self.path,
                 self.path.with_name(f"{self.path.name}-wal"),
@@ -224,15 +249,48 @@ class EscalationStore:
             ):
                 if path.exists():
                     os.chmod(path, 0o600)
-            return conn
         except sqlite3.Error as exc:
+            conn.close()
             raise EscalationStoreError(
                 f"Cannot open escalation store {self.path}: {exc}"
             ) from exc
+        return conn
+
+    def _adopt_wal(self, conn: sqlite3.Connection) -> None:
+        """Put the database in WAL mode, tolerating a concurrent first open.
+
+        Journal mode is a persistent property of the file, so this only has to
+        succeed once - every later opener reads ``wal`` back and does nothing.
+        The switch needs an exclusive lock and SQLite deliberately does *not*
+        run the busy handler for it, so ``PRAGMA busy_timeout`` cannot cover
+        the window where two processes create the store at the same moment.
+        Retrying here is what keeps that race off the caller: without it a
+        concurrent open fails with a spurious "database is locked".
+        """
+        deadline = time.monotonic() + WAL_ADOPTION_TIMEOUT_SECONDS
+        delay = 0.005
+        while True:
+            if str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+                return
+            try:
+                row = conn.execute("PRAGMA journal_mode = WAL").fetchone()
+            except sqlite3.OperationalError:
+                row = None
+            if row is not None and str(row[0]).lower() == "wal":
+                return
+            if time.monotonic() >= deadline:
+                raise EscalationStoreError(
+                    f"Cannot enable WAL on escalation store {self.path}: "
+                    "another connection held it locked for "
+                    f"{WAL_ADOPTION_TIMEOUT_SECONDS:g}s"
+                )
+            time.sleep(delay)
+            delay = min(delay * 2, 0.25)
 
     def _initialize(self) -> None:
         try:
             with self._connect() as conn:
+                self._adopt_wal(conn)
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS launcher_identities (
@@ -507,6 +565,31 @@ class EscalationStore:
             raise EscalationStoreError(f"Escalation is missing: {escalation_id}")
         return _from_row(row)
 
+    def resolve_dedupe_key(self, dedupe_key: str) -> ParkedEscalation | None:
+        """Close a parked record once its wake was delivered after all.
+
+        Returns the record under the key, or None when the key was never
+        parked - so a caller that had a live destination all along can call
+        this unconditionally.
+        """
+        completed_at = time.time()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE escalations
+                    SET status = 'resolved', resolved_at = ?
+                    WHERE dedupe_key = ? AND status = 'parked'
+                    """,
+                    (completed_at, dedupe_key),
+                )
+                row = conn.execute(
+                    "SELECT * FROM escalations WHERE dedupe_key = ?", (dedupe_key,)
+                ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise EscalationStoreError(f"Cannot resolve escalation: {exc}") from exc
+        return _from_row(row) if row is not None else None
+
     def acknowledge(
         self,
         *,
@@ -580,7 +663,7 @@ class EscalationStore:
         body: str,
     ) -> OrderExpectation:
         """Record the one durable promise made by an ordered follow-up."""
-        safe_body = _safe_order_body(body)
+        safe_body = redact_credentials(body)
         key = order_id or f"order:{uuid.uuid4()}"
         now = time.time()
         digest = hashlib.sha256(safe_body.encode("utf-8")).hexdigest()

@@ -514,6 +514,30 @@ def test_cli_routing_set_metered_persists_and_rejects_an_invalid_value(
         cli.parser().parse_args(["--json", "routing", "set-metered", "sometimes"])
 
 
+def test_cli_routing_set_free_fallback_toggles_the_billing_opt_in(
+    routing_settings_path: Path, capsys
+) -> None:
+    """Why: degrading a failed free route onto an account that bills is an
+    operator decision, so it needs an explicit switch and must start off."""
+    args = cli.parser().parse_args(["--json", "routing", "show"])
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out)["fallbackOnFreeFailure"] is False
+
+    args = cli.parser().parse_args(["--json", "routing", "set-free-fallback", "on"])
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out)["fallbackOnFreeFailure"] is True
+    assert json.loads(routing_settings_path.read_text(encoding="utf-8"))[
+        "executionRouting"
+    ]["fallbackOnFreeFailure"] is True
+
+    args = cli.parser().parse_args(["--json", "routing", "set-free-fallback", "off"])
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out)["fallbackOnFreeFailure"] is False
+
+    with pytest.raises(SystemExit):
+        cli.parser().parse_args(["--json", "routing", "set-free-fallback", "maybe"])
+
+
 def test_cli_routing_validate_reports_routes_without_an_eligible_account(
     pool_root: Path, routing_settings_path: Path, monkeypatch, capsys
 ) -> None:

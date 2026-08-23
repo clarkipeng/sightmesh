@@ -8,18 +8,27 @@ from pathlib import Path
 import pytest
 
 from sightmesh import execution_routing, succession
+from sightmesh.cdesktop import CdesktopError
 from sightmesh.durable import DurableExecutionReconciler
-from sightmesh.execution_routing import ExecutionRoutingSettings, Route, select_route
+from sightmesh.escalation import EscalationStore
+from sightmesh.execution_routing import (
+    ExecutionRoutingSettings,
+    ExecutionRoutingStore,
+    Route,
+    select_route,
+)
 from sightmesh.pool import core as pool_core
 from sightmesh.succession import (
     OwnershipStore,
     QuarantinedSessionError,
     SuccessionError,
+    escalate_free_route_failure,
     reroute_after_quota_exhaustion,
     resolve_live_successor,
     transfer_ownership,
 )
 
+from fixtures import free_route_failures
 
 class FakeCdesktop:
     """Stateful stand-in for cdesktop's durable command machinery.
@@ -275,6 +284,42 @@ def test_child_terminal_notification_follows_successor_and_never_retired(
     assert session_id == "parent-2"
     assert key == "child-terminal:child-1:interrupted"
     assert intent == "continue"
+
+
+def test_undeliverable_parent_wake_is_parked_then_resolved_on_delivery(
+    tmp_path,
+) -> None:
+    """Why: a quarantined parent with no successor used to swallow the child's
+    only terminal signal into a log line. The inbox has to carry it instead,
+    and stop carrying it once a successor finally takes delivery."""
+    ownership = store(tmp_path)
+    ownership.retire("parent-1", state="superseded", reason="failover")
+    signal_store = EscalationStore()
+    client = FakeCdesktop()
+    reconciler = DurableExecutionReconciler(
+        client, ownership=ownership, signal_store=signal_store
+    )
+    child = {"id": "child-1", "parent_session_id": "parent-1"}
+
+    reconciler.reconcile_child_terminal(child, status="interrupted")
+
+    assert client.sent == []  # never into the retired parent
+    parked = signal_store.pending()
+    assert len(parked) == 1
+    assert parked[0].dedupe_key == "child-terminal:child-1:interrupted"
+    assert parked[0].recorded_parent_session_id == "parent-1"
+    assert "CHILD_TERMINAL: child-1 interrupted" in parked[0].message
+
+    # Repeated sweeps keep it to one record rather than flooding the inbox.
+    reconciler.reconcile_child_terminal(child, status="interrupted")
+    assert len(signal_store.pending()) == 1
+
+    ownership.link_successor("parent-1", "parent-2")
+    reconciler.reconcile_child_terminal(child, status="interrupted")
+
+    assert client.sent[0][0] == "parent-2"
+    # Delivered after all, so the stand-in no longer sits in the inbox.
+    assert signal_store.pending() == []
 
 
 def test_terminal_command_wake_never_targets_retired_parent_and_delivers_once(
@@ -620,3 +665,278 @@ def test_routed_selection_reroutes_spawn_after_quota_exhaustion(
         "codex-pool",
         "codex-b",
     )
+
+
+# ---------------------------------------------------------------- free route failure
+
+
+class FakeParentClient:
+    """cdesktop surface `escalate` needs: resolve a parent, then enqueue to it."""
+
+    def __init__(self, sessions=None, workspaces=None):
+        self.sessions_by_id = sessions or {}
+        self.workspaces_by_id = workspaces or {}
+        self.sent: list[dict] = []
+
+    def session(self, session_id):
+        if session_id not in self.sessions_by_id:
+            raise CdesktopError(f"no such session {session_id}")
+        return self.sessions_by_id[session_id]
+
+    def workspace(self, workspace_id):
+        return self.workspaces_by_id[workspace_id]
+
+    def send(self, session_id, prompt, sender_session=None, *, dedupe_key=None, intent="continue"):
+        self.sent.append(
+            {"session_id": session_id, "prompt": prompt, "dedupe_key": dedupe_key, "intent": intent}
+        )
+        return {"ok": True}
+
+
+def _live_parent_client() -> FakeParentClient:
+    return FakeParentClient(
+        sessions={"parent-1": {"id": "parent-1", "workspace_id": "ws-1"}},
+        workspaces={"ws-1": {"id": "ws-1", "archived": False}},
+    )
+
+
+FREE_ROUTE = Route(
+    id="opencode-ox-free",
+    executor="OPENCODE",
+    model="opencode/x-preview-f-free",
+    billing_class="free",
+)
+PAID_ROUTE = Route(
+    id="codex-max",
+    executor="CODEX",
+    model="gpt-5-codex",
+    billing_class="subscription",
+    account_pool="codex",
+)
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        (free_route_failures.MODEL_NOT_FOUND, "model_unavailable"),
+        (free_route_failures.UNKNOWN_PROVIDER, "model_unavailable"),
+        (free_route_failures.SERVER_ERROR, "provider_rejected"),
+        ("", "unknown"),
+    ],
+)
+def test_free_failure_outcome_is_classified_from_captured_executor_output(
+    output, expected
+) -> None:
+    """Why: the outcome class an operator reads has to come from the text the
+    free tier really prints, not from a shape invented to match the parser."""
+    assert execution_routing.classify_free_failure(output) == expected
+    assert expected in execution_routing.FREE_FAILURE_OUTCOMES
+
+
+def test_free_route_failure_escalates_to_a_live_parent_and_never_degrades(
+    pool_root: Path,
+) -> None:
+    """Why: a free route owns no account, so nothing cools and nothing reroutes.
+    Without an escalation the worker is simply blocked with no signal at all."""
+    client = _live_parent_client()
+    settings = ExecutionRoutingSettings(routes=(FREE_ROUTE, PAID_ROUTE))
+    assert settings.fallback_on_free_failure is False
+
+    failure = escalate_free_route_failure(
+        client,
+        settings,
+        route_id=FREE_ROUTE.id,
+        child_session_id="child-1",
+        child_workspace_id="ws-child",
+        parent_session_id="parent-1",
+        output=free_route_failures.MODEL_NOT_FOUND,
+    )
+
+    assert failure.outcome == "model_unavailable"
+    assert failure.escalation["delivered"] is True
+    # No opt-in, so no selection was made at all: the paid route is untouched.
+    assert failure.selection is None
+
+    delivered = client.sent[0]
+    assert delivered["session_id"] == "parent-1"
+    # A blocked worker needs a decision, so this replaces the parent's turn.
+    assert delivered["intent"] == "replace"
+    assert FREE_ROUTE.id in delivered["prompt"]
+    assert "model_unavailable" in delivered["prompt"]
+    assert "Model not found" in delivered["prompt"]
+    assert PAID_ROUTE.id not in delivered["prompt"]
+
+
+def test_free_route_failure_parks_in_the_decision_inbox_without_a_parent(
+    pool_root: Path,
+) -> None:
+    """Why: an externally launched worker has no parent to wake. Dropping the
+    failure there is exactly the silent block this path exists to remove."""
+    store_ = EscalationStore()
+    failure = escalate_free_route_failure(
+        FakeParentClient(),
+        ExecutionRoutingSettings(routes=(FREE_ROUTE,)),
+        route_id=FREE_ROUTE.id,
+        child_session_id="child-1",
+        parent_session_id=None,
+        output=free_route_failures.SERVER_ERROR,
+        store=store_,
+    )
+
+    assert failure.escalation["delivered"] is False
+    assert failure.escalation["reason"] == "no_parent"
+    parked = store_.pending()
+    assert len(parked) == 1
+    assert "provider_rejected" in parked[0].message
+    assert parked[0].dedupe_key == (
+        "free-route-failure:child-1:opencode-ox-free:provider_rejected"
+    )
+
+
+def test_repeated_free_route_failures_collapse_to_one_record(pool_root: Path) -> None:
+    """Why: a retrying launcher must not turn one broken route into an inbox flood."""
+    store_ = EscalationStore()
+    settings = ExecutionRoutingSettings(routes=(FREE_ROUTE,))
+    for _ in range(3):
+        escalate_free_route_failure(
+            FakeParentClient(),
+            settings,
+            route_id=FREE_ROUTE.id,
+            child_session_id="child-1",
+            parent_session_id=None,
+            output=free_route_failures.MODEL_NOT_FOUND,
+            store=store_,
+        )
+
+    assert len(store_.pending()) == 1
+
+
+def test_free_route_failure_degrades_to_a_paid_route_only_when_opted_in(
+    pool_root: Path, monkeypatch
+) -> None:
+    """Why: falling back onto an owned account spends real quota, so it may only
+    happen on an explicit policy - and the escalation must name where it went."""
+    pool_core.save_pool(
+        {
+            "accounts": [
+                {
+                    "id": "codex-sub1",
+                    "provider": "codex",
+                    "kind": "chatgpt",
+                    "codex_home": "/tmp/codex-sub1",
+                }
+            ]
+        }
+    )
+    monkeypatch.setattr(
+        pool_core, "quota", lambda _account: {"known": False, "reason": "no source"}
+    )
+    client = _live_parent_client()
+    settings = ExecutionRoutingSettings(
+        routes=(FREE_ROUTE, PAID_ROUTE), fallback_on_free_failure=True
+    )
+
+    failure = escalate_free_route_failure(
+        client,
+        settings,
+        route_id=FREE_ROUTE.id,
+        child_session_id="child-1",
+        parent_session_id="parent-1",
+        output=free_route_failures.MODEL_NOT_FOUND,
+    )
+
+    assert failure.selection is not None
+    assert failure.selection.status == "resolved"
+    assert failure.selection.target is not None
+    # The failed free route is excluded by id; every free route shares the
+    # binding sentinel, so account exclusion could not have named just this one.
+    assert failure.selection.target.route_id == PAID_ROUTE.id
+    assert failure.selection.target.billing_class == "subscription"
+    assert PAID_ROUTE.id in client.sent[0]["prompt"]
+
+
+def test_opted_in_fallback_still_reports_when_no_route_is_left(
+    pool_root: Path,
+) -> None:
+    """Why: opting in must not reintroduce the silent block when the fallback
+    itself finds nothing - the operator still has to hear about it."""
+    client = _live_parent_client()
+    settings = ExecutionRoutingSettings(
+        routes=(FREE_ROUTE,), fallback_on_free_failure=True
+    )
+
+    failure = escalate_free_route_failure(
+        client,
+        settings,
+        route_id=FREE_ROUTE.id,
+        child_session_id="child-1",
+        parent_session_id="parent-1",
+        output=free_route_failures.MODEL_NOT_FOUND,
+    )
+
+    assert failure.selection is not None
+    assert failure.selection.status == "blocked"
+    assert failure.selection.reason == "routes_exhausted"
+    assert "routes_exhausted" in client.sent[0]["prompt"]
+
+
+def test_free_route_failure_never_reads_pool_state_unless_opted_in(
+    monkeypatch, pool_root: Path
+) -> None:
+    """Why: the free path must stay clear of accounts and credentials entirely
+    while the default policy is in force."""
+    for name in ("load_pool", "load_state"):
+        monkeypatch.setattr(
+            pool_core, name, lambda name=name: pytest.fail(f"free failure read {name}")
+        )
+
+    failure = escalate_free_route_failure(
+        _live_parent_client(),
+        ExecutionRoutingSettings(routes=(FREE_ROUTE, PAID_ROUTE)),
+        route_id=FREE_ROUTE.id,
+        child_session_id="child-1",
+        parent_session_id="parent-1",
+        output=free_route_failures.MODEL_NOT_FOUND,
+    )
+    assert failure.selection is None
+
+
+def test_free_failure_detail_is_bounded_and_redacted(pool_root: Path) -> None:
+    """Why: provider output is untrusted text that lands in a durable record."""
+    store_ = EscalationStore()
+    failure = escalate_free_route_failure(
+        FakeParentClient(),
+        ExecutionRoutingSettings(routes=(FREE_ROUTE,)),
+        route_id=FREE_ROUTE.id,
+        child_session_id="child-1",
+        parent_session_id=None,
+        output="Error: refused, api_key=sk-live-secret-value " + "x" * 2000,
+        store=store_,
+    )
+
+    assert "sk-live-secret-value" not in failure.detail
+    assert "[REDACTED]" in failure.detail
+    assert len(failure.detail) <= succession.FREE_FAILURE_DETAIL_LIMIT
+    assert "sk-live-secret-value" not in store_.pending()[0].message
+
+
+def test_fallback_on_free_failure_defaults_off_and_round_trips(tmp_path: Path) -> None:
+    """Why: the opt-in is a billing decision, so it must survive a restart
+    exactly as written and must never be enabled by an older settings file."""
+    path = tmp_path / "execution_routing.json"
+    store_ = ExecutionRoutingStore(path)
+
+    # A settings file written before this field existed stays opted out.
+    path.write_text(
+        json.dumps({"version": 1, "executionRouting": {"routes": []}}), encoding="utf-8"
+    )
+    assert store_.load().fallback_on_free_failure is False
+
+    saved = store_.save(
+        ExecutionRoutingSettings(routes=(FREE_ROUTE,), fallback_on_free_failure=True)
+    )
+    assert saved.fallback_on_free_failure is True
+    assert store_.load() == saved
+    assert json.loads(path.read_text(encoding="utf-8"))["executionRouting"][
+        "fallbackOnFreeFailure"
+    ] is True
