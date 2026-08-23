@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 PROFILE_VERSION = 1
-EXECUTORS = {"CLAUDE_CODE", "CODEX"}
+EXECUTORS = {"CLAUDE_CODE", "CODEX", "OPENCODE"}
 CREDENTIAL_KINDS = {"ambient", "api", "enterprise"}
 
 

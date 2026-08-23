@@ -25,8 +25,14 @@ from .pool import core as pool_core
 
 SETTINGS_VERSION = 1
 
-EXECUTORS = {"CLAUDE_CODE", "CODEX"}
-BILLING_CLASSES = {"subscription", "metered"}
+EXECUTORS = {"CLAUDE_CODE", "CODEX", "OPENCODE"}
+BILLING_CLASSES = {"subscription", "metered", "free"}
+
+# A free route bills nothing and therefore owns no account. Selection still has
+# to hand the launcher *some* binding id, so it gets this fixed sentinel - which
+# resolves to no credential anywhere, keeping "free never spends" true by
+# construction rather than by remembering to check.
+FREE_AUTH_BINDING = "free"
 METERED_FALLBACK_VALUES = {"auto", "ask", "never"}
 ALL_ROUTES_EXHAUSTED_VALUES = {"block"}
 
@@ -79,7 +85,7 @@ class Route:
                 raise ExecutionRoutingError(
                     f"Route {self.id} must not set account for a subscription route"
                 )
-        else:
+        elif self.billing_class == "metered":
             if not self.account:
                 raise ExecutionRoutingError(
                     f"Route {self.id} requires account for a metered route"
@@ -88,6 +94,11 @@ class Route:
                 raise ExecutionRoutingError(
                     f"Route {self.id} must not set accountPool for a metered route"
                 )
+        elif self.account or self.account_pool:
+            raise ExecutionRoutingError(
+                f"Route {self.id} must not name an account or accountPool for a "
+                "free route"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -274,6 +285,8 @@ def route_warnings(settings: ExecutionRoutingSettings) -> list[str]:
     state = pool_core.load_state()
     warnings: list[str] = []
     for route in settings.routes:
+        if route.billing_class == "free":
+            continue
         if not any(
             _account_eligibility(account, state, frozenset())[0]
             for account in _route_candidates(route, pool)
@@ -360,15 +373,15 @@ def _trace_account(account: dict[str, Any], settings: ExecutionRoutingSettings) 
 
 
 def _target(
-    route: Route, account: dict[str, Any], settings: ExecutionRoutingSettings
+    route: Route, account: dict[str, Any] | None, settings: ExecutionRoutingSettings
 ) -> SelectedTarget:
-    account_id = account["id"]
+    account_id = account["id"] if account else None
     return SelectedTarget(
         route_id=route.id,
         executor=route.executor,
         model=route.model,
         billing_class=route.billing_class,
-        auth_binding_id=account_id,
+        auth_binding_id=account_id or FREE_AUTH_BINDING,
         account_alias=account_id if settings.expose_account_alias else None,
     )
 
@@ -394,8 +407,15 @@ def select_route(
         trace.append("no routes configured")
         return SelectionResult("blocked", None, tuple(trace), "routes_exhausted")
 
-    pool = pool_core.load_pool()
-    state = pool_core.load_state()
+    # Loaded on the first route that actually needs an account, so a free route
+    # reaching the front of the list never touches pool state at all.
+    pool_state: tuple[dict[str, Any], dict[str, Any]] | None = None
+
+    def pool_and_state() -> tuple[dict[str, Any], dict[str, Any]]:
+        nonlocal pool_state
+        if pool_state is None:
+            pool_state = (pool_core.load_pool(), pool_core.load_state())
+        return pool_state
 
     for route in settings.routes:
         if preferred_model and route.model != preferred_model:
@@ -405,6 +425,12 @@ def select_route(
             )
             continue
 
+        if route.billing_class == "free":
+            trace.append(f"selected route {route.id}: free, no account required")
+            return SelectionResult(
+                "resolved", _target(route, None, settings), tuple(trace), None
+            )
+
         if route.billing_class == "metered" and settings.metered_fallback == "never":
             trace.append(
                 f"route {route.id}: skip, metered route blocked by "
@@ -412,6 +438,7 @@ def select_route(
             )
             continue
 
+        pool, state = pool_and_state()
         candidates = _route_candidates(route, pool)
         if route.billing_class == "metered" and not candidates:
             account = route.account if settings.expose_account_alias else "account"

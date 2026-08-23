@@ -80,3 +80,18 @@ def test_provider_summary_redacts_secret_values() -> None:
         "claude": True,
         "codex": True,
     }
+
+
+def test_opencode_profile_pins_the_free_tier(tmp_path) -> None:
+    path = tmp_path / "profiles.json"
+    profile = Profile(
+        name="opencode-ox-free",
+        executor="OPENCODE",
+        provider_id="default",
+        model="opencode/x-preview-f-free",
+        reasoning="medium",
+    )
+
+    ProfileStore(path).set(profile)
+
+    assert ProfileStore(path).get("opencode-ox-free") == profile

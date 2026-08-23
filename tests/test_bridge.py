@@ -205,3 +205,11 @@ def test_no_bridge_child_still_gets_stall_recovery(monkeypatch) -> None:
     assert client.stopped == ["process-1"]
     assert client.sent[0][0] == "parent"
     assert supervisor.tasks == {}
+
+
+def test_each_executor_maps_to_its_own_repowire_backend() -> None:
+    from sightmesh.bridge import _backend
+
+    assert _backend("CLAUDE_CODE") == "claude-code"
+    assert _backend("CODEX") == "codex"
+    assert _backend("OPENCODE") == "opencode"
