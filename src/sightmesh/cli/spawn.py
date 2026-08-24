@@ -13,6 +13,7 @@ class LaunchSelection:
     profile: str | None
     route_id: str | None = None
     auth_binding_id: str | None = None
+    billing_class: str | None = None
 
 
 def _routed_selection(args: argparse.Namespace) -> LaunchSelection:
@@ -47,6 +48,35 @@ def _routed_selection(args: argparse.Namespace) -> LaunchSelection:
         profile=None,
         route_id=target.route_id,
         auth_binding_id=target.auth_binding_id,
+        billing_class=target.billing_class,
+    )
+
+
+def _report_free_route_failure(
+    client: CdesktopClient,
+    args: argparse.Namespace,
+    selection: LaunchSelection,
+    error: BaseException,
+) -> None:
+    """Make a refused free-route launch visible before re-raising.
+
+    A subscription route that fails leaves a binding to cool and a session to
+    reconcile. A free route owns neither, and a launch cdesktop refused leaves
+    no worker behind to notice either - so this escalation is the only signal
+    the failure ever produces. Deliberately not wrapped in a handler: if the
+    durable record cannot be written, that surfaces alongside the spawn error
+    rather than quietly replacing it.
+    """
+    if selection.billing_class != "free" or not selection.route_id:
+        return
+    succession.escalate_free_route_failure(
+        client,
+        execution_routing.ExecutionRoutingStore().load(),
+        route_id=selection.route_id,
+        # No session exists to name; this namespace cannot collide with one.
+        child_session_id=f"pending-spawn:{args.name}",
+        parent_session_id=os.environ.get(escalation.CDESKTOP_SESSION_ENV),
+        output=str(error),
     )
 
 
@@ -246,9 +276,10 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
             setup_script=setup_script,
             auth_binding_id=selection.auth_binding_id,
         )
-    except Exception:
+    except Exception as spawn_error:
         if pending_lease:
             lease_store.release(pending_lease.token)
+        _report_free_route_failure(client, args, selection, spawn_error)
         raise
     workspace_id = _workspace_id(result)
     session_id = _primary_session_id(result)

@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from . import execution_routing
-from .escalation import EscalationStore
+from .escalation import EscalationStore, escalate, redact_credentials
 from .pool import core as pool_core
 
 OWNERSHIP_VERSION = 1
@@ -35,6 +35,10 @@ SUPERSEDED = "superseded"
 TERMINAL_STATES = {RETIRED, SUPERSEDED}
 
 COMMAND_TERMINAL_STATES = {"done", "failed", "cancelled"}
+
+# Enough captured failure text to diagnose the route, bounded so a runaway
+# provider dump cannot become the escalation body.
+FREE_FAILURE_DETAIL_LIMIT = 400
 
 
 class SuccessionError(RuntimeError):
@@ -389,4 +393,105 @@ def reroute_after_quota_exhaustion(
         settings,
         preferred_model=preferred_model,
         exclude_account_ids=frozenset({exhausted_binding_id}),
+    )
+
+
+# ---------------------------------------------------------------- free route failure
+
+
+@dataclass(frozen=True)
+class FreeRouteFailure:
+    route_id: str
+    outcome: str
+    detail: str
+    escalation: dict[str, Any]
+    selection: execution_routing.SelectionResult | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "route_id": self.route_id,
+            "outcome": self.outcome,
+            "detail": self.detail,
+            "escalation": self.escalation,
+            "selection": self.selection.to_dict() if self.selection else None,
+        }
+
+
+def _failure_detail(output: str) -> str:
+    """The first meaningful line of captured output, redacted and bounded."""
+    for line in str(output or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            return redact_credentials(stripped)[:FREE_FAILURE_DETAIL_LIMIT]
+    return "no output captured"
+
+
+def escalate_free_route_failure(
+    client: Any,
+    settings: execution_routing.ExecutionRoutingSettings,
+    *,
+    route_id: str,
+    child_session_id: str,
+    child_workspace_id: str | None = None,
+    parent_session_id: str | None = None,
+    output: str = "",
+    store: EscalationStore | None = None,
+) -> FreeRouteFailure:
+    """Make a free route's terminal failure visible, and never quietly billed.
+
+    A free route owns no account by construction, so there is no binding to
+    cool and nothing for `reroute_after_quota_exhaustion` to act on - a
+    terminal failure would otherwise leave the worker blocked with no signal
+    at all. This gives it exactly one visible outcome: an escalation carrying
+    the route id and outcome class, delivered to a live parent or parked in
+    the decision inbox by :func:`escalate`, which has no third result.
+
+    Degrading onto a route that bills is a separate decision the operator has
+    to make: it happens only under `fallbackOnFreeFailure`, and the escalation
+    names the route that was chosen either way. Selection is a pure read, so
+    computing it first costs nothing and lets one message carry the whole
+    story rather than leaving the operator to correlate two.
+    """
+    outcome = execution_routing.classify_free_failure(output)
+    detail = _failure_detail(output)
+
+    selection: execution_routing.SelectionResult | None = None
+    if settings.fallback_on_free_failure:
+        selection = execution_routing.select_route(
+            settings, exclude_route_ids=frozenset({route_id})
+        )
+
+    if selection is None:
+        consequence = (
+            "fallbackOnFreeFailure is off, so no billed account was used and "
+            "this session stays blocked until you route it"
+        )
+    elif selection.status == "resolved" and selection.target is not None:
+        consequence = (
+            f"fallbackOnFreeFailure moved it to route {selection.target.route_id} "
+            f"({selection.target.billing_class})"
+        )
+    else:
+        consequence = (
+            f"fallbackOnFreeFailure found no other route ({selection.reason})"
+        )
+
+    record = escalate(
+        client,
+        child_session_id=str(child_session_id),
+        child_workspace_id=child_workspace_id,
+        parent_session_id=parent_session_id,
+        message=(
+            f"DECISION: free route {route_id} failed ({outcome}); "
+            f"{consequence}. Detail: {detail}"
+        ),
+        store=store,
+        dedupe_key=f"free-route-failure:{child_session_id}:{route_id}:{outcome}",
+    )
+    return FreeRouteFailure(
+        route_id=str(route_id),
+        outcome=outcome,
+        detail=detail,
+        escalation=record,
+        selection=selection,
     )

@@ -56,6 +56,15 @@ def cmd_routing(args: argparse.Namespace) -> int:
         _emit(updated.to_dict(), args.json)
         return 0
 
+    if action == "set-free-fallback":
+        updated = store.save(
+            dataclasses.replace(
+                store.load(), fallback_on_free_failure=args.value == "on"
+            )
+        )
+        _emit(updated.to_dict(), args.json)
+        return 0
+
     if action == "routes":
         return _cmd_routing_routes(args, store)
 
@@ -183,6 +192,16 @@ def add_parser(sub: argparse._SubParsersAction[Any]) -> None:
     )
     routing_set_metered.add_argument("value", choices=sorted(execution_routing.METERED_FALLBACK_VALUES))
     routing_set_metered.set_defaults(func=cmd_routing)
+
+    routing_set_free_fallback = routing_sub.add_parser(
+        "set-free-fallback",
+        help=(
+            "Allow a failed free route to fall back onto a route that bills "
+            "(off by default; the failure is escalated either way)"
+        ),
+    )
+    routing_set_free_fallback.add_argument("value", choices=["on", "off"])
+    routing_set_free_fallback.set_defaults(func=cmd_routing)
 
     routing_routes = routing_sub.add_parser("routes", help="Manage configured routes")
     routing_routes_sub = routing_routes.add_subparsers(

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from sightmesh import __version__, approvals, cli, escalation, succession
+from sightmesh.cdesktop import CdesktopError
 from sightmesh.cli import (
     _fleet_sessions,
     _idle_unmet_orders,
@@ -616,7 +617,6 @@ def test_approval_command_approves_reviewed_plan(monkeypatch, tmp_path, capsys) 
 
     monkeypatch.setattr(cli, "CdesktopClient", client_factory)
     monkeypatch.setattr(approvals, "approval_db_path", lambda: tmp_path / "audit.db")
-    monkeypatch.delenv("CDESKTOP_SESSION_ID", raising=False)
     args = parser().parse_args(["--json", "approval", "approve", "approval-a"])
 
     assert args.func(args) == 0
@@ -659,6 +659,9 @@ class FakeSpawnClient:
         }
 
     def workspaces(self):
+        return []
+
+    def workspace_summaries(self, archived=False):
         return []
 
     def workspace(self, workspace_id):
@@ -1048,6 +1051,81 @@ def test_spawn_direct_acquires_workspace_lease(
     assert leases[0].session_id == "session-a"
 
 
+def test_refused_free_route_spawn_escalates_and_releases_its_lease(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Why: a free route cdesktop refuses to launch leaves no worker behind to
+    notice and no binding to cool, so without this the operator gets a CLI
+    error and the fleet gets no record at all."""
+    from sightmesh import execution_routing
+    from sightmesh.escalation import EscalationStore
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lease_dir = tmp_path / "leases"
+    settings_path = tmp_path / "execution_routing.json"
+    monkeypatch.setattr(
+        execution_routing, "default_settings_path", lambda: settings_path
+    )
+    execution_routing.ExecutionRoutingStore(settings_path).save(
+        execution_routing.ExecutionRoutingSettings(
+            routes=(
+                execution_routing.Route(
+                    id="opencode-ox-free",
+                    executor="OPENCODE",
+                    model="opencode/x-preview-f-free",
+                    billing_class="free",
+                ),
+            )
+        )
+    )
+
+    class RefusingClient(FakeSpawnClient):
+        def spawn_workspace(self, **kwargs):
+            raise CdesktopError(
+                "Model not found: opencode/x-preview-f-free. "
+                "Did you mean: hy3-free, mimo-v2.5-free?"
+            )
+
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
+    monkeypatch.setattr(cli, "CdesktopClient", RefusingClient)
+    monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
+    monkeypatch.setattr(cli.leases, "sync_active_workspaces", lambda _client: [])
+
+    args = argparse.Namespace(
+        prompt="start",
+        prompt_file=None,
+        repo=str(repo),
+        url=None,
+        name="demo",
+        base="main",
+        executor=None,
+        profile_name=None,
+        worktree=False,
+        permission="SUPERVISED",
+        unattended=False,
+        model=None,
+        reasoning=None,
+        provider=None,
+        lease_ttl_seconds=60,
+        no_bridge=False,
+        json=True,
+    )
+
+    with pytest.raises(CdesktopError):
+        cli.cmd_spawn(args)
+
+    # No parent to wake from this launcher, so the record lands in the inbox.
+    parked = EscalationStore().pending()
+    assert len(parked) == 1
+    assert "opencode-ox-free" in parked[0].message
+    assert "model_unavailable" in parked[0].message
+    assert "Model not found" in parked[0].message
+
+    # The refused spawn must not strand the lease it took.
+    assert LeaseStore(lease_dir).list() == []
+
+
 def test_lease_capability_boundary_redacts_inspection(tmp_path: Path, capsys) -> None:
     store = LeaseStore(tmp_path / "leases")
     lease = store.acquire("owner", tmp_path, ttl_seconds=60)
@@ -1331,7 +1409,6 @@ def test_spawn_captures_external_launcher_identity_and_it_survives_restart(
     monkeypatch.setattr(cli.leases, "sync_active_workspaces", lambda _client: [])
     monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
     monkeypatch.setattr(escalation, "escalation_db_path", lambda: escalation_db)
-    monkeypatch.delenv("CDESKTOP_SESSION_ID", raising=False)
     monkeypatch.setenv("CONDUCTOR_WORKSPACE_NAME", "my-workspace")
     monkeypatch.setattr(cli, "CdesktopClient", FakeSpawnClient)
 
@@ -1488,7 +1565,6 @@ def test_worktree_spawn_configures_repository_setup_hook(
     monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: tmp_path / "leases")
     monkeypatch.setattr(cli.routing, "enable", lambda _workspace_id: None)
     monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
-    monkeypatch.delenv("CDESKTOP_SESSION_ID", raising=False)
 
     class Client(FakeSpawnClient):
         instance = None
@@ -1514,7 +1590,6 @@ def test_worktree_spawn_without_setup_hook_is_a_noop(
     monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: tmp_path / "leases")
     monkeypatch.setattr(cli.routing, "enable", lambda _workspace_id: None)
     monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
-    monkeypatch.delenv("CDESKTOP_SESSION_ID", raising=False)
 
     class Client(FakeSpawnClient):
         instance = None
@@ -1540,7 +1615,6 @@ def test_worktree_setup_failure_propagates_without_a_lease(
     lease_dir = tmp_path / "leases"
     monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
     monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
-    monkeypatch.delenv("CDESKTOP_SESSION_ID", raising=False)
 
     class Client(FakeSpawnClient):
         def spawn_workspace(self, **kwargs):

@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pytest
+
 from sightmesh.cdesktop import CdesktopError
 from sightmesh.escalation import (
     EscalationClass,
     EscalationStore,
+    EscalationStoreError,
     LauncherIdentity,
     classify_escalation,
     detect_launcher,
@@ -322,3 +329,91 @@ def test_escalate_is_idempotent_on_repeated_identical_retries(tmp_path):
 
     assert first["parked"]["escalation_id"] == second["parked"]["escalation_id"]
     assert len(store.pending()) == 1
+
+
+# ---------------------------------------------------------------- store durability
+
+
+def test_concurrent_openers_never_fail_with_database_is_locked(tmp_path: Path) -> None:
+    """Why: SQLite refuses a journal-mode switch while another connection is
+    open and does not run the busy handler for it, so two processes creating
+    the store at the same moment used to surface a spurious
+    "database is locked" - the failure looked like the caller's fault and lost
+    a durable escalation write."""
+    path = tmp_path / "escalations.sqlite3"
+
+    def park(index: int):
+        store = EscalationStore(path)
+        return store.park(
+            child_session_id=f"child-{index}",
+            child_workspace_id=None,
+            recorded_parent_session_id=None,
+            reason="no_parent",
+            message=f"BLOCKED: {index}",
+            dedupe_key=f"key-{index}",
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        parked = list(workers.map(park, range(24)))
+
+    assert len({record.escalation_id for record in parked}) == 24
+    assert len(EscalationStore(path).pending()) == 24
+
+
+def test_wal_is_adopted_once_and_reread_by_later_openers(tmp_path: Path) -> None:
+    """Why: journal mode is a persistent property of the file, so every opener
+    after the first must read it back rather than re-take an exclusive lock."""
+    path = tmp_path / "escalations.sqlite3"
+    EscalationStore(path)
+
+    with sqlite3.connect(path) as probe:
+        assert probe.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        # A second opener succeeds even while this connection is held open,
+        # which an unconditional `PRAGMA journal_mode = WAL` could not do.
+        EscalationStore(path)
+    probe.close()
+
+
+def test_every_connection_the_store_opens_is_closed(monkeypatch, tmp_path: Path) -> None:
+    """Why: a leaked connection keeps SQLite refusing the journal-mode switch
+    for the life of the process, and the store opens one per operation."""
+    opened: list[sqlite3.Connection] = []
+    real_connect = sqlite3.connect
+
+    def tracking_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracking_connect)
+
+    store = EscalationStore(tmp_path / "escalations.sqlite3")
+    store.park(
+        child_session_id="child-1",
+        child_workspace_id=None,
+        recorded_parent_session_id=None,
+        reason="no_parent",
+        message="BLOCKED: work",
+        dedupe_key="key-1",
+    )
+    store.pending()
+
+    assert opened
+    for conn in opened:
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
+
+
+def test_a_failing_statement_keeps_its_own_error_message(tmp_path: Path) -> None:
+    """Why: the connection wrapper must not relabel statement errors as open
+    failures, or every caller's specific message would be replaced."""
+    store = EscalationStore(tmp_path / "escalations.sqlite3")
+    conn = sqlite3.connect(store.path)
+    try:
+        conn.execute("DROP TABLE escalations")
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(EscalationStoreError, match="Cannot read parked escalations"):
+        store.pending()

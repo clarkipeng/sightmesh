@@ -437,19 +437,31 @@ class DurableExecutionReconciler:
         message: str,
         key: str,
     ) -> None:
-        """Deliver once to a live successor, or leave the wake parked for retry."""
+        """Deliver once to a live successor, or park the wake in the inbox.
+
+        A quarantined parent may still have a successor linked later, so this
+        stays retryable. Parking is what makes the gap visible in the
+        meantime: a warning alone left the child's terminal signal invisible
+        for as long as - possibly forever - no successor appeared. The shared
+        dedupe key keeps repeated ticks to one parked record and lets a later
+        delivery resolve it.
+        """
         if key in self._notified:
             return
         destination = resolve_live_successor(self.ownership, parent_session_id)
         if destination is None:
-            LOGGER.warning(
-                "Parking child notification for quarantined parent %s with no live "
-                "successor",
-                parent_session_id,
+            self.signal_store.park(
+                child_session_id=child_session_id,
+                child_workspace_id=None,
+                recorded_parent_session_id=parent_session_id,
+                reason="parent_unreachable",
+                message=message,
+                dedupe_key=key,
             )
             return
         self.queue.notify_parent(destination, child_session_id, message, key)
         self._notified.add(key)
+        self.signal_store.resolve_dedupe_key(key)
 
     def _interrupt_and_requeue(self, command: DurableCommand) -> None:
         # Lifecycle writes are idempotent in cdesktop; duplicate ticks cannot

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 import zipfile
@@ -73,9 +75,27 @@ def test_runtime_artifact_checksum_succeeds_and_fails_closed(tmp_path: Path) -> 
         verify_file_sha256(artifact, "0" * 64)
 
 
+def _wheel_build_command(out_dir: Path) -> list[str] | None:
+    """Any PEP 517 frontend present in this environment, or None.
+
+    Pinning one frontend keeps breaking somewhere: `python -m build` is absent
+    from a clean checkout, and `uv` is absent from the CI runner. The test
+    cares that the wheel carries the lock resource, not which tool produced
+    it, so it takes whichever is actually installed.
+    """
+    if shutil.which("uv"):
+        return ["uv", "build", "--wheel", "--out-dir", str(out_dir)]
+    if importlib.util.find_spec("build"):
+        return [sys.executable, "-m", "build", "--wheel", "--outdir", str(out_dir)]
+    return None
+
+
 def test_built_wheel_contains_loadable_runtime_lock(tmp_path: Path) -> None:
+    command = _wheel_build_command(tmp_path)
+    if command is None:
+        pytest.skip("no PEP 517 build frontend available (install `uv` or `build`)")
     subprocess.run(
-        [sys.executable, "-m", "build", "--wheel", "--outdir", str(tmp_path)],
+        command,
         cwd=ROOT,
         check=True,
         capture_output=True,
