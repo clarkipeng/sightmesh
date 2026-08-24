@@ -3,10 +3,10 @@
   "cdesktop": {
     "repository": "clarkipeng/cdesktop",
     "version": "0.2.6",
-    "tag": "v0.2.6-20260823073422",
+    "tag": "v0.2.6-20260823235118",
     "package": {
-      "url": "https://github.com/clarkipeng/cdesktop/releases/download/v0.2.6-20260823073422/cdesktop-0.2.6.tgz",
-      "sha256": "dbfe87cb36863ec089a076a4afec5632dde9d446ba6fc886536f52e7ebd304bd"
+      "url": "https://github.com/clarkipeng/cdesktop/releases/download/v0.2.6-20260823235118/cdesktop-0.2.6.tgz",
+      "sha256": "47deba33faa798f799da6e8bcf42375766622c736984505440675dd93d7c48cf"
     },
     "compatibility": {
       "minimum": "0.2.5",
