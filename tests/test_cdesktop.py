@@ -406,3 +406,46 @@ def test_delete_workspace_encodes_rust_booleans_in_lowercase(monkeypatch) -> Non
     CdesktopClient("http://127.0.0.1:3210").delete_workspace("workspace-a")
 
     assert requests[0][0].full_url.endswith("delete_remote=false&delete_branches=false")
+
+
+def test_missing_repository_is_reconciled_not_dirty(tmp_path) -> None:
+    """A path that does not exist holds no uncommitted work.
+
+    Live condition: cdesktop had already reclaimed these managed worktrees, so
+    the directory was gone. Reporting that as dirty state blocked archive, and
+    delete refuses anything not yet archived, leaving the workspace unremovable.
+    """
+    container = tmp_path / "reclaimed"
+    client = FakeClient()
+    client.workspace = lambda _: {
+        "use_worktree": True,
+        "container_ref": str(container),
+        "archived": False,
+    }
+    client.workspace_repos = lambda _: [
+        {"is_git": True, "path": "/unused", "name": "repo"}
+    ]
+
+    assert client.dirty_repositories("workspace") == []
+    assert client.missing_repositories("workspace") == [
+        {
+            "path": str(container / "repo"),
+            "status": "repository path is missing",
+        }
+    ]
+
+
+def test_missing_container_ref_is_reconciled_not_dirty() -> None:
+    """A managed worktree that was never materialised has nothing on disk."""
+    client = FakeClient()
+    client.workspace = lambda _: {
+        "use_worktree": True,
+        "container_ref": None,
+        "archived": False,
+    }
+    client.workspace_repos = lambda _: [
+        {"is_git": True, "path": "/unused", "name": "repo"}
+    ]
+
+    assert client.dirty_repositories("workspace") == []
+    assert client.missing_repositories("workspace") == []

@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from sightmesh import __version__, approvals, cli, escalation, succession
-from sightmesh.cdesktop import CdesktopError
+from sightmesh.cdesktop import CdesktopClient, CdesktopError
 from sightmesh.cli import (
     _fleet_sessions,
     _idle_unmet_orders,
@@ -685,6 +685,10 @@ class FakeSpawnClient:
     def dirty_repositories(self, workspace_id):
         assert workspace_id == "workspace-a"
         return list(self.dirty)
+
+    def missing_repositories(self, workspace_id):
+        assert workspace_id == "workspace-a"
+        return []
 
     def sessions(self, _workspace_id):
         return [{"id": "session-a", "created_at": "2026-08-12T00:00:00Z"}]
@@ -1760,37 +1764,32 @@ def test_workspace_delete_requires_archived_and_preserves_branch(
     assert '"branch_preserved": true' in capsys.readouterr().out
 
 
-def test_workspace_delete_requires_extra_confirmation_for_missing_direct_repo(
-    monkeypatch,
+def test_workspace_delete_reports_missing_direct_repo_without_refusing(
+    monkeypatch, capsys
 ) -> None:
+    """A direct repository that has already disappeared leaves nothing to lose,
+    so deletion proceeds and simply records what was missing."""
+
     class MissingRepoClient(FakeSpawnClient):
         def __init__(self, _url=None) -> None:
             super().__init__(_url)
             self.workspace_data["archived"] = True
-            self.dirty = [
+
+        def missing_repositories(self, _workspace_id):
+            return [
                 {"path": "/missing/repo", "status": "repository path is missing"}
             ]
 
     client = MissingRepoClient()
     monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
-    args = parser().parse_args(
-        ["workspace", "delete", "workspace-a", "--confirm-delete"]
-    )
-    with pytest.raises(ValueError, match="--allow-missing-repo"):
-        args.func(args)
-
     monkeypatch.setattr(cli.routing, "disable", lambda _workspace_id: None)
     args = parser().parse_args(
-        [
-            "workspace",
-            "delete",
-            "workspace-a",
-            "--confirm-delete",
-            "--allow-missing-repo",
-        ]
+        ["--json", "workspace", "delete", "workspace-a", "--confirm-delete"]
     )
+
     assert args.func(args) == 0
     assert client.deleted == ["workspace-a"]
+    assert "/missing/repo" in capsys.readouterr().out
 
 
 def test_workspace_delete_can_preserve_dirty_direct_repo(monkeypatch) -> None:
@@ -2165,3 +2164,58 @@ def test_cmd_parent_delivers_normally_when_parent_is_live(
     assert len(client.sent) == 1
     assert client.sent[0]["session_id"] == "parent-a"
     assert escalation.EscalationStore(escalation_db).pending() == []
+
+
+def test_workspace_with_missing_worktree_archives_then_deletes(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    """The live catch-22: archive refused the workspace because its already
+    reclaimed directory read as dirty, and delete refused it because it was
+    never archived. 170 workspaces were structurally unremovable this way.
+
+    Both steps run the real reconciliation logic against a container directory
+    that genuinely does not exist on disk.
+    """
+    container = tmp_path / "reclaimed-container"
+
+    class ReclaimedWorktreeClient(FakeSpawnClient):
+        def __init__(self, _url=None) -> None:
+            super().__init__(_url)
+            self.workspace_data.update(
+                {
+                    "use_worktree": True,
+                    "container_ref": str(container),
+                    "archived": False,
+                }
+            )
+
+        def workspace_repos(self, _workspace_id):
+            return [{"is_git": True, "path": str(container / "repo"), "name": "repo"}]
+
+        _git_repository_paths = CdesktopClient._git_repository_paths
+        dirty_repositories = CdesktopClient.dirty_repositories
+        missing_repositories = CdesktopClient.missing_repositories
+
+    client = ReclaimedWorktreeClient()
+    monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
+    monkeypatch.setattr(cli.routing, "disable", lambda _workspace_id: None)
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: tmp_path / "leases")
+    monkeypatch.setattr(
+        succession, "default_ownership_path", lambda: tmp_path / "ownership.json"
+    )
+
+    archive = parser().parse_args(
+        ["--json", "workspace", "archive", "workspace-a", "--confirm-reconciled"]
+    )
+    assert archive.func(archive) == 0
+    assert client.archived == ["workspace-a"]
+
+    client.workspace_data["archived"] = True
+    delete = parser().parse_args(
+        ["--json", "workspace", "delete", "workspace-a", "--confirm-delete"]
+    )
+    assert delete.func(delete) == 0
+    assert client.deleted == ["workspace-a"]
+
+    out = capsys.readouterr().out
+    assert "repository path is missing" in out
