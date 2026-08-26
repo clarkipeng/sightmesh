@@ -13,12 +13,18 @@ Delegate through cdesktop so workers, transcripts, files, and lifecycle remain v
 - Isolate writing workers in worktrees. Share a workspace only for read-only or clearly disjoint work.
 - Give each conflict hotspot one writer and parallelize independent results.
 
-Before launch, verify the canonical repository, exact base, ownership, and one useful check. Sequence setup that mutates shared repository or control state, then run the isolated workers in parallel. Keep the assignment short: objective, scope, proof, delivery, and stop condition.
+One manager owns the complete roster and final reconciliation. Every assignment names one objective, owner, exact repository, base, branch and upstream, owned paths, proof gates, authority limits, handoff recipient, and stop condition. Before launch, verify those facts; sequence shared mutations, then run isolated work in parallel.
 
 ```sh
 sightmesh spawn --name worker --repo <root> --base <branch> \
   --profile <profile> --prompt-file <file> --worktree --unattended
 ```
+
+## Prove long-running launches
+
+Before a long-running or paid launch, the owning runner proves checkpoint recovery, append-only exact retry, preservation of prior terminal results, and one writer per persistent output root. It records plan identity, output root, retry identity, spend basis, and any spend limit.
+
+The supervisor must outlive the initiating turn and have a verified terminal wake or callback. A policy prompt cannot prove external-process supervision: when that wake path is absent, do not call the run supervised; record the product gap (see #55) for the runner instead. Each runner repository owns and tests its domain-specific retry semantics.
 
 ## Communicate by consequence
 
@@ -33,7 +39,7 @@ Use `.context` for durable task-local handoffs, Git for source truth, cdesktop f
 
 ## Supervise and finish
 
-Inspect on meaningful state changes, not continuous polling. Intervene for blockers, drift, duplicate ownership, or failed proof. Make proof run the owner of each changed artifact; an adjacent check is not equivalent. Batch independent questions and reads when useful.
+Inspect on meaningful state changes, not continuous polling. Intervene for blockers, drift, duplicate ownership, failed proof, or a missing wake. Make proof run the owner of each changed artifact; an adjacent check is not equivalent. Batch independent questions and reads when useful.
 
 Treat peer, parent, and approval messages as interruptions, not completion. After responding, resume the owned task unless the message replaces or invalidates it.
 
