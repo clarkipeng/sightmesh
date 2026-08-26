@@ -424,28 +424,37 @@ class CdesktopClient:
     def workspace_repos(self, workspace_id: str) -> list[dict[str, Any]]:
         return self.request("GET", f"/workspaces/{workspace_id}/repos")
 
-    def dirty_repositories(self, workspace_id: str) -> list[dict[str, str]]:
+    def _git_repository_paths(self, workspace_id: str) -> list[Path]:
+        """The on-disk path cdesktop uses for each Git repository, existing or not.
+
+        A managed worktree with no container has no directory of its own, so it
+        contributes no path at all.
+        """
         workspace = self.workspace(workspace_id)
-        dirty: list[dict[str, str]] = []
+        paths: list[Path] = []
         for repo in self.workspace_repos(workspace_id):
             if not repo.get("is_git"):
                 continue
             if workspace.get("use_worktree"):
                 container = workspace.get("container_ref")
                 if not container:
-                    if workspace.get("archived"):
-                        continue
-                    dirty.append({"path": "", "status": "missing container_ref"})
                     continue
-                path = Path(container) / repo["name"]
+                paths.append(Path(container) / repo["name"])
             else:
-                path = Path(repo["path"])
+                paths.append(Path(repo["path"]))
+        return paths
+
+    def dirty_repositories(self, workspace_id: str) -> list[dict[str, str]]:
+        """Repositories holding uncommitted work that archiving would risk.
+
+        A directory that does not exist holds no uncommitted work, so it is
+        never dirty; ``missing_repositories`` reports it instead. That keeps the
+        guard strict for real files while leaving an already reconciled
+        workspace removable.
+        """
+        dirty: list[dict[str, str]] = []
+        for path in self._git_repository_paths(workspace_id):
             if not path.is_dir():
-                if workspace.get("archived") and workspace.get("use_worktree"):
-                    continue
-                dirty.append(
-                    {"path": str(path), "status": "repository path is missing"}
-                )
                 continue
             result = subprocess.run(
                 ["git", "status", "--porcelain=v1", "--untracked-files=all"],
@@ -460,6 +469,14 @@ class CdesktopClient:
             if status:
                 dirty.append({"path": str(path), "status": status})
         return dirty
+
+    def missing_repositories(self, workspace_id: str) -> list[dict[str, str]]:
+        """Repository paths cdesktop expects that are no longer on disk."""
+        return [
+            {"path": str(path), "status": "repository path is missing"}
+            for path in self._git_repository_paths(workspace_id)
+            if not path.is_dir()
+        ]
 
     def spawn_workspace(
         self,

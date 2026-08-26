@@ -18,7 +18,7 @@ SightMesh keeps orchestration data local and separates durable source state from
 
 ## Workspace lifecycle
 
-Archive is the ordinary retirement action. It stops execution, disables message routing, releases the ownership lease, and preserves the cdesktop workspace record and session history. SightMesh refuses to archive a dirty cdesktop-managed worktree because cdesktop may reclaim that directory after about one hour. A direct workspace may preserve reconciled dirty state only with `--preserve-dirty`; cdesktop never owns or removes its repository.
+Archive is the ordinary retirement action. It stops execution, disables message routing, releases the ownership lease, and preserves the cdesktop workspace record and session history. SightMesh refuses to archive a dirty cdesktop-managed worktree because cdesktop may reclaim that directory after about one hour. A worktree cdesktop has already reclaimed holds no uncommitted work, so it never counts as dirty. A direct workspace may preserve reconciled dirty state only with `--preserve-dirty`; cdesktop never owns or removes its repository.
 
 Restore reactivates the same cdesktop record, reacquires its ownership lease, and re-enables routing. If cdesktop already reclaimed a clean managed worktree, it recreates the worktree from the preserved Git branch when execution resumes.
 
