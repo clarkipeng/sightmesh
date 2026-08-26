@@ -140,26 +140,17 @@ def cmd_workspace(args: argparse.Namespace) -> int:
         if not workspace.get("archived"):
             raise ValueError("Refusing to delete an active workspace; archive it first")
         dirty = client.dirty_repositories(args.workspace_id)
-        missing = [
-            item for item in dirty if item.get("status") == "repository path is missing"
-        ]
-        substantive_dirty = [item for item in dirty if item not in missing]
-        if missing and not args.allow_missing_repo:
-            raise ValueError(
-                "The archived direct workspace's repository path is missing. Refusing "
-                "to delete its remaining cdesktop history without --allow-missing-repo. "
-                f"Missing state: {json.dumps(missing)}"
-            )
-        if substantive_dirty and workspace.get("use_worktree"):
+        missing = client.missing_repositories(args.workspace_id)
+        if dirty and workspace.get("use_worktree"):
             raise ValueError(
                 "Refusing to delete an archived managed worktree with dirty files. "
-                f"Dirty state: {json.dumps(substantive_dirty)}"
+                f"Dirty state: {json.dumps(dirty)}"
             )
-        if substantive_dirty and not args.preserve_dirty:
+        if dirty and not args.preserve_dirty:
             raise ValueError(
                 "Refusing to delete cdesktop history for a dirty direct workspace "
                 "without --preserve-dirty. The repository itself will remain untouched. "
-                f"Dirty state: {json.dumps(substantive_dirty)}"
+                f"Dirty state: {json.dumps(dirty)}"
             )
         result = client.delete_workspace(args.workspace_id)
         routing.disable(args.workspace_id)
@@ -170,7 +161,7 @@ def cmd_workspace(args: argparse.Namespace) -> int:
                 "action": "deleted",
                 "branch_preserved": True,
                 "missing_repositories": missing,
-                "preserved_dirty": substantive_dirty,
+                "preserved_dirty": dirty,
                 "cdesktop_result": result,
                 "released_lease": released.to_public_dict() if released else None,
             },
@@ -356,11 +347,6 @@ def add_workspace_parser(sub: argparse._SubParsersAction[Any]) -> None:
     )
     workspace_delete.add_argument("workspace_id")
     workspace_delete.add_argument("--confirm-delete", action="store_true")
-    workspace_delete.add_argument(
-        "--allow-missing-repo",
-        action="store_true",
-        help="Delete remaining cdesktop history after its direct repository disappeared",
-    )
     workspace_delete.add_argument(
         "--preserve-dirty",
         action="store_true",
