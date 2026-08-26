@@ -219,6 +219,28 @@ def _repository_setup_script(repo_path: Path, base: str) -> str | None:
     return setup.strip() or None
 
 
+EPHEMERAL_BASE_MARKERS = ("conductor/workspaces/", ".cdesktop-workspaces/")
+
+
+def _reject_ephemeral_base(repo_path: Path, *, allow: bool) -> None:
+    """A spawn worktree is tethered to the repo it branches from, so an
+    ephemeral checkout (a Conductor workspace, another spawn's worktree) must
+    not become that home: deleting the temp copy later breaks every derived
+    worktree. Canonical checkouts live outside these directories."""
+    if allow:
+        return
+    posix = repo_path.as_posix()
+    for marker in EPHEMERAL_BASE_MARKERS:
+        if f"/{marker}" in posix:
+            raise ValueError(
+                f"Refusing to spawn from an ephemeral checkout: {repo_path} "
+                f'lives under "{marker}". Deleting that temporary copy would '
+                "break every worktree derived from it. Spawn from the "
+                "canonical checkout instead, or pass --ephemeral-base to "
+                "accept the risk."
+            )
+
+
 def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
     prompt = _with_coordination_contract(
         _read_text(args.prompt, args.prompt_file, "prompt")
@@ -228,6 +250,7 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
     repo_path = Path(args.repo).expanduser().resolve()
     if not repo_path.is_dir():
         raise ValueError(f"Repository path does not exist: {repo_path}")
+    _reject_ephemeral_base(repo_path, allow=getattr(args, "ephemeral_base", False))
     base_ref = _validate_base_branch(
         repo_path, args.base, getattr(args, "local_base", False)
     ) or args.base
@@ -525,6 +548,12 @@ def add_spawn_parser(sub: argparse._SubParsersAction[Any]) -> None:
         "--local-base",
         action="store_true",
         help="Use the local branch ref even when origin/<base> exists",
+    )
+    spawn.add_argument(
+        "--ephemeral-base",
+        action="store_true",
+        help="Allow spawning from a temporary checkout (Conductor workspace "
+        "or another spawn's worktree) despite the lifetime coupling",
     )
     spawn.add_argument("--executor", choices=["CLAUDE_CODE", "CODEX", "OPENCODE"])
     spawn.add_argument(

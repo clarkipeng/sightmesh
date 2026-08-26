@@ -2219,3 +2219,23 @@ def test_workspace_with_missing_worktree_archives_then_deletes(
 
     out = capsys.readouterr().out
     assert "repository path is missing" in out
+
+
+def test_spawn_refuses_ephemeral_base(tmp_path: Path) -> None:
+    from sightmesh.cli.spawn import _reject_ephemeral_base
+
+    conductor = tmp_path / "conductor/workspaces/baku/repo"
+    conductor.mkdir(parents=True)
+    with pytest.raises(ValueError, match="ephemeral"):
+        _reject_ephemeral_base(conductor, allow=False)
+
+    worktree = tmp_path / ".local/share/sightmesh/.cdesktop-workspaces/abcd-lane/repo"
+    worktree.mkdir(parents=True)
+    with pytest.raises(ValueError, match="ephemeral"):
+        _reject_ephemeral_base(worktree, allow=False)
+
+    canonical = tmp_path / "Documents/Code/catapult-games"
+    canonical.mkdir(parents=True)
+    _reject_ephemeral_base(canonical, allow=False)
+
+    _reject_ephemeral_base(conductor, allow=True)
