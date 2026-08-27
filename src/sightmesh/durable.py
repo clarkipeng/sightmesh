@@ -30,6 +30,8 @@ from .succession import COMMAND_TERMINAL_STATES, OwnershipStore, resolve_live_su
 
 LOGGER = logging.getLogger("sightmesh.durable")
 
+LIFECYCLE_WAKE_PREFIXES = ("child-command:", "child-terminal:", "signal-policy:")
+
 
 def supports_durable_recovery(version: object) -> bool:
     """Return whether cdesktop exposes the process-scoped recovery API."""
@@ -421,6 +423,13 @@ class DurableExecutionReconciler:
             state = command.delivery_state(None)
             if state not in {"terminal", "rejected"}:
                 continue
+            # A lifecycle wake is already the receipt for another transition.
+            # Receipting it again manufactures a fresh command identity and can
+            # turn one completion into an unbounded self-sustaining loop.
+            if command.dedupe_key and command.dedupe_key.startswith(
+                LIFECYCLE_WAKE_PREFIXES
+            ):
+                continue
             key = f"child-command:{command.id}:{command.state}"
             self._notify_live_parent(
                 parent_session_id=str(parent),
@@ -449,7 +458,13 @@ class DurableExecutionReconciler:
         if key in self._notified:
             return
         destination = resolve_live_successor(self.ownership, parent_session_id)
-        if destination is None:
+        if destination is None or destination == child_session_id:
+            if destination == child_session_id:
+                LOGGER.error(
+                    "Refusing lifecycle wake %s resolved back to child session %s",
+                    key,
+                    child_session_id,
+                )
             self.signal_store.park(
                 child_session_id=child_session_id,
                 child_workspace_id=None,

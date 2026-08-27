@@ -358,6 +358,55 @@ def test_terminal_command_wake_never_targets_retired_parent_and_delivers_once(
     ]
 
 
+def test_superseded_parent_resolving_to_child_never_self_resumes(tmp_path) -> None:
+    """A lifecycle receipt cannot become a new child command forever.
+
+    This reproduces the 3184-cr-mgr8 incident shape: parent A is superseded
+    by child B while B still records A as its parent.
+    """
+    ownership = store(tmp_path)
+    ownership.retire("parent-a", state="superseded", reason="failover")
+    ownership.link_successor("parent-a", "child-b")
+    client = FakeCdesktop(
+        commands=[
+            {
+                "id": "work-command",
+                "session_id": "child-b",
+                "body": "finished work",
+                "state": "done",
+                "dedupe_key": "original-work",
+            },
+            {
+                "id": "receipt-command",
+                "session_id": "child-b",
+                "body": "CHILD_DELIVERY: child-b prior done",
+                "state": "done",
+                "dedupe_key": "child-command:prior:done",
+            },
+        ]
+    )
+    signal_store = EscalationStore()
+    reconciler = DurableExecutionReconciler(
+        client, ownership=ownership, signal_store=signal_store
+    )
+    child = {
+        "id": "child-b",
+        "workspace_id": "workspace-b",
+        "parent_session_id": "parent-a",
+    }
+
+    for _ in range(5):
+        reconciler.reconcile_session(child)
+
+    assert client.sent == []
+    assert client.enqueued == {}
+    assert len(client.commands) == 2
+    parked = signal_store.pending()
+    assert len(parked) == 1
+    assert parked[0].dedupe_key == "child-command:work-command:done"
+    assert parked[0].recorded_parent_session_id == "parent-a"
+
+
 # ---------------------------------------------------------------- restart
 
 
