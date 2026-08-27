@@ -7,9 +7,20 @@
 
 - Objective:
 - Owner:
+- Handoff recipient:
+- Owned paths:
+- Authority limits:
+- Stop condition:
 - cdesktop workspace:
 - cdesktop session:
 - Repowire peer:
+
+## Launch record
+
+- Plan identity:
+- Persistent output root:
+- Retry identity:
+- Spend basis and limit:
 
 ## Git and review
 
@@ -24,6 +35,8 @@
 
 - Artifact:
 - Validation:
+- Requested-item classification (delivered, deferred with owner, blocked with evidence, or missing):
+- Terminal state, aggregate usage or cost, and owning PR (long-running work):
 
 ## Remaining state
 

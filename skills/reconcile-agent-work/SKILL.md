@@ -53,7 +53,7 @@ Compare:
 - PR diff, comments, reviews, checks, and merge state;
 - deployed state when the assignment included deployment.
 
-Classify every requested item as delivered, explicitly deferred with owner, blocked with evidence, or missing. Do not archive while unique work or an unresolved ownership conflict remains.
+Classify every requested item as delivered, explicitly deferred with owner, blocked with evidence, or missing. For a long-running assignment also record terminal state, aggregate usage or cost, artifacts, and the owning PR. Do not archive while unique work or an unresolved ownership conflict remains.
 
 ## Close visibly
 
