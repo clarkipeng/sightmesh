@@ -117,6 +117,30 @@ def test_missing_receipt_after_process_disappears_is_lost_unknown(tmp_path: Path
     assert saved.state == "notified"
     assert saved.terminal_state is None
     assert saved.diagnostic == "process fingerprint disappeared"
+    assert saved.lease_released_at is not None
+
+
+def test_receipt_published_during_final_liveness_check_wins(tmp_path: Path) -> None:
+    store, result = _subscribe(tmp_path)
+    record = store.bind(
+        result.subscription.subscription_id,
+        writer_capability=result.writer_capability,
+        pid=1234,
+        process_start="start-a",
+        observer=lambda _pid: "start-a",
+    )
+
+    def exits_after_receipt(_pid: int) -> None:
+        _receipt(record)
+        return None
+
+    client = Client()
+    RunReconciler(client, store, observer=exits_after_receipt).reconcile_one(record)
+
+    saved = store.get(record.subscription_id)
+    assert saved.state == "notified"
+    assert saved.terminal_state == "completed"
+    assert "terminal/completed" in str(client.sent[0]["prompt"])
 
 
 def test_restart_reloads_subscription_and_delivers_terminal_receipt(tmp_path: Path) -> None:
@@ -256,3 +280,30 @@ def test_unreachable_parent_parks_wake_and_marks_notified(tmp_path: Path) -> Non
     assert len(parked) == 1
     assert parked[0].dedupe_key == result.subscription.dedupe_key
     assert parked[0].reason == "parent_unreachable"
+
+
+def test_bad_receipt_is_isolated_and_does_not_block_other_wakes(tmp_path: Path) -> None:
+    store = RunSubscriptionStore(tmp_path / "escalations.sqlite3")
+    bad = store.subscribe(
+        run_id="bad",
+        output_root=tmp_path / "bad",
+        return_session_id="parent-a",
+    ).subscription
+    Path(bad.receipt_path).mkdir()
+    good = store.subscribe(
+        run_id="good",
+        output_root=tmp_path / "good",
+        return_session_id="parent-a",
+    ).subscription
+    _receipt(good)
+    client = Client()
+
+    results = RunReconciler(client, store).reconcile()
+
+    assert [result["state"] for result in results] == ["notified", "notified"]
+    assert store.get(bad.subscription_id).terminal_state is None
+    assert store.get(bad.subscription_id).diagnostic.startswith(
+        "Cannot read terminal receipt"
+    )
+    assert store.get(good.subscription_id).terminal_state == "completed"
+    assert len(client.sent) == 2

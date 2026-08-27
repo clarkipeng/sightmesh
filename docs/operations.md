@@ -24,7 +24,7 @@ sightmesh run subscribe \
   --return-workspace WORKSPACE_ID
 ```
 
-The command creates a durable record in the escalation store, reserves the canonical output root, and returns the subscription ID, one-time writer capability, stable dedupe key, and receipt path. The runner must subscribe before provider activity and must use a fresh empty output root per run. SightMesh rejects duplicate run IDs, duplicate output roots, non-directories, symlink roots, and non-empty roots.
+The command creates a durable record in the escalation store, atomically reserves the canonical output root, and returns the subscription ID, one-time writer capability, stable dedupe key, and receipt path. The runner must subscribe before provider activity and use a fresh absent or empty output root. SightMesh rejects duplicate run IDs, claimed roots, non-directories, symlink roots, and non-empty roots.
 
 After launch, bind the process fingerprint once:
 
@@ -44,6 +44,8 @@ The runner publishes exactly one UTF-8 JSON object at `<output-root>/terminal-re
 ```
 
 `terminal_state` is `completed` or `failed`; `exit_code` may be `null`. SightMesh validates identity and shape only. It does not inspect artifacts, costs, usage, or domain success. A valid receipt is authoritative even if the PID has already disappeared; disappearance or PID reuse without a valid receipt becomes `lost/unknown`.
+
+The output-root lease is released logically when terminal evidence or explicit loss is preserved (`lease_released_at`), while the historical root identity remains reserved so old append-only evidence can never acquire a second run meaning. The root's owner-only filesystem permissions are the receipt-writer trust boundary; the capability separately prevents another caller from binding a different process fingerprint.
 
 The managed bridge runs the same pass as:
 

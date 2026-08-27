@@ -44,6 +44,7 @@ class RunSubscription:
     receipt_digest: str | None
     diagnostic: str | None
     lost_at: float | None
+    lease_released_at: float | None
     notified_at: float | None
 
     def to_public_dict(self) -> dict[str, Any]:
@@ -67,6 +68,7 @@ class RunSubscription:
             "receipt_digest": self.receipt_digest,
             "diagnostic": self.diagnostic,
             "lost_at": self.lost_at,
+            "lease_released_at": self.lease_released_at,
             "notified_at": self.notified_at,
         }
 
@@ -128,8 +130,14 @@ def _prepare_output_root(path: str | Path) -> tuple[str, bool]:
         if any(root.iterdir()):
             raise RunSubscriptionError("Output root must be empty before subscription")
     else:
-        root.mkdir(parents=True, mode=0o700)
-        created = True
+        try:
+            root.mkdir(parents=True, mode=0o700)
+            created = True
+        except FileExistsError:
+            if not root.is_dir() or any(root.iterdir()):
+                raise RunSubscriptionError(
+                    "Output root must be an empty directory"
+                ) from None
     root.chmod(0o700)
     return str(root), created
 
@@ -150,6 +158,8 @@ def _receipt_at(subscription: RunSubscription) -> Receipt | None:
         raw = path.read_bytes()
     except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise RunSubscriptionError(f"Cannot read terminal receipt: {exc}") from exc
     try:
         text = raw.decode("utf-8")
         data = json.loads(text)
@@ -201,10 +211,6 @@ class RunSubscriptionStore:
         now = time.time()
         try:
             with self.escalations._connect() as conn:
-                # Serialize root preparation with the unique durable claim. Without
-                # this writer lock, a losing subscriber could mistake the winner's
-                # newly created empty directory for its own rollback artifact.
-                conn.execute("BEGIN IMMEDIATE")
                 canonical_root, created = _prepare_output_root(canonical_root)
                 conn.execute(
                     """
@@ -228,7 +234,7 @@ class RunSubscriptionStore:
                     ),
                 )
         except sqlite3.IntegrityError as exc:
-            if created:
+            if created and not self._root_is_claimed(canonical_root):
                 Path(canonical_root).rmdir()
             raise RunSubscriptionError(
                 "Run ID or output root is already subscribed"
@@ -238,6 +244,18 @@ class RunSubscriptionStore:
                 Path(canonical_root).rmdir()
             raise EscalationStoreError(f"Cannot create run subscription: {exc}") from exc
         return SubscribeResult(self.get(subscription_id), capability)
+
+    def _root_is_claimed(self, canonical_root: str) -> bool:
+        """Protect a concurrent winner's directory from loser cleanup."""
+        try:
+            with self.escalations._connect() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM run_subscriptions WHERE output_root = ?",
+                    (canonical_root,),
+                ).fetchone()
+        except sqlite3.DatabaseError:
+            return True
+        return row is not None
 
     def bind(
         self,
@@ -252,6 +270,21 @@ class RunSubscriptionStore:
             raise RunSubscriptionError("pid must be positive")
         if not process_start.strip():
             raise RunSubscriptionError("process_start must not be empty")
+        try:
+            with self.escalations._connect() as conn:
+                authorized = conn.execute(
+                    "SELECT writer_capability_digest FROM run_subscriptions "
+                    "WHERE subscription_id = ?",
+                    (subscription_id,),
+                ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise EscalationStoreError(f"Cannot authorize run binding: {exc}") from exc
+        if authorized is None:
+            raise RunSubscriptionError(f"No run subscription: {subscription_id}")
+        if authorized["writer_capability_digest"] != _capability_digest(
+            writer_capability
+        ):
+            raise RunSubscriptionError("Writer capability mismatch")
         observer = observer or observe_process_start
         live_start = observer(pid)
         if live_start != process_start:
@@ -285,8 +318,6 @@ class RunSubscriptionStore:
                     (pid, process_start, now, now, subscription_id),
                 )
         except sqlite3.DatabaseError as exc:
-            if isinstance(exc, RunSubscriptionError):
-                raise
             raise EscalationStoreError(f"Cannot bind run subscription: {exc}") from exc
         return self.get(subscription_id)
 
@@ -362,7 +393,7 @@ class RunSubscriptionStore:
                     UPDATE run_subscriptions
                     SET state = 'terminal', terminal_state = ?, exit_code = ?,
                         finished_at = ?, receipt_digest = ?, diagnostic = NULL,
-                        updated_at = ?
+                        lease_released_at = ?, updated_at = ?
                     WHERE subscription_id = ? AND state IN ('subscribed', 'running')
                     """,
                     (
@@ -370,6 +401,7 @@ class RunSubscriptionStore:
                         receipt.exit_code,
                         receipt.finished_at,
                         receipt.digest,
+                        now,
                         now,
                         subscription.subscription_id,
                     ),
@@ -388,10 +420,11 @@ class RunSubscriptionStore:
                     """
                     UPDATE run_subscriptions
                     SET state = 'lost', terminal_state = NULL, exit_code = NULL,
-                        finished_at = NULL, diagnostic = ?, lost_at = ?, updated_at = ?
+                        finished_at = NULL, diagnostic = ?, lost_at = ?,
+                        lease_released_at = ?, updated_at = ?
                     WHERE subscription_id = ? AND state IN ('subscribed', 'running')
                     """,
-                    (diagnostic, now, now, subscription.subscription_id),
+                    (diagnostic, now, now, now, subscription.subscription_id),
                 )
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(f"Cannot preserve run loss: {exc}") from exc
@@ -444,7 +477,16 @@ class RunReconciler:
     def reconcile(self) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         for subscription in self.store.list_active():
-            results.append(self.reconcile_one(subscription))
+            try:
+                results.append(self.reconcile_one(subscription))
+            except (OSError, RuntimeError) as exc:
+                results.append(
+                    {
+                        "subscription_id": subscription.subscription_id,
+                        "state": subscription.state,
+                        "error": str(exc),
+                    }
+                )
         return results
 
     def reconcile_one(self, subscription: RunSubscription | str) -> dict[str, Any]:
@@ -468,13 +510,17 @@ class RunReconciler:
             if record.pid is not None and live:
                 record = self.store._diagnose(record.subscription_id, receipt_error)
                 return {"subscription_id": record.subscription_id, "state": record.state}
-            if record.pid is not None:
-                record = self.store.preserve_lost(record, receipt_error)
-            else:
-                record = self.store._diagnose(record.subscription_id, receipt_error)
-                return {"subscription_id": record.subscription_id, "state": record.state}
+            record = self.store.preserve_lost(record, receipt_error)
         elif record.state == "running" and not self._fingerprint_live(record):
-            record = self.store.preserve_lost(record, "process fingerprint disappeared")
+            # The runner may publish its receipt immediately before exit. Re-read
+            # after the negative liveness observation so terminal evidence wins.
+            receipt = _receipt_at(record)
+            if receipt is not None:
+                record = self.store.preserve_terminal(record, receipt)
+            else:
+                record = self.store.preserve_lost(
+                    record, "process fingerprint disappeared"
+                )
 
         if record.state in {"terminal", "lost"}:
             delivered = self._deliver(record)
@@ -507,7 +553,7 @@ class RunReconciler:
                 store=self.store.escalations,
                 dedupe_key=subscription.dedupe_key,
             )
-        except (CdesktopError, OSError, RuntimeError):
+        except (CdesktopError, OSError):
             return False
         return True
 
@@ -533,5 +579,6 @@ def _subscription_from_row(row: sqlite3.Row) -> RunSubscription:
         receipt_digest=row["receipt_digest"],
         diagnostic=row["diagnostic"],
         lost_at=row["lost_at"],
+        lease_released_at=row["lease_released_at"],
         notified_at=row["notified_at"],
     )

@@ -283,11 +283,6 @@ class BridgeSupervisor:
         except (CdesktopError, leases.LeaseError) as exc:
             LOGGER.warning("Cannot reconcile cdesktop ownership: %s", exc)
             return
-        try:
-            await asyncio.to_thread(self.run_reconciler.reconcile)
-        except RuntimeError as exc:
-            LOGGER.warning("Cannot reconcile external run subscriptions: %s", exc)
-
         for session_id in set(self.tasks) - set(desired):
             self.tasks.pop(session_id).cancel()
         for session_id, bridged in desired.items():
@@ -301,6 +296,10 @@ class BridgeSupervisor:
                     ).run(),
                     name=f"bridge-{session_id}",
                 )
+        try:
+            await asyncio.to_thread(self.run_reconciler.reconcile)
+        except (OSError, RuntimeError) as exc:
+            LOGGER.warning("Cannot reconcile external run subscriptions: %s", exc)
 
 
 async def run_bridge(cdesktop_url: str | None, repowire_url: str) -> None:

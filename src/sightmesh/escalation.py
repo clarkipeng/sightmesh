@@ -405,6 +405,7 @@ class EscalationStore:
                         receipt_digest TEXT,
                         diagnostic TEXT,
                         lost_at REAL,
+                        lease_released_at REAL,
                         notified_at REAL
                     )
                     """
