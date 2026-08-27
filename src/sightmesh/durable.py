@@ -30,7 +30,11 @@ from .succession import COMMAND_TERMINAL_STATES, OwnershipStore, resolve_live_su
 
 LOGGER = logging.getLogger("sightmesh.durable")
 
-LIFECYCLE_NOTIFICATION_KEY_PREFIXES = ("child-command:", "child-terminal:")
+LIFECYCLE_NOTIFICATION_KEY_PREFIXES = (
+    "child-command:",
+    "child-terminal:",
+    "signal-policy:",
+)
 
 
 def supports_durable_recovery(version: object) -> bool:

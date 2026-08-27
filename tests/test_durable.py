@@ -205,15 +205,26 @@ def test_terminal_wake_refuses_self_delivery_and_parks_once(tmp_path, caplog):
 
 def test_lifecycle_notification_completion_does_not_generate_another_wake():
     client = Client({"id": "process-1", "status": "completed"}, {})
-    generated = DurableCommand(
-        "command-2",
-        "parent",
-        "CHILD_DELIVERY: child command-1 done",
-        "done",
-        "child-command:command-1:done",
-        "process-1",
+    queue = Queue(
+        [
+            DurableCommand(
+                f"command-{index}",
+                "parent",
+                "generated lifecycle notification",
+                "done",
+                key,
+                "process-1",
+            )
+            for index, key in enumerate(
+                (
+                    "child-command:command-1:done",
+                    "child-terminal:child:completed",
+                    "signal-policy:child:terminal",
+                ),
+                start=2,
+            )
+        ]
     )
-    queue = Queue([generated])
 
     DurableExecutionReconciler(client, queue).reconcile_session(
         {"id": "parent", "parent_session_id": "grandparent"}
