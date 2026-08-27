@@ -28,6 +28,15 @@ def test_register_repo_reuses_exact_path() -> None:
     assert client.calls == []
 
 
+def test_set_parent_rejects_self_link_before_request() -> None:
+    client = FakeClient()
+
+    with pytest.raises(ValueError, match="cannot be its own parent"):
+        client.set_parent("session-a", "session-a")
+
+    assert client.calls == []
+
+
 def test_success_false_is_a_typed_server_rejection(monkeypatch) -> None:
     class Response:
         status = 200

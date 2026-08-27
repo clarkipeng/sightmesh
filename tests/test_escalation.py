@@ -283,6 +283,28 @@ def test_escalate_parks_when_recorded_parent_session_no_longer_resolves(tmp_path
     assert client.sent == []
 
 
+def test_escalate_never_delivers_back_to_child_session(tmp_path):
+    client = FakeClient(
+        sessions={"child-a": {"id": "child-a", "workspace_id": "workspace-a"}},
+        workspaces={"workspace-a": {"id": "workspace-a", "archived": False}},
+    )
+    store = EscalationStore(tmp_path / "escalations.sqlite3")
+
+    result = escalate(
+        client,
+        child_session_id="child-a",
+        child_workspace_id="workspace-a",
+        parent_session_id="child-a",
+        message="STATUS: done",
+        store=store,
+    )
+
+    assert result["delivered"] is False
+    assert result["reason"] == "parent_unreachable"
+    assert client.sent == []
+    assert store.pending()[0].recorded_parent_session_id == "child-a"
+
+
 def test_escalate_parked_decision_survives_process_restart(tmp_path):
     path = tmp_path / "escalations.sqlite3"
     client = FakeClient()

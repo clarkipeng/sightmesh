@@ -814,7 +814,9 @@ def escalate(
     key = dedupe_key or default_dedupe_key(child_session_id, message)
     classification = classify_escalation(message)
     reason: str
-    if parent_session_id:
+    if parent_session_id == child_session_id:
+        reason = "parent_unreachable"
+    elif parent_session_id:
         try:
             parent = client.session(parent_session_id)
             workspace = client.workspace(str(parent["workspace_id"]))

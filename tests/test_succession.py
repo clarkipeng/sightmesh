@@ -286,6 +286,28 @@ def test_child_terminal_notification_follows_successor_and_never_retired(
     assert intent == "continue"
 
 
+def test_child_terminal_notification_never_resolves_back_to_child(tmp_path) -> None:
+    ownership = store(tmp_path)
+    ownership.retire("parent-1", state="superseded", reason="bad handoff")
+    ownership.link_successor("parent-1", "child-1")
+    signal_store = EscalationStore()
+    client = FakeCdesktop()
+    reconciler = DurableExecutionReconciler(
+        client, ownership=ownership, signal_store=signal_store
+    )
+
+    reconciler.reconcile_child_terminal(
+        {"id": "child-1", "parent_session_id": "parent-1"},
+        status="completed",
+    )
+
+    assert client.sent == []
+    parked = signal_store.pending()
+    assert len(parked) == 1
+    assert parked[0].recorded_parent_session_id == "parent-1"
+    assert parked[0].dedupe_key == "child-terminal:child-1:completed"
+
+
 def test_undeliverable_parent_wake_is_parked_then_resolved_on_delivery(
     tmp_path,
 ) -> None:

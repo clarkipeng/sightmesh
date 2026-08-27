@@ -30,6 +30,12 @@ from .succession import COMMAND_TERMINAL_STATES, OwnershipStore, resolve_live_su
 
 LOGGER = logging.getLogger("sightmesh.durable")
 
+LIFECYCLE_NOTIFICATION_KEY_PREFIXES = (
+    "child-command:",
+    "child-terminal:",
+    "signal-policy:",
+)
+
 
 def supports_durable_recovery(version: object) -> bool:
     """Return whether cdesktop exposes the process-scoped recovery API."""
@@ -418,6 +424,13 @@ class DurableExecutionReconciler:
             return
         child_id = str(child_session["id"])
         for command in commands:
+            # A lifecycle notification is an output of this reconciler, never
+            # a new child event. Treating it as input creates a fresh command
+            # id and defeats the original dedupe key on every hop.
+            if command.dedupe_key and command.dedupe_key.startswith(
+                LIFECYCLE_NOTIFICATION_KEY_PREFIXES
+            ):
+                continue
             state = command.delivery_state(None)
             if state not in {"terminal", "rejected"}:
                 continue
@@ -448,8 +461,39 @@ class DurableExecutionReconciler:
         """
         if key in self._notified:
             return
+        if parent_session_id == child_session_id:
+            LOGGER.error(
+                "Refusing lifecycle notification %s because session %s is its own parent",
+                key,
+                child_session_id,
+            )
+            self.signal_store.park(
+                child_session_id=child_session_id,
+                child_workspace_id=None,
+                recorded_parent_session_id=parent_session_id,
+                reason="parent_unreachable",
+                message=message,
+                dedupe_key=key,
+            )
+            return
         destination = resolve_live_successor(self.ownership, parent_session_id)
         if destination is None:
+            self.signal_store.park(
+                child_session_id=child_session_id,
+                child_workspace_id=None,
+                recorded_parent_session_id=parent_session_id,
+                reason="parent_unreachable",
+                message=message,
+                dedupe_key=key,
+            )
+            return
+        if destination == child_session_id:
+            LOGGER.error(
+                "Refusing lifecycle notification %s because parent succession resolves "
+                "back to child session %s",
+                key,
+                child_session_id,
+            )
             self.signal_store.park(
                 child_session_id=child_session_id,
                 child_workspace_id=None,
