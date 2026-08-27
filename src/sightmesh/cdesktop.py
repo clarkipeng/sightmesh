@@ -211,6 +211,8 @@ class CdesktopClient:
         )
 
     def set_parent(self, session_id: str, parent_session_id: str) -> dict[str, Any]:
+        if str(session_id) == str(parent_session_id):
+            raise ValueError(f"Session {session_id} cannot be its own parent")
         return self.request(
             "PUT",
             f"/sessions/{session_id}",

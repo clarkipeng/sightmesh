@@ -182,6 +182,46 @@ def test_restart_terminal_wake_uses_native_dedupe_and_does_not_loop():
     ]
 
 
+def test_terminal_wake_refuses_self_delivery_and_parks_once(tmp_path, caplog):
+    client = Client({"id": "process-1", "status": "completed"}, {})
+    queue = Queue([command("done")])
+    from sightmesh.escalation import EscalationStore
+
+    signal_store = EscalationStore(tmp_path / "signals.sqlite3")
+    session = {"id": "child", "parent_session_id": "child"}
+
+    for _ in range(2):
+        DurableExecutionReconciler(
+            client, queue, signal_store=signal_store
+        ).reconcile_session(session)
+
+    assert queue.notifications == []
+    parked = signal_store.pending()
+    assert len(parked) == 1
+    assert parked[0].recorded_parent_session_id == "child"
+    assert parked[0].dedupe_key == "child-command:command-1:done"
+    assert "is its own parent" in caplog.text
+
+
+def test_lifecycle_notification_completion_does_not_generate_another_wake():
+    client = Client({"id": "process-1", "status": "completed"}, {})
+    generated = DurableCommand(
+        "command-2",
+        "parent",
+        "CHILD_DELIVERY: child command-1 done",
+        "done",
+        "child-command:command-1:done",
+        "process-1",
+    )
+    queue = Queue([generated])
+
+    DurableExecutionReconciler(client, queue).reconcile_session(
+        {"id": "parent", "parent_session_id": "grandparent"}
+    )
+
+    assert queue.notifications == []
+
+
 def test_suite_child_activity_prevents_recovery():
     client = Client(
         {"id": "process-1", "status": "running"},
