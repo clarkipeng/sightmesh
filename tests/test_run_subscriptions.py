@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -177,12 +178,16 @@ def test_duplicate_receipt_with_different_content_preserves_first_evidence(
     assert first.state == "terminal"
 
     _receipt(record, terminal_state="failed", exit_code=1)
-    RunReconciler(Client(), store).reconcile_one(record)
+    client = Client()
+    RunReconciler(client, store).reconcile_one(record)
 
     saved = store.get(record.subscription_id)
     assert saved.receipt_digest == first.receipt_digest
     assert saved.terminal_state == "completed"
     assert saved.diagnostic == "duplicate terminal receipt differs"
+    assert "diagnostic=duplicate terminal receipt differs" in str(
+        client.sent[0]["prompt"]
+    )
 
 
 def test_repeated_delivery_retries_with_stable_dedupe_key(tmp_path: Path) -> None:
@@ -307,3 +312,26 @@ def test_bad_receipt_is_isolated_and_does_not_block_other_wakes(tmp_path: Path) 
     )
     assert store.get(good.subscription_id).terminal_state == "completed"
     assert len(client.sent) == 2
+
+
+def test_restart_repairs_draft_schema_missing_lease_release_column(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "escalations.sqlite3"
+    RunSubscriptionStore(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE run_subscriptions DROP COLUMN lease_released_at")
+
+    reopened = RunSubscriptionStore(path)
+    result = reopened.subscribe(
+        run_id="run-a",
+        output_root=tmp_path / "run-a",
+        return_session_id="parent-a",
+    )
+
+    assert result.subscription.lease_released_at is None
+    with sqlite3.connect(path) as conn:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(run_subscriptions)")
+        }
+    assert "lease_released_at" in columns

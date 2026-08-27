@@ -30,6 +30,7 @@ from .routing_commands import *
 from .pool_commands import *
 from .run_commands import *
 from ..run_subscriptions import RunSubscriptionError
+from ..escalation import EscalationStoreError
 
 
 def parser() -> argparse.ArgumentParser:
@@ -113,6 +114,7 @@ def main() -> None:
         PoolError,
         ProfileError,
         RepowireError,
+        EscalationStoreError,
         RunSubscriptionError,
         ValueError,
     ) as exc:

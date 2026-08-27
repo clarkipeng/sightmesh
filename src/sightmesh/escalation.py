@@ -414,6 +414,17 @@ class EscalationStore:
                     "CREATE INDEX IF NOT EXISTS idx_run_subscriptions_state "
                     "ON run_subscriptions(state, updated_at ASC)"
                 )
+                run_columns = {
+                    str(row[1])
+                    for row in conn.execute(
+                        "PRAGMA table_info(run_subscriptions)"
+                    ).fetchall()
+                }
+                if "lease_released_at" not in run_columns:
+                    conn.execute(
+                        "ALTER TABLE run_subscriptions "
+                        "ADD COLUMN lease_released_at REAL"
+                    )
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(
                 f"Cannot initialize escalation store {self.path}: {exc}"

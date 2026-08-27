@@ -543,6 +543,8 @@ class RunReconciler:
             f"STATUS: run {subscription.run_id} {outcome}; "
             f"output_root={subscription.output_root}; receipt={subscription.receipt_path}"
         )
+        if subscription.diagnostic:
+            message += f"; diagnostic={subscription.diagnostic}"
         try:
             escalate(
                 self.client,
