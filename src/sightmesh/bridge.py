@@ -15,6 +15,7 @@ import websockets
 from . import leases
 from .cdesktop import CdesktopClient, CdesktopError
 from .durable import DurableExecutionReconciler
+from .run_subscriptions import RunReconciler
 from .routing import (
     clear_peer_identity,
     enabled_workspaces,
@@ -228,6 +229,7 @@ class BridgeSupervisor:
         self.repowire_url = repowire_url
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self.reconciler = DurableExecutionReconciler(client)
+        self.run_reconciler = RunReconciler(client)
         # Read-only compatibility surface for callers that tuned PR #9's
         # observation threshold; recovery itself belongs to the reconciler.
         self.stalls = self.reconciler.liveness
@@ -281,6 +283,10 @@ class BridgeSupervisor:
         except (CdesktopError, leases.LeaseError) as exc:
             LOGGER.warning("Cannot reconcile cdesktop ownership: %s", exc)
             return
+        try:
+            await asyncio.to_thread(self.run_reconciler.reconcile)
+        except RuntimeError as exc:
+            LOGGER.warning("Cannot reconcile external run subscriptions: %s", exc)
 
         for session_id in set(self.tasks) - set(desired):
             self.tasks.pop(session_id).cancel()

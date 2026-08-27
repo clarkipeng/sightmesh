@@ -381,6 +381,38 @@ class EscalationStore:
                     )
                     """
                 )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS run_subscriptions (
+                        subscription_id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL UNIQUE,
+                        output_root TEXT NOT NULL UNIQUE,
+                        return_session_id TEXT NOT NULL,
+                        return_workspace_id TEXT,
+                        writer_capability_digest TEXT NOT NULL,
+                        dedupe_key TEXT NOT NULL UNIQUE,
+                        state TEXT NOT NULL
+                            CHECK (state IN ('subscribed', 'running', 'terminal', 'lost', 'notified')),
+                        pid INTEGER,
+                        process_start TEXT,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        bound_at REAL,
+                        terminal_state TEXT CHECK (terminal_state IN ('completed', 'failed')),
+                        exit_code INTEGER,
+                        finished_at TEXT,
+                        receipt_path TEXT NOT NULL,
+                        receipt_digest TEXT,
+                        diagnostic TEXT,
+                        lost_at REAL,
+                        notified_at REAL
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_run_subscriptions_state "
+                    "ON run_subscriptions(state, updated_at ASC)"
+                )
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(
                 f"Cannot initialize escalation store {self.path}: {exc}"

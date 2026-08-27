@@ -12,6 +12,48 @@ Use `sightmesh prompt-idle @AGENT --message-file FILE` for automation that must 
 
 `sightmesh message @AGENT` always appends a native `continue` command; cdesktop starts it only at that session's next safe boundary. `steer` is the explicit `replace` path.
 
+## External run wake subscriptions
+
+Use a run subscription when an external long-running process must wake a cdesktop session after the initiating turn or SightMesh bridge process may be gone:
+
+```sh
+sightmesh run subscribe \
+  --run-id RUN_ID \
+  --output-root /path/to/fresh-output-root \
+  --return-session SESSION_ID \
+  --return-workspace WORKSPACE_ID
+```
+
+The command creates a durable record in the escalation store, reserves the canonical output root, and returns the subscription ID, one-time writer capability, stable dedupe key, and receipt path. The runner must subscribe before provider activity and must use a fresh empty output root per run. SightMesh rejects duplicate run IDs, duplicate output roots, non-directories, symlink roots, and non-empty roots.
+
+After launch, bind the process fingerprint once:
+
+```sh
+sightmesh run bind SUBSCRIPTION_ID \
+  --writer-capability TOKEN \
+  --pid PID \
+  --process-start "PLATFORM_START_TOKEN"
+```
+
+The bind verifies the live `(pid, process_start)` observation and never gives SightMesh process authority. Replaying the identical bind is harmless; a different token or fingerprint fails closed. Launch failure is represented by writing a failed terminal receipt before bind.
+
+The runner publishes exactly one UTF-8 JSON object at `<output-root>/terminal-receipt.json`:
+
+```json
+{"schema_version":1,"subscription_id":"...","run_id":"...","terminal_state":"completed","exit_code":0,"finished_at":"2026-08-27T12:00:00Z"}
+```
+
+`terminal_state` is `completed` or `failed`; `exit_code` may be `null`. SightMesh validates identity and shape only. It does not inspect artifacts, costs, usage, or domain success. A valid receipt is authoritative even if the PID has already disappeared; disappearance or PID reuse without a valid receipt becomes `lost/unknown`.
+
+The managed bridge runs the same pass as:
+
+```sh
+sightmesh run reconcile
+sightmesh run show [SUBSCRIPTION_ID]
+```
+
+Terminal and lost wakes are routine `STATUS` escalations to the return session with the stable key `run-wake:<subscription-id>`. If the return session is missing, archived, or unreachable, the wake is durably parked in the existing escalation inbox and the subscription is marked notified. Transport is at least once; repeated attempts reuse the same key.
+
 Use `sightmesh inbox` for one global view of pending questions, plans, and tool requests. A manager agent can copy the included response templates into one `sightmesh respond --responses JSON` call. The complete batch is structurally validated before any response is sent. Live timeout races are isolated per response, so one expired request does not prevent later valid responses from being attempted.
 
 Use `sightmesh steer @AGENT --message-file FILE` when the current turn must change immediately. SightMesh resolves an exact ambiguity-safe selector, refuses self-steering and pending interactions, stops only that session's active non-dev-server execution, verifies the persisted state left `running`, and sends a native follow-up. Peer sessions in the same worktree and the dev server remain running. The visible transcript and the session's executor, model, reasoning, permissions, and provider remain intact.

@@ -17,6 +17,7 @@ from . import service_updates
 from . import bridge_commands
 from . import routing_commands
 from . import pool_commands
+from . import run_commands
 from .diagnostics import *
 from .fleet import *
 from .spawn import *
@@ -27,6 +28,8 @@ from .service_updates import *
 from .bridge_commands import *
 from .routing_commands import *
 from .pool_commands import *
+from .run_commands import *
+from ..run_subscriptions import RunSubscriptionError
 
 
 def parser() -> argparse.ArgumentParser:
@@ -47,6 +50,7 @@ def parser() -> argparse.ArgumentParser:
     approvals_commands.add_parser(sub)
     routing_commands.add_parser(sub)
     pool_commands.add_parser(sub)
+    run_commands.add_parser(sub)
     workspace_commands.add_workspace_parser(sub)
     service_updates.add_parser(sub)
     bridge_commands.add_parser(sub)
@@ -67,6 +71,7 @@ def __getattr__(name: str):
         bridge_commands,
         routing_commands,
         pool_commands,
+        run_commands,
     ):
         if hasattr(module, name):
             return getattr(module, name)
@@ -90,6 +95,7 @@ class _CliModule(types.ModuleType):
             bridge_commands,
             routing_commands,
             pool_commands,
+            run_commands,
         ):
             if name in vars(module):
                 setattr(module, name, value)
@@ -102,7 +108,14 @@ def main() -> None:
     args = parser().parse_args()
     try:
         code = args.func(args)
-    except (CdesktopError, PoolError, ProfileError, RepowireError, ValueError) as exc:
+    except (
+        CdesktopError,
+        PoolError,
+        ProfileError,
+        RepowireError,
+        RunSubscriptionError,
+        ValueError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         code = 2
     raise SystemExit(code)

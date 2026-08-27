@@ -370,6 +370,46 @@ def test_parser_registers_compact_fleet_commands() -> None:
     assert parser().parse_args(["respond", "--responses", "[]"]).func is cli.cmd_respond
 
 
+def test_parser_registers_run_subscription_commands() -> None:
+    assert (
+        parser()
+        .parse_args(
+            [
+                "run",
+                "subscribe",
+                "--run-id",
+                "run-a",
+                "--output-root",
+                "/tmp/run-a",
+                "--return-session",
+                "parent-a",
+            ]
+        )
+        .func
+        is cli.cmd_run_subscribe
+    )
+    assert (
+        parser()
+        .parse_args(
+            [
+                "run",
+                "bind",
+                "subscription-a",
+                "--writer-capability",
+                "token",
+                "--pid",
+                "1234",
+                "--process-start",
+                "start-a",
+            ]
+        )
+        .func
+        is cli.cmd_run_bind
+    )
+    assert parser().parse_args(["run", "show"]).func is cli.cmd_run_show
+    assert parser().parse_args(["run", "reconcile"]).func is cli.cmd_run_reconcile
+
+
 def test_pending_request_is_derived_from_matching_approval() -> None:
     snapshot = {
         "entries": [

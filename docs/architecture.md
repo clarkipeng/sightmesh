@@ -26,6 +26,14 @@ Prompts, follow-ups, UI actions, and bridged messages enter cdesktop's durable c
 
 Durability here means the command record survives a process boundary and can be reconciled. It does not yet prove that every manager wake and delivery is acknowledged during prolonged real-world load. That is the current experimental release gate.
 
+## External run wakes
+
+External provider runs are not cdesktop execution processes, so SightMesh stores one durable wake subscription before provider activity begins. The record lives in the existing owner-only escalation SQLite store and binds a caller run ID, canonical output root, return cdesktop session, one-time writer capability digest, optional process fingerprint, and stable delivery dedupe key.
+
+The output root is the lease. `sightmesh run subscribe` atomically reserves one fresh root and subscription; `sightmesh run bind` verifies the runner's `(pid, process_start)` fingerprint after launch. SightMesh never launches, waits for, kills, retries, or interprets the run.
+
+The runner publishes the authoritative terminal evidence as `<output-root>/terminal-receipt.json`. The bridge reconciliation pass checks that receipt before process liveness. A valid receipt produces `terminal/completed` or `terminal/failed`; disappearance or PID reuse without a valid receipt produces `lost/unknown`. Delivery uses the existing parent escalation path with `dedupe_key=run-wake:<subscription-id>`, so repeated attempts converge through cdesktop durable command dedupe or the parked escalation inbox.
+
 ## Stall and recovery model
 
 The managed bridge watches spawned children for event-snapshot silence and surfaces stalls. Recovery preserves the native evidence first: the visible transcript, Git worktree and branch, durable command state, and optional `.context` handoff. Parent-session links provide a return address for status or escalation; they are not an authority hierarchy.
