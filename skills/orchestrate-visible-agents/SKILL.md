@@ -22,9 +22,9 @@ sightmesh spawn --name worker --repo <root> --base <branch> \
 
 ## Prove long-running launches
 
-Before a long-running or paid launch, the owning runner proves checkpoint recovery, append-only exact retry, preservation of prior terminal results, and one writer per persistent output root. It records plan identity, output root, retry identity, spend basis, and any spend limit.
+Before a long-running or paid launch writes durable output, the owning runner proves checkpoint recovery, append-only exact retry, preservation of prior terminal results, and one writer per persistent output root. It records plan identity, output root, retry identity, spend basis, and any spend limit.
 
-The supervisor must outlive the initiating turn and have a verified terminal wake or callback. A policy prompt cannot prove external-process supervision: when that wake path is absent, do not call the run supervised; record the product gap (see #55) for the runner instead. Each runner repository owns and tests its domain-specific retry semantics.
+The supervisor must outlive the initiating turn and have a verified terminal wake or callback. A policy prompt cannot prove external-process supervision: when that wake path is absent, do not call the run supervised; record the missing capability for the runner instead. Each runner repository owns and tests its domain-specific retry semantics.
 
 ## Communicate by consequence
 
