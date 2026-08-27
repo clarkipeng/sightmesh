@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -202,6 +203,33 @@ def test_duplicate_output_root_rejected_atomically(tmp_path: Path) -> None:
             return_session_id="parent-a",
         )
     assert [record.run_id for record in store.all()] == ["run-a"]
+
+
+def test_competing_output_root_claim_keeps_winners_directory(tmp_path: Path) -> None:
+    store = RunSubscriptionStore(tmp_path / "escalations.sqlite3")
+    output_root = tmp_path / "contended"
+
+    def subscribe(run_id: str):
+        return store.subscribe(
+            run_id=run_id,
+            output_root=output_root,
+            return_session_id="parent-a",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        attempts = [pool.submit(subscribe, run_id) for run_id in ("run-a", "run-b")]
+    results = []
+    errors = []
+    for attempt in attempts:
+        try:
+            results.append(attempt.result())
+        except RunSubscriptionError as exc:
+            errors.append(exc)
+
+    assert len(results) == 1
+    assert len(errors) == 1
+    assert output_root.is_dir()
+    assert len(store.all()) == 1
 
 
 def test_launch_failure_is_failed_receipt_before_bind(tmp_path: Path) -> None:

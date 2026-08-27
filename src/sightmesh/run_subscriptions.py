@@ -194,12 +194,18 @@ class RunSubscriptionStore:
             raise RunSubscriptionError("run_id must not be empty")
         if not return_session_id.strip():
             raise RunSubscriptionError("return_session must not be empty")
-        canonical_root, created = _prepare_output_root(output_root)
+        canonical_root = str(_canonical_output_root(output_root))
+        created = False
         subscription_id = str(uuid.uuid4())
         capability = secrets.token_urlsafe(32)
         now = time.time()
         try:
             with self.escalations._connect() as conn:
+                # Serialize root preparation with the unique durable claim. Without
+                # this writer lock, a losing subscriber could mistake the winner's
+                # newly created empty directory for its own rollback artifact.
+                conn.execute("BEGIN IMMEDIATE")
+                canonical_root, created = _prepare_output_root(canonical_root)
                 conn.execute(
                     """
                     INSERT INTO run_subscriptions (
