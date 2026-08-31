@@ -315,9 +315,6 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
     lease_store = leases.LeaseStore()
     if not task_store:
         lease_store.assert_spawn_allowed(repo_path, use_worktree=args.worktree)
-    client = CdesktopClient(args.url)
-    leases.sync_active_workspaces(client)
-    selection = _profile_selection(args, client)
     task_reservation = supplied_reservation or (
         task_store.reserve(
             task_id,
@@ -330,6 +327,19 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
     )
     if task_reservation and not task_reservation.should_spawn:
         return {"action": "task-launch-existing", "task": task_reservation.task.to_dict()}
+    client = CdesktopClient(args.url)
+    if task_store and task_reservation:
+        try:
+            client.require_task_launch_contract()
+        except CdesktopRejectedError as exc:
+            task_store.park_issue(
+                task_reservation.task,
+                message=f"BLOCKED: task {task_id} requires task-launch-v1: {exc}",
+                dedupe_key=f"task-launch-capability:{task_id}",
+            )
+            raise
+    leases.sync_active_workspaces(client)
+    selection = _profile_selection(args, client)
     if task_store:
         try:
             lease_store.assert_spawn_allowed(repo_path, use_worktree=args.worktree)
@@ -351,28 +361,108 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
                 task_store.failed(task_id, task_reservation.reservation_id)
             raise
     try:
-        result = client.spawn_workspace(
-            name=args.name,
-            repo_path=repo_path,
-            target_branch=base_ref,
-            executor=selection.executor,
-            prompt=prompt,
-            use_worktree=args.worktree,
-            permission_policy=permission_policy,
-            model=selection.model,
-            reasoning=selection.reasoning,
-            provider_id=selection.provider_id,
-            setup_script=setup_script,
-            auth_binding_id=selection.auth_binding_id,
-            launch_key=(
-                task_reservation.reservation_id if task_reservation else None
-            ),
-        )
+        if task_store and task_reservation:
+            assert task_reservation.reservation_id is not None
+            launch_key = task_reservation.task.idempotency_key
+            assert launch_key is not None
+            existing_launch = client.lookup_task_launch(launch_key)
+            launch_spec = client.workspace_launch_spec(
+                name=args.name,
+                repo_path=repo_path,
+                target_branch=base_ref,
+                executor=selection.executor,
+                prompt=prompt,
+                use_worktree=args.worktree,
+                permission_policy=permission_policy,
+                model=selection.model,
+                reasoning=selection.reasoning,
+                provider_id=selection.provider_id,
+                setup_script=setup_script,
+                auth_binding_id=selection.auth_binding_id,
+            )
+            if existing_launch is None:
+                authorized = task_store.authorize_creation(
+                    task_id, task_reservation.reservation_id
+                )
+                if not authorized.should_spawn:
+                    return {
+                        "action": "task-launch-blocked",
+                        "task": authorized.task.to_dict(),
+                    }
+            native_launch = client.create_or_return_task_launch(
+                task_id=task_id,
+                incarnation_generation=task_reservation.task.incarnation_generation,
+                attempt_id=task_reservation.reservation_id,
+                idempotency_key=launch_key,
+                launch=launch_spec,
+            )
+            if native_launch.phase != "active":
+                failed_task = task_store.failed(
+                    task_id, task_reservation.reservation_id
+                )
+                if failed_task.state != "blocked":
+                    task_store.park_issue(
+                        failed_task,
+                        message=(
+                            f"BLOCKED: task {task_id} native launch is "
+                            f"{native_launch.phase}"
+                        ),
+                        dedupe_key=f"task-launch-outcome:{task_id}:{launch_key}",
+                    )
+                raise CdesktopRejectedError(
+                    f"Task {task_id} native launch is {native_launch.phase}"
+                )
+            result = {
+                "workspace_id": native_launch.workspace_id,
+                "session_id": native_launch.session_id,
+                "task_launch": dataclasses.asdict(native_launch),
+            }
+        else:
+            result = client.spawn_workspace(
+                name=args.name,
+                repo_path=repo_path,
+                target_branch=base_ref,
+                executor=selection.executor,
+                prompt=prompt,
+                use_worktree=args.worktree,
+                permission_policy=permission_policy,
+                model=selection.model,
+                reasoning=selection.reasoning,
+                provider_id=selection.provider_id,
+                setup_script=setup_script,
+                auth_binding_id=selection.auth_binding_id,
+            )
+    except (CdesktopInterruptedError, CdesktopPendingError) as spawn_error:
+        if pending_lease:
+            lease_store.release(pending_lease.token)
+        if task_store and task_reservation:
+            task_store.park_issue(
+                task_reservation.task,
+                message=f"BLOCKED: task {task_id} launch is ambiguous: {spawn_error}",
+                dedupe_key=(
+                    f"task-launch-ambiguous:{task_id}:"
+                    f"{task_reservation.reservation_id}"
+                ),
+            )
+        raise
+    except CdesktopRejectedError:
+        if pending_lease:
+            lease_store.release(pending_lease.token)
+        raise
     except Exception as spawn_error:
         if pending_lease:
             lease_store.release(pending_lease.token)
         # A keyed create may have committed remotely before its response was
         # lost. Keep the capability reserved so recovery must replay that key.
+        if task_store and task_reservation:
+            task_store.park_issue(
+                task_reservation.task,
+                message=f"BLOCKED: task {task_id} launch is ambiguous: {spawn_error}",
+                dedupe_key=(
+                    f"task-launch-ambiguous:{task_id}:"
+                    f"{task_reservation.reservation_id}"
+                ),
+            )
         _report_free_route_failure(client, args, selection, spawn_error)
         raise
     # Parsing and activation are the first local operations after the external
@@ -486,6 +576,21 @@ def cmd_failover(args: argparse.Namespace) -> int:
             f"Failover for task {failover_reservation.task.task_id} is already in progress "
             "or has exhausted its attempt budget"
         )
+    if failover_reservation:
+        try:
+            client.require_task_launch_contract()
+        except CdesktopRejectedError as exc:
+            launch_store.park_issue(
+                failover_reservation.task,
+                message=(
+                    f"BLOCKED: task {failover_reservation.task.task_id} "
+                    f"requires task-launch-v1: {exc}"
+                ),
+                dedupe_key=(
+                    f"task-launch-capability:{failover_reservation.task.task_id}"
+                ),
+            )
+            raise
     if not args.new_worktree:
         prompt = (
             "Take over this visible workspace after a checkpointed capacity or provider "
@@ -499,7 +604,29 @@ def cmd_failover(args: argparse.Namespace) -> int:
         spawned: dict[str, Any] = {}
 
         def spawn_successor() -> str:
-            replacement = client.spawn_teammate(
+            if failover_reservation is None:
+                replacement = client.spawn_teammate(
+                    caller_session=lead_session_id,
+                    name=args.name or f"successor-{profile.name}",
+                    prompt=prompt,
+                    executor=profile.executor,
+                    permission_policy=(
+                        "BYPASS_PERMISSIONS" if args.unattended else "SUPERVISED"
+                    ),
+                    model=profile.model,
+                    reasoning=profile.reasoning,
+                    provider_id=profile.provider_id,
+                )
+                spawned["replacement"] = replacement
+                successor_id = _primary_session_id(replacement)
+                if not successor_id:
+                    raise ValueError("cdesktop did not return a successor session id")
+                return successor_id
+            assert failover_reservation.reservation_id is not None
+            launch_key = failover_reservation.task.idempotency_key
+            assert launch_key is not None
+            existing = client.lookup_task_launch(launch_key)
+            launch_spec = client.teammate_launch_spec(
                 caller_session=lead_session_id,
                 name=args.name or f"successor-{profile.name}",
                 prompt=prompt,
@@ -510,13 +637,52 @@ def cmd_failover(args: argparse.Namespace) -> int:
                 model=profile.model,
                 reasoning=profile.reasoning,
                 provider_id=profile.provider_id,
-                launch_key=(
-                    failover_reservation.reservation_id
-                    if failover_reservation else None
-                ),
             )
+            if existing is None:
+                authorized = launch_store.authorize_creation(
+                    failover_reservation.task.task_id,
+                    failover_reservation.reservation_id,
+                )
+                if not authorized.should_spawn:
+                    raise ValueError(
+                        f"Task {failover_reservation.task.task_id} exhausted its attempt budget"
+                    )
+            native = client.create_or_return_task_launch(
+                task_id=failover_reservation.task.task_id,
+                incarnation_generation=(
+                    failover_reservation.task.incarnation_generation
+                ),
+                attempt_id=failover_reservation.reservation_id,
+                idempotency_key=launch_key,
+                launch=launch_spec,
+            )
+            if native.phase != "active":
+                failed_task = launch_store.failed(
+                    failover_reservation.task.task_id,
+                    failover_reservation.reservation_id,
+                )
+                if failed_task.state != "blocked":
+                    launch_store.park_issue(
+                        failed_task,
+                        message=(
+                            f"BLOCKED: task {failed_task.task_id} native launch is "
+                            f"{native.phase}"
+                        ),
+                        dedupe_key=(
+                            f"task-launch-outcome:{failed_task.task_id}:{launch_key}"
+                        ),
+                    )
+                raise CdesktopRejectedError(
+                    f"Task {failover_reservation.task.task_id} native launch is "
+                    f"{native.phase}"
+                )
+            replacement = {
+                "workspace_id": native.workspace_id,
+                "session_id": native.session_id,
+                "task_launch": dataclasses.asdict(native),
+            }
             spawned["replacement"] = replacement
-            successor_id = _primary_session_id(replacement)
+            successor_id = native.session_id
             if not successor_id:
                 raise ValueError("cdesktop did not return a successor session id")
             return successor_id

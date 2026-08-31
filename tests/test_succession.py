@@ -27,6 +27,7 @@ from sightmesh.succession import (
     resolve_live_successor,
     transfer_ownership,
 )
+from sightmesh.tasks import TaskLaunchStore
 
 from fixtures import free_route_failures
 
@@ -304,21 +305,24 @@ def test_completed_turn_manager_still_resumes(tmp_path) -> None:
     assert client.dispatches == ["session-1"]
 
 
-def test_first_successor_reservation_precedes_spawn_and_closes_race(tmp_path) -> None:
+def test_managed_successor_replays_one_key_during_failover_race(tmp_path) -> None:
     ownership = store(tmp_path)
     client = FakeCdesktop()
     spawn_calls = []
+    launch_store = TaskLaunchStore(ownership._store)
+    reservation = launch_store.reserve("manager", max_spawn_attempts=3)
+    launch_store.authorize_creation("manager", reservation.reservation_id)
 
     def winning_spawn():
         spawn_calls.append("winner")
-        with pytest.raises(SuccessionError, match="already reserved"):
-            transfer_ownership(
-                client,
-                ownership,
-                source_session_id="manager",
-                spawn=lambda: spawn_calls.append("loser") or "wrong-successor",
-                reason="failover",
-            )
+        transfer_ownership(
+            client,
+            ownership,
+            source_session_id="manager",
+            spawn=lambda: spawn_calls.append("replay") or "successor",
+            reason="failover",
+            launch_reservation=reservation,
+        )
         return "successor"
 
     first = transfer_ownership(
@@ -327,16 +331,18 @@ def test_first_successor_reservation_precedes_spawn_and_closes_race(tmp_path) ->
         source_session_id="manager",
         spawn=winning_spawn,
         reason="failover",
+        launch_reservation=reservation,
     )
     retry = transfer_ownership(
         client,
         ownership,
         source_session_id="manager",
-        spawn=lambda: spawn_calls.append("retry") or "wrong-successor",
+        spawn=lambda: spawn_calls.append("retry") or "successor",
         reason="failover",
+        launch_reservation=reservation,
     )
 
-    assert spawn_calls == ["winner"]
+    assert spawn_calls == ["winner", "replay"]
     assert first.spawned is True
     assert retry.spawned is False
     assert retry.successor_session_id == "successor"

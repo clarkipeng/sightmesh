@@ -360,11 +360,15 @@ def transfer_ownership(
 
     if record.successor_session_id:
         successor, spawned = record.successor_session_id, False
+    elif launch_reservation is None:
+        successor = str(spawn())
+        if not successor or successor == source:
+            raise SuccessionError("Successor spawn must return a distinct session id")
+        store.link_successor(source, successor)
+        spawned = True
     else:
         launch_store = TaskLaunchStore(store._store)
-        reservation = launch_reservation or launch_store.reserve(
-            f"successor:{source}", max_spawn_attempts=3
-        )
+        reservation = launch_reservation
         launch_task_id = reservation.task.task_id
         if not reservation.should_spawn:
             if reservation.task.state == "active" and reservation.task.session_id:
@@ -376,18 +380,11 @@ def transfer_ownership(
                 )
         else:
             assert reservation.reservation_id is not None
-            try:
-                successor = str(spawn())
-                if not successor or successor == source:
-                    raise SuccessionError(
-                        "Successor spawn must return a distinct session id"
-                    )
-            except Exception:
-                if launch_reservation is None:
-                    launch_store.failed(
-                        launch_task_id, reservation.reservation_id
-                    )
-                raise
+            successor = str(spawn())
+            if not successor or successor == source:
+                raise SuccessionError(
+                    "Successor spawn must return a distinct session id"
+                )
             current_task = launch_store.get(launch_task_id)
             if not (
                 current_task

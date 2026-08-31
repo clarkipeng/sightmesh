@@ -10,6 +10,12 @@ def task_store(tmp_path):
     return TaskLaunchStore(EscalationStore(tmp_path / "state.sqlite3"))
 
 
+def authorize(store, reservation):
+    return store.authorize_creation(
+        reservation.task.task_id, reservation.reservation_id
+    )
+
+
 def test_duplicate_wakes_and_concurrent_callers_reserve_one_launch(tmp_path):
     path = tmp_path / "state.sqlite3"
 
@@ -19,14 +25,24 @@ def test_duplicate_wakes_and_concurrent_callers_reserve_one_launch(tmp_path):
     with ThreadPoolExecutor(max_workers=8) as workers:
         reservations = list(workers.map(lambda _: reserve(), range(8)))
 
-    assert sum(item.should_spawn for item in reservations) == 1
+    assert all(item.should_spawn for item in reservations)
     assert {item.task.task_id for item in reservations} == {"stable-task"}
-    assert {item.task.spawn_attempts for item in reservations} == {1}
+    assert len({item.reservation_id for item in reservations}) == 1
+
+    def authorize_one(reservation):
+        return TaskLaunchStore(EscalationStore(path)).authorize_creation(
+            "stable-task", reservation.reservation_id
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        list(workers.map(authorize_one, reservations))
+    assert TaskLaunchStore(EscalationStore(path)).get("stable-task").spawn_attempts == 1
 
 
 def test_activation_makes_spawn_idempotent(tmp_path):
     store = task_store(tmp_path)
     first = store.reserve("stable-task")
+    authorize(store, first)
     store.activate(
         "stable-task",
         first.reservation_id,
@@ -44,6 +60,7 @@ def test_activation_makes_spawn_idempotent(tmp_path):
 def test_activation_persistence_failure_replays_the_same_capability(tmp_path):
     store = task_store(tmp_path)
     first = store.reserve("stable-task")
+    authorize(store, first)
     with store.store._connect() as conn:
         conn.execute(
             "CREATE TRIGGER fail_activation BEFORE UPDATE ON task_launches "
@@ -65,55 +82,32 @@ def test_activation_persistence_failure_replays_the_same_capability(tmp_path):
     assert recovered.state == "active"
 
 
-def test_manager_crash_requires_explicit_capability_transfer(tmp_path):
+def test_ambiguous_retry_keeps_the_same_key_and_attempt(tmp_path):
     store = task_store(tmp_path)
     crashed = store.reserve("stable-task")
-    assert store.reserve("stable-task").should_spawn is False
+    authorize(store, crashed)
+    retry = store.reserve("stable-task")
 
-    successor = store.transfer_reservation(
-        "stable-task", crashed.reservation_id, prior_spawn_absent=True
-    )
-    with pytest.raises(TaskLaunchError, match="no longer owned"):
-        store.activate(
-            "stable-task",
-            crashed.reservation_id,
-            workspace_id="wrong",
-            session_id="wrong",
-        )
+    assert retry.should_spawn is True
+    assert retry.reservation_id == crashed.reservation_id
+    assert retry.task.idempotency_key == crashed.task.idempotency_key
+    authorize(store, retry)
+    assert store.get("stable-task").spawn_attempts == 1
+
     active = store.activate(
         "stable-task",
-        successor.reservation_id,
+        retry.reservation_id,
         workspace_id="workspace-2",
         session_id="session-2",
     )
     assert active.state == "active"
 
 
-def test_transfer_requires_owner_proof_and_consumes_attempt_budget(tmp_path):
-    state = EscalationStore(tmp_path / "state.sqlite3")
-    store = TaskLaunchStore(state)
-    first = store.reserve("stable-task", max_spawn_attempts=2)
-
-    with pytest.raises(TaskLaunchError, match="destination-owned proof"):
-        store.transfer_reservation("stable-task", first.reservation_id)
-    assert store.get("stable-task").spawn_attempts == 1
-
-    second = store.transfer_reservation(
-        "stable-task", first.reservation_id, prior_spawn_absent=True
-    )
-    assert second.task.spawn_attempts == 2
-    blocked = store.transfer_reservation(
-        "stable-task", second.reservation_id, prior_spawn_absent=True
-    )
-    assert blocked.should_spawn is False
-    assert blocked.task.state == "blocked"
-    assert len(state.pending()) == 1
-
-
 def test_manager_failover_preserves_identity_limits_and_is_single_winner(tmp_path):
     path = tmp_path / "state.sqlite3"
     store = TaskLaunchStore(EscalationStore(path))
     first = store.reserve("manager", max_children=7, max_spawn_attempts=4)
+    authorize(store, first)
     store.activate(
         "manager", first.reservation_id,
         workspace_id="workspace-a", session_id="session-a",
@@ -131,12 +125,29 @@ def test_manager_failover_preserves_identity_limits_and_is_single_winner(tmp_pat
     assert task.task_id == "manager"
     assert task.max_children == 7
     assert task.max_spawn_attempts == 4
-    assert task.spawn_attempts == 2
+    assert task.spawn_attempts == 1
+    assert task.incarnation_generation == 2
+    assert task.session_id == "session-a"
+
+    authorized = store.authorize_creation("manager", attempts[0].reservation_id)
+    assert authorized.task.spawn_attempts == 2
+    successor = store.activate(
+        "manager",
+        attempts[0].reservation_id,
+        workspace_id="workspace-b",
+        session_id="session-b",
+    )
+    assert successor.task_id == "manager"
+    assert successor.incarnation_generation == 2
+    assert successor.max_children == 7
+    assert successor.session_id == "session-b"
+    assert store.get_by_session("session-a") is None
 
 
 def test_fixed_child_budget_and_no_recursive_manager(tmp_path):
     store = task_store(tmp_path)
     manager = store.reserve("manager", max_children=1)
+    authorize(store, manager)
     store.activate(
         "manager",
         manager.reservation_id,
@@ -150,12 +161,39 @@ def test_fixed_child_budget_and_no_recursive_manager(tmp_path):
         store.reserve("manager", parent_task_id="manager")
 
 
+def test_child_is_counted_only_after_native_acceptance(tmp_path):
+    store = task_store(tmp_path)
+    manager = store.reserve("manager", max_children=1)
+    authorize(store, manager)
+    store.activate(
+        "manager",
+        manager.reservation_id,
+        workspace_id="manager-workspace",
+        session_id="manager-session",
+    )
+    child = store.reserve("child", parent_task_id="manager")
+    assert store.get("manager").child_count == 0
+    authorize(store, child)
+    assert store.get("manager").child_count == 0
+
+    store.activate(
+        "child",
+        child.reservation_id,
+        workspace_id="child-workspace",
+        session_id="child-session",
+    )
+    assert store.get("manager").child_count == 1
+    assert store.get("child").parent_counted == 1
+
+
 def test_spawn_attempt_circuit_breaker_parks_once(tmp_path):
     state = EscalationStore(tmp_path / "state.sqlite3")
     store = TaskLaunchStore(state)
     for _ in range(3):
         reservation = store.reserve("flaky", max_spawn_attempts=3)
         assert reservation.should_spawn
+        authorized = authorize(store, reservation)
+        assert authorized.should_spawn
         store.failed("flaky", reservation.reservation_id)
 
     blocked = store.reserve("flaky", max_spawn_attempts=3)
@@ -176,6 +214,7 @@ def test_task_limits_are_immutable_across_retries(tmp_path):
 def test_active_task_is_resolved_from_manager_session(tmp_path):
     store = task_store(tmp_path)
     reservation = store.reserve("manager", max_children=2)
+    authorize(store, reservation)
     store.activate(
         "manager",
         reservation.reservation_id,

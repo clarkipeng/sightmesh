@@ -28,6 +28,9 @@ class TaskLaunch:
     workspace_id: str | None
     session_id: str | None
     parent_task_id: str | None
+    incarnation_generation: int
+    attempt_authorized: int
+    parent_counted: int
     max_children: int
     child_count: int
     spawn_attempts: int
@@ -39,6 +42,15 @@ class TaskLaunch:
         result = asdict(self)
         result.pop("reservation_id", None)
         return result
+
+    @property
+    def idempotency_key(self) -> str | None:
+        if not self.reservation_id:
+            return None
+        return (
+            f"task-launch:{self.task_id}:{self.incarnation_generation}:"
+            f"{self.reservation_id}"
+        )
 
 
 @dataclass(frozen=True)
@@ -110,23 +122,15 @@ class TaskLaunchStore:
                         raise TaskLaunchError(
                             f"Task {task_id} already exists with different immutable limits"
                         )
-                    if task.state in {"reserved", "active", "blocked"}:
+                    if task.state == "reserved":
+                        conn.execute("COMMIT")
+                        return LaunchReservation(task, task.reservation_id, True)
+                    if task.state in {"active", "blocked"}:
                         conn.execute("COMMIT")
                         return LaunchReservation(task, None, False)
-                    if task.spawn_attempts >= task.max_spawn_attempts:
-                        conn.execute(
-                            "UPDATE task_launches SET state = 'blocked', updated_at = ? "
-                            "WHERE task_id = ?",
-                            (now, task_id),
-                        )
-                        conn.execute("COMMIT")
-                        blocked = self.get(task_id)
-                        assert blocked is not None
-                        self._park_blocked(blocked)
-                        return LaunchReservation(blocked, None, False)
                     conn.execute(
                         "UPDATE task_launches SET state = 'reserved', reservation_id = ?, "
-                        "spawn_attempts = spawn_attempts + 1, updated_at = ? WHERE task_id = ?",
+                        "attempt_authorized = 0, updated_at = ? WHERE task_id = ?",
                         (reservation_id, now, task_id),
                     )
                 else:
@@ -140,21 +144,22 @@ class TaskLaunchStore:
                             raise TaskLaunchError(
                                 f"Parent task {parent_task_id} is not active"
                             )
-                        if parent["child_count"] >= parent["max_children"]:
+                        pending_children = conn.execute(
+                            "SELECT COUNT(*) FROM task_launches WHERE parent_task_id = ? "
+                            "AND parent_counted = 0 AND state != 'blocked'",
+                            (parent_task_id,),
+                        ).fetchone()[0]
+                        if parent["child_count"] + pending_children >= parent["max_children"]:
                             raise TaskLaunchError(
                                 f"Parent task {parent_task_id} reached its child limit"
                             )
-                        conn.execute(
-                            "UPDATE task_launches SET child_count = child_count + 1, "
-                            "updated_at = ? WHERE task_id = ?",
-                            (now, parent_task_id),
-                        )
                     conn.execute(
                         """INSERT INTO task_launches
                         (task_id, state, reservation_id, workspace_id, session_id,
-                         parent_task_id, max_children, child_count, spawn_attempts,
+                         parent_task_id, incarnation_generation, attempt_authorized,
+                         parent_counted, max_children, child_count, spawn_attempts,
                          max_spawn_attempts, created_at, updated_at)
-                        VALUES (?, 'reserved', ?, NULL, NULL, ?, ?, 0, 1, ?, ?, ?)""",
+                        VALUES (?, 'reserved', ?, NULL, NULL, ?, 1, 0, 0, ?, 0, 0, ?, ?, ?)""",
                         (
                             task_id,
                             reservation_id,
@@ -175,37 +180,10 @@ class TaskLaunchStore:
             raise TaskLaunchError(f"Cannot reserve task {task_id}: {exc}") from exc
         return LaunchReservation(TaskLaunch(**dict(row)), reservation_id, True)
 
-    def activate(
-        self,
-        task_id: str,
-        reservation_id: str,
-        *,
-        workspace_id: str,
-        session_id: str | None,
-    ) -> TaskLaunch:
-        return self._transition(
-            task_id,
-            reservation_id,
-            "active",
-            workspace_id=workspace_id,
-            session_id=session_id,
-            keep_reservation=True,
-        )
-
-    def transfer_reservation(
-        self, task_id: str, reservation_id: str, *, prior_spawn_absent: bool = False
+    def authorize_creation(
+        self, task_id: str, reservation_id: str
     ) -> LaunchReservation:
-        """Explicitly rotate a crashed launcher's capability before retrying.
-
-        The destination must first atomically prove that the old idempotency
-        key never committed. A workspace listing is not such a proof.
-        """
-        if not prior_spawn_absent:
-            raise TaskLaunchError(
-                "Reservation transfer requires destination-owned proof that the "
-                "prior spawn did not commit"
-            )
-        replacement = str(uuid.uuid4())
+        """Consume one attempt exactly once before a new native effect is allowed."""
         blocked: TaskLaunch | None = None
         try:
             with self.store._connect() as conn:
@@ -221,6 +199,10 @@ class TaskLaunchStore:
                     raise TaskLaunchError(
                         f"Task {task_id} reservation is no longer owned"
                     )
+                if row["attempt_authorized"]:
+                    conn.execute("COMMIT")
+                    task = TaskLaunch(**dict(row))
+                    return LaunchReservation(task, reservation_id, True)
                 if row["spawn_attempts"] >= row["max_spawn_attempts"]:
                     conn.execute(
                         "UPDATE task_launches SET state = 'blocked', "
@@ -234,10 +216,10 @@ class TaskLaunchStore:
                     blocked = TaskLaunch(**dict(blocked_row))
                 else:
                     conn.execute(
-                        "UPDATE task_launches SET reservation_id = ?, "
+                        "UPDATE task_launches SET attempt_authorized = 1, "
                         "spawn_attempts = spawn_attempts + 1, updated_at = ? "
                         "WHERE task_id = ?",
-                        (replacement, time.time(), task_id),
+                        (time.time(), task_id),
                     )
                     row = conn.execute(
                         "SELECT * FROM task_launches WHERE task_id = ?", (task_id,)
@@ -246,12 +228,63 @@ class TaskLaunchStore:
         except TaskLaunchError:
             raise
         except sqlite3.DatabaseError as exc:
-            raise TaskLaunchError(f"Cannot transfer task {task_id}: {exc}") from exc
+            raise TaskLaunchError(f"Cannot authorize task {task_id}: {exc}") from exc
         if blocked is not None:
             self._park_blocked(blocked)
             return LaunchReservation(blocked, None, False)
         task = TaskLaunch(**dict(row))
-        return LaunchReservation(task, replacement, True)
+        return LaunchReservation(task, reservation_id, True)
+
+    def activate(
+        self,
+        task_id: str,
+        reservation_id: str,
+        *,
+        workspace_id: str,
+        session_id: str | None,
+    ) -> TaskLaunch:
+        try:
+            with self.store._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM task_launches WHERE task_id = ?", (task_id,)
+                ).fetchone()
+                if (
+                    row is None
+                    or row["state"] != "reserved"
+                    or row["reservation_id"] != reservation_id
+                    or not row["attempt_authorized"]
+                ):
+                    raise TaskLaunchError(
+                        f"Task {task_id} reservation is no longer authorized"
+                    )
+                if row["parent_task_id"] and not row["parent_counted"]:
+                    changed = conn.execute(
+                        "UPDATE task_launches SET child_count = child_count + 1, "
+                        "updated_at = ? WHERE task_id = ? AND state = 'active' "
+                        "AND child_count < max_children",
+                        (time.time(), row["parent_task_id"]),
+                    ).rowcount
+                    if changed != 1:
+                        raise TaskLaunchError(
+                            f"Parent task {row['parent_task_id']} reached its child limit"
+                        )
+                conn.execute(
+                    "UPDATE task_launches SET state = 'active', workspace_id = ?, "
+                    "session_id = ?, parent_counted = CASE WHEN parent_task_id IS NULL "
+                    "THEN parent_counted ELSE 1 END, updated_at = ? "
+                    "WHERE task_id = ? AND reservation_id = ?",
+                    (workspace_id, session_id, time.time(), task_id, reservation_id),
+                )
+                row = conn.execute(
+                    "SELECT * FROM task_launches WHERE task_id = ?", (task_id,)
+                ).fetchone()
+                conn.execute("COMMIT")
+        except TaskLaunchError:
+            raise
+        except sqlite3.DatabaseError as exc:
+            raise TaskLaunchError(f"Cannot activate task {task_id}: {exc}") from exc
+        return TaskLaunch(**dict(row))
 
     def reserve_failover(self, source_session_id: str) -> LaunchReservation:
         """Atomically move an active manager task into its next launch attempt."""
@@ -294,7 +327,8 @@ class TaskLaunchStore:
                 else:
                     conn.execute(
                         "UPDATE task_launches SET state = 'reserved', reservation_id = ?, "
-                        "spawn_attempts = spawn_attempts + 1, updated_at = ? "
+                        "incarnation_generation = incarnation_generation + 1, "
+                        "attempt_authorized = 0, updated_at = ? "
                         "WHERE task_id = ? AND state = 'active'",
                         (replacement, now, task.task_id),
                     )
@@ -358,19 +392,28 @@ class TaskLaunchStore:
         return task
 
     def _park_blocked(self, task: TaskLaunch) -> None:
+        self.park_issue(
+            task,
+            message=(
+                f"BLOCKED: task {task.task_id} exceeded "
+                f"{task.max_spawn_attempts} spawn attempts"
+            ),
+            dedupe_key=f"task-spawn-circuit:{task.task_id}",
+        )
+
+    def park_issue(
+        self, task: TaskLaunch, *, message: str, dedupe_key: str
+    ) -> None:
         try:
             self.store.park(
                 child_session_id=f"task:{task.task_id}",
                 child_workspace_id=None,
                 recorded_parent_session_id=None,
                 reason="no_parent",
-                message=(
-                    f"BLOCKED: task {task.task_id} exceeded "
-                    f"{task.max_spawn_attempts} spawn attempts"
-                ),
-                dedupe_key=f"task-spawn-circuit:{task.task_id}",
+                message=message,
+                dedupe_key=dedupe_key,
             )
         except EscalationStoreError as exc:
             raise TaskLaunchError(
-                f"Cannot park blocked task {task.task_id}: {exc}"
+                f"Cannot park task {task.task_id}: {exc}"
             ) from exc

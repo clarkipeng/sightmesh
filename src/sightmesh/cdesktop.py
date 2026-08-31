@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -59,6 +60,7 @@ class TaskLaunchResult:
     incarnation_generation: int
     attempt_id: str
     idempotency_key: str
+    launch_fingerprint: str
     phase: str
     effect: str
     workspace_id: str | None
@@ -202,6 +204,9 @@ class CdesktopClient:
         launch: dict[str, Any],
     ) -> TaskLaunchResult:
         """Lookup first, then atomically create-or-return one keyed side effect."""
+        launch_fingerprint = hashlib.sha256(
+            json.dumps(launch, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         existing = self.lookup_task_launch(idempotency_key)
         if existing is not None:
             _match_task_launch(
@@ -209,6 +214,7 @@ class CdesktopClient:
                 task_id=task_id,
                 incarnation_generation=incarnation_generation,
                 attempt_id=attempt_id,
+                launch_fingerprint=launch_fingerprint,
             )
             return existing
         result = self.request(
@@ -220,6 +226,7 @@ class CdesktopClient:
                 "incarnation_generation": incarnation_generation,
                 "attempt_id": attempt_id,
                 "idempotency_key": idempotency_key,
+                "launch_fingerprint": launch_fingerprint,
                 "launch": launch,
             },
         )
@@ -229,6 +236,7 @@ class CdesktopClient:
             task_id=task_id,
             incarnation_generation=incarnation_generation,
             attempt_id=attempt_id,
+            launch_fingerprint=launch_fingerprint,
         )
         return parsed
 
@@ -617,6 +625,49 @@ class CdesktopClient:
         auth_binding_id: str | None = None,
         launch_key: str | None = None,
     ) -> dict[str, Any]:
+        known_workspace_ids = {str(item.get("id")) for item in self.workspaces()}
+        payload = self.workspace_launch_spec(
+            name=name,
+            repo_path=repo_path,
+            target_branch=target_branch,
+            executor=executor,
+            prompt=prompt,
+            use_worktree=use_worktree,
+            permission_policy=permission_policy,
+            model=model,
+            reasoning=reasoning,
+            provider_id=provider_id,
+            setup_script=setup_script,
+            auth_binding_id=auth_binding_id,
+        )
+        if launch_key:
+            payload["idempotency_key"] = launch_key
+        try:
+            return self.request("POST", "/workspaces/start", payload)
+        except CdesktopError as exc:
+            if launch_key:
+                raise
+            cleanup = self._cleanup_failed_workspace_start(name, known_workspace_ids)
+            if cleanup:
+                raise CdesktopError(f"{exc}; {cleanup}") from exc
+            raise
+
+    def workspace_launch_spec(
+        self,
+        *,
+        name: str,
+        repo_path: Path,
+        target_branch: str,
+        executor: str,
+        prompt: str,
+        use_worktree: bool,
+        permission_policy: str,
+        model: str | None,
+        reasoning: str | None,
+        provider_id: str | None,
+        setup_script: str | None = None,
+        auth_binding_id: str | None = None,
+    ) -> dict[str, Any]:
         repo = self.register_repo(
             repo_path,
             setup_script=setup_script,
@@ -630,7 +681,6 @@ class CdesktopClient:
             executor_config["model_id"] = model
         if reasoning:
             executor_config["reasoning_id"] = reasoning
-        known_workspace_ids = {str(item.get("id")) for item in self.workspaces()}
         payload: dict[str, Any] = {
             "name": name,
             "repos": [{"repo_id": repo["id"], "target_branch": target_branch}],
@@ -645,19 +695,7 @@ class CdesktopClient:
             # Opaque pool binding id per the SessionCommandConfig contract;
             # resolution to a credential happens inside cdesktop at launch.
             payload["auth_binding_id"] = auth_binding_id
-        if launch_key:
-            # cdesktop owns the create side effect and must atomically return the
-            # same workspace for every request carrying this opaque key.
-            payload["idempotency_key"] = launch_key
-        try:
-            return self.request("POST", "/workspaces/start", payload)
-        except CdesktopError as exc:
-            if launch_key:
-                raise
-            cleanup = self._cleanup_failed_workspace_start(name, known_workspace_ids)
-            if cleanup:
-                raise CdesktopError(f"{exc}; {cleanup}") from exc
-            raise
+        return payload
 
     def _cleanup_failed_workspace_start(
         self, name: str, known_workspace_ids: set[str]
@@ -750,6 +788,35 @@ class CdesktopClient:
         auth_binding_id: str | None = None,
         launch_key: str | None = None,
     ) -> dict[str, Any]:
+        payload = self.teammate_launch_spec(
+            caller_session=caller_session,
+            name=name,
+            prompt=prompt,
+            executor=executor,
+            permission_policy=permission_policy,
+            model=model,
+            reasoning=reasoning,
+            provider_id=provider_id,
+            auth_binding_id=auth_binding_id,
+        )
+        payload.pop("caller_session_id", None)
+        if launch_key:
+            payload["idempotency_key"] = launch_key
+        return self.request("POST", f"/sessions/{caller_session}/teammates", payload)
+
+    def teammate_launch_spec(
+        self,
+        *,
+        caller_session: str,
+        name: str,
+        prompt: str,
+        executor: str | None = None,
+        permission_policy: str | None = None,
+        model: str | None = None,
+        reasoning: str | None = None,
+        provider_id: str | None = None,
+        auth_binding_id: str | None = None,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {"name": name, "prompt": prompt}
         config: dict[str, Any] = {}
         if executor:
@@ -766,9 +833,8 @@ class CdesktopClient:
             payload["selected_provider_id"] = provider_id
         if auth_binding_id:
             payload["auth_binding_id"] = auth_binding_id
-        if launch_key:
-            payload["idempotency_key"] = launch_key
-        return self.request("POST", f"/sessions/{caller_session}/teammates", payload)
+        payload["caller_session_id"] = caller_session
+        return payload
 
     def stop_workspace(self, workspace_id: str) -> Any:
         return self.request("POST", f"/workspaces/{workspace_id}/execution/stop", {})
@@ -811,6 +877,7 @@ def _task_launch_result(value: Any, *, expected_key: str) -> TaskLaunchResult:
         "incarnation_generation": int,
         "attempt_id": str,
         "idempotency_key": str,
+        "launch_fingerprint": str,
         "phase": str,
         "effect": str,
     }
@@ -818,6 +885,11 @@ def _task_launch_result(value: Any, *, expected_key: str) -> TaskLaunchResult:
         raise CdesktopError("cdesktop task launch response has invalid identity fields")
     if value["idempotency_key"] != expected_key:
         raise CdesktopError("cdesktop task launch response changed the idempotency key")
+    fingerprint = value["launch_fingerprint"]
+    if len(fingerprint) != 64 or any(
+        character not in "0123456789abcdef" for character in fingerprint
+    ):
+        raise CdesktopError("cdesktop task launch response has an invalid fingerprint")
     if value["phase"] not in {"pending", "active", "terminal", "refused"}:
         raise CdesktopError("cdesktop task launch response has an invalid phase")
     if value["effect"] not in {"created", "existing", "none"}:
@@ -870,6 +942,7 @@ def _task_launch_result(value: Any, *, expected_key: str) -> TaskLaunchResult:
         incarnation_generation=value["incarnation_generation"],
         attempt_id=value["attempt_id"],
         idempotency_key=value["idempotency_key"],
+        launch_fingerprint=value["launch_fingerprint"],
         phase=value["phase"],
         effect=value["effect"],
         workspace_id=value.get("workspace_id"),
@@ -885,11 +958,13 @@ def _match_task_launch(
     task_id: str,
     incarnation_generation: int,
     attempt_id: str,
+    launch_fingerprint: str,
 ) -> None:
     if (
         result.task_id != task_id
         or result.incarnation_generation != incarnation_generation
         or result.attempt_id != attempt_id
+        or result.launch_fingerprint != launch_fingerprint
     ):
         raise CdesktopRejectedError(
             "Existing cdesktop idempotency key belongs to different launch parameters"

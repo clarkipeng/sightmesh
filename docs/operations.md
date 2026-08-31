@@ -110,22 +110,26 @@ The default starts a visible successor session in the same cdesktop workspace. T
 
 For manager programs, pass a stable `--task-id` to `sightmesh spawn`. SightMesh
 commits one launch reservation in the existing escalation database before it
-calls cdesktop. Repeating the same command, including from simultaneous wakeups,
-returns the existing task record and never creates a second workspace. Limits
+calls cdesktop's versioned create-or-return API. Repeating the same command,
+including from simultaneous wakeups, replays one key and converges on the same
+native workspace/session. Limits
 are immutable: `--max-spawn-attempts` bounds failed launch attempts, and
 `--max-children` fixes the number of distinct child task IDs a manager can own.
 Children name that manager with `--parent-task-id`; a task cannot parent or
 replace itself.
 
-A crashed launcher leaves a reserved record, which fails closed. SightMesh sends
-that reservation as cdesktop's opaque idempotency key; cdesktop must atomically
-return the original workspace/session when the key is replayed. SightMesh never
-uses a workspace listing as proof. Rotating a reservation is allowed only after
-cdesktop proves the old key did not commit, and consumes one attempt atomically.
-Reaching the fixed attempt limit blocks the task and writes one deduplicated
-escalation. Until cdesktop ships that create-key contract, crash recovery is
-fail-closed rather than exactly retryable. Manager failover transfers the same
-task row, child limit, and attempt limit to its successor.
+A crashed launcher leaves a reserved record and one stable key. Every replay
+first looks up that key; reservation rotation never authorizes recreation.
+SightMesh consumes an attempt once, immediately before authorizing a new native
+effect, while lookups and replays consume none. A child consumes its manager's
+fixed child budget only after cdesktop durably accepts create-or-return; pending
+child reservations still hold capacity so concurrent callers cannot oversubscribe
+the limit. Reaching the attempt limit blocks the task and writes one deduplicated
+escalation. Until the pinned cdesktop advertises the complete
+[task-launch-v1 contract](cdesktop-task-launch-v1.md), task-ID launch parks one
+visible reason and performs no creation request. Manager failover increments a
+fenced incarnation generation while preserving the same task row, child count,
+and immutable limits.
 
 Task rows contain IDs, counters, limits, and cdesktop workspace/session
 references only. cdesktop and its executors remain the sole owners of transcript

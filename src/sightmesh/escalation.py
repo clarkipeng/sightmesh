@@ -395,6 +395,9 @@ class EscalationStore:
                         workspace_id TEXT,
                         session_id TEXT,
                         parent_task_id TEXT,
+                        incarnation_generation INTEGER NOT NULL DEFAULT 1,
+                        attempt_authorized INTEGER NOT NULL DEFAULT 0,
+                        parent_counted INTEGER NOT NULL DEFAULT 0,
                         max_children INTEGER NOT NULL CHECK (max_children >= 0),
                         child_count INTEGER NOT NULL DEFAULT 0,
                         spawn_attempts INTEGER NOT NULL DEFAULT 0,
@@ -408,6 +411,18 @@ class EscalationStore:
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_launches_active_session "
                     "ON task_launches(session_id) WHERE session_id IS NOT NULL"
                 )
+                task_columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(task_launches)")
+                }
+                for name, declaration in (
+                    ("incarnation_generation", "INTEGER NOT NULL DEFAULT 1"),
+                    ("attempt_authorized", "INTEGER NOT NULL DEFAULT 0"),
+                    ("parent_counted", "INTEGER NOT NULL DEFAULT 0"),
+                ):
+                    if name not in task_columns:
+                        conn.execute(
+                            f"ALTER TABLE task_launches ADD COLUMN {name} {declaration}"
+                        )
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(
                 f"Cannot initialize escalation store {self.path}: {exc}"

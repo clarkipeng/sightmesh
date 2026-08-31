@@ -32,7 +32,13 @@ from .. import (
     updates,
 )
 from ..bridge import run_bridge
-from ..cdesktop import CdesktopClient, CdesktopError
+from ..cdesktop import (
+    CdesktopClient,
+    CdesktopError,
+    CdesktopInterruptedError,
+    CdesktopPendingError,
+    CdesktopRejectedError,
+)
 from ..pool import core as pool_core
 from ..pool.core import PoolError
 from ..profiles import (

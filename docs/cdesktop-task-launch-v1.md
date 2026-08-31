@@ -50,6 +50,7 @@ makes a runtime-lock upgrade an explicit release prerequisite.
   "incarnation_generation": 2,
   "attempt_id": "durable authorization ID",
   "idempotency_key": "task-launch:task-id:2:attempt-id",
+  "launch_fingerprint": "sha256 of canonical launch parameters",
   "launch": {"executor-owned launch parameters": "..."}
 }
 ```
@@ -61,8 +62,10 @@ timeout or crash. Reservation or capability rotation in SightMesh never
 authorizes blind native recreation.
 
 Requests are at least once. cdesktop guarantees one logical effect per
-idempotency key. Reusing a key with different task, generation, attempt, or
-launch parameters returns 409. A generation older than cdesktop's accepted
+idempotency key. SightMesh computes the lowercase SHA-256 fingerprint from
+canonical sorted-key compact JSON and verifies it on lookup. Reusing a key with
+different task, generation, attempt, fingerprint, or launch parameters returns
+409. A generation older than cdesktop's accepted
 generation for the task is rejected. Concurrent callers converge on the same
 record. A new creation attempt is counted by SightMesh only when a distinct
 durable attempt ID is authorized; lookup and return of an existing effect do

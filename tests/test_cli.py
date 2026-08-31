@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from sightmesh import __version__, approvals, cli, escalation, succession
-from sightmesh.cdesktop import CdesktopClient, CdesktopError
+from sightmesh.cdesktop import (
+    CdesktopClient,
+    CdesktopError,
+    CdesktopRejectedError,
+    TaskLaunchResult,
+)
 from sightmesh.cli import (
     _fleet_sessions,
     _idle_unmet_orders,
@@ -650,6 +655,7 @@ class FakeSpawnClient:
             "use_worktree": False,
         }
         self.last_spawn = None
+        self.task_launch = None
 
     def spawn_workspace(self, **kwargs):
         self.last_spawn = kwargs
@@ -657,6 +663,43 @@ class FakeSpawnClient:
             "workspace": dict(self.workspace_data),
             "sessions": [{"id": "session-a"}],
         }
+
+    def require_task_launch_contract(self):
+        return None
+
+    def lookup_task_launch(self, _idempotency_key):
+        return self.task_launch
+
+    def workspace_launch_spec(self, **kwargs):
+        return {key: str(value) for key, value in kwargs.items()}
+
+    def teammate_launch_spec(self, **kwargs):
+        return dict(kwargs)
+
+    def create_or_return_task_launch(
+        self,
+        *,
+        task_id,
+        incarnation_generation,
+        attempt_id,
+        idempotency_key,
+        launch,
+    ):
+        self.last_spawn = launch
+        self.task_launch = TaskLaunchResult(
+            task_id=task_id,
+            incarnation_generation=incarnation_generation,
+            attempt_id=attempt_id,
+            idempotency_key=idempotency_key,
+            launch_fingerprint="a" * 64,
+            phase="active",
+            effect="created",
+            workspace_id="workspace-a",
+            session_id="session-a",
+            outcome=None,
+            history_ref=None,
+        )
+        return self.task_launch
 
     def workspaces(self):
         return []
@@ -1065,9 +1108,9 @@ def test_spawn_task_id_reuses_active_launch_before_lease_preflight(
     class CountingClient(FakeSpawnClient):
         spawns = 0
 
-        def spawn_workspace(self, **kwargs):
+        def create_or_return_task_launch(self, **kwargs):
             type(self).spawns += 1
-            return super().spawn_workspace(**kwargs)
+            return super().create_or_return_task_launch(**kwargs)
 
     monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
     monkeypatch.setattr(cli, "CdesktopClient", CountingClient)
@@ -1118,9 +1161,9 @@ def test_reserved_spawn_replays_same_destination_key(monkeypatch, tmp_path):
     seen = []
 
     class Client(FakeSpawnClient):
-        def spawn_workspace(self, **kwargs):
-            seen.append(kwargs["launch_key"])
-            return super().spawn_workspace(**kwargs)
+        def create_or_return_task_launch(self, **kwargs):
+            seen.append(kwargs["idempotency_key"])
+            return super().create_or_return_task_launch(**kwargs)
 
     monkeypatch.setattr(cli.tasks, "TaskLaunchStore", lambda: store_type(state))
     monkeypatch.setattr(cli, "CdesktopClient", Client)
@@ -1137,7 +1180,103 @@ def test_reserved_spawn_replays_same_destination_key(monkeypatch, tmp_path):
     )
 
     cli._spawn_workspace(args)
-    assert seen == [reservation.reservation_id]
+    assert seen == [reservation.task.idempotency_key]
+
+
+def test_task_launch_without_capability_parks_once_and_never_posts(
+    monkeypatch, tmp_path
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state = escalation.EscalationStore(tmp_path / "state.sqlite3")
+    store_type = cli.tasks.TaskLaunchStore
+
+    class UnsupportedClient(FakeSpawnClient):
+        creates = 0
+
+        def require_task_launch_contract(self):
+            raise CdesktopRejectedError("task-launch-v1 unavailable")
+
+        def create_or_return_task_launch(self, **kwargs):
+            type(self).creates += 1
+            return super().create_or_return_task_launch(**kwargs)
+
+    monkeypatch.setattr(cli.tasks, "TaskLaunchStore", lambda: store_type(state))
+    monkeypatch.setattr(cli, "CdesktopClient", UnsupportedClient)
+    monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
+    args = argparse.Namespace(
+        prompt="start", prompt_file=None, repo=str(repo), url=None, name="demo",
+        task_id="stable-task", parent_task_id=None, max_children=0,
+        max_spawn_attempts=3, base="main", executor="CODEX", worktree=False,
+        permission="SUPERVISED", unattended=False, model=None, reasoning=None,
+        provider=None, lease_ttl_seconds=60, no_bridge=False, json=True,
+    )
+
+    for _ in range(2):
+        with pytest.raises(CdesktopRejectedError, match="unavailable"):
+            cli._spawn_workspace(args)
+
+    assert UnsupportedClient.creates == 0
+    assert store_type(state).get("stable-task").spawn_attempts == 0
+    parked = state.pending()
+    assert len(parked) == 1
+    assert parked[0].dedupe_key == "task-launch-capability:stable-task"
+
+
+def test_ambiguous_task_create_is_looked_up_and_activated_once(
+    monkeypatch, tmp_path
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state = escalation.EscalationStore(tmp_path / "state.sqlite3")
+    store_type = cli.tasks.TaskLaunchStore
+    client = FakeSpawnClient()
+    client.create_calls = 0
+
+    def ambiguous_then_existing(**kwargs):
+        client.create_calls += 1
+        if client.task_launch is None:
+            client.task_launch = TaskLaunchResult(
+                task_id=kwargs["task_id"],
+                incarnation_generation=kwargs["incarnation_generation"],
+                attempt_id=kwargs["attempt_id"],
+                idempotency_key=kwargs["idempotency_key"],
+                launch_fingerprint="a" * 64,
+                phase="active",
+                effect="created",
+                workspace_id="workspace-a",
+                session_id="session-a",
+                outcome=None,
+                history_ref=None,
+            )
+            raise CdesktopError("response lost after acceptance")
+        return client.task_launch
+
+    client.create_or_return_task_launch = ambiguous_then_existing
+    monkeypatch.setattr(cli.tasks, "TaskLaunchStore", lambda: store_type(state))
+    monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
+    monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
+    monkeypatch.setattr(cli.leases, "sync_active_workspaces", lambda _client: [])
+    monkeypatch.setattr(cli.routing, "enable", lambda _workspace_id: None)
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: tmp_path / "leases")
+    args = argparse.Namespace(
+        prompt="start", prompt_file=None, repo=str(repo), url=None, name="demo",
+        task_id="stable-task", parent_task_id=None, max_children=0,
+        max_spawn_attempts=3, base="main", executor="CODEX", worktree=False,
+        permission="SUPERVISED", unattended=False, model=None, reasoning=None,
+        provider=None, lease_ttl_seconds=60, no_bridge=False, json=True,
+    )
+
+    with pytest.raises(CdesktopError, match="response lost"):
+        cli._spawn_workspace(args)
+    result = cli._spawn_workspace(args)
+
+    assert result["task"]["state"] == "active"
+    assert client.create_calls == 2
+    task = store_type(state).get("stable-task")
+    assert task.spawn_attempts == 1
+    assert task.session_id == "session-a"
+    assert len(state.pending()) == 1
 
 
 def test_refused_free_route_spawn_escalates_and_releases_its_lease(
