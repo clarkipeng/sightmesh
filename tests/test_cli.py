@@ -1109,6 +1109,37 @@ def test_workspace_response_parse_failure_leaves_reservation_replayable(tmp_path
     assert unchanged.reservation_id == reservation.reservation_id
 
 
+def test_reserved_spawn_replays_same_destination_key(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    state = escalation.EscalationStore(tmp_path / "state.sqlite3")
+    store_type = cli.tasks.TaskLaunchStore
+    reservation = store_type(state).reserve("stable-task")
+    seen = []
+
+    class Client(FakeSpawnClient):
+        def spawn_workspace(self, **kwargs):
+            seen.append(kwargs["launch_key"])
+            return super().spawn_workspace(**kwargs)
+
+    monkeypatch.setattr(cli.tasks, "TaskLaunchStore", lambda: store_type(state))
+    monkeypatch.setattr(cli, "CdesktopClient", Client)
+    monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
+    monkeypatch.setattr(cli.leases, "sync_active_workspaces", lambda _client: [])
+    monkeypatch.setattr(cli.routing, "enable", lambda _workspace_id: None)
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: tmp_path / "leases")
+    args = argparse.Namespace(
+        prompt="start", prompt_file=None, repo=str(repo), url=None, name="demo",
+        task_id="stable-task", parent_task_id=None, max_children=0,
+        max_spawn_attempts=3, base="main", executor="CODEX", worktree=False,
+        permission="SUPERVISED", unattended=False, model=None, reasoning=None,
+        provider=None, lease_ttl_seconds=60, no_bridge=False, json=True,
+    )
+
+    cli._spawn_workspace(args)
+    assert seen == [reservation.reservation_id]
+
+
 def test_refused_free_route_spawn_escalates_and_releases_its_lease(
     monkeypatch, tmp_path: Path
 ) -> None:

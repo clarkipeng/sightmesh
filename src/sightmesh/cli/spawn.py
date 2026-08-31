@@ -285,14 +285,33 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
         if parent_task_id and parent_task_id != caller_task.task_id:
             raise ValueError("A managed manager cannot assign another task as parent")
         parent_task_id = caller_task.task_id
-    if task_store and supplied_reservation is None and task_store.get(task_id) is not None:
-        existing = task_store.reserve(
-            task_id,
-            parent_task_id=parent_task_id,
-            max_children=getattr(args, "max_children", 0),
-            max_spawn_attempts=getattr(args, "max_spawn_attempts", 3),
-        )
-        return {"action": "task-launch-existing", "task": existing.task.to_dict()}
+    if task_store and supplied_reservation is None:
+        existing_task = task_store.get(task_id)
+        if existing_task and existing_task.state == "active":
+            if existing_task.session_id:
+                escalation.EscalationStore().record_launcher(
+                    session_id=existing_task.session_id,
+                    workspace_id=existing_task.workspace_id,
+                    identity=escalation.detect_launcher(),
+                )
+            return {"action": "task-launch-existing", "task": existing_task.to_dict()}
+        if existing_task and existing_task.state == "reserved":
+            supplied_reservation = tasks.LaunchReservation(
+                existing_task, existing_task.reservation_id, True
+            )
+        elif existing_task:
+            existing = task_store.reserve(
+                task_id,
+                parent_task_id=parent_task_id,
+                max_children=getattr(args, "max_children", 0),
+                max_spawn_attempts=getattr(args, "max_spawn_attempts", 3),
+            )
+            if not existing.should_spawn:
+                return {
+                    "action": "task-launch-existing",
+                    "task": existing.task.to_dict(),
+                }
+            supplied_reservation = existing
     lease_store = leases.LeaseStore()
     if not task_store:
         lease_store.assert_spawn_allowed(repo_path, use_worktree=args.worktree)
