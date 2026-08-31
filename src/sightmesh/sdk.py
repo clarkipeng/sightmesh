@@ -313,7 +313,7 @@ class SightMesh:
             "executor": selected.executor,
             "model": selected.model,
             "reasoning": task.spec.get("reasoning"),
-            "provider_id": None,
+            "provider_id": self._default_provider_id(),
             "auth_binding_id": selected.auth_binding_id,
             "route_id": selected.route_id,
             "billing_class": selected.billing_class,
@@ -501,10 +501,24 @@ class SightMesh:
             "executor": target.executor,
             "model": target.model,
             "reasoning": spec.reasoning,
-            "provider_id": None,
+            "provider_id": self._default_provider_id(),
             "auth_binding_id": target.auth_binding_id,
             "route_id": target.route_id,
         }
+
+    def _default_provider_id(self) -> str:
+        providers = [
+            provider
+            for provider in self.client.providers()
+            if provider.get("kind") == "Default"
+            and provider.get("enabled")
+            and provider.get("id")
+        ]
+        if len(providers) != 1:
+            raise SightMeshError(
+                "Execution routing requires one enabled cdesktop Default provider"
+            )
+        return str(providers[0]["id"])
 
     def _resolve_repo(self, handle: str) -> dict[str, Any]:
         candidate = Path(handle).expanduser()
