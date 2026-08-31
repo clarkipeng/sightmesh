@@ -32,6 +32,7 @@ DEFAULT_COOLDOWN = 5 * 3600
 
 LIMIT_PATTERNS = [
     r"usage limit reached",
+    r"reached your .{1,40} limit",
     r"rate.?limit",
     r"limit reached",
     r"quota",

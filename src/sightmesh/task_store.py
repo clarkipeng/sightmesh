@@ -212,7 +212,9 @@ class TaskStore:
             (str(workspace_id), str(session_id), time.time()),
         )
 
-    def prepare_replacement(self, task_id: str) -> TaskRecord:
+    def prepare_replacement(
+        self, task_id: str, *, target: dict[str, Any] | None = None
+    ) -> TaskRecord:
         try:
             with self._database._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -234,14 +236,19 @@ class TaskStore:
                         f"Task {task.key!r} tripped its {task.max_attempts}-attempt "
                         "circuit breaker"
                     )
+                spec = task.spec if target is None else {**task.spec, "target": target}
                 conn.execute(
                     """
                     UPDATE managed_tasks
                     SET state = 'replacing', epoch = epoch + 1,
-                        attempts = attempts + 1, updated_at = ?
+                        attempts = attempts + 1, spec_json = ?, updated_at = ?
                     WHERE task_id = ?
                     """,
-                    (time.time(), str(task_id)),
+                    (
+                        json.dumps(spec, sort_keys=True, separators=(",", ":")),
+                        time.time(),
+                        str(task_id),
+                    ),
                 )
                 row = conn.execute(
                     "SELECT * FROM managed_tasks WHERE task_id = ?", (str(task_id),)

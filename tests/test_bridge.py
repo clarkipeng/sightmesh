@@ -11,6 +11,7 @@ from sightmesh.bridge import (
     _dedupe_key,
     _peer_name,
 )
+from sightmesh.pool.core import PoolError
 
 
 class FakeClient:
@@ -195,15 +196,26 @@ def test_no_bridge_child_still_gets_stall_recovery(monkeypatch) -> None:
     client = StallClient()
     client.stopped = []
     supervisor = BridgeSupervisor(client, "ws://127.0.0.1:8377/ws")
+    reconciled = []
+
+    def reconcile_quota_failure(session_id):
+        reconciled.append(session_id)
+        if len(reconciled) == 1:
+            raise PoolError("pool state unavailable")
+
+    supervisor.managed_tasks.reconcile_quota_failure = reconcile_quota_failure
     supervisor.stalls.threshold = timedelta(0)
     monkeypatch.setattr(bridge_module, "enabled_workspaces", lambda: set())
-    monkeypatch.setattr(bridge_module.leases, "sync_active_workspaces", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        bridge_module.leases, "sync_active_workspaces", lambda *_args, **_kwargs: []
+    )
 
     asyncio.run(supervisor.reconcile())
     asyncio.run(supervisor.reconcile())
 
     assert client.stopped == ["process-1"]
     assert client.sent[0][0] == "parent"
+    assert reconciled == ["child", "child"]
     assert supervisor.tasks == {}
 
 

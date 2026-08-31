@@ -41,7 +41,9 @@ Keep subscription routes before metered routes when subscription capacity should
 
 `auto` selects the first eligible metered route after earlier routes cannot resolve. `ask` returns an `approval_needed` outcome for the first eligible metered route. `never` skips every metered route and returns blocked when no subscription route resolves; it does not inspect the metered account credential.
 
-These are durable selector guarantees: the settings are persisted and each selection produces a resolved, approval-needed, or blocked result. SightMesh spawn and teammate launches route through the selector and carry the selected binding. The cdesktop side of the contract - durable metered approvals and route-swap recovery - requires a pinned cdesktop release that includes it; until the runtime lock references such a release, do not describe those cdesktop behaviors as active.
+These are durable selector guarantees: the settings are persisted and each selection produces a resolved, approval-needed, or blocked result. SightMesh spawn and teammate launches route through the selector and carry the selected binding.
+
+Managed SDK tasks also persist that opaque binding. When the bridge observes a terminal assistant response that reports subscription quota exhaustion, it cools that binding and transfers the task to one successor on the next eligible configured route. The task epoch, active lease, and attempt budget make repeated observations idempotent and bounded. Explicit-profile tasks and ordinary non-quota failures never change routes automatically. A route that requires metered approval or a fully exhausted chain leaves the task blocked for a human decision.
 
 Use the non-launching commands to review the policy:
 
