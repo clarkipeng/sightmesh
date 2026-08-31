@@ -77,6 +77,47 @@ sightmesh steer @docs-review --message "Stop implementation and report findings"
 
 `message` waits for the next safe turn boundary. `steer` sends a native `replace` command scoped to the selected session; on this release it does not independently guard against a pending approval or question, so inspect the target before steering.
 
+## Managed task SDK
+
+Use semantic task keys and normal prompt strings. SightMesh owns task IDs, epochs, request hashes, leases, and command dedupe keys. cdesktop owns visible workspaces, worktrees, sessions, transcripts, and the exact-once native launch journal.
+
+```python
+from sightmesh import Command, SightMesh, WorkerSpec
+
+mesh = SightMesh()
+mesh.start(WorkerSpec(
+    key="auth-audit",
+    prompt="Audit the authentication boundary and report concrete risks.",
+    repo="catapult-games",
+    base="main",
+))
+
+mesh.start_all([
+    WorkerSpec("api-tests", "Add focused API coverage.", "catapult-games"),
+    WorkerSpec("docs-check", "Verify the public setup guide.", "catapult-games"),
+])
+mesh.send_all([
+    Command("api-tests", "Also cover duplicate wakeups."),
+    Command("docs-check", "Keep examples human-readable."),
+])
+```
+
+`start` is idempotent for a key in the current manager scope. `start_all` validates and reserves the full batch before launching its members, then returns one result or error per key. `send_all` validates every destination before queueing any command. A replacement gets a new session in the same task-owned worktree only after the old session is quarantined. Checkpoint content stays in that worktree under `.context`, addressed by its content hash; SightMesh stores only the reference. Three total launch attempts trip the circuit breaker.
+
+The flat CLI uses the same service:
+
+```sh
+sightmesh start auth-audit "Audit the authentication boundary" --repo catapult-games
+sightmesh show auth-audit
+sightmesh send auth-audit "Also inspect refresh-token rotation"
+sightmesh checkpoint "Tests pass; documentation remains"
+sightmesh complete --summary "Audit complete"
+```
+
+For batches, prefer the Python SDK. The CLI also accepts `sightmesh start --batch jobs.json` and `sightmesh send --batch commands.json` for shell workflows. Prompt files are optional, not required.
+
+Model rules of thumb are judgment, not routing code. Terra or Luna are usually efficient worker defaults. Use a stronger model such as Sol or Opus when debugging, auditing, or planning genuinely requires it. Scope and uncertainty matter more than the role label; profiles and the configured routing chain remain the source of truth.
+
 ## How ownership stays native
 
 ```text

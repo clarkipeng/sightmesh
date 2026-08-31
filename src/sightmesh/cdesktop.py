@@ -496,6 +496,46 @@ class CdesktopClient:
         setup_script: str | None = None,
         auth_binding_id: str | None = None,
     ) -> dict[str, Any]:
+        payload = self.workspace_launch_request(
+            name=name,
+            repo_path=repo_path,
+            target_branch=target_branch,
+            executor=executor,
+            prompt=prompt,
+            use_worktree=use_worktree,
+            permission_policy=permission_policy,
+            model=model,
+            reasoning=reasoning,
+            provider_id=provider_id,
+            setup_script=setup_script,
+            auth_binding_id=auth_binding_id,
+        )
+        known_workspace_ids = {str(item.get("id")) for item in self.workspaces()}
+        try:
+            return self.request("POST", "/workspaces/start", payload)
+        except CdesktopError as exc:
+            cleanup = self._cleanup_failed_workspace_start(name, known_workspace_ids)
+            if cleanup:
+                raise CdesktopError(f"{exc}; {cleanup}") from exc
+            raise
+
+    def workspace_launch_request(
+        self,
+        *,
+        name: str,
+        repo_path: Path,
+        target_branch: str,
+        executor: str,
+        prompt: str,
+        use_worktree: bool,
+        permission_policy: str,
+        model: str | None,
+        reasoning: str | None,
+        provider_id: str | None,
+        setup_script: str | None = None,
+        auth_binding_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Build the native launch request used by direct and managed starts."""
         repo = self.register_repo(
             repo_path,
             setup_script=setup_script,
@@ -509,7 +549,6 @@ class CdesktopClient:
             executor_config["model_id"] = model
         if reasoning:
             executor_config["reasoning_id"] = reasoning
-        known_workspace_ids = {str(item.get("id")) for item in self.workspaces()}
         payload: dict[str, Any] = {
             "name": name,
             "repos": [{"repo_id": repo["id"], "target_branch": target_branch}],
@@ -524,13 +563,7 @@ class CdesktopClient:
             # Opaque pool binding id per the SessionCommandConfig contract;
             # resolution to a credential happens inside cdesktop at launch.
             payload["auth_binding_id"] = auth_binding_id
-        try:
-            return self.request("POST", "/workspaces/start", payload)
-        except CdesktopError as exc:
-            cleanup = self._cleanup_failed_workspace_start(name, known_workspace_ids)
-            if cleanup:
-                raise CdesktopError(f"{exc}; {cleanup}") from exc
-            raise
+        return payload
 
     def _cleanup_failed_workspace_start(
         self, name: str, known_workspace_ids: set[str]
@@ -622,6 +655,31 @@ class CdesktopClient:
         provider_id: str | None = None,
         auth_binding_id: str | None = None,
     ) -> dict[str, Any]:
+        payload = self.session_launch_request(
+            name=name,
+            prompt=prompt,
+            executor=executor,
+            permission_policy=permission_policy,
+            model=model,
+            reasoning=reasoning,
+            provider_id=provider_id,
+            auth_binding_id=auth_binding_id,
+        )
+        return self.request("POST", f"/sessions/{caller_session}/teammates", payload)
+
+    @staticmethod
+    def session_launch_request(
+        *,
+        name: str,
+        prompt: str,
+        executor: str | None = None,
+        permission_policy: str | None = None,
+        model: str | None = None,
+        reasoning: str | None = None,
+        provider_id: str | None = None,
+        auth_binding_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Build the native teammate request used by direct and managed starts."""
         payload: dict[str, Any] = {"name": name, "prompt": prompt}
         config: dict[str, Any] = {}
         if executor:
@@ -638,7 +696,24 @@ class CdesktopClient:
             payload["selected_provider_id"] = provider_id
         if auth_binding_id:
             payload["auth_binding_id"] = auth_binding_id
-        return self.request("POST", f"/sessions/{caller_session}/teammates", payload)
+        return payload
+
+    def managed_launch(
+        self, task_id: str, epoch: int, launch: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Create or return the one native effect reserved for a task epoch."""
+        if epoch < 1:
+            raise ValueError("Task epoch must be positive")
+        result = self.request("PUT", f"/managed-tasks/{task_id}/epochs/{epoch}", launch)
+        if not isinstance(result, dict):
+            raise CdesktopError("cdesktop managed launch response is invalid")
+        return result
+
+    def managed_effect(self, task_id: str, epoch: int) -> dict[str, Any]:
+        result = self.request("GET", f"/managed-tasks/{task_id}/epochs/{epoch}")
+        if not isinstance(result, dict):
+            raise CdesktopError("cdesktop managed effect response is invalid")
+        return result
 
     def stop_workspace(self, workspace_id: str) -> Any:
         return self.request("POST", f"/workspaces/{workspace_id}/execution/stop", {})
