@@ -37,6 +37,19 @@ def test_set_parent_rejects_self_link_before_request() -> None:
     assert client.calls == []
 
 
+def test_managed_launch_uses_the_task_epoch_route() -> None:
+    client = FakeClient()
+    launch = {"kind": "workspace", "request": {"prompt": "audit"}}
+
+    client.managed_launch("task-a", 2, launch)
+    client.managed_effect("task-a", 2)
+
+    assert client.calls == [
+        ("PUT", "/managed-tasks/task-a/epochs/2", launch, None, None),
+        ("GET", "/managed-tasks/task-a/epochs/2", None, None, None),
+    ]
+
+
 def test_success_false_is_a_typed_server_rejection(monkeypatch) -> None:
     class Response:
         status = 200
@@ -65,7 +78,9 @@ def test_success_false_is_a_typed_server_rejection(monkeypatch) -> None:
         (425, cdesktop.CdesktopPendingError),
     ],
 )
-def test_stop_operation_http_outcomes_are_typed(monkeypatch, status, error_type) -> None:
+def test_stop_operation_http_outcomes_are_typed(
+    monkeypatch, status, error_type
+) -> None:
     error = HTTPError(
         "http://127.0.0.1:1/api/execution-processes/process-a/stop",
         status,
@@ -104,11 +119,15 @@ def test_failed_start_cleans_the_one_new_native_workspace() -> None:
         def request(self, method, path, payload=None, query=None, headers=None):
             self.calls.append((method, path, payload, query, headers))
             if path == "/workspaces/start":
-                raise cdesktop.CdesktopError("POST /workspaces/start failed: HTTP 500: SpawnError")
+                raise cdesktop.CdesktopError(
+                    "POST /workspaces/start failed: HTTP 500: SpawnError"
+                )
             return {"id": "created"}
 
     client = Client()
-    with pytest.raises(cdesktop.CdesktopError, match="native cleanup deleted partial workspace partial"):
+    with pytest.raises(
+        cdesktop.CdesktopError, match="native cleanup deleted partial workspace partial"
+    ):
         client.spawn_workspace(
             name="worker",
             repo_path=Path("/tmp/repo"),

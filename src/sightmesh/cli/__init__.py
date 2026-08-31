@@ -5,28 +5,33 @@ import sys
 import types
 
 from .. import __version__
+from ..sdk import SightMeshError
+from ..task_store import TaskStoreError
+from . import (
+    approvals_commands,
+    bridge_commands,
+    pool_commands,
+    routing_commands,
+    service_updates,
+)
 from . import common as common_commands
-from .common import *
 from . import diagnostics as diagnostics_commands
 from . import fleet as fleet_commands
-from . import spawn as spawn_commands
 from . import messaging as messaging_commands
-from . import approvals_commands
+from . import spawn as spawn_commands
+from . import tasks as task_commands
 from . import workspaces as workspace_commands
-from . import service_updates
-from . import bridge_commands
-from . import routing_commands
-from . import pool_commands
+from .approvals_commands import *
+from .bridge_commands import *
+from .common import *
 from .diagnostics import *
 from .fleet import *
-from .spawn import *
 from .messaging import *
-from .approvals_commands import *
-from .workspaces import *
-from .service_updates import *
-from .bridge_commands import *
-from .routing_commands import *
 from .pool_commands import *
+from .routing_commands import *
+from .service_updates import *
+from .spawn import *
+from .workspaces import *
 
 
 def parser() -> argparse.ArgumentParser:
@@ -47,6 +52,7 @@ def parser() -> argparse.ArgumentParser:
     approvals_commands.add_parser(sub)
     routing_commands.add_parser(sub)
     pool_commands.add_parser(sub)
+    task_commands.add_parser(sub)
     workspace_commands.add_workspace_parser(sub)
     service_updates.add_parser(sub)
     bridge_commands.add_parser(sub)
@@ -67,6 +73,7 @@ def __getattr__(name: str):
         bridge_commands,
         routing_commands,
         pool_commands,
+        task_commands,
     ):
         if hasattr(module, name):
             return getattr(module, name)
@@ -90,6 +97,7 @@ class _CliModule(types.ModuleType):
             bridge_commands,
             routing_commands,
             pool_commands,
+            task_commands,
         ):
             if name in vars(module):
                 setattr(module, name, value)
@@ -102,7 +110,15 @@ def main() -> None:
     args = parser().parse_args()
     try:
         code = args.func(args)
-    except (CdesktopError, PoolError, ProfileError, RepowireError, ValueError) as exc:
+    except (
+        CdesktopError,
+        PoolError,
+        ProfileError,
+        RepowireError,
+        SightMeshError,
+        TaskStoreError,
+        ValueError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         code = 2
     raise SystemExit(code)

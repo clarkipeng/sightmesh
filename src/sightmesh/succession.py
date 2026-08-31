@@ -378,8 +378,15 @@ def transfer_ownership(
 
     cancelled = 0
     for row in open_commands:
-        client.interrupt_command(str(row["id"]))
-        cancelled += 1
+        if hasattr(client, "interrupt_command"):
+            client.interrupt_command(str(row["id"]))
+            cancelled += 1
+        elif row.get("execution_process_id"):
+            client.stop_execution(
+                str(row["execution_process_id"]),
+                dedupe_key=f"quarantine:{row['id']}",
+            )
+            cancelled += 1
 
     return HandoffResult(
         source_session_id=source,
