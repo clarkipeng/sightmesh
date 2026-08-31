@@ -1,3 +1,5 @@
+import hashlib
+import json
 from io import BytesIO
 from pathlib import Path
 from urllib.error import HTTPError
@@ -59,12 +61,16 @@ def task_launch_capability() -> dict:
 
 
 def launch_result(**changes) -> dict:
+    fingerprint = hashlib.sha256(
+        json.dumps({"name": "worker"}, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     result = {
         "contract_version": 1,
         "task_id": "task-a",
         "incarnation_generation": 2,
         "attempt_id": "attempt-a",
         "idempotency_key": "task-launch:task-a:2:attempt-a",
+        "launch_fingerprint": fingerprint,
         "phase": "active",
         "effect": "created",
         "workspace_id": "workspace-a",
@@ -126,6 +132,7 @@ def test_task_launch_looks_up_before_create_and_sends_versioned_identity() -> No
         "incarnation_generation": 2,
         "attempt_id": "attempt-a",
         "idempotency_key": "task-launch:task-a:2:attempt-a",
+        "launch_fingerprint": launch_result()["launch_fingerprint"],
         "launch": {"name": "worker"},
     }
 
@@ -148,6 +155,26 @@ def test_existing_key_with_mismatched_identity_refuses_without_create() -> None:
             launch={"name": "worker"},
         )
 
+    assert all(call[1] != "/task-launches" for call in client.calls)
+
+
+def test_existing_key_with_mismatched_launch_refuses_without_create() -> None:
+    class Client(FakeClient):
+        def request(self, method, path, payload=None, query=None, headers=None):
+            self.calls.append((method, path, payload, query, headers))
+            if path == "/info":
+                return task_launch_capability()
+            return launch_result(launch_fingerprint="b" * 64, effect="existing")
+
+    client = Client()
+    with pytest.raises(cdesktop.CdesktopRejectedError, match="different launch"):
+        client.create_or_return_task_launch(
+            task_id="task-a",
+            incarnation_generation=2,
+            attempt_id="attempt-a",
+            idempotency_key="task-launch:task-a:2:attempt-a",
+            launch={"name": "worker"},
+        )
     assert all(call[1] != "/task-launches" for call in client.calls)
 
 

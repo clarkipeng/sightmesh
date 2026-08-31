@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -59,6 +60,7 @@ class TaskLaunchResult:
     incarnation_generation: int
     attempt_id: str
     idempotency_key: str
+    launch_fingerprint: str
     phase: str
     effect: str
     workspace_id: str | None
@@ -202,6 +204,9 @@ class CdesktopClient:
         launch: dict[str, Any],
     ) -> TaskLaunchResult:
         """Lookup first, then atomically create-or-return one keyed side effect."""
+        launch_fingerprint = hashlib.sha256(
+            json.dumps(launch, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         existing = self.lookup_task_launch(idempotency_key)
         if existing is not None:
             _match_task_launch(
@@ -209,6 +214,7 @@ class CdesktopClient:
                 task_id=task_id,
                 incarnation_generation=incarnation_generation,
                 attempt_id=attempt_id,
+                launch_fingerprint=launch_fingerprint,
             )
             return existing
         result = self.request(
@@ -220,6 +226,7 @@ class CdesktopClient:
                 "incarnation_generation": incarnation_generation,
                 "attempt_id": attempt_id,
                 "idempotency_key": idempotency_key,
+                "launch_fingerprint": launch_fingerprint,
                 "launch": launch,
             },
         )
@@ -229,6 +236,7 @@ class CdesktopClient:
             task_id=task_id,
             incarnation_generation=incarnation_generation,
             attempt_id=attempt_id,
+            launch_fingerprint=launch_fingerprint,
         )
         return parsed
 
@@ -801,6 +809,7 @@ def _task_launch_result(value: Any, *, expected_key: str) -> TaskLaunchResult:
         "incarnation_generation": int,
         "attempt_id": str,
         "idempotency_key": str,
+        "launch_fingerprint": str,
         "phase": str,
         "effect": str,
     }
@@ -808,6 +817,11 @@ def _task_launch_result(value: Any, *, expected_key: str) -> TaskLaunchResult:
         raise CdesktopError("cdesktop task launch response has invalid identity fields")
     if value["idempotency_key"] != expected_key:
         raise CdesktopError("cdesktop task launch response changed the idempotency key")
+    fingerprint = value["launch_fingerprint"]
+    if len(fingerprint) != 64 or any(
+        character not in "0123456789abcdef" for character in fingerprint
+    ):
+        raise CdesktopError("cdesktop task launch response has an invalid fingerprint")
     if value["phase"] not in {"pending", "active", "terminal", "refused"}:
         raise CdesktopError("cdesktop task launch response has an invalid phase")
     if value["effect"] not in {"created", "existing", "none"}:
@@ -860,6 +874,7 @@ def _task_launch_result(value: Any, *, expected_key: str) -> TaskLaunchResult:
         incarnation_generation=value["incarnation_generation"],
         attempt_id=value["attempt_id"],
         idempotency_key=value["idempotency_key"],
+        launch_fingerprint=value["launch_fingerprint"],
         phase=value["phase"],
         effect=value["effect"],
         workspace_id=value.get("workspace_id"),
@@ -875,11 +890,13 @@ def _match_task_launch(
     task_id: str,
     incarnation_generation: int,
     attempt_id: str,
+    launch_fingerprint: str,
 ) -> None:
     if (
         result.task_id != task_id
         or result.incarnation_generation != incarnation_generation
         or result.attempt_id != attempt_id
+        or result.launch_fingerprint != launch_fingerprint
     ):
         raise CdesktopRejectedError(
             "Existing cdesktop idempotency key belongs to different launch parameters"
