@@ -266,6 +266,44 @@ def test_completed_turn_manager_still_resumes(tmp_path) -> None:
     assert client.dispatches == ["session-1"]
 
 
+def test_first_successor_reservation_precedes_spawn_and_closes_race(tmp_path) -> None:
+    ownership = store(tmp_path)
+    client = FakeCdesktop()
+    spawn_calls = []
+
+    def winning_spawn():
+        spawn_calls.append("winner")
+        with pytest.raises(SuccessionError, match="already reserved"):
+            transfer_ownership(
+                client,
+                ownership,
+                source_session_id="manager",
+                spawn=lambda: spawn_calls.append("loser") or "wrong-successor",
+                reason="failover",
+            )
+        return "successor"
+
+    first = transfer_ownership(
+        client,
+        ownership,
+        source_session_id="manager",
+        spawn=winning_spawn,
+        reason="failover",
+    )
+    retry = transfer_ownership(
+        client,
+        ownership,
+        source_session_id="manager",
+        spawn=lambda: spawn_calls.append("retry") or "wrong-successor",
+        reason="failover",
+    )
+
+    assert spawn_calls == ["winner"]
+    assert first.spawned is True
+    assert retry.spawned is False
+    assert retry.successor_session_id == "successor"
+
+
 def test_child_terminal_notification_follows_successor_and_never_retired(
     tmp_path,
 ) -> None:

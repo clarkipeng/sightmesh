@@ -269,21 +269,67 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
         permission_policy = args.permission or "SUPERVISED"
         if permission_policy == "BYPASS_PERMISSIONS":
             raise ValueError("BYPASS_PERMISSIONS requires explicit --unattended")
+    task_id = getattr(args, "task_id", None)
+    task_store = tasks.TaskLaunchStore() if task_id else None
+    parent_task_id = getattr(args, "parent_task_id", None)
+    caller_session_id = os.environ.get(escalation.CDESKTOP_SESSION_ENV)
+    caller_task = (
+        (task_store or tasks.TaskLaunchStore()).get_by_session(caller_session_id)
+        if caller_session_id
+        else None
+    )
+    if caller_task:
+        if not task_id:
+            raise ValueError("A managed manager must assign a stable child --task-id")
+        if parent_task_id and parent_task_id != caller_task.task_id:
+            raise ValueError("A managed manager cannot assign another task as parent")
+        parent_task_id = caller_task.task_id
+    if task_store and task_store.get(task_id) is not None:
+        existing = task_store.reserve(
+            task_id,
+            parent_task_id=parent_task_id,
+            max_children=getattr(args, "max_children", 0),
+            max_spawn_attempts=getattr(args, "max_spawn_attempts", 3),
+        )
+        return {"action": "task-launch-existing", "task": existing.task.to_dict()}
     lease_store = leases.LeaseStore()
-    lease_store.assert_spawn_allowed(repo_path, use_worktree=args.worktree)
+    if not task_store:
+        lease_store.assert_spawn_allowed(repo_path, use_worktree=args.worktree)
     client = CdesktopClient(args.url)
     leases.sync_active_workspaces(client)
     selection = _profile_selection(args, client)
+    task_reservation = (
+        task_store.reserve(
+            task_id,
+            parent_task_id=parent_task_id,
+            max_children=getattr(args, "max_children", 0),
+            max_spawn_attempts=getattr(args, "max_spawn_attempts", 3),
+        )
+        if task_store
+        else None
+    )
+    if task_reservation and not task_reservation.should_spawn:
+        return {"action": "task-launch-existing", "task": task_reservation.task.to_dict()}
+    if task_store:
+        try:
+            lease_store.assert_spawn_allowed(repo_path, use_worktree=args.worktree)
+        except Exception:
+            if task_reservation and task_reservation.reservation_id:
+                task_store.failed(task_id, task_reservation.reservation_id)
+            raise
     lease_owner = f"cdesktop-spawn:{args.name}"
     pending_lease: leases.Lease | None = None
-    if args.worktree:
-        lease_store.assert_spawn_allowed(repo_path, use_worktree=True)
-    else:
-        pending_lease = lease_store.acquire(
-            lease_owner,
-            repo_path,
-            ttl_seconds=args.lease_ttl_seconds,
-        )
+    if not args.worktree:
+        try:
+            pending_lease = lease_store.acquire(
+                lease_owner,
+                repo_path,
+                ttl_seconds=args.lease_ttl_seconds,
+            )
+        except Exception:
+            if task_store and task_reservation and task_reservation.reservation_id:
+                task_store.failed(task_id, task_reservation.reservation_id)
+            raise
     try:
         result = client.spawn_workspace(
             name=args.name,
@@ -302,6 +348,8 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
     except Exception as spawn_error:
         if pending_lease:
             lease_store.release(pending_lease.token)
+        if task_store and task_reservation and task_reservation.reservation_id:
+            task_store.failed(task_id, task_reservation.reservation_id)
         _report_free_route_failure(client, args, selection, spawn_error)
         raise
     workspace_id = _workspace_id(result)
@@ -334,7 +382,17 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
             client.stop_workspace(workspace_id)
         elif pending_lease:
             lease_store.release(pending_lease.token)
+        if task_store and task_reservation and task_reservation.reservation_id:
+            task_store.failed(task_id, task_reservation.reservation_id)
         raise
+    if task_store and task_reservation and task_reservation.reservation_id:
+        task = task_store.activate(
+            task_id,
+            task_reservation.reservation_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+        )
+        result["task"] = task.to_dict()
     if not args.no_bridge:
         routing.enable(workspace_id)
     if lease:
@@ -540,6 +598,16 @@ def cmd_failover(args: argparse.Namespace) -> int:
 def add_spawn_parser(sub: argparse._SubParsersAction[Any]) -> None:
     spawn = sub.add_parser("spawn", help="Launch a full visible cdesktop workspace")
     spawn.add_argument("--name", required=True)
+    spawn.add_argument(
+        "--task-id",
+        help="Stable logical task id; repeated launches return the existing record",
+    )
+    spawn.add_argument(
+        "--parent-task-id",
+        help="Active manager task whose fixed child budget owns this task",
+    )
+    spawn.add_argument("--max-children", type=int, default=0)
+    spawn.add_argument("--max-spawn-attempts", type=int, default=3)
     spawn.add_argument("--repo", required=True)
     spawn.add_argument(
         "--base", required=True, help="Existing Git branch; origin/<base> is preferred"

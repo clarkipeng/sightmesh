@@ -106,6 +106,30 @@ sightmesh failover WORKSPACE_ID \
 
 The default starts a visible successor session in the same cdesktop workspace. This preserves dirty files and the human-visible transcript while changing the explicitly selected provider. `--new-worktree` requires a clean source and starts a separate workspace. The source remains active unless archival is explicitly confirmed.
 
+## Idempotent task launches
+
+For manager programs, pass a stable `--task-id` to `sightmesh spawn`. SightMesh
+commits one launch reservation in the existing escalation database before it
+calls cdesktop. Repeating the same command, including from simultaneous wakeups,
+returns the existing task record and never creates a second workspace. Limits
+are immutable: `--max-spawn-attempts` bounds failed launch attempts, and
+`--max-children` fixes the number of distinct child task IDs a manager can own.
+Children name that manager with `--parent-task-id`; a task cannot parent or
+replace itself.
+
+A crashed launcher leaves a reserved record, which fails closed. Recovery must
+explicitly transfer its reservation capability through `TaskLaunchStore` before
+another spawn side effect is allowed. Failed attempts become retryable; reaching
+the fixed attempt limit blocks the task and writes one deduplicated escalation.
+Successor failover uses the same reservation invariant, closing the former race
+where two callers could both spawn before either persisted the successor link.
+
+Task rows contain IDs, counters, limits, and cdesktop workspace/session
+references only. cdesktop and its executors remain the sole owners of transcript
+bytes, content-addressed history, rollout persistence, and byte/disk quota-stop
+signals. SightMesh deliberately defines no history-payload API until at least
+two real consumers need one.
+
 ## Workspace ownership leases
 
 Use `sightmesh lease acquire --owner <name> --repo <path>` before taking recovery or migration ownership of a repository. Add `--worktree <path>` when the active checkout is a worktree. Leases are local JSON records under `~/.local/state/sightmesh/leases`, written under an interprocess `fcntl.flock`.

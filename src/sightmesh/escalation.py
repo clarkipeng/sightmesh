@@ -247,8 +247,12 @@ class EscalationStore:
                 self.path.with_name(f"{self.path.name}-wal"),
                 self.path.with_name(f"{self.path.name}-shm"),
             ):
-                if path.exists():
+                try:
                     os.chmod(path, 0o600)
+                except FileNotFoundError:
+                    # SQLite removes sidecars when the last connection closes.
+                    # Their disappearance between enumeration and chmod is benign.
+                    pass
         except sqlite3.Error as exc:
             conn.close()
             raise EscalationStoreError(
@@ -380,6 +384,30 @@ class EscalationStore:
                         successor_session_id TEXT
                     )
                     """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS task_launches (
+                        task_id TEXT PRIMARY KEY,
+                        state TEXT NOT NULL CHECK (
+                            state IN ('reserved', 'active', 'retryable', 'blocked')
+                        ),
+                        reservation_id TEXT UNIQUE,
+                        workspace_id TEXT,
+                        session_id TEXT,
+                        parent_task_id TEXT,
+                        max_children INTEGER NOT NULL CHECK (max_children >= 0),
+                        child_count INTEGER NOT NULL DEFAULT 0,
+                        spawn_attempts INTEGER NOT NULL DEFAULT 0,
+                        max_spawn_attempts INTEGER NOT NULL CHECK (max_spawn_attempts > 0),
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_launches_active_session "
+                    "ON task_launches(session_id) WHERE session_id IS NOT NULL"
                 )
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(
