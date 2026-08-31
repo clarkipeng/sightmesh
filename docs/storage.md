@@ -33,3 +33,9 @@ Do not place secrets in prompts, transcripts, `.context`, handoffs, command argu
 Approval decisions are stored in `~/.local/state/sightmesh/approvals.sqlite3`. The database and its WAL files are owner-only. Rejection text is not copied into this store; SightMesh records only its SHA-256 digest so an audit can correlate a decision without creating another transcript.
 
 Parent return addresses and queued commands live in cdesktop's application database. During the v0.9 update, legacy SightMesh delivery and relationship databases are imported, copied to `~/.local/state/sightmesh/legacy`, and removed from the active state directory.
+
+Task handoff may carry only the opaque content-addressed history reference from
+the [cdesktop task launch contract](cdesktop-task-launch-v1.md). cdesktop and
+the executor enforce transcript, fork, and free-disk limits before writing;
+SightMesh neither stores transcript bytes nor claims it can prevent writer-side
+disk growth.

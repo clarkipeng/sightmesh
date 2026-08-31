@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -29,12 +30,41 @@ class CdesktopRejectedError(CdesktopError):
         self.status = status
 
 
+class CdesktopNotFoundError(CdesktopRejectedError):
+    """A versioned cdesktop resource does not exist (HTTP 404)."""
+
+
 class CdesktopInterruptedError(CdesktopRejectedError):
     """cdesktop cannot establish whether the keyed side effect ran (HTTP 424)."""
 
 
 class CdesktopPendingError(CdesktopRejectedError):
     """A keyed operation is still owned by another cdesktop request (HTTP 425)."""
+
+
+TASK_LAUNCH_CONTRACT_VERSION = 1
+TASK_LAUNCH_OUTCOMES = {
+    "completed",
+    "failed",
+    "quota_exhausted",
+    "approval_timeout",
+    "storage_refused",
+    "lost",
+}
+
+
+@dataclass(frozen=True)
+class TaskLaunchResult:
+    task_id: str
+    incarnation_generation: int
+    attempt_id: str
+    idempotency_key: str
+    phase: str
+    effect: str
+    workspace_id: str | None
+    session_id: str | None
+    outcome: dict[str, Any] | None
+    history_ref: str | None
 
 
 class CdesktopClient:
@@ -89,6 +119,7 @@ class CdesktopClient:
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             error_type = {
+                404: CdesktopNotFoundError,
                 409: CdesktopRejectedError,
                 424: CdesktopInterruptedError,
                 425: CdesktopPendingError,
@@ -111,6 +142,95 @@ class CdesktopClient:
 
     def info(self) -> dict[str, Any]:
         return self.request("GET", "/info")
+
+    def require_task_launch_contract(self) -> None:
+        """Fail closed unless cdesktop advertises the complete v1 contract."""
+        info = self.info()
+        capabilities = info.get("capabilities") if isinstance(info, dict) else None
+        capability = (
+            capabilities.get("task_launch")
+            if isinstance(capabilities, dict)
+            else None
+        )
+        required = {
+            "create_or_return",
+            "lookup",
+            "typed_outcomes",
+            "content_addressed_history",
+        }
+        limits = {"transcript_bytes", "fork_bytes", "free_disk_bytes"}
+        features = (
+            set(capability.get("features", ()))
+            if isinstance(capability, dict)
+            else set()
+        )
+        writer_limits = (
+            set(capability.get("writer_limits", ()))
+            if isinstance(capability, dict)
+            else set()
+        )
+        if (
+            not isinstance(capability, dict)
+            or capability.get("contract_version") != TASK_LAUNCH_CONTRACT_VERSION
+            or not required <= features
+            or not limits <= writer_limits
+        ):
+            raise CdesktopRejectedError(
+                "Pinned cdesktop does not advertise the complete task-launch-v1 "
+                "idempotency and writer-quota contract; refusing task-id launch"
+            )
+
+    def lookup_task_launch(self, idempotency_key: str) -> TaskLaunchResult | None:
+        self.require_task_launch_contract()
+        try:
+            result = self.request(
+                "GET",
+                "/task-launches/by-key",
+                query={"idempotency_key": idempotency_key},
+            )
+        except CdesktopNotFoundError:
+            return None
+        return _task_launch_result(result, expected_key=idempotency_key)
+
+    def create_or_return_task_launch(
+        self,
+        *,
+        task_id: str,
+        incarnation_generation: int,
+        attempt_id: str,
+        idempotency_key: str,
+        launch: dict[str, Any],
+    ) -> TaskLaunchResult:
+        """Lookup first, then atomically create-or-return one keyed side effect."""
+        existing = self.lookup_task_launch(idempotency_key)
+        if existing is not None:
+            _match_task_launch(
+                existing,
+                task_id=task_id,
+                incarnation_generation=incarnation_generation,
+                attempt_id=attempt_id,
+            )
+            return existing
+        result = self.request(
+            "POST",
+            "/task-launches",
+            {
+                "contract_version": TASK_LAUNCH_CONTRACT_VERSION,
+                "task_id": task_id,
+                "incarnation_generation": incarnation_generation,
+                "attempt_id": attempt_id,
+                "idempotency_key": idempotency_key,
+                "launch": launch,
+            },
+        )
+        parsed = _task_launch_result(result, expected_key=idempotency_key)
+        _match_task_launch(
+            parsed,
+            task_id=task_id,
+            incarnation_generation=incarnation_generation,
+            attempt_id=attempt_id,
+        )
+        return parsed
 
     def set_update_drain(self, seconds: int) -> dict[str, Any]:
         if not 0 <= seconds <= 30:
@@ -670,6 +790,99 @@ class CdesktopClient:
             "DELETE",
             f"/workspaces/{workspace_id}",
             query={"delete_remote": False, "delete_branches": False},
+        )
+
+
+def _task_launch_result(value: Any, *, expected_key: str) -> TaskLaunchResult:
+    if not isinstance(value, dict) or value.get("contract_version") != 1:
+        raise CdesktopError("cdesktop task launch response is not contract version 1")
+    required = {
+        "task_id": str,
+        "incarnation_generation": int,
+        "attempt_id": str,
+        "idempotency_key": str,
+        "phase": str,
+        "effect": str,
+    }
+    if any(not isinstance(value.get(field), kind) for field, kind in required.items()):
+        raise CdesktopError("cdesktop task launch response has invalid identity fields")
+    if value["idempotency_key"] != expected_key:
+        raise CdesktopError("cdesktop task launch response changed the idempotency key")
+    if value["phase"] not in {"pending", "active", "terminal", "refused"}:
+        raise CdesktopError("cdesktop task launch response has an invalid phase")
+    if value["effect"] not in {"created", "existing", "none"}:
+        raise CdesktopError("cdesktop task launch response has an invalid effect")
+
+    outcome = value.get("outcome")
+    if outcome is not None:
+        if not isinstance(outcome, dict) or outcome.get("kind") not in TASK_LAUNCH_OUTCOMES:
+            raise CdesktopError("cdesktop task launch response has an invalid outcome")
+        for field in ("provider_id", "account_id"):
+            if outcome.get(field) is not None and not isinstance(outcome[field], str):
+                raise CdesktopError(f"cdesktop task launch outcome has invalid {field}")
+        if outcome.get("retry_at") is not None and not isinstance(
+            outcome["retry_at"], (int, float)
+        ):
+            raise CdesktopError("cdesktop task launch outcome has invalid retry_at")
+        if outcome["kind"] == "storage_refused" and outcome.get(
+            "refused_before_write"
+        ) is not True:
+            raise CdesktopError(
+                "cdesktop storage refusal does not prove pre-write enforcement"
+            )
+
+    history_ref = value.get("history_ref")
+    if history_ref is not None:
+        digest = history_ref.removeprefix("sha256:") if isinstance(history_ref, str) else ""
+        if (
+            not isinstance(history_ref, str)
+            or not history_ref.startswith("sha256:")
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise CdesktopError(
+                "cdesktop task launch history_ref is not content-addressed"
+            )
+
+    for field in ("workspace_id", "session_id"):
+        if value.get(field) is not None and not isinstance(value[field], str):
+            raise CdesktopError(f"cdesktop task launch response has invalid {field}")
+    if value["phase"] == "active" and not all(
+        isinstance(value.get(field), str) and value[field]
+        for field in ("workspace_id", "session_id")
+    ):
+        raise CdesktopError("active cdesktop task launch is missing native identities")
+    if value["phase"] in {"terminal", "refused"} and outcome is None:
+        raise CdesktopError("terminal cdesktop task launch is missing its typed outcome")
+
+    return TaskLaunchResult(
+        task_id=value["task_id"],
+        incarnation_generation=value["incarnation_generation"],
+        attempt_id=value["attempt_id"],
+        idempotency_key=value["idempotency_key"],
+        phase=value["phase"],
+        effect=value["effect"],
+        workspace_id=value.get("workspace_id"),
+        session_id=value.get("session_id"),
+        outcome=dict(outcome) if outcome is not None else None,
+        history_ref=history_ref,
+    )
+
+
+def _match_task_launch(
+    result: TaskLaunchResult,
+    *,
+    task_id: str,
+    incarnation_generation: int,
+    attempt_id: str,
+) -> None:
+    if (
+        result.task_id != task_id
+        or result.incarnation_generation != incarnation_generation
+        or result.attempt_id != attempt_id
+    ):
+        raise CdesktopRejectedError(
+            "Existing cdesktop idempotency key belongs to different launch parameters"
         )
 
 
