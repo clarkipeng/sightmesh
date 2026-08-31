@@ -219,11 +219,7 @@ class OwnershipStore:
             raise
         except sqlite3.DatabaseError as exc:
             raise SuccessionError(f"Cannot link successor for {session_id}: {exc}") from exc
-<<<<<<< HEAD
         updated = self._record_from_row(row, source)
-=======
-        updated = self._record_from_row(row, session_id)
->>>>>>> 1230c51 (Fix task launch recovery invariants)
         if updated.successor_session_id != successor:
             raise SuccessionError(
                 f"Session {session_id} already has successor "
