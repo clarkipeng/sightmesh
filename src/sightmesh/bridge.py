@@ -15,12 +15,17 @@ import websockets
 from . import leases
 from .cdesktop import CdesktopClient, CdesktopError
 from .durable import DurableExecutionReconciler
+from .execution_routing import ExecutionRoutingError
+from .pool.core import PoolError
 from .routing import (
     clear_peer_identity,
     enabled_workspaces,
     peer_identity,
     set_peer_identity,
 )
+from .sdk import SightMesh, SightMeshError
+from .succession import SuccessionError
+from .task_store import TaskStore, TaskStoreError
 
 LOGGER = logging.getLogger("sightmesh.bridge")
 
@@ -79,7 +84,7 @@ class RepowireSessionBridge:
                 delay = 1.0
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - isolate one bridge connection
                 LOGGER.warning("Bridge %s disconnected: %s", self.assigned_name, exc)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 15.0)
@@ -228,6 +233,11 @@ class BridgeSupervisor:
         self.repowire_url = repowire_url
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self.reconciler = DurableExecutionReconciler(client)
+        self.managed_tasks = SightMesh(
+            client=client,
+            store=TaskStore(self.reconciler.signal_store.path),
+            ownership=self.reconciler.ownership,
+        )
         # Read-only compatibility surface for callers that tuned PR #9's
         # observation threshold; recovery itself belongs to the reconciler.
         self.stalls = self.reconciler.liveness
@@ -262,6 +272,25 @@ class BridgeSupervisor:
                     )
                     continue
                 await asyncio.to_thread(self.reconciler.reconcile_sessions, sessions)
+                for session in sessions:
+                    try:
+                        await asyncio.to_thread(
+                            self.managed_tasks.reconcile_quota_failure,
+                            str(session["id"]),
+                        )
+                    except (
+                        CdesktopError,
+                        ExecutionRoutingError,
+                        PoolError,
+                        SightMeshError,
+                        SuccessionError,
+                        TaskStoreError,
+                    ) as exc:
+                        LOGGER.warning(
+                            "Cannot reconcile managed task %s: %s",
+                            session.get("id"),
+                            exc,
+                        )
                 if workspace["id"] not in enabled:
                     continue
                 try:

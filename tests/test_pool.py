@@ -574,6 +574,7 @@ def test_limit_detection_matches_real_provider_refusals() -> None:
     # Missing one means a limited account keeps being chosen and every launch on
     # it fails.
     assert core.looks_limited("Claude usage limit reached. Resets at 3pm")
+    assert core.looks_limited("You've reached your Fable 5 limit.")
     assert core.looks_limited("HTTP 429 Too Many Requests")
     assert core.looks_limited("insufficient_quota")
     assert not core.looks_limited("compilation finished with 2 warnings")

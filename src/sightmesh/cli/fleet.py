@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from ..cdesktop import execution_process_event_time, latest_execution_process
 from .common import *
+
 
 def _fleet_sessions(
     client: CdesktopClient, *, include_archived: bool = False
@@ -100,39 +102,8 @@ def _session_processes(
     return client.execution_processes(str(row["session_id"]))
 
 
-def _process_event_time(process: dict[str, Any]) -> datetime | None:
-    raw = (
-        process.get("completed_at")
-        or process.get("updated_at")
-        or process.get("started_at")
-        or process.get("created_at")
-    )
-    if not isinstance(raw, str):
-        return None
-    try:
-        value = datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
-
-
-def _latest_process(processes: list[dict[str, Any]]) -> dict[str, Any] | None:
-    eligible = [
-        process
-        for process in processes
-        if not process.get("dropped") and process.get("run_reason") != "devserver"
-    ]
-    return (
-        max(
-            eligible,
-            key=lambda process: (
-                _process_event_time(process) or datetime.min.replace(tzinfo=UTC),
-                str(process.get("id") or ""),
-            ),
-        )
-        if eligible
-        else None
-    )
+_process_event_time = execution_process_event_time
+_latest_process = latest_execution_process
 
 
 def _idle_unmet_orders(
@@ -294,7 +265,6 @@ def cmd_peek(args: argparse.Namespace) -> int:
     }
     _emit(result, args.json)
     return 0
-
 
 
 def add_parser(sub: argparse._SubParsersAction[Any]) -> None:

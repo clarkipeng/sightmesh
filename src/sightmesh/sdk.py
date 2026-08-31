@@ -13,10 +13,15 @@ from pathlib import Path
 from typing import Any, Generic, TypeVar
 
 from . import execution_routing
-from .cdesktop import CdesktopClient, CdesktopError
+from .cdesktop import CdesktopClient, CdesktopError, latest_execution_process
 from .escalation import CDESKTOP_SESSION_ENV, EscalationStore, LauncherIdentity
+from .pool import core as pool_core
 from .profiles import ProfileStore, validate_provider
-from .succession import OwnershipStore, transfer_ownership
+from .succession import (
+    OwnershipStore,
+    reroute_after_quota_exhaustion,
+    transfer_ownership,
+)
 from .task_store import TaskRecord, TaskStore, TaskStoreError
 
 KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")
@@ -269,7 +274,60 @@ class SightMesh:
         if not replacement_prompt or not replacement_prompt.strip():
             raise SightMeshError("Replacement requires a prompt or saved checkpoint")
         self._require_contract()
-        prepared = self.store.prepare_replacement(task.task_id)
+        target = {**task.spec["target"]}
+        target.pop("recovery", None)
+        prepared = self.store.prepare_replacement(task.task_id, target=target)
+        return Worker.from_record(self._replace_prepared(prepared, replacement_prompt))
+
+    def reconcile_quota_failure(self, session_id: str) -> Worker | None:
+        """Move one managed task past an observed subscription quota refusal."""
+        task = self.store.get_by_session(session_id)
+        if task is None:
+            return None
+        target = task.spec.get("target", {})
+        if task.state == "replacing" and target.get("recovery") == "quota":
+            self._require_contract()
+            return Worker.from_record(
+                self._replace_prepared(task, str(task.spec["prompt"]))
+            )
+        if task.state != "active":
+            return None
+        failure = self._quota_failure(session_id)
+        route_id = target.get("route_id")
+        binding_id = target.get("auth_binding_id")
+        if failure is None or not route_id or not binding_id:
+            return None
+
+        selection = reroute_after_quota_exhaustion(
+            execution_routing.ExecutionRoutingStore().load(),
+            exhausted_binding_id=str(binding_id),
+        )
+        if selection.status != "resolved" or selection.target is None:
+            reason = f"Quota exhausted for route {route_id}; {selection.reason}"
+            blocked = self.store.finish(task.task_id, "blocked", reason)
+            self._notify_parent(blocked, "blocked", reason)
+            return Worker.from_record(blocked)
+
+        selected = selection.target
+        next_target = {
+            "executor": selected.executor,
+            "model": selected.model,
+            "reasoning": task.spec.get("reasoning"),
+            "provider_id": None,
+            "auth_binding_id": selected.auth_binding_id,
+            "route_id": selected.route_id,
+            "billing_class": selected.billing_class,
+            "recovery": "quota",
+        }
+        self._require_contract()
+        prepared = self.store.prepare_replacement(task.task_id, target=next_target)
+        return Worker.from_record(
+            self._replace_prepared(prepared, str(task.spec["prompt"]))
+        )
+
+    def _replace_prepared(
+        self, prepared: TaskRecord, replacement_prompt: str
+    ) -> TaskRecord:
         target = prepared.spec["target"]
         request = self.client.session_launch_request(
             name=prepared.key,
@@ -309,7 +367,27 @@ class SightMesh:
             session_id=transfer.successor_session_id,
         )
         self._record_launcher(active)
-        return Worker.from_record(active)
+        return active
+
+    def _quota_failure(self, session_id: str) -> str | None:
+        latest = latest_execution_process(
+            [
+                process
+                for process in self.client.execution_processes(session_id)
+                if process.get("run_reason") == "codingagent"
+            ]
+        )
+        if latest is None or latest.get("status") != "failed":
+            return None
+        snapshot = self.client.normalized_snapshot(str(latest["id"]))
+        messages: list[str] = []
+        for wrapped in snapshot.get("entries", []):
+            content = wrapped.get("content") if isinstance(wrapped, dict) else None
+            entry = content.get("entry_type") if isinstance(content, dict) else None
+            if isinstance(entry, dict) and entry.get("type") == "assistant_message":
+                messages.append(str(content.get("content") or ""))
+        output = "\n".join(messages)
+        return output if pool_core.looks_limited(output) else None
 
     def _start_reserved(self, task: TaskRecord) -> TaskRecord:
         if task.state != "reserved":
@@ -444,6 +522,16 @@ class SightMesh:
             }
             if folded in names:
                 matches.append(repo)
+        canonical = [
+            repo
+            for repo in matches
+            if repo.get("path")
+            and not self._is_ephemeral_repo_path(Path(str(repo["path"])))
+        ]
+        if len(canonical) == 1:
+            return canonical[0]
+        if len(canonical) > 1:
+            matches = canonical
         if len(matches) != 1:
             detail = "not registered" if not matches else "ambiguous"
             raise SightMeshError(
@@ -560,11 +648,15 @@ class SightMesh:
 
     @staticmethod
     def _reject_ephemeral(repo_path: Path) -> None:
-        value = repo_path.as_posix()
-        if "/conductor/workspaces/" in value or "/.cdesktop-workspaces/" in value:
+        if SightMesh._is_ephemeral_repo_path(repo_path):
             raise SightMeshError(
                 f"Repository {repo_path} is an ephemeral worktree; register its canonical checkout"
             )
+
+    @staticmethod
+    def _is_ephemeral_repo_path(repo_path: Path) -> bool:
+        value = repo_path.expanduser().resolve().as_posix()
+        return "/conductor/workspaces/" in value or "/.cdesktop-workspaces/" in value
 
     @staticmethod
     def _setup_script(repo_path: Path, base: str) -> str | None:

@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -35,6 +36,44 @@ class CdesktopInterruptedError(CdesktopRejectedError):
 
 class CdesktopPendingError(CdesktopRejectedError):
     """A keyed operation is still owned by another cdesktop request (HTTP 425)."""
+
+
+def execution_process_event_time(process: dict[str, Any]) -> datetime | None:
+    raw = (
+        process.get("completed_at")
+        or process.get("updated_at")
+        or process.get("started_at")
+        or process.get("created_at")
+    )
+    if not isinstance(raw, str):
+        return None
+    try:
+        value = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+def latest_execution_process(
+    processes: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    eligible = [
+        process
+        for process in processes
+        if not process.get("dropped") and process.get("run_reason") != "devserver"
+    ]
+    return (
+        max(
+            eligible,
+            key=lambda process: (
+                execution_process_event_time(process)
+                or datetime.min.replace(tzinfo=UTC),
+                str(process.get("id") or ""),
+            ),
+        )
+        if eligible
+        else None
+    )
 
 
 class CdesktopClient:

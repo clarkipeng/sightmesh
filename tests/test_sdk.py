@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from sightmesh import execution_routing
+from sightmesh import sdk as sdk_module
 from sightmesh.cdesktop import CdesktopError
 from sightmesh.sdk import BatchError, Command, SightMesh, SightMeshError, WorkerSpec
 from sightmesh.task_store import TaskStore, TaskStoreError
@@ -19,12 +21,17 @@ class FakeClient:
         self.sent = []
         self.stopped = []
         self.lose_response_once = False
+        self.repo_rows = None
+        self.processes = {}
+        self.snapshots = {}
 
     def info(self):
         return {"service_capabilities": {"managed_task_launch": 1}}
 
     def repos(self):
-        return [{"id": "repo-1", "name": "project", "path": str(self.repo_path)}]
+        return self.repo_rows or [
+            {"id": "repo-1", "name": "project", "path": str(self.repo_path)}
+        ]
 
     def workspace(self, workspace_id):
         container = self.repo_path.parent / "worktrees" / workspace_id
@@ -77,6 +84,12 @@ class FakeClient:
 
     def session_commands(self, _session_id):
         return []
+
+    def execution_processes(self, session_id):
+        return self.processes.get(session_id, [])
+
+    def normalized_snapshot(self, process_id):
+        return self.snapshots[process_id]
 
     def stop_workspace(self, workspace_id):
         self.stopped.append(workspace_id)
@@ -145,6 +158,28 @@ def test_start_is_idempotent_for_one_semantic_key(system):
 
     assert replayed == first
     assert len(client.launches) == 1
+
+
+def test_repo_name_prefers_the_canonical_registration(system):
+    mesh, client, _store, _ownership = system
+    client.repo_rows = [
+        {"id": "canonical", "name": "project", "path": str(client.repo_path)},
+        {
+            "id": "managed",
+            "name": "project",
+            "path": str(
+                client.repo_path.parent
+                / ".cdesktop-workspaces"
+                / "old-worker"
+                / "project"
+            ),
+        },
+    ]
+
+    mesh.start(spec())
+
+    request = client.launches[0][1]["request"]["workspace"]
+    assert request["repo_path"] == client.repo_path.resolve()
 
 
 def test_response_loss_retries_the_same_native_effect(system):
@@ -257,6 +292,161 @@ def test_duplicate_failover_wakeups_reserve_one_successor_epoch(system):
 
     assert {replacement.epoch for replacement in replacements} == {2}
     assert {replacement.attempts for replacement in replacements} == {2}
+
+
+def test_quota_failure_moves_once_to_the_next_configured_route(system, monkeypatch):
+    mesh, client, store, _ownership = system
+    settings = execution_routing.ExecutionRoutingSettings()
+    first_target = execution_routing.SelectedTarget(
+        "fable", "CLAUDE_CODE", "fable", "subscription", "max-a", "max-a"
+    )
+    next_target = execution_routing.SelectedTarget(
+        "sol", "CODEX", "gpt-5.6-sol", "subscription", "codex-a", "codex-a"
+    )
+    monkeypatch.setattr(
+        execution_routing.ExecutionRoutingStore,
+        "load",
+        lambda _self: settings,
+    )
+    monkeypatch.setattr(
+        execution_routing,
+        "select_route",
+        lambda _settings, **_kwargs: execution_routing.SelectionResult(
+            "resolved", first_target, (), None
+        ),
+    )
+    exhausted = []
+
+    def reroute(_settings, *, exhausted_binding_id, **_kwargs):
+        exhausted.append(exhausted_binding_id)
+        return execution_routing.SelectionResult("resolved", next_target, (), None)
+
+    monkeypatch.setattr(sdk_module, "reroute_after_quota_exhaustion", reroute)
+    started = mesh.start(spec(executor=None))
+    client.processes[started.session_id] = [
+        {"id": "failed-fable", "run_reason": "codingagent", "status": "failed"}
+    ]
+    client.snapshots["failed-fable"] = {
+        "entries": [
+            {
+                "content": {
+                    "entry_type": {"type": "assistant_message"},
+                    "content": "You've reached your Fable 5 limit.",
+                }
+            }
+        ]
+    }
+
+    client.lose_response_once = True
+    with pytest.raises(CdesktopError, match="response lost"):
+        mesh.reconcile_quota_failure(started.session_id)
+    recovered = mesh.reconcile_quota_failure(started.session_id)
+    assert recovered is not None
+    assert recovered.workspace_id == started.workspace_id
+    assert recovered.session_id != started.session_id
+    assert recovered.attempts == 2
+    assert exhausted == ["max-a"]
+    assert len(client.effects) == 2
+    assert mesh.reconcile_quota_failure(started.session_id) is None
+
+    replacement = client.launches[-1][1]["request"]["session"]
+    assert replacement["executor"] == "CODEX"
+    assert replacement["model"] == "gpt-5.6-sol"
+    assert replacement["prompt"] == "Audit the boundary"
+    record = store.get("operator", "audit")
+    assert record is not None
+    assert record.spec["target"]["route_id"] == "sol"
+
+
+def test_non_quota_failure_does_not_replace_a_managed_task(system):
+    mesh, client, _store, _ownership = system
+    started = mesh.start(spec())
+    client.processes[started.session_id] = [
+        {"id": "failed-build", "run_reason": "codingagent", "status": "failed"}
+    ]
+    client.snapshots["failed-build"] = {
+        "entries": [
+            {
+                "content": {
+                    "entry_type": {"type": "assistant_message"},
+                    "content": "Compilation failed with a type error.",
+                }
+            }
+        ]
+    }
+
+    assert mesh.reconcile_quota_failure(started.session_id) is None
+    assert len(client.launches) == 1
+
+
+def test_newer_success_ignores_an_older_quota_failure(system):
+    mesh, client, _store, _ownership = system
+    started = mesh.start(spec())
+    client.processes[started.session_id] = [
+        {
+            "id": "new-success",
+            "run_reason": "codingagent",
+            "status": "completed",
+            "completed_at": "2026-08-31T02:00:00Z",
+        },
+        {
+            "id": "old-quota",
+            "run_reason": "codingagent",
+            "status": "failed",
+            "completed_at": "2026-08-31T01:00:00Z",
+        },
+    ]
+
+    assert mesh.reconcile_quota_failure(started.session_id) is None
+    assert len(client.launches) == 1
+
+
+def test_exhausted_route_chain_blocks_without_spawning(system, monkeypatch):
+    mesh, client, store, _ownership = system
+    target = execution_routing.SelectedTarget(
+        "fable", "CLAUDE_CODE", "fable", "subscription", "max-a", "max-a"
+    )
+    monkeypatch.setattr(
+        execution_routing,
+        "select_route",
+        lambda _settings, **_kwargs: execution_routing.SelectionResult(
+            "resolved", target, (), None
+        ),
+    )
+    monkeypatch.setattr(
+        execution_routing.ExecutionRoutingStore,
+        "load",
+        lambda _self: execution_routing.ExecutionRoutingSettings(),
+    )
+    monkeypatch.setattr(
+        sdk_module,
+        "reroute_after_quota_exhaustion",
+        lambda *_args, **_kwargs: execution_routing.SelectionResult(
+            "blocked", None, (), "routes_exhausted"
+        ),
+    )
+    started = mesh.start(spec(executor=None))
+    client.processes[started.session_id] = [
+        {"id": "failed-fable", "run_reason": "codingagent", "status": "failed"}
+    ]
+    client.snapshots["failed-fable"] = {
+        "entries": [
+            {
+                "content": {
+                    "entry_type": {"type": "assistant_message"},
+                    "content": "You've reached your Fable 5 limit.",
+                }
+            }
+        ]
+    }
+
+    blocked = mesh.reconcile_quota_failure(started.session_id)
+
+    assert blocked is not None and blocked.state == "blocked"
+    assert len(client.launches) == 1
+    record = store.get("operator", "audit")
+    assert record is not None and record.result is not None
+    assert "routes_exhausted" in record.result
 
 
 def test_completion_notifies_only_the_recorded_parent(system):
