@@ -27,6 +27,7 @@ from typing import Any
 from . import execution_routing
 from .escalation import EscalationStore, escalate, redact_credentials
 from .pool import core as pool_core
+from .tasks import TaskLaunchStore
 
 OWNERSHIP_VERSION = 1
 
@@ -360,11 +361,39 @@ def transfer_ownership(
     if record.successor_session_id:
         successor, spawned = record.successor_session_id, False
     else:
-        successor = str(spawn())
-        if not successor:
-            raise SuccessionError("Successor spawn did not return a session id")
-        store.link_successor(source, successor)
-        spawned = True
+        launch_store = TaskLaunchStore(store._store)
+        reservation = launch_store.reserve(
+            f"successor:{source}", max_spawn_attempts=3
+        )
+        if not reservation.should_spawn:
+            if reservation.task.state == "active" and reservation.task.session_id:
+                successor, spawned = reservation.task.session_id, False
+                store.link_successor(source, successor)
+            else:
+                raise SuccessionError(
+                    f"Successor transfer for {source} is already reserved"
+                )
+        else:
+            assert reservation.reservation_id is not None
+            try:
+                successor = str(spawn())
+                if not successor or successor == source:
+                    raise SuccessionError(
+                        "Successor spawn must return a distinct session id"
+                    )
+            except Exception:
+                launch_store.failed(
+                    f"successor:{source}", reservation.reservation_id
+                )
+                raise
+            launch_store.activate(
+                f"successor:{source}",
+                reservation.reservation_id,
+                workspace_id=f"session:{successor}",
+                session_id=successor,
+            )
+            store.link_successor(source, successor)
+            spawned = True
     store.assert_deliverable(successor)
 
     forwarded = 0

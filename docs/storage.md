@@ -33,3 +33,9 @@ Do not place secrets in prompts, transcripts, `.context`, handoffs, command argu
 Approval decisions are stored in `~/.local/state/sightmesh/approvals.sqlite3`. The database and its WAL files are owner-only. Rejection text is not copied into this store; SightMesh records only its SHA-256 digest so an audit can correlate a decision without creating another transcript.
 
 Parent return addresses and queued commands live in cdesktop's application database. During the v0.9 update, legacy SightMesh delivery and relationship databases are imported, copied to `~/.local/state/sightmesh/legacy`, and removed from the active state directory.
+
+Stable task-launch rows share SightMesh's escalation database. They contain only
+launch identity, reservation state, immutable attempt/child budgets, and opaque
+cdesktop IDs. They never contain transcript text or history blobs. Transcript
+deduplication and disk ceilings must be enforced by cdesktop or the executor at
+the write boundary; observing them later in SightMesh cannot prevent exhaustion.

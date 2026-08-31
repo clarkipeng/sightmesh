@@ -1055,6 +1055,47 @@ def test_spawn_direct_acquires_workspace_lease(
     assert leases[0].session_id == "session-a"
 
 
+def test_spawn_task_id_reuses_active_launch_before_lease_preflight(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lease_dir = tmp_path / "leases"
+
+    class CountingClient(FakeSpawnClient):
+        spawns = 0
+
+        def spawn_workspace(self, **kwargs):
+            type(self).spawns += 1
+            return super().spawn_workspace(**kwargs)
+
+    monkeypatch.setattr(cli.leases, "default_lease_dir", lambda: lease_dir)
+    monkeypatch.setattr(cli, "CdesktopClient", CountingClient)
+    monkeypatch.setattr(cli, "_validate_base_branch", lambda *_args: None)
+    monkeypatch.setattr(cli.routing, "enable", lambda _workspace_id: None)
+    monkeypatch.setattr(cli.leases, "sync_active_workspaces", lambda _client: [])
+    args = argparse.Namespace(
+        prompt="start", prompt_file=None, repo=str(repo), url=None, name="demo",
+        task_id="stable-task", parent_task_id=None, max_children=2,
+        max_spawn_attempts=3, base="main", executor="CODEX", worktree=False,
+        permission="SUPERVISED", unattended=False, model=None, reasoning=None,
+        provider=None, lease_ttl_seconds=60, no_bridge=False, json=True,
+    )
+
+    assert cli.cmd_spawn(args) == 0
+    capsys.readouterr()
+    assert cli.cmd_spawn(args) == 0
+
+    assert CountingClient.spawns == 1
+    assert json.loads(capsys.readouterr().out)["action"] == "task-launch-existing"
+
+    monkeypatch.setenv(escalation.CDESKTOP_SESSION_ENV, "session-a")
+    args.task_id = None
+    with pytest.raises(ValueError, match="stable child --task-id"):
+        cli.cmd_spawn(args)
+    assert CountingClient.spawns == 1
+
+
 def test_refused_free_route_spawn_escalates_and_releases_its_lease(
     monkeypatch, tmp_path: Path
 ) -> None:

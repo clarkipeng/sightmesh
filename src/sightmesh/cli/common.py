@@ -28,6 +28,7 @@ from .. import (
     routing,
     service,
     succession,
+    tasks,
     updates,
 )
 from ..bridge import run_bridge
