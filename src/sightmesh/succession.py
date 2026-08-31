@@ -27,7 +27,7 @@ from typing import Any
 from . import execution_routing
 from .escalation import EscalationStore, escalate, redact_credentials
 from .pool import core as pool_core
-from .tasks import TaskLaunchStore
+from .tasks import LaunchReservation, TaskLaunchStore
 
 OWNERSHIP_VERSION = 1
 
@@ -192,7 +192,6 @@ class OwnershipStore:
                         f"Session {source} already has successor "
                         f"{row['successor_session_id']}; refusing {successor}"
                     )
-
                 seen = {source}
                 current: str | None = successor
                 while current is not None:
@@ -220,7 +219,11 @@ class OwnershipStore:
             raise
         except sqlite3.DatabaseError as exc:
             raise SuccessionError(f"Cannot link successor for {session_id}: {exc}") from exc
+<<<<<<< HEAD
         updated = self._record_from_row(row, source)
+=======
+        updated = self._record_from_row(row, session_id)
+>>>>>>> 1230c51 (Fix task launch recovery invariants)
         if updated.successor_session_id != successor:
             raise SuccessionError(
                 f"Session {session_id} already has successor "
@@ -337,6 +340,7 @@ def transfer_ownership(
     spawn: Callable[[], str],
     reason: str,
     logical_key: str | None = None,
+    launch_reservation: LaunchReservation | None = None,
 ) -> HandoffResult:
     """Quarantine the source and hand its live intent to exactly one successor.
 
@@ -362,9 +366,10 @@ def transfer_ownership(
         successor, spawned = record.successor_session_id, False
     else:
         launch_store = TaskLaunchStore(store._store)
-        reservation = launch_store.reserve(
+        reservation = launch_reservation or launch_store.reserve(
             f"successor:{source}", max_spawn_attempts=3
         )
+        launch_task_id = reservation.task.task_id
         if not reservation.should_spawn:
             if reservation.task.state == "active" and reservation.task.session_id:
                 successor, spawned = reservation.task.session_id, False
@@ -382,16 +387,25 @@ def transfer_ownership(
                         "Successor spawn must return a distinct session id"
                     )
             except Exception:
-                launch_store.failed(
-                    f"successor:{source}", reservation.reservation_id
-                )
+                if launch_reservation is None:
+                    launch_store.failed(
+                        launch_task_id, reservation.reservation_id
+                    )
                 raise
-            launch_store.activate(
-                f"successor:{source}",
-                reservation.reservation_id,
-                workspace_id=f"session:{successor}",
-                session_id=successor,
-            )
+            current_task = launch_store.get(launch_task_id)
+            if not (
+                current_task
+                and current_task.state == "active"
+                and current_task.session_id == successor
+            ):
+                launch_store.activate(
+                    launch_task_id,
+                    reservation.reservation_id,
+                    workspace_id=(
+                        reservation.task.workspace_id or f"session:{successor}"
+                    ),
+                    session_id=successor,
+                )
             store.link_successor(source, successor)
             spawned = True
     store.assert_deliverable(successor)

@@ -271,6 +271,7 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("BYPASS_PERMISSIONS requires explicit --unattended")
     task_id = getattr(args, "task_id", None)
     task_store = tasks.TaskLaunchStore() if task_id else None
+    supplied_reservation = getattr(args, "task_reservation", None)
     parent_task_id = getattr(args, "parent_task_id", None)
     caller_session_id = os.environ.get(escalation.CDESKTOP_SESSION_ENV)
     caller_task = (
@@ -284,7 +285,7 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
         if parent_task_id and parent_task_id != caller_task.task_id:
             raise ValueError("A managed manager cannot assign another task as parent")
         parent_task_id = caller_task.task_id
-    if task_store and task_store.get(task_id) is not None:
+    if task_store and supplied_reservation is None and task_store.get(task_id) is not None:
         existing = task_store.reserve(
             task_id,
             parent_task_id=parent_task_id,
@@ -298,7 +299,7 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
     client = CdesktopClient(args.url)
     leases.sync_active_workspaces(client)
     selection = _profile_selection(args, client)
-    task_reservation = (
+    task_reservation = supplied_reservation or (
         task_store.reserve(
             task_id,
             parent_task_id=parent_task_id,
@@ -344,16 +345,30 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
             provider_id=selection.provider_id,
             setup_script=setup_script,
             auth_binding_id=selection.auth_binding_id,
+            launch_key=(
+                task_reservation.reservation_id if task_reservation else None
+            ),
         )
     except Exception as spawn_error:
         if pending_lease:
             lease_store.release(pending_lease.token)
-        if task_store and task_reservation and task_reservation.reservation_id:
-            task_store.failed(task_id, task_reservation.reservation_id)
+        # A keyed create may have committed remotely before its response was
+        # lost. Keep the capability reserved so recovery must replay that key.
         _report_free_route_failure(client, args, selection, spawn_error)
         raise
+    # Parsing and activation are the first local operations after the external
+    # create.  If either crashes, replaying the same destination-owned key must
+    # return this exact workspace; SightMesh never guesses from a listing.
     workspace_id = _workspace_id(result)
     session_id = _primary_session_id(result)
+    if task_store and task_reservation and task_reservation.reservation_id:
+        task = task_store.activate(
+            task_id,
+            task_reservation.reservation_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+        )
+        result["task"] = task.to_dict()
     if session_id:
         escalation.EscalationStore().record_launcher(
             session_id=session_id,
@@ -382,17 +397,7 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
             client.stop_workspace(workspace_id)
         elif pending_lease:
             lease_store.release(pending_lease.token)
-        if task_store and task_reservation and task_reservation.reservation_id:
-            task_store.failed(task_id, task_reservation.reservation_id)
         raise
-    if task_store and task_reservation and task_reservation.reservation_id:
-        task = task_store.activate(
-            task_id,
-            task_reservation.reservation_id,
-            workspace_id=workspace_id,
-            session_id=session_id,
-        )
-        result["task"] = task.to_dict()
     if not args.no_bridge:
         routing.enable(workspace_id)
     if lease:
@@ -452,6 +457,16 @@ def cmd_failover(args: argparse.Namespace) -> int:
     lead_session_id = sessions[0]["id"]
     source_session_id = str(sessions[-1]["id"])
     ownership = succession.OwnershipStore()
+    launch_store = tasks.TaskLaunchStore(ownership._store)
+    source_task = launch_store.get_by_session(source_session_id)
+    failover_reservation = (
+        launch_store.reserve_failover(source_session_id) if source_task else None
+    )
+    if failover_reservation and not failover_reservation.should_spawn:
+        raise ValueError(
+            f"Failover for task {failover_reservation.task.task_id} is already in progress "
+            "or has exhausted its attempt budget"
+        )
     if not args.new_worktree:
         prompt = (
             "Take over this visible workspace after a checkpointed capacity or provider "
@@ -476,6 +491,10 @@ def cmd_failover(args: argparse.Namespace) -> int:
                 model=profile.model,
                 reasoning=profile.reasoning,
                 provider_id=profile.provider_id,
+                launch_key=(
+                    failover_reservation.reservation_id
+                    if failover_reservation else None
+                ),
             )
             spawned["replacement"] = replacement
             successor_id = _primary_session_id(replacement)
@@ -492,6 +511,7 @@ def cmd_failover(args: argparse.Namespace) -> int:
             source_session_id=source_session_id,
             spawn=spawn_successor,
             reason=f"failover:{profile.name}",
+            launch_reservation=failover_reservation,
         )
         _emit(
             {
@@ -549,6 +569,17 @@ def cmd_failover(args: argparse.Namespace) -> int:
         lease_ttl_seconds=args.lease_ttl_seconds,
         no_bridge=args.no_bridge,
         json=args.json,
+        task_id=failover_reservation.task.task_id if failover_reservation else None,
+        parent_task_id=(
+            failover_reservation.task.parent_task_id if failover_reservation else None
+        ),
+        max_children=(
+            failover_reservation.task.max_children if failover_reservation else 0
+        ),
+        max_spawn_attempts=(
+            failover_reservation.task.max_spawn_attempts if failover_reservation else 3
+        ),
+        task_reservation=failover_reservation,
     )
     spawned_workspace: dict[str, Any] = {}
 
@@ -566,6 +597,7 @@ def cmd_failover(args: argparse.Namespace) -> int:
         source_session_id=source_session_id,
         spawn=spawn_replacement,
         reason=f"failover:{profile.name}",
+        launch_reservation=failover_reservation,
     )
     result: dict[str, Any] = {
         "action": "replacement-started",

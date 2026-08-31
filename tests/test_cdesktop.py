@@ -168,6 +168,30 @@ def test_failed_start_never_guesses_between_partial_workspaces() -> None:
         )
 
 
+def test_keyed_workspace_spawn_passes_owner_key_and_never_advisory_cleans() -> None:
+    class Client(FakeClient):
+        def workspaces(self):
+            return [{"id": "existing", "name": "other"}]
+
+        def request(self, method, path, payload=None, query=None, headers=None):
+            self.calls.append((method, path, payload, query, headers))
+            if path == "/workspaces/start":
+                raise cdesktop.CdesktopError("response lost after commit")
+            return {"id": "created"}
+
+    client = Client()
+    with pytest.raises(cdesktop.CdesktopError, match="response lost"):
+        client.spawn_workspace(
+            name="worker", repo_path=Path("/tmp/repo"), target_branch="main",
+            executor="CODEX", prompt="start", use_worktree=True,
+            permission_policy="SUPERVISED", model=None, reasoning=None,
+            provider_id=None, launch_key="reservation-1",
+        )
+
+    assert client.calls[-1][2]["idempotency_key"] == "reservation-1"
+    assert all(call[0] != "DELETE" for call in client.calls)
+
+
 def test_send_marks_sender_when_provided() -> None:
     client = FakeClient()
     client.send("target", "hello", "sender")

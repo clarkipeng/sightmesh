@@ -1096,6 +1096,19 @@ def test_spawn_task_id_reuses_active_launch_before_lease_preflight(
     assert CountingClient.spawns == 1
 
 
+def test_workspace_response_parse_failure_leaves_reservation_replayable(tmp_path):
+    state = escalation.EscalationStore(tmp_path / "state.sqlite3")
+    store = cli.tasks.TaskLaunchStore(state)
+    reservation = store.reserve("stable-task")
+
+    with pytest.raises(ValueError, match="workspace id"):
+        cli._workspace_id({"unexpected": True})
+
+    unchanged = store.get("stable-task")
+    assert unchanged.state == "reserved"
+    assert unchanged.reservation_id == reservation.reservation_id
+
+
 def test_refused_free_route_spawn_escalates_and_releases_its_lease(
     monkeypatch, tmp_path: Path
 ) -> None:

@@ -66,7 +66,7 @@ class TaskLaunchStore:
         try:
             with self.store._connect() as conn:
                 row = conn.execute(
-                    "SELECT * FROM task_launches WHERE session_id = ? AND state = 'active'",
+                    "SELECT * FROM task_launches WHERE session_id = ?",
                     (session_id,),
                 ).fetchone()
         except sqlite3.DatabaseError as exc:
@@ -193,29 +193,125 @@ class TaskLaunchStore:
         )
 
     def transfer_reservation(
-        self, task_id: str, reservation_id: str
+        self, task_id: str, reservation_id: str, *, prior_spawn_absent: bool = False
     ) -> LaunchReservation:
         """Explicitly rotate a crashed launcher's capability before retrying.
 
-        This is the only way a reserved task can acquire a new launcher.  The
-        prior capability is required, so an unrelated duplicate wake cannot
-        steal an in-flight launch.
+        The destination must first atomically prove that the old idempotency
+        key never committed. A workspace listing is not such a proof.
         """
+        if not prior_spawn_absent:
+            raise TaskLaunchError(
+                "Reservation transfer requires destination-owned proof that the "
+                "prior spawn did not commit"
+            )
         replacement = str(uuid.uuid4())
+        blocked: TaskLaunch | None = None
         try:
             with self.store._connect() as conn:
-                changed = conn.execute(
-                    "UPDATE task_launches SET reservation_id = ?, updated_at = ? "
-                    "WHERE task_id = ? AND state = 'reserved' AND reservation_id = ?",
-                    (replacement, time.time(), task_id, reservation_id),
-                ).rowcount
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM task_launches WHERE task_id = ?", (task_id,)
+                ).fetchone()
+                if (
+                    row is None
+                    or row["state"] != "reserved"
+                    or row["reservation_id"] != reservation_id
+                ):
+                    raise TaskLaunchError(
+                        f"Task {task_id} reservation is no longer owned"
+                    )
+                if row["spawn_attempts"] >= row["max_spawn_attempts"]:
+                    conn.execute(
+                        "UPDATE task_launches SET state = 'blocked', "
+                        "reservation_id = NULL, updated_at = ? WHERE task_id = ?",
+                        (time.time(), task_id),
+                    )
+                    blocked_row = conn.execute(
+                        "SELECT * FROM task_launches WHERE task_id = ?", (task_id,)
+                    ).fetchone()
+                    conn.execute("COMMIT")
+                    blocked = TaskLaunch(**dict(blocked_row))
+                else:
+                    conn.execute(
+                        "UPDATE task_launches SET reservation_id = ?, "
+                        "spawn_attempts = spawn_attempts + 1, updated_at = ? "
+                        "WHERE task_id = ?",
+                        (replacement, time.time(), task_id),
+                    )
+                    row = conn.execute(
+                        "SELECT * FROM task_launches WHERE task_id = ?", (task_id,)
+                    ).fetchone()
+                    conn.execute("COMMIT")
+        except TaskLaunchError:
+            raise
         except sqlite3.DatabaseError as exc:
             raise TaskLaunchError(f"Cannot transfer task {task_id}: {exc}") from exc
-        if changed != 1:
-            raise TaskLaunchError(f"Task {task_id} reservation is no longer owned")
-        task = self.get(task_id)
-        assert task is not None
+        if blocked is not None:
+            self._park_blocked(blocked)
+            return LaunchReservation(blocked, None, False)
+        task = TaskLaunch(**dict(row))
         return LaunchReservation(task, replacement, True)
+
+    def reserve_failover(self, source_session_id: str) -> LaunchReservation:
+        """Atomically move an active manager task into its next launch attempt."""
+        replacement = str(uuid.uuid4())
+        now = time.time()
+        blocked: TaskLaunch | None = None
+        try:
+            with self.store._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM task_launches WHERE session_id = ?",
+                    (source_session_id,),
+                ).fetchone()
+                if row is None:
+                    conn.execute("COMMIT")
+                    raise TaskLaunchError(
+                        f"Session {source_session_id} has no managed task identity"
+                    )
+                task = TaskLaunch(**dict(row))
+                if task.state == "reserved":
+                    conn.execute("COMMIT")
+                    # Concurrent/restarted failover callers replay one exact
+                    # destination-owned key. This is the same attempt, not a
+                    # newly authorized side effect.
+                    return LaunchReservation(task, task.reservation_id, True)
+                if task.state == "blocked" or task.spawn_attempts >= task.max_spawn_attempts:
+                    conn.execute(
+                        "UPDATE task_launches SET state = 'blocked', "
+                        "reservation_id = NULL, updated_at = ? WHERE task_id = ?",
+                        (now, task.task_id),
+                    )
+                    row = conn.execute(
+                        "SELECT * FROM task_launches WHERE task_id = ?", (task.task_id,)
+                    ).fetchone()
+                    conn.execute("COMMIT")
+                    blocked = TaskLaunch(**dict(row))
+                elif task.state != "active":
+                    conn.execute("COMMIT")
+                    raise TaskLaunchError(f"Task {task.task_id} is not active")
+                else:
+                    conn.execute(
+                        "UPDATE task_launches SET state = 'reserved', reservation_id = ?, "
+                        "spawn_attempts = spawn_attempts + 1, updated_at = ? "
+                        "WHERE task_id = ? AND state = 'active'",
+                        (replacement, now, task.task_id),
+                    )
+                    row = conn.execute(
+                        "SELECT * FROM task_launches WHERE task_id = ?", (task.task_id,)
+                    ).fetchone()
+                    conn.execute("COMMIT")
+        except TaskLaunchError:
+            raise
+        except sqlite3.DatabaseError as exc:
+            raise TaskLaunchError(
+                f"Cannot reserve failover for {source_session_id}: {exc}"
+            ) from exc
+        if blocked is not None:
+            self._park_blocked(blocked)
+            return LaunchReservation(blocked, None, False)
+        return LaunchReservation(TaskLaunch(**dict(row)), replacement, True)
 
     def failed(self, task_id: str, reservation_id: str) -> TaskLaunch:
         task = self._transition(task_id, reservation_id, "retryable")

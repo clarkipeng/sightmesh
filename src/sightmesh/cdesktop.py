@@ -495,6 +495,7 @@ class CdesktopClient:
         provider_id: str | None,
         setup_script: str | None = None,
         auth_binding_id: str | None = None,
+        launch_key: str | None = None,
     ) -> dict[str, Any]:
         repo = self.register_repo(
             repo_path,
@@ -524,9 +525,15 @@ class CdesktopClient:
             # Opaque pool binding id per the SessionCommandConfig contract;
             # resolution to a credential happens inside cdesktop at launch.
             payload["auth_binding_id"] = auth_binding_id
+        if launch_key:
+            # cdesktop owns the create side effect and must atomically return the
+            # same workspace for every request carrying this opaque key.
+            payload["idempotency_key"] = launch_key
         try:
             return self.request("POST", "/workspaces/start", payload)
         except CdesktopError as exc:
+            if launch_key:
+                raise
             cleanup = self._cleanup_failed_workspace_start(name, known_workspace_ids)
             if cleanup:
                 raise CdesktopError(f"{exc}; {cleanup}") from exc
@@ -621,6 +628,7 @@ class CdesktopClient:
         reasoning: str | None = None,
         provider_id: str | None = None,
         auth_binding_id: str | None = None,
+        launch_key: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"name": name, "prompt": prompt}
         config: dict[str, Any] = {}
@@ -638,6 +646,8 @@ class CdesktopClient:
             payload["selected_provider_id"] = provider_id
         if auth_binding_id:
             payload["auth_binding_id"] = auth_binding_id
+        if launch_key:
+            payload["idempotency_key"] = launch_key
         return self.request("POST", f"/sessions/{caller_session}/teammates", payload)
 
     def stop_workspace(self, workspace_id: str) -> Any:

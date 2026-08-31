@@ -117,12 +117,15 @@ are immutable: `--max-spawn-attempts` bounds failed launch attempts, and
 Children name that manager with `--parent-task-id`; a task cannot parent or
 replace itself.
 
-A crashed launcher leaves a reserved record, which fails closed. Recovery must
-explicitly transfer its reservation capability through `TaskLaunchStore` before
-another spawn side effect is allowed. Failed attempts become retryable; reaching
-the fixed attempt limit blocks the task and writes one deduplicated escalation.
-Successor failover uses the same reservation invariant, closing the former race
-where two callers could both spawn before either persisted the successor link.
+A crashed launcher leaves a reserved record, which fails closed. SightMesh sends
+that reservation as cdesktop's opaque idempotency key; cdesktop must atomically
+return the original workspace/session when the key is replayed. SightMesh never
+uses a workspace listing as proof. Rotating a reservation is allowed only after
+cdesktop proves the old key did not commit, and consumes one attempt atomically.
+Reaching the fixed attempt limit blocks the task and writes one deduplicated
+escalation. Until cdesktop ships that create-key contract, crash recovery is
+fail-closed rather than exactly retryable. Manager failover transfers the same
+task row, child limit, and attempt limit to its successor.
 
 Task rows contain IDs, counters, limits, and cdesktop workspace/session
 references only. cdesktop and its executors remain the sole owners of transcript
