@@ -39,7 +39,14 @@ class FakeClient:
         return {"id": workspace_id, "container_ref": str(container)}
 
     def providers(self):
-        return []
+        return [
+            {
+                "id": "default-provider",
+                "name": "Default",
+                "kind": "Default",
+                "enabled": True,
+            }
+        ]
 
     def register_repo(self, path, **_kwargs):
         assert path.resolve() == self.repo_path.resolve()
@@ -352,6 +359,7 @@ def test_quota_failure_moves_once_to_the_next_configured_route(system, monkeypat
     replacement = client.launches[-1][1]["request"]["session"]
     assert replacement["executor"] == "CODEX"
     assert replacement["model"] == "gpt-5.6-sol"
+    assert replacement["provider_id"] == "default-provider"
     assert replacement["prompt"] == "Audit the boundary"
     record = store.get("operator", "audit")
     assert record is not None
@@ -447,6 +455,24 @@ def test_exhausted_route_chain_blocks_without_spawning(system, monkeypatch):
     record = store.get("operator", "audit")
     assert record is not None and record.result is not None
     assert "routes_exhausted" in record.result
+
+
+def test_routed_start_requires_one_enabled_default_provider(system, monkeypatch):
+    mesh, client, _store, _ownership = system
+    client.providers = list
+    target = execution_routing.SelectedTarget(
+        "fable", "CLAUDE_CODE", "fable", "subscription", "max-a", "max-a"
+    )
+    monkeypatch.setattr(
+        execution_routing,
+        "select_route",
+        lambda _settings, **_kwargs: execution_routing.SelectionResult(
+            "resolved", target, (), None
+        ),
+    )
+
+    with pytest.raises(SightMeshError, match="one enabled cdesktop Default provider"):
+        mesh.start(spec(executor=None))
 
 
 def test_completion_notifies_only_the_recorded_parent(system):
