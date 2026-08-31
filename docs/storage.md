@@ -37,5 +37,8 @@ Parent return addresses and queued commands live in cdesktop's application datab
 Stable task-launch rows share SightMesh's escalation database. They contain only
 launch identity, reservation state, immutable attempt/child budgets, and opaque
 cdesktop IDs. They never contain transcript text or history blobs. Transcript
-deduplication and disk ceilings must be enforced by cdesktop or the executor at
-the write boundary; observing them later in SightMesh cannot prevent exhaustion.
+handoff may carry only the opaque content-addressed history reference from
+the [cdesktop task launch contract](cdesktop-task-launch-v1.md). cdesktop and
+the executor enforce transcript, fork, and free-disk limits before writing;
+SightMesh neither stores transcript bytes nor claims it can prevent writer-side
+disk growth.

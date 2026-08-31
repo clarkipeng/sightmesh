@@ -14,6 +14,11 @@ SightMesh is a thin local policy layer over native owners. Its purpose is to mak
 
 This boundary is intentional. SightMesh validates operator intent and calls the native owner; it does not mirror all transcripts, source state, or relationships into a global database.
 
+Crash-safe task-ID launch additionally requires the versioned [cdesktop task
+launch contract](cdesktop-task-launch-v1.md). SightMesh owns the fenced logical
+task authorization; cdesktop owns create-or-return idempotency and writer-side
+storage refusal. An unsupported pinned runtime fails closed.
+
 ## Visible sessions and isolation
 
 `sightmesh spawn` creates a cdesktop workspace and full provider session. The normal implementation path uses a dedicated Git worktree, allowing independent workers from one repository to coexist. Direct-checkout work is supported but conflicts with other ownership for that repository and cannot use unattended mode.
