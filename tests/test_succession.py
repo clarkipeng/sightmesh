@@ -205,6 +205,44 @@ def test_successor_linkage_is_single_and_conflict_rejected(tmp_path) -> None:
     assert resolve_live_successor(ownership, "session-1") == "successor-2"
 
 
+def test_successor_cycle_and_self_link_leave_state_unchanged(tmp_path) -> None:
+    ownership = store(tmp_path)
+    ownership.retire("a", state="superseded", reason="failover")
+    ownership.retire("b", state="superseded", reason="failover")
+    ownership.link_successor("a", "b")
+
+    with pytest.raises(SuccessionError, match="cycle"):
+        ownership.link_successor("b", "a")
+    with pytest.raises(SuccessionError, match="own successor"):
+        ownership.link_successor("b", "b")
+
+    assert ownership.get("a").successor_session_id == "b"
+    assert ownership.get("b").successor_session_id is None
+
+
+def test_concurrent_opposite_successor_links_cannot_form_cycle(tmp_path) -> None:
+    ownership = store(tmp_path)
+    ownership.retire("a", state="superseded", reason="failover")
+    ownership.retire("b", state="superseded", reason="failover")
+
+    def link(source: str, successor: str) -> str:
+        try:
+            store(tmp_path).link_successor(source, successor)
+        except SuccessionError:
+            return "rejected"
+        return "linked"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(
+            executor.map(lambda edge: link(*edge), [("a", "b"), ("b", "a")])
+        )
+
+    assert sorted(outcomes) == ["linked", "rejected"]
+    a_successor = ownership.get("a").successor_session_id
+    b_successor = ownership.get("b").successor_session_id
+    assert (a_successor, b_successor) in (("b", None), (None, "a"))
+
+
 # ---------------------------------------------------------------- quarantine
 
 
