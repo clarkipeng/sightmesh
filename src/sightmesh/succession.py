@@ -168,34 +168,59 @@ class OwnershipStore:
     def link_successor(
         self, session_id: str, successor_session_id: str
     ) -> TerminalOwnership:
-        record = self.get(session_id)
-        if record is None:
-            raise SuccessionError(
-                f"Session {session_id} has no terminal ownership record to link"
-            )
-        if record.successor_session_id == successor_session_id:
-            return record
-        if record.successor_session_id is not None:
-            raise SuccessionError(
-                f"Session {session_id} already has successor "
-                f"{record.successor_session_id}; refusing {successor_session_id}"
-            )
+        source = str(session_id)
+        successor = str(successor_session_id)
+        if source == successor:
+            raise SuccessionError(f"Session {source} cannot be its own successor")
         try:
             with self._store._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT session_id, state, reason, retired_at, logical_key, "
+                    "successor_session_id FROM terminal_ownerships WHERE session_id = ?",
+                    (source,),
+                ).fetchone()
+                if row is None:
+                    raise SuccessionError(
+                        f"Session {source} has no terminal ownership record to link"
+                    )
+                if row["successor_session_id"] == successor:
+                    return self._record_from_row(row, source)
+                if row["successor_session_id"] is not None:
+                    raise SuccessionError(
+                        f"Session {source} already has successor "
+                        f"{row['successor_session_id']}; refusing {successor}"
+                    )
+
+                seen = {source}
+                current: str | None = successor
+                while current is not None:
+                    if current in seen:
+                        raise SuccessionError("Successor link would create a cycle")
+                    seen.add(current)
+                    next_row = conn.execute(
+                        "SELECT successor_session_id FROM terminal_ownerships "
+                        "WHERE session_id = ?",
+                        (current,),
+                    ).fetchone()
+                    current = next_row["successor_session_id"] if next_row else None
+
                 conn.execute(
                     """UPDATE terminal_ownerships SET successor_session_id = ?
                     WHERE session_id = ? AND successor_session_id IS NULL""",
-                    (str(successor_session_id), str(session_id)),
+                    (successor, source),
                 )
                 row = conn.execute(
                     "SELECT session_id, state, reason, retired_at, logical_key, "
                     "successor_session_id FROM terminal_ownerships WHERE session_id = ?",
-                    (str(session_id),),
+                    (source,),
                 ).fetchone()
+        except SuccessionError:
+            raise
         except sqlite3.DatabaseError as exc:
             raise SuccessionError(f"Cannot link successor for {session_id}: {exc}") from exc
-        updated = self._record_from_row(row, session_id)
-        if updated.successor_session_id != str(successor_session_id):
+        updated = self._record_from_row(row, source)
+        if updated.successor_session_id != successor:
             raise SuccessionError(
                 f"Session {session_id} already has successor "
                 f"{updated.successor_session_id}; refusing {successor_session_id}"

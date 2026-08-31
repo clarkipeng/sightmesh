@@ -247,8 +247,11 @@ class EscalationStore:
                 self.path.with_name(f"{self.path.name}-wal"),
                 self.path.with_name(f"{self.path.name}-shm"),
             ):
-                if path.exists():
+                try:
                     os.chmod(path, 0o600)
+                except FileNotFoundError:
+                    # SQLite may remove a sidecar after it was enumerated.
+                    pass
         except sqlite3.Error as exc:
             conn.close()
             raise EscalationStoreError(

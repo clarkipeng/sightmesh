@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import sightmesh.escalation as escalation_module
 from sightmesh.cdesktop import CdesktopError
 from sightmesh.escalation import (
     EscalationClass,
@@ -43,6 +44,21 @@ class FakeClient:
             }
         )
         return {"ok": True}
+
+
+def test_disappearing_sqlite_sidecar_does_not_break_open(monkeypatch, tmp_path) -> None:
+    real_chmod = escalation_module.os.chmod
+
+    def racing_chmod(path, mode, **kwargs):
+        if str(path).endswith("-shm"):
+            raise FileNotFoundError(path)
+        return real_chmod(path, mode, **kwargs)
+
+    monkeypatch.setattr(escalation_module.os, "chmod", racing_chmod)
+    store = EscalationStore(tmp_path / "escalations.sqlite3")
+
+    with store._connect() as connection:
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
 
 
 def test_detect_launcher_recognizes_cdesktop_from_session_env():

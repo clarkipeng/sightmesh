@@ -24,6 +24,8 @@ cdesktop remains the inspection surface: conversation, process output, changed-f
 
 Prompts, follow-ups, UI actions, and bridged messages enter cdesktop's durable command path. A `continue` command waits for an idle boundary. A `replace` command requests cancellation of the active coding turn and then runs through the same dispatcher. Command state and execution ownership are recorded before more work is admitted for that session.
 
+Successor routing is append-only and acyclic. SightMesh validates the complete proposed successor chain in the same serialized transaction that records an edge, so a direct or transitive self-successor is rejected without changing durable ownership state.
+
 Durability here means the command record survives a process boundary and can be reconciled. It does not yet prove that every manager wake and delivery is acknowledged during prolonged real-world load. That is the current experimental release gate.
 
 ## Stall and recovery model
