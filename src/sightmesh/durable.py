@@ -17,16 +17,19 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from . import wakes
 from .cdesktop import (
     CdesktopClient,
     CdesktopError,
     CdesktopInterruptedError,
     CdesktopPendingError,
 )
+from .effects import EffectJournal
 from .escalation import EscalationStore, escalate
 from .runtime_lock import RUNTIME_LOCK
 from .stalls import is_active_suite_work, threshold_from_environment
 from .succession import COMMAND_TERMINAL_STATES, OwnershipStore, resolve_live_successor
+from .task_store import TaskStore, TaskStoreError
 
 LOGGER = logging.getLogger("sightmesh.durable")
 
@@ -161,7 +164,11 @@ def _context_pressure(snapshot: dict[str, Any]) -> float | None:
         entry = content.get("entry_type") if isinstance(content, dict) else None
         if isinstance(entry, dict) and entry.get("type") == "token_usage_info":
             used, window = entry.get("total_tokens"), entry.get("model_context_window")
-            if isinstance(used, (int, float)) and isinstance(window, (int, float)) and window:
+            if (
+                isinstance(used, (int, float))
+                and isinstance(window, (int, float))
+                and window
+            ):
                 return float(used) / float(window)
     return None
 
@@ -200,6 +207,7 @@ class DurableExecutionReconciler:
         liveness: SuiteLiveness | None = None,
         ownership: OwnershipStore | None = None,
         signal_store: EscalationStore | None = None,
+        task_store: TaskStore | None = None,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self.client = client
@@ -207,6 +215,7 @@ class DurableExecutionReconciler:
         self.probe = probe or getattr(client, "probe_connectivity", lambda: True)
         self.ownership = ownership or OwnershipStore()
         self.signal_store = signal_store or EscalationStore()
+        self._task_store = task_store
         self.clock = clock or time.time
         self._stopped: set[str] = set()
         self._requeued: set[str] = set()
@@ -236,6 +245,46 @@ class DurableExecutionReconciler:
                 version or "unknown version",
             )
         return self._durable_supported
+
+    @property
+    def task_store(self) -> TaskStore:
+        """Share the escalation store's database; two views cannot disagree."""
+        if self._task_store is None:
+            self._task_store = TaskStore(self.signal_store.path)
+        return self._task_store
+
+    def reconcile_kernel(self) -> dict[str, int]:
+        """Close the gaps a crash can leave in the task kernel.
+
+        Scans durable task state rather than commands, so a crash between a
+        child's terminal write and its parent's wake, a wake claimed by a dead
+        pump, and a reservation whose owner never reached the native call all
+        heal on the next tick instead of waiting for a human.
+        """
+        store = self.task_store
+        repaired = {"wakes_inserted": 0, "wakes_delivered": 0, "effects_expired": 0}
+        try:
+            with store.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                parents = [
+                    str(row["parent_task_id"])
+                    for row in conn.execute(
+                        "SELECT DISTINCT parent_task_id FROM managed_tasks "
+                        "WHERE parent_task_id IS NOT NULL"
+                    ).fetchall()
+                ]
+                for parent_task_id in parents:
+                    repaired["wakes_inserted"] += len(
+                        wakes.record_wakes(conn, parent_task_id)
+                    )
+                conn.execute("COMMIT")
+            repaired["wakes_delivered"] = wakes.WakeDelivery(self.client, store).pump()
+            repaired["effects_expired"] = len(
+                EffectJournal(store).expire_reservations()
+            )
+        except TaskStoreError as exc:
+            LOGGER.warning("Cannot reconcile the task kernel: %s", exc)
+        return repaired
 
     def reconcile_sessions(self, sessions: Iterable[dict[str, Any]]) -> None:
         """Reconcile all sessions in one writer, tolerating partial reads."""
@@ -338,7 +387,9 @@ class DurableExecutionReconciler:
                 value
                 for process in process_rows
                 for value in [
-                    _context_pressure(self.client.normalized_snapshot(str(process["id"])))
+                    _context_pressure(
+                        self.client.normalized_snapshot(str(process["id"]))
+                    )
                 ]
                 if value is not None
             ),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import subprocess
@@ -12,8 +13,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
-from . import execution_routing
+from . import execution_routing, wakes
 from .cdesktop import CdesktopClient, CdesktopError, latest_execution_process
+from .effects import EffectJournal, new_owner_instance, request_hash
 from .escalation import CDESKTOP_SESSION_ENV, EscalationStore, LauncherIdentity
 from .pool import core as pool_core
 from .profiles import ProfileStore, validate_provider
@@ -22,10 +24,15 @@ from .succession import (
     reroute_after_quota_exhaustion,
     transfer_ownership,
 )
-from .task_store import TaskRecord, TaskStore, TaskStoreError
+from .task_store import StaleTransition, TaskRecord, TaskStore, TaskStoreError
+
+LOGGER = logging.getLogger("sightmesh.sdk")
 
 KEY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,23}$")
 MAX_ATTEMPTS = 3
+#: A task id no ``uuid5`` derivation can produce, reserved for the launch
+#: contract probe so the lookup can only ever answer "not found".
+CONTRACT_PROBE_TASK_ID = "00000000-0000-0000-0000-000000000000"
 T = TypeVar("T")
 
 
@@ -132,7 +139,10 @@ class SightMesh:
         self.store = store or TaskStore()
         self.ownership = ownership or OwnershipStore()
         self.environment = environment if environment is not None else os.environ
-        self._contract_checked = False
+        self.owner_instance = new_owner_instance()
+        self.journal = EffectJournal(self.store)
+        self.wakes = wakes.WakeDelivery(self.client, self.store)
+        self.contract_probe: str | None = None
 
     def start(self, spec: WorkerSpec | None = None, **kwargs: Any) -> Worker:
         requested = spec or WorkerSpec(**kwargs)
@@ -248,23 +258,19 @@ class SightMesh:
 
     def complete(self, summary: str | None = None, worker: str | None = None) -> Worker:
         task = self._current() if worker is None else self._find(worker)
-        updated = self.store.finish(task.task_id, "completed", summary)
-        self._notify_parent(updated, "completed", summary)
-        return Worker.from_record(updated)
+        return Worker.from_record(self._finish(task, "completed", summary))
 
     def blocked(self, reason: str, worker: str | None = None) -> Worker:
         if not reason.strip():
             raise SightMeshError("Blocked reason must not be empty")
         task = self._current() if worker is None else self._find(worker)
-        updated = self.store.finish(task.task_id, "blocked", reason)
-        self._notify_parent(updated, "blocked", reason)
-        return Worker.from_record(updated)
+        return Worker.from_record(self._finish(task, "blocked", reason))
 
     def cancel(self, worker: str) -> Worker:
         task = self._find(worker)
         if task.workspace_id:
             self.client.stop_workspace(task.workspace_id)
-        return Worker.from_record(self.store.finish(task.task_id, "cancelled"))
+        return Worker.from_record(self._finish(task, "cancelled", None))
 
     def replace(self, worker: str, prompt: str | None = None) -> Worker:
         task = self._find(worker)
@@ -276,8 +282,31 @@ class SightMesh:
         self._require_contract()
         target = {**task.spec["target"]}
         target.pop("recovery", None)
-        prepared = self.store.prepare_replacement(task.task_id, target=target)
+        # A task already in ``replacing`` is a crashed replacement, not a new
+        # one: resume the epoch that was prepared instead of burning another.
+        prepared = (
+            task
+            if task.state == "replacing"
+            else self.store.prepare_replacement(
+                task.task_id, target=target, expect_version=task.version
+            )
+        )
         return Worker.from_record(self._replace_prepared(prepared, replacement_prompt))
+
+    def _finish(self, task: TaskRecord, state: str, result: str | None) -> TaskRecord:
+        """Terminate one task, record its parent's wake, then try to deliver."""
+        try:
+            updated, _created = wakes.finish_with_wake(
+                self.store, task.task_id, state, result
+            )
+        except StaleTransition as exc:
+            if exc.current.state == state:
+                # A duplicate lifecycle call for the state already reached is
+                # the caller repeating itself, not a conflict.
+                return exc.current
+            raise
+        self.wakes.pump()
+        return updated
 
     def reconcile_quota_failure(self, session_id: str) -> Worker | None:
         """Move one managed task past an observed subscription quota refusal."""
@@ -304,9 +333,7 @@ class SightMesh:
         )
         if selection.status != "resolved" or selection.target is None:
             reason = f"Quota exhausted for route {route_id}; {selection.reason}"
-            blocked = self.store.finish(task.task_id, "blocked", reason)
-            self._notify_parent(blocked, "blocked", reason)
-            return Worker.from_record(blocked)
+            return Worker.from_record(self._finish(task, "blocked", reason))
 
         selected = selection.target
         next_target = {
@@ -320,7 +347,9 @@ class SightMesh:
             "recovery": "quota",
         }
         self._require_contract()
-        prepared = self.store.prepare_replacement(task.task_id, target=next_target)
+        prepared = self.store.prepare_replacement(
+            task.task_id, target=next_target, expect_version=task.version
+        )
         return Worker.from_record(
             self._replace_prepared(prepared, str(task.spec["prompt"]))
         )
@@ -340,18 +369,15 @@ class SightMesh:
             auth_binding_id=target.get("auth_binding_id"),
         )
 
+        launch = {
+            "kind": "session",
+            "workspace_id": prepared.workspace_id,
+            "caller_session_id": prepared.holder_session_id,
+            "request": request,
+        }
+
         def spawn() -> str:
-            effect = self.client.managed_launch(
-                prepared.task_id,
-                prepared.epoch,
-                {
-                    "kind": "session",
-                    "workspace_id": prepared.workspace_id,
-                    "caller_session_id": prepared.holder_session_id,
-                    "request": request,
-                },
-            )
-            return self._effect_ids(prepared, effect)[1]
+            return self._journaled_launch(prepared, launch)[1]
 
         transfer = transfer_ownership(
             self.client,
@@ -407,22 +433,42 @@ class SightMesh:
             setup_script=task.spec.get("setup_script"),
             auth_binding_id=target.get("auth_binding_id"),
         )
-        effect = self.client.managed_launch(
-            task.task_id, task.epoch, {"kind": "workspace", "request": request}
+        workspace_id, session_id = self._journaled_launch(
+            task, {"kind": "workspace", "request": request}
         )
-        workspace_id, session_id = self._effect_ids(task, effect)
         active = self.store.activate(
             task.task_id, workspace_id=workspace_id, session_id=session_id
         )
         self._record_launcher(active)
         return active
 
+    def _journaled_launch(
+        self, task: TaskRecord, launch: Mapping[str, Any]
+    ) -> tuple[str, str]:
+        """Reserve, launch once, and record the native identifiers.
+
+        The journal row is written before the native call and advanced after
+        it, so a crash anywhere in between is resolved on the next run by
+        adopting the reserved epoch instead of forking a second session.
+        """
+        effect, _took_over = self.journal.reserve(
+            task.task_id, task.epoch, request_hash(launch), self.owner_instance
+        )
+        if effect.state == "launched" and effect.workspace_id and effect.session_id:
+            return effect.workspace_id, effect.session_id
+        native = self.client.managed_launch(task.task_id, task.epoch, dict(launch))
+        workspace_id, session_id = self._effect_ids(task, native)
+        self.journal.mark_launched(task.task_id, task.epoch, workspace_id, session_id)
+        return workspace_id, session_id
+
     def _effect_ids(
         self, task: TaskRecord, effect: Mapping[str, Any]
     ) -> tuple[str, str]:
         state = str(effect.get("state") or "")
         if state == "lost":
-            self.store.finish(task.task_id, "lost", str(effect.get("reason") or "lost"))
+            reason = str(effect.get("reason") or "lost")
+            self.journal.mark_terminal(task.task_id, task.epoch, f"lost:{reason}")
+            self._finish(task, "lost", reason)
             raise SightMeshError(f"Native launch for {task.key!r} was lost")
         workspace_id = effect.get("workspace_id")
         session_id = effect.get("session_id")
@@ -613,37 +659,47 @@ class SightMesh:
         except OSError as exc:
             raise SightMeshError(f"Cannot read checkpoint {path}: {exc}") from exc
 
-    def _notify_parent(self, task: TaskRecord, state: str, detail: str | None) -> None:
-        if not task.parent_task_id:
-            return
-        parent = self.store.get_by_id(task.parent_task_id)
-        if (
-            parent is None
-            or not parent.holder_session_id
-            or parent.holder_session_id == task.holder_session_id
-        ):
-            return
-        message = f"{state.upper()}: {task.key}"
-        if detail:
-            message += f"\n{detail}"
-        self.client.send(
-            parent.holder_session_id,
-            message,
-            task.holder_session_id,
-            dedupe_key=f"task-{state}:{task.task_id}",
-            intent="continue" if state == "completed" else "replace",
-        )
+    def _require_contract(self) -> str:
+        """Probe the managed-launch seam instead of trusting the advertisement.
 
-    def _require_contract(self) -> None:
-        if self._contract_checked:
-            return
+        An advertised capability with no working lookup is exactly the state
+        that lets a launch path fail late, so the probe runs once per instance
+        and its outcome is reported by ``doctor``.
+        """
+        if self.contract_probe is not None:
+            return self.contract_probe
         info = self.client.info()
         capabilities = info.get("service_capabilities", {})
         if int(capabilities.get("managed_task_launch", 0)) < 1:
             raise SightMeshError(
                 "cdesktop does not support the managed task launch contract"
             )
-        self._contract_checked = True
+        self.contract_probe = self._probe_managed_launch()
+        return self.contract_probe
+
+    def _probe_managed_launch(self) -> str:
+        lookup = getattr(self.client, "managed_effect", None)
+        if lookup is None:
+            # Seam v2 adds an executed probe for every capability; until then
+            # this runtime can only be taken at its word, and says so.
+            return "advertised-only"
+        try:
+            effect = lookup(CONTRACT_PROBE_TASK_ID, 1)
+        except CdesktopError as exc:
+            if "404" not in str(exc):
+                raise SightMeshError(
+                    f"cdesktop managed task launch probe failed: {exc}"
+                ) from exc
+            return "lookup"
+        if not isinstance(effect, Mapping):
+            raise SightMeshError(
+                "cdesktop managed task launch probe returned a malformed effect"
+            )
+        if effect.get("state") not in {None, "", "missing", "not_found"}:
+            raise SightMeshError(
+                "cdesktop managed task launch probe found a reserved sentinel effect"
+            )
+        return "lookup"
 
     @staticmethod
     def _validate_spec(spec: WorkerSpec) -> None:

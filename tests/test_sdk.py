@@ -10,7 +10,7 @@ from sightmesh import execution_routing
 from sightmesh import sdk as sdk_module
 from sightmesh.cdesktop import CdesktopError
 from sightmesh.sdk import BatchError, Command, SightMesh, SightMeshError, WorkerSpec
-from sightmesh.task_store import TaskStore, TaskStoreError
+from sightmesh.task_store import StaleTransition, TaskStore, TaskStoreError
 
 
 class FakeClient:
@@ -287,18 +287,32 @@ def test_checkpoint_content_stays_in_the_task_worktree(system):
 
 
 def test_duplicate_failover_wakeups_reserve_one_successor_epoch(system):
+    """Two managers observing the same failure must not burn two epochs.
+
+    Both read version N and both try to replace; the version guard is what
+    turns the loser into a visible StaleTransition instead of a second
+    silent epoch bump that would double-charge the circuit breaker.
+    """
     mesh, _client, store, _ownership = system
     mesh.start(spec())
     task = store.get("operator", "audit")
     assert task is not None
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        replacements = list(
-            pool.map(lambda _: store.prepare_replacement(task.task_id), range(2))
-        )
+    def race(_index):
+        try:
+            return store.prepare_replacement(task.task_id, expect_version=task.version)
+        except StaleTransition as exc:
+            return exc
 
-    assert {replacement.epoch for replacement in replacements} == {2}
-    assert {replacement.attempts for replacement in replacements} == {2}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(race, range(2)))
+
+    winners = [item for item in outcomes if not isinstance(item, StaleTransition)]
+    losers = [item for item in outcomes if isinstance(item, StaleTransition)]
+    assert len(winners) == 1 and len(losers) == 1
+    assert winners[0].epoch == 2
+    assert winners[0].attempts == 2
+    assert losers[0].current.epoch == 2
 
 
 def test_quota_failure_moves_once_to_the_next_configured_route(system, monkeypatch):
@@ -498,3 +512,137 @@ def test_completion_notifies_only_the_recorded_parent(system):
     assert len(client.sent) == 1
     assert client.sent[0][0] == parent.session_id
     assert client.sent[0][0] != child.session_id
+
+
+def test_a_duplicate_completion_is_an_idempotent_no_op(system):
+    """A worker that repeats `complete` after a lost response, or a manager
+    that completes a child the reconciler already closed, must not see an
+    error and must not send the parent a second wake."""
+    mesh, client, store, ownership = system
+    parent = mesh.start(spec("manager", children=1))
+    child_mesh = SightMesh(
+        client=client,
+        store=store,
+        ownership=ownership,
+        environment={"CDESKTOP_SESSION_ID": parent.session_id},
+    )
+    child = child_mesh.start(spec("child"))
+    client.sent.clear()
+    running_child = SightMesh(
+        client=client,
+        store=store,
+        ownership=ownership,
+        environment={"CDESKTOP_SESSION_ID": child.session_id},
+    )
+
+    first = running_child.complete("all checks pass")
+    replayed = running_child.complete("all checks pass")
+
+    assert replayed == first
+    assert len(client.sent) == 1
+
+
+def test_a_late_completion_on_a_terminal_task_is_a_visible_error(system):
+    """Idempotence is only for an identical target. A `complete` arriving
+    after the task was cancelled changes the outcome and must be refused."""
+    mesh, _client, _store, _ownership = system
+    mesh.start(spec())
+    mesh.cancel("audit")
+
+    with pytest.raises(StaleTransition, match="cancelled"):
+        mesh.complete("too late", worker="audit")
+
+
+def test_a_blocked_child_never_replaces_the_parent_turn(system):
+    """The old per-child mail sent intent='replace' whenever a child blocked,
+    interrupting the manager mid-cohort. Every wake now continues the turn."""
+    mesh, client, store, ownership = system
+    parent = mesh.start(spec("manager", children=1))
+    child_mesh = SightMesh(
+        client=client,
+        store=store,
+        ownership=ownership,
+        environment={"CDESKTOP_SESSION_ID": parent.session_id},
+    )
+    child = child_mesh.start(spec("child"))
+    client.sent.clear()
+
+    SightMesh(
+        client=client,
+        store=store,
+        ownership=ownership,
+        environment={"CDESKTOP_SESSION_ID": child.session_id},
+    ).blocked("needs a decision")
+
+    assert [row[4] for row in client.sent] == ["continue"]
+
+
+def test_a_crash_between_launch_and_activation_adopts_the_same_session(system):
+    """The journal row is written before the native call, so a retry after a
+    crash at activation must reuse the recorded workspace and session rather
+    than forking a second native run for the same epoch."""
+    mesh, client, store, _ownership = system
+    activate = store.activate
+
+    def crash(*_args, **_kwargs):
+        raise RuntimeError("the process died before activation")
+
+    store.activate = crash
+    with pytest.raises(RuntimeError):
+        mesh.start(spec())
+    store.activate = activate
+
+    started = mesh.start(spec())
+
+    assert len(client.launches) == 1
+    effect = mesh.journal.get(store.get("operator", "audit").task_id, 1)
+    assert (effect.workspace_id, effect.session_id) == (
+        started.workspace_id,
+        started.session_id,
+    )
+
+
+def test_a_hundred_concurrent_starts_launch_once(system):
+    """Every manager fanning out re-runs `start` for its whole cohort; the
+    journal is what stops that from creating a session per caller."""
+    mesh, client, _store, _ownership = system
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: mesh.start_all([spec()]), range(100)))
+
+    assert len(client.effects) == 1
+    assert {key for result in results for key in result.items} <= {"audit"}
+
+
+def test_the_contract_probe_reports_an_advertised_only_runtime(system):
+    """cdesktop 0.2.7 has no lookup to probe, and an unprobed capability must
+    say so rather than pass as if it had been executed."""
+    mesh, _client, _store, _ownership = system
+
+    assert mesh._require_contract() == "advertised-only"
+
+
+def test_the_contract_probe_executes_the_managed_launch_lookup(system):
+    """When the lookup exists, a well-formed not-found answer is the proof
+    the seam is actually wired, not merely advertised."""
+    mesh, client, _store, _ownership = system
+    looked_up = []
+
+    def managed_effect(task_id, epoch):
+        looked_up.append((task_id, epoch))
+        return {"state": "missing"}
+
+    client.managed_effect = managed_effect
+
+    assert mesh._require_contract() == "lookup"
+    assert looked_up == [(sdk_module.CONTRACT_PROBE_TASK_ID, 1)]
+
+
+def test_a_probe_that_finds_the_sentinel_reserved_fails_the_contract(system):
+    """A runtime answering the sentinel with a live effect is not speaking
+    this contract, and starting work against it would corrupt a real task."""
+    mesh, client, _store, _ownership = system
+    client.managed_effect = lambda _task_id, _epoch: {"state": "active"}
+
+    with pytest.raises(SightMeshError, match="reserved sentinel effect"):
+        mesh.start(spec())
