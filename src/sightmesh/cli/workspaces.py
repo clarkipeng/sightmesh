@@ -50,13 +50,18 @@ def _archive_workspace(args: argparse.Namespace, client: CdesktopClient) -> int:
     workspace = client.workspace(args.workspace_id)
     if workspace.get("archived"):
         raise ValueError("Workspace is already archived")
-    dirty = client.dirty_repositories(args.workspace_id)
-    if dirty and workspace.get("use_worktree"):
+    closeout = client.closeout_report(args.workspace_id) if workspace.get("use_worktree") else {}
+    blockers = {
+        key: closeout.get(key, [])
+        for key in ("agent_changes", "managed_inputs_modified", "missing")
+        if closeout.get(key)
+    }
+    if blockers:
         raise ValueError(
-            "Refusing to archive a dirty managed worktree. cdesktop may remove archived "
-            "worktrees after one hour, so commit, hand off, or otherwise reconcile these "
-            f"files first. Dirty state: {json.dumps(dirty)}"
+            "Refusing to archive a managed worktree before human reconciliation. "
+            f"Closeout state: {json.dumps(blockers)}"
         )
+    dirty = [] if workspace.get("use_worktree") else client.dirty_repositories(args.workspace_id)
     if dirty and not args.preserve_dirty:
         raise ValueError(
             "Refusing to archive a dirty direct workspace. Reconcile it or pass "
@@ -75,11 +80,22 @@ def _archive_workspace(args: argparse.Namespace, client: CdesktopClient) -> int:
     archived = client.archive_workspace(args.workspace_id)
     routing.disable(args.workspace_id)
     released = leases.LeaseStore().release_workspace_if_present(args.workspace_id)
+    reclamation = (
+        {
+            "state": "reclaimed" if archived.get("worktree_deleted") else "scheduled",
+            "grace_period_seconds": 3600,
+            "owner": "cdesktop",
+        }
+        if workspace.get("use_worktree")
+        else {"state": "not-managed", "owner": "repository-owner"}
+    )
     _emit(
         {
             "workspace": archived,
             "action": "stopped-and-archived",
+            "reclamation": reclamation,
             "preserved_dirty": dirty,
+            "closeout": closeout,
             "retired_sessions": retired_sessions,
             "released_lease": released.to_public_dict() if released else None,
         },

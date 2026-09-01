@@ -1,0 +1,1106 @@
+diff --git a/crates/db/.sqlx/query-0c7b20643f119afd3e233105b0fa2920e8e940bdad86cdc95d01e485a20d6ed4.json b/crates/db/.sqlx/query-0c7b20643f119afd3e233105b0fa2920e8e940bdad86cdc95d01e485a20d6ed4.json
+deleted file mode 100644
+index adfd2686..00000000
+--- a/crates/db/.sqlx/query-0c7b20643f119afd3e233105b0fa2920e8e940bdad86cdc95d01e485a20d6ed4.json
++++ /dev/null
+@@ -1,80 +0,0 @@
+-{
+-  "db_name": "SQLite",
+-  "query": "SELECT\n                    ep.id as \"id!: Uuid\",\n                    ep.session_id as \"session_id!: Uuid\",\n                    ep.run_reason as \"run_reason!: ExecutionProcessRunReason\",\n                    ep.executor_action as \"executor_action!: sqlx::types::Json<ExecutorActionField>\",\n                    ep.status as \"status!: ExecutionProcessStatus\",\n                    ep.exit_code,\n                    ep.dropped as \"dropped!: bool\",\n                    ep.started_at as \"started_at!: DateTime<Utc>\",\n                    ep.completed_at as \"completed_at?: DateTime<Utc>\",\n                    ep.created_at as \"created_at!: DateTime<Utc>\",\n                    ep.updated_at as \"updated_at!: DateTime<Utc>\"\n               FROM execution_processes ep\n               JOIN sessions s ON ep.session_id = s.id\n               WHERE s.workspace_id = ? AND ep.run_reason = ? AND ep.dropped = FALSE\n               ORDER BY ep.created_at DESC LIMIT 1",
+-  "describe": {
+-    "columns": [
+-      {
+-        "name": "id!: Uuid",
+-        "ordinal": 0,
+-        "type_info": "Blob"
+-      },
+-      {
+-        "name": "session_id!: Uuid",
+-        "ordinal": 1,
+-        "type_info": "Blob"
+-      },
+-      {
+-        "name": "run_reason!: ExecutionProcessRunReason",
+-        "ordinal": 2,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "executor_action!: sqlx::types::Json<ExecutorActionField>",
+-        "ordinal": 3,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "status!: ExecutionProcessStatus",
+-        "ordinal": 4,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "exit_code",
+-        "ordinal": 5,
+-        "type_info": "Integer"
+-      },
+-      {
+-        "name": "dropped!: bool",
+-        "ordinal": 6,
+-        "type_info": "Integer"
+-      },
+-      {
+-        "name": "started_at!: DateTime<Utc>",
+-        "ordinal": 7,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "completed_at?: DateTime<Utc>",
+-        "ordinal": 8,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "created_at!: DateTime<Utc>",
+-        "ordinal": 9,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "updated_at!: DateTime<Utc>",
+-        "ordinal": 10,
+-        "type_info": "Text"
+-      }
+-    ],
+-    "parameters": {
+-      "Right": 2
+-    },
+-    "nullable": [
+-      true,
+-      false,
+-      false,
+-      false,
+-      false,
+-      true,
+-      false,
+-      false,
+-      true,
+-      false,
+-      false
+-    ]
+-  },
+-  "hash": "0c7b20643f119afd3e233105b0fa2920e8e940bdad86cdc95d01e485a20d6ed4"
+-}
+diff --git a/crates/db/.sqlx/query-13826fc6fdd367255cb921640e5972f30905ac7a81ad477cf8bbcfc24f06f39b.json b/crates/db/.sqlx/query-13826fc6fdd367255cb921640e5972f30905ac7a81ad477cf8bbcfc24f06f39b.json
+deleted file mode 100644
+index ffe922a2..00000000
+--- a/crates/db/.sqlx/query-13826fc6fdd367255cb921640e5972f30905ac7a81ad477cf8bbcfc24f06f39b.json
++++ /dev/null
+@@ -1,80 +0,0 @@
+-{
+-  "db_name": "SQLite",
+-  "query": "\n        SELECT\n            ep.id as \"id!: Uuid\",\n            ep.session_id as \"session_id!: Uuid\",\n            ep.run_reason as \"run_reason!: ExecutionProcessRunReason\",\n            ep.executor_action as \"executor_action!: sqlx::types::Json<ExecutorActionField>\",\n            ep.status as \"status!: ExecutionProcessStatus\",\n            ep.exit_code,\n            ep.dropped as \"dropped!: bool\",\n            ep.started_at as \"started_at!: DateTime<Utc>\",\n            ep.completed_at as \"completed_at?: DateTime<Utc>\",\n            ep.created_at as \"created_at!: DateTime<Utc>\",\n            ep.updated_at as \"updated_at!: DateTime<Utc>\"\n        FROM execution_processes ep\n        JOIN sessions s ON ep.session_id = s.id\n        WHERE s.workspace_id = ?\n          AND ep.status = 'running'\n          AND ep.run_reason = 'devserver'\n        ORDER BY ep.created_at DESC\n        ",
+-  "describe": {
+-    "columns": [
+-      {
+-        "name": "id!: Uuid",
+-        "ordinal": 0,
+-        "type_info": "Blob"
+-      },
+-      {
+-        "name": "session_id!: Uuid",
+-        "ordinal": 1,
+-        "type_info": "Blob"
+-      },
+-      {
+-        "name": "run_reason!: ExecutionProcessRunReason",
+-        "ordinal": 2,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "executor_action!: sqlx::types::Json<ExecutorActionField>",
+-        "ordinal": 3,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "status!: ExecutionProcessStatus",
+-        "ordinal": 4,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "exit_code",
+-        "ordinal": 5,
+-        "type_info": "Integer"
+-      },
+-      {
+-        "name": "dropped!: bool",
+-        "ordinal": 6,
+-        "type_info": "Integer"
+-      },
+-      {
+-        "name": "started_at!: DateTime<Utc>",
+-        "ordinal": 7,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "completed_at?: DateTime<Utc>",
+-        "ordinal": 8,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "created_at!: DateTime<Utc>",
+-        "ordinal": 9,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "updated_at!: DateTime<Utc>",
+-        "ordinal": 10,
+-        "type_info": "Text"
+-      }
+-    ],
+-    "parameters": {
+-      "Right": 1
+-    },
+-    "nullable": [
+-      true,
+-      false,
+-      false,
+-      false,
+-      false,
+-      true,
+-      false,
+-      false,
+-      true,
+-      false,
+-      false
+-    ]
+-  },
+-  "hash": "13826fc6fdd367255cb921640e5972f30905ac7a81ad477cf8bbcfc24f06f39b"
+-}
+diff --git a/crates/db/.sqlx/query-3266b6a544952177f84e2e7c31be9dba212c92d91b997de7f6aa811e08ed6c72.json b/crates/db/.sqlx/query-3266b6a544952177f84e2e7c31be9dba212c92d91b997de7f6aa811e08ed6c72.json
+deleted file mode 100644
+index 2b6fcedc..00000000
+--- a/crates/db/.sqlx/query-3266b6a544952177f84e2e7c31be9dba212c92d91b997de7f6aa811e08ed6c72.json
++++ /dev/null
+@@ -1,80 +0,0 @@
+-{
+-  "db_name": "SQLite",
+-  "query": "SELECT\n                    ep.id as \"id!: Uuid\",\n                    ep.session_id as \"session_id!: Uuid\",\n                    ep.run_reason as \"run_reason!: ExecutionProcessRunReason\",\n                    ep.executor_action as \"executor_action!: sqlx::types::Json<ExecutorActionField>\",\n                    ep.status as \"status!: ExecutionProcessStatus\",\n                    ep.exit_code,\n                    ep.dropped as \"dropped!: bool\",\n                    ep.started_at as \"started_at!: DateTime<Utc>\",\n                    ep.completed_at as \"completed_at?: DateTime<Utc>\",\n                    ep.created_at as \"created_at!: DateTime<Utc>\",\n                    ep.updated_at as \"updated_at!: DateTime<Utc>\"\n               FROM execution_processes ep\n               WHERE ep.session_id = ? AND ep.run_reason = ? AND ep.dropped = FALSE\n               ORDER BY ep.created_at DESC LIMIT 1",
+-  "describe": {
+-    "columns": [
+-      {
+-        "name": "id!: Uuid",
+-        "ordinal": 0,
+-        "type_info": "Blob"
+-      },
+-      {
+-        "name": "session_id!: Uuid",
+-        "ordinal": 1,
+-        "type_info": "Blob"
+-      },
+-      {
+-        "name": "run_reason!: ExecutionProcessRunReason",
+-        "ordinal": 2,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "executor_action!: sqlx::types::Json<ExecutorActionField>",
+-        "ordinal": 3,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "status!: ExecutionProcessStatus",
+-        "ordinal": 4,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "exit_code",
+-        "ordinal": 5,
+-        "type_info": "Integer"
+-      },
+-      {
+-        "name": "dropped!: bool",
+-        "ordinal": 6,
+-        "type_info": "Integer"
+-      },
+-      {
+-        "name": "started_at!: DateTime<Utc>",
+-        "ordinal": 7,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "completed_at?: DateTime<Utc>",
+-        "ordinal": 8,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "created_at!: DateTime<Utc>",
+-        "ordinal": 9,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "updated_at!: DateTime<Utc>",
+-        "ordinal": 10,
+-        "type_info": "Text"
+-      }
+-    ],
+-    "parameters": {
+-      "Right": 2
+-    },
+-    "nullable": [
+-      true,
+-      false,
+-      false,
+-      false,
+-      false,
+-      true,
+-      false,
+-      false,
+-      true,
+-      false,
+-      false
+-    ]
+-  },
+-  "hash": "3266b6a544952177f84e2e7c31be9dba212c92d91b997de7f6aa811e08ed6c72"
+-}
+diff --git a/crates/db/.sqlx/query-3f4b2179dcd8857fc18f1e5f6e6cf10f152eebbb141b2d3604dd4191e0c2f367.json b/crates/db/.sqlx/query-3f4b2179dcd8857fc18f1e5f6e6cf10f152eebbb141b2d3604dd4191e0c2f367.json
+deleted file mode 100644
+index 84b0f3fc..00000000
+--- a/crates/db/.sqlx/query-3f4b2179dcd8857fc18f1e5f6e6cf10f152eebbb141b2d3604dd4191e0c2f367.json
++++ /dev/null
+@@ -1,80 +0,0 @@
+-{
+-  "db_name": "SQLite",
+-  "query": "SELECT\n                    ep.id as \"id!: Uuid\",\n                    ep.session_id as \"session_id!: Uuid\",\n                    ep.run_reason as \"run_reason!: ExecutionProcessRunReason\",\n                    ep.executor_action as \"executor_action!: sqlx::types::Json<ExecutorActionField>\",\n                    ep.status as \"status!: ExecutionProcessStatus\",\n                    ep.exit_code,\n                    ep.dropped as \"dropped!: bool\",\n                    ep.started_at as \"started_at!: DateTime<Utc>\",\n                    ep.completed_at as \"completed_at?: DateTime<Utc>\",\n                    ep.created_at as \"created_at!: DateTime<Utc>\",\n                    ep.updated_at as \"updated_at!: DateTime<Utc>\"\n               FROM execution_processes ep WHERE ep.id = ?",
+-  "describe": {
+-    "columns": [
+-      {
+-        "name": "id!: Uuid",
+-        "ordinal": 0,
+-        "type_info": "Blob"
+-      },
+-      {
+-        "name": "session_id!: Uuid",
+-        "ordinal": 1,
+-        "type_info": "Blob"
+-      },
+-      {
+-        "name": "run_reason!: ExecutionProcessRunReason",
+-        "ordinal": 2,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "executor_action!: sqlx::types::Json<ExecutorActionField>",
+-        "ordinal": 3,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "status!: ExecutionProcessStatus",
+-        "ordinal": 4,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "exit_code",
+-        "ordinal": 5,
+-        "type_info": "Integer"
+-      },
+-      {
+-        "name": "dropped!: bool",
+-        "ordinal": 6,
+-        "type_info": "Integer"
+-      },
+-      {
+-        "name": "started_at!: DateTime<Utc>",
+-        "ordinal": 7,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "completed_at?: DateTime<Utc>",
+-        "ordinal": 8,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "created_at!: DateTime<Utc>",
+-        "ordinal": 9,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "updated_at!: DateTime<Utc>",
+-        "ordinal": 10,
+-        "type_info": "Text"
+-      }
+-    ],
+-    "parameters": {
+-      "Right": 1
+-    },
+-    "nullable": [
+-      true,
+-      false,
+-      false,
+-      false,
+-      false,
+-      true,
+-      false,
+-      false,
+-      true,
+-      false,
+-      false
+-    ]
+-  },
+-  "hash": "3f4b2179dcd8857fc18f1e5f6e6cf10f152eebbb141b2d3604dd4191e0c2f367"
+-}
+diff --git a/crates/db/.sqlx/query-5d9739705372b113b1bb45d441ebdf2846dc4cd83b8547128c733cd282b5b4f2.json b/crates/db/.sqlx/query-5d9739705372b113b1bb45d441ebdf2846dc4cd83b8547128c733cd282b5b4f2.json
+deleted file mode 100644
+index ca76ec2f..00000000
+--- a/crates/db/.sqlx/query-5d9739705372b113b1bb45d441ebdf2846dc4cd83b8547128c733cd282b5b4f2.json
++++ /dev/null
+@@ -1,12 +0,0 @@
+-{
+-  "db_name": "SQLite",
+-  "query": "UPDATE execution_processes\n               SET status = $1, exit_code = $2, completed_at = $3\n               WHERE id = $4",
+-  "describe": {
+-    "columns": [],
+-    "parameters": {
+-      "Right": 4
+-    },
+-    "nullable": []
+-  },
+-  "hash": "5d9739705372b113b1bb45d441ebdf2846dc4cd83b8547128c733cd282b5b4f2"
+-}
+diff --git a/crates/db/.sqlx/query-7d12bf106e68365fc1aa239b8b39065430f30ad658d0bf9801c81e3ced2127da.json b/crates/db/.sqlx/query-7d12bf106e68365fc1aa239b8b39065430f30ad658d0bf9801c81e3ced2127da.json
+deleted file mode 100644
+index 3e463112..00000000
+--- a/crates/db/.sqlx/query-7d12bf106e68365fc1aa239b8b39065430f30ad658d0bf9801c81e3ced2127da.json
++++ /dev/null
+@@ -1,80 +0,0 @@
+-{
+-  "db_name": "SQLite",
+-  "query": "SELECT\n                    ep.id as \"id!: Uuid\",\n                    ep.session_id as \"session_id!: Uuid\",\n                    ep.run_reason as \"run_reason!: ExecutionProcessRunReason\",\n                    ep.executor_action as \"executor_action!: sqlx::types::Json<ExecutorActionField>\",\n                    ep.status as \"status!: ExecutionProcessStatus\",\n                    ep.exit_code,\n                    ep.dropped as \"dropped!: bool\",\n                    ep.started_at as \"started_at!: DateTime<Utc>\",\n                    ep.completed_at as \"completed_at?: DateTime<Utc>\",\n                    ep.created_at as \"created_at!: DateTime<Utc>\",\n                    ep.updated_at as \"updated_at!: DateTime<Utc>\"\n               FROM execution_processes ep WHERE ep.rowid = ?",
+-  "describe": {
+-    "columns": [
+-      {
+-        "name": "id!: Uuid",
+-        "ordinal": 0,
+-        "type_info": "Blob"
+-      },
+-      {
+-        "name": "session_id!: Uuid",
+-        "ordinal": 1,
+-        "type_info": "Blob"
+-      },
+-      {
+-        "name": "run_reason!: ExecutionProcessRunReason",
+-        "ordinal": 2,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "executor_action!: sqlx::types::Json<ExecutorActionField>",
+-        "ordinal": 3,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "status!: ExecutionProcessStatus",
+-        "ordinal": 4,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "exit_code",
+-        "ordinal": 5,
+-        "type_info": "Integer"
+-      },
+-      {
+-        "name": "dropped!: bool",
+-        "ordinal": 6,
+-        "type_info": "Integer"
+-      },
+-      {
+-        "name": "started_at!: DateTime<Utc>",
+-        "ordinal": 7,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "completed_at?: DateTime<Utc>",
+-        "ordinal": 8,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "created_at!: DateTime<Utc>",
+-        "ordinal": 9,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "updated_at!: DateTime<Utc>",
+-        "ordinal": 10,
+-        "type_info": "Text"
+-      }
+-    ],
+-    "parameters": {
+-      "Right": 1
+-    },
+-    "nullable": [
+-      true,
+-      false,
+-      false,
+-      false,
+-      false,
+-      true,
+-      false,
+-      false,
+-      true,
+-      false,
+-      false
+-    ]
+-  },
+-  "hash": "7d12bf106e68365fc1aa239b8b39065430f30ad658d0bf9801c81e3ced2127da"
+-}
+diff --git a/crates/db/.sqlx/query-80e6cfb4e27fcaa79b7dbd37ac16aac255f46a646c75aa65111b2f58ec03f892.json b/crates/db/.sqlx/query-80e6cfb4e27fcaa79b7dbd37ac16aac255f46a646c75aa65111b2f58ec03f892.json
+deleted file mode 100644
+index 17aa5124..00000000
+--- a/crates/db/.sqlx/query-80e6cfb4e27fcaa79b7dbd37ac16aac255f46a646c75aa65111b2f58ec03f892.json
++++ /dev/null
+@@ -1,80 +0,0 @@
+-{
+-  "db_name": "SQLite",
+-  "query": "SELECT\n                    ep.id as \"id!: Uuid\",\n                    ep.session_id as \"session_id!: Uuid\",\n                    ep.run_reason as \"run_reason!: ExecutionProcessRunReason\",\n                    ep.executor_action as \"executor_action!: sqlx::types::Json<ExecutorActionField>\",\n                    ep.status as \"status!: ExecutionProcessStatus\",\n                    ep.exit_code,\n                    ep.dropped as \"dropped!: bool\",\n                    ep.started_at as \"started_at!: DateTime<Utc>\",\n                    ep.completed_at as \"completed_at?: DateTime<Utc>\",\n                    ep.created_at as \"created_at!: DateTime<Utc>\",\n                    ep.updated_at as \"updated_at!: DateTime<Utc>\"\n               FROM execution_processes ep WHERE ep.status = 'running' ORDER BY ep.created_at ASC",
+-  "describe": {
+-    "columns": [
+-      {
+-        "name": "id!: Uuid",
+-        "ordinal": 0,
+-        "type_info": "Blob"
+-      },
+-      {
+-        "name": "session_id!: Uuid",
+-        "ordinal": 1,
+-        "type_info": "Blob"
+-      },
+-      {
+-        "name": "run_reason!: ExecutionProcessRunReason",
+-        "ordinal": 2,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "executor_action!: sqlx::types::Json<ExecutorActionField>",
+-        "ordinal": 3,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "status!: ExecutionProcessStatus",
+-        "ordinal": 4,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "exit_code",
+-        "ordinal": 5,
+-        "type_info": "Integer"
+-      },
+-      {
+-        "name": "dropped!: bool",
+-        "ordinal": 6,
+-        "type_info": "Integer"
+-      },
+-      {
+-        "name": "started_at!: DateTime<Utc>",
+-        "ordinal": 7,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "completed_at?: DateTime<Utc>",
+-        "ordinal": 8,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "created_at!: DateTime<Utc>",
+-        "ordinal": 9,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "updated_at!: DateTime<Utc>",
+-        "ordinal": 10,
+-        "type_info": "Text"
+-      }
+-    ],
+-    "parameters": {
+-      "Right": 0
+-    },
+-    "nullable": [
+-      true,
+-      false,
+-      false,
+-      false,
+-      false,
+-      true,
+-      false,
+-      false,
+-      true,
+-      false,
+-      false
+-    ]
+-  },
+-  "hash": "80e6cfb4e27fcaa79b7dbd37ac16aac255f46a646c75aa65111b2f58ec03f892"
+-}
+diff --git a/crates/db/.sqlx/query-d7a11078522c029b71a75f4a45abc941536d3ce08d8ee0fcbde3eacf6360b7d5.json b/crates/db/.sqlx/query-d7a11078522c029b71a75f4a45abc941536d3ce08d8ee0fcbde3eacf6360b7d5.json
+deleted file mode 100644
+index 1949dce9..00000000
+--- a/crates/db/.sqlx/query-d7a11078522c029b71a75f4a45abc941536d3ce08d8ee0fcbde3eacf6360b7d5.json
++++ /dev/null
+@@ -1,80 +0,0 @@
+-{
+-  "db_name": "SQLite",
+-  "query": "SELECT\n                      ep.id              as \"id!: Uuid\",\n                      ep.session_id      as \"session_id!: Uuid\",\n                      ep.run_reason      as \"run_reason!: ExecutionProcessRunReason\",\n                      ep.executor_action as \"executor_action!: sqlx::types::Json<ExecutorActionField>\",\n                      ep.status          as \"status!: ExecutionProcessStatus\",\n                      ep.exit_code,\n                      ep.dropped as \"dropped!: bool\",\n                      ep.started_at      as \"started_at!: DateTime<Utc>\",\n                      ep.completed_at    as \"completed_at?: DateTime<Utc>\",\n                      ep.created_at      as \"created_at!: DateTime<Utc>\",\n                      ep.updated_at      as \"updated_at!: DateTime<Utc>\"\n               FROM execution_processes ep\n               WHERE ep.session_id = ?\n                 AND (? OR ep.dropped = FALSE)\n               ORDER BY ep.created_at ASC",
+-  "describe": {
+-    "columns": [
+-      {
+-        "name": "id!: Uuid",
+-        "ordinal": 0,
+-        "type_info": "Blob"
+-      },
+-      {
+-        "name": "session_id!: Uuid",
+-        "ordinal": 1,
+-        "type_info": "Blob"
+-      },
+-      {
+-        "name": "run_reason!: ExecutionProcessRunReason",
+-        "ordinal": 2,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "executor_action!: sqlx::types::Json<ExecutorActionField>",
+-        "ordinal": 3,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "status!: ExecutionProcessStatus",
+-        "ordinal": 4,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "exit_code",
+-        "ordinal": 5,
+-        "type_info": "Integer"
+-      },
+-      {
+-        "name": "dropped!: bool",
+-        "ordinal": 6,
+-        "type_info": "Integer"
+-      },
+-      {
+-        "name": "started_at!: DateTime<Utc>",
+-        "ordinal": 7,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "completed_at?: DateTime<Utc>",
+-        "ordinal": 8,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "created_at!: DateTime<Utc>",
+-        "ordinal": 9,
+-        "type_info": "Text"
+-      },
+-      {
+-        "name": "updated_at!: DateTime<Utc>",
+-        "ordinal": 10,
+-        "type_info": "Text"
+-      }
+-    ],
+-    "parameters": {
+-      "Right": 2
+-    },
+-    "nullable": [
+-      true,
+-      false,
+-      false,
+-      false,
+-      false,
+-      true,
+-      false,
+-      false,
+-      true,
+-      false,
+-      false
+-    ]
+-  },
+-  "hash": "d7a11078522c029b71a75f4a45abc941536d3ce08d8ee0fcbde3eacf6360b7d5"
+-}
+diff --git a/crates/db/src/models/execution_process.rs b/crates/db/src/models/execution_process.rs
+index 1d890e2b..1f03be03 100644
+--- a/crates/db/src/models/execution_process.rs
++++ b/crates/db/src/models/execution_process.rs
+@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
+ use chrono::{DateTime, Utc};
+ use executors::{
+     actions::{ExecutorAction, ExecutorActionType},
++    outcome::{BindingScope, ExecutionOutcomeClass, NormalizedOutcome},
+     profile::{ExecutorConfig, ExecutorProfileId},
+ };
+ use serde::{Deserialize, Serialize};
+@@ -39,8 +40,8 @@ pub enum ExecutionProcessError {
+ #[cfg(test)]
+ mod tests {
+     use executors::actions::{
+-        script::{ScriptContext, ScriptRequest, ScriptRequestLanguage},
+         ExecutorAction, ExecutorActionType,
++        script::{ScriptContext, ScriptRequest, ScriptRequestLanguage},
+     };
+ 
+     use super::ExecutorActionField;
+@@ -104,6 +105,12 @@ pub struct ExecutionProcess {
+     pub dropped: bool,
+     pub started_at: DateTime<Utc>,
+     pub completed_at: Option<DateTime<Utc>>,
++    pub outcome_class: Option<ExecutionOutcomeClass>,
++    pub provider_code: Option<String>,
++    pub retry_after_seconds: Option<i64>,
++    pub resets_at: Option<DateTime<Utc>>,
++    pub binding_scope: Option<BindingScope>,
++    pub safe_message: Option<String>,
+     pub created_at: DateTime<Utc>,
+     pub updated_at: DateTime<Utc>,
+ }
+@@ -152,6 +159,16 @@ pub struct MissingBeforeContext {
+ }
+ 
+ impl ExecutionProcess {
++    pub fn normalized_outcome(&self) -> Option<NormalizedOutcome> {
++        self.outcome_class.clone().map(|class| NormalizedOutcome {
++            class,
++            provider_code: self.provider_code.clone(),
++            retry_after_seconds: self.retry_after_seconds,
++            resets_at: self.resets_at,
++            binding_scope: self.binding_scope.clone(),
++            safe_message: self.safe_message.clone(),
++        })
++    }
+     /// Find execution process by ID
+     pub async fn find_by_id(pool: &SqlitePool, id: Uuid) -> Result<Option<Self>, sqlx::Error> {
+         sqlx::query_as!(
+@@ -166,6 +183,12 @@ impl ExecutionProcess {
+                     ep.dropped as "dropped!: bool",
+                     ep.started_at as "started_at!: DateTime<Utc>",
+                     ep.completed_at as "completed_at?: DateTime<Utc>",
++                    ep.outcome_class as "outcome_class?: ExecutionOutcomeClass",
++                    ep.provider_code,
++                    ep.retry_after_seconds,
++                    ep.resets_at as "resets_at?: DateTime<Utc>",
++                    ep.binding_scope as "binding_scope?: BindingScope",
++                    ep.safe_message,
+                     ep.created_at as "created_at!: DateTime<Utc>",
+                     ep.updated_at as "updated_at!: DateTime<Utc>"
+                FROM execution_processes ep WHERE ep.id = ?"#,
+@@ -240,6 +263,10 @@ impl ExecutionProcess {
+                     ep.dropped as "dropped!: bool",
+                     ep.started_at as "started_at!: DateTime<Utc>",
+                     ep.completed_at as "completed_at?: DateTime<Utc>",
++                    ep.outcome_class as "outcome_class?: ExecutionOutcomeClass",
++                    ep.provider_code, ep.retry_after_seconds,
++                    ep.resets_at as "resets_at?: DateTime<Utc>",
++                    ep.binding_scope as "binding_scope?: BindingScope", ep.safe_message,
+                     ep.created_at as "created_at!: DateTime<Utc>",
+                     ep.updated_at as "updated_at!: DateTime<Utc>"
+                FROM execution_processes ep WHERE ep.rowid = ?"#,
+@@ -267,6 +294,10 @@ impl ExecutionProcess {
+                       ep.dropped as "dropped!: bool",
+                       ep.started_at      as "started_at!: DateTime<Utc>",
+                       ep.completed_at    as "completed_at?: DateTime<Utc>",
++                      ep.outcome_class as "outcome_class?: ExecutionOutcomeClass",
++                      ep.provider_code, ep.retry_after_seconds,
++                      ep.resets_at as "resets_at?: DateTime<Utc>",
++                      ep.binding_scope as "binding_scope?: BindingScope", ep.safe_message,
+                       ep.created_at      as "created_at!: DateTime<Utc>",
+                       ep.updated_at      as "updated_at!: DateTime<Utc>"
+                FROM execution_processes ep
+@@ -294,6 +325,10 @@ impl ExecutionProcess {
+                     ep.dropped as "dropped!: bool",
+                     ep.started_at as "started_at!: DateTime<Utc>",
+                     ep.completed_at as "completed_at?: DateTime<Utc>",
++                    ep.outcome_class as "outcome_class?: ExecutionOutcomeClass",
++                    ep.provider_code, ep.retry_after_seconds,
++                    ep.resets_at as "resets_at?: DateTime<Utc>",
++                    ep.binding_scope as "binding_scope?: BindingScope", ep.safe_message,
+                     ep.created_at as "created_at!: DateTime<Utc>",
+                     ep.updated_at as "updated_at!: DateTime<Utc>"
+                FROM execution_processes ep WHERE ep.status = 'running' ORDER BY ep.created_at ASC"#,
+@@ -366,6 +401,10 @@ impl ExecutionProcess {
+             ep.dropped as "dropped!: bool",
+             ep.started_at as "started_at!: DateTime<Utc>",
+             ep.completed_at as "completed_at?: DateTime<Utc>",
++            ep.outcome_class as "outcome_class?: ExecutionOutcomeClass",
++            ep.provider_code, ep.retry_after_seconds,
++            ep.resets_at as "resets_at?: DateTime<Utc>",
++            ep.binding_scope as "binding_scope?: BindingScope", ep.safe_message,
+             ep.created_at as "created_at!: DateTime<Utc>",
+             ep.updated_at as "updated_at!: DateTime<Utc>"
+         FROM execution_processes ep
+@@ -400,6 +439,10 @@ impl ExecutionProcess {
+                     ep.dropped as "dropped!: bool",
+                     ep.started_at as "started_at!: DateTime<Utc>",
+                     ep.completed_at as "completed_at?: DateTime<Utc>",
++                    ep.outcome_class as "outcome_class?: ExecutionOutcomeClass",
++                    ep.provider_code, ep.retry_after_seconds,
++                    ep.resets_at as "resets_at?: DateTime<Utc>",
++                    ep.binding_scope as "binding_scope?: BindingScope", ep.safe_message,
+                     ep.created_at as "created_at!: DateTime<Utc>",
+                     ep.updated_at as "updated_at!: DateTime<Utc>"
+                FROM execution_processes ep
+@@ -474,19 +517,47 @@ impl ExecutionProcess {
+         status: ExecutionProcessStatus,
+         exit_code: Option<i64>,
+     ) -> Result<(), sqlx::Error> {
+-        let completed_at = if matches!(status, ExecutionProcessStatus::Running) {
+-            None
+-        } else {
+-            Some(Utc::now())
+-        };
++        let outcome = matches!(status, ExecutionProcessStatus::Killed)
++            .then(|| NormalizedOutcome::new(ExecutionOutcomeClass::UserStopped));
++        Self::update_completion_with_outcome(pool, id, status, exit_code, outcome).await
++    }
++
++    pub async fn update_completion_with_outcome(
++        pool: &SqlitePool,
++        id: Uuid,
++        status: ExecutionProcessStatus,
++        exit_code: Option<i64>,
++        outcome: Option<NormalizedOutcome>,
++    ) -> Result<(), sqlx::Error> {
++        let completed_at = (!matches!(status, ExecutionProcessStatus::Running)).then(Utc::now);
++        let outcome_class = outcome.as_ref().map(|outcome| outcome.class.clone());
++        let provider_code = outcome
++            .as_ref()
++            .and_then(|outcome| outcome.provider_code.clone());
++        let retry_after_seconds = outcome
++            .as_ref()
++            .and_then(|outcome| outcome.retry_after_seconds);
++        let resets_at = outcome.as_ref().and_then(|outcome| outcome.resets_at);
++        let binding_scope = outcome
++            .as_ref()
++            .and_then(|outcome| outcome.binding_scope.clone());
++        let safe_message = outcome.and_then(|outcome| outcome.safe_message);
+ 
+         sqlx::query!(
+             r#"UPDATE execution_processes
+-               SET status = $1, exit_code = $2, completed_at = $3
+-               WHERE id = $4"#,
++               SET status = $1, exit_code = $2, completed_at = $3,
++                   outcome_class = $4, provider_code = $5, retry_after_seconds = $6,
++                   resets_at = $7, binding_scope = $8, safe_message = $9
++               WHERE id = $10"#,
+             status,
+             exit_code,
+             completed_at,
++            outcome_class,
++            provider_code,
++            retry_after_seconds,
++            resets_at,
++            binding_scope,
++            safe_message,
+             id
+         )
+         .execute(pool)
+@@ -612,6 +683,10 @@ impl ExecutionProcess {
+                     ep.dropped as "dropped!: bool",
+                     ep.started_at as "started_at!: DateTime<Utc>",
+                     ep.completed_at as "completed_at?: DateTime<Utc>",
++                    ep.outcome_class as "outcome_class?: ExecutionOutcomeClass",
++                    ep.provider_code, ep.retry_after_seconds,
++                    ep.resets_at as "resets_at?: DateTime<Utc>",
++                    ep.binding_scope as "binding_scope?: BindingScope", ep.safe_message,
+                     ep.created_at as "created_at!: DateTime<Utc>",
+                     ep.updated_at as "updated_at!: DateTime<Utc>"
+                FROM execution_processes ep
+@@ -667,6 +742,10 @@ impl ExecutionProcess {
+                     ep.dropped as "dropped!: bool",
+                     ep.started_at as "started_at!: DateTime<Utc>",
+                     ep.completed_at as "completed_at?: DateTime<Utc>",
++                    ep.outcome_class as "outcome_class?: ExecutionOutcomeClass",
++                    ep.provider_code, ep.retry_after_seconds,
++                    ep.resets_at as "resets_at?: DateTime<Utc>",
++                    ep.binding_scope as "binding_scope?: BindingScope", ep.safe_message,
+                     ep.created_at as "created_at!: DateTime<Utc>",
+                     ep.updated_at as "updated_at!: DateTime<Utc>"
+                FROM execution_processes ep
+diff --git a/crates/db/src/models/provider.rs b/crates/db/src/models/provider.rs
+index 9a13c4ab..0d73e3e0 100644
+--- a/crates/db/src/models/provider.rs
++++ b/crates/db/src/models/provider.rs
+@@ -363,13 +363,7 @@ impl Provider {
+         if matches!(kind, AiProviderKind::Default) {
+             return Ok(());
+         }
+-        let is_on = |k: &str| {
+-            payloads
+-                .per_agent_enabled
+-                .get(k)
+-                .copied()
+-                .unwrap_or(false)
+-        };
++        let is_on = |k: &str| payloads.per_agent_enabled.get(k).copied().unwrap_or(false);
+         let has = |s: &Option<String>| s.as_deref().is_some_and(|v| !v.is_empty());
+         let missing = |agent: &str, ok: bool| {
+             if ok {
+@@ -666,9 +660,7 @@ impl Provider {
+     /// `record.codex.env` is overlaid first so the `CDT_API_KEY` we set
+     /// last cannot be silently clobbered by a vendor-quirk env entry.
+     /// Returns `Ok(None)` for the Default provider (ambient auth path).
+-    pub fn build_codex_injection(
+-        &self,
+-    ) -> Result<Option<CodexInjection>, ProviderError> {
++    pub fn build_codex_injection(&self) -> Result<Option<CodexInjection>, ProviderError> {
+         if self.kind == AiProviderKind::Default {
+             return Ok(None);
+         }
+diff --git a/crates/db/src/models/session_command.rs b/crates/db/src/models/session_command.rs
+index 7cd97f0b..8e137ec2 100644
+--- a/crates/db/src/models/session_command.rs
++++ b/crates/db/src/models/session_command.rs
+@@ -32,6 +32,10 @@ pub struct SessionCommandConfig {
+     #[serde(default)]
+     #[ts(optional)]
+     pub selected_provider_id: Option<Uuid>,
++    /// Opaque auth-binding reference, deliberately separate from any secret.
++    #[serde(default)]
++    #[ts(optional)]
++    pub auth_binding_id: Option<String>,
+ }
+ 
+ #[derive(Debug, Clone, FromRow, Serialize, Deserialize, TS)]
+@@ -45,6 +49,17 @@ pub struct SessionCommand {
+     pub config: Json<SessionCommandConfig>,
+     pub state: SessionCommandState,
+     pub execution_process_id: Option<Uuid>,
++    pub attempt: i64,
++    pub route_id: Option<String>,
++    #[serde(skip_serializing)]
++    #[ts(skip)]
++    pub auth_binding_id: Option<String>,
++    pub account_alias: Option<String>,
++    pub executor: Option<String>,
++    pub model: Option<String>,
++    pub billing_class: Option<String>,
++    pub policy_digest: Option<String>,
++    pub predecessor_execution_process_id: Option<Uuid>,
+     pub created_at: DateTime<Utc>,
+     pub finished_at: Option<DateTime<Utc>>,
+ }
+@@ -212,7 +227,9 @@ impl SessionCommand {
+     ) -> Result<u64, sqlx::Error> {
+         let result = sqlx::query(
+             "UPDATE session_commands SET state = 'pending', execution_process_id = NULL, \
+-             finished_at = NULL WHERE execution_process_id = ? AND state IN ('claimed', 'failed')",
++             finished_at = NULL, attempt = attempt + 1, \
++             predecessor_execution_process_id = execution_process_id \
++             WHERE execution_process_id = ? AND state IN ('claimed', 'failed')",
+         )
+         .bind(execution_process_id)
+         .execute(pool)
+@@ -229,7 +246,8 @@ impl SessionCommand {
+     ) -> Result<u64, sqlx::Error> {
+         let result = sqlx::query(
+             "UPDATE session_commands SET state = 'pending', execution_process_id = NULL, \
+-             finished_at = NULL WHERE execution_process_id = ? \
++             finished_at = NULL, attempt = attempt + 1, \
++             predecessor_execution_process_id = execution_process_id WHERE execution_process_id = ? \
+              AND state IN ('claimed', 'failed', 'done')",
+         )
+         .bind(execution_process_id)
+@@ -282,6 +300,22 @@ impl SessionCommand {
+         Ok(())
+     }
+ 
++    /// An attempt is authoritative only while it remains the command's active
++    /// claimant. This makes stale predecessors harmless after a retry claim.
++    pub async fn is_stale_attempt(
++        pool: &SqlitePool,
++        execution_process_id: Uuid,
++    ) -> Result<bool, sqlx::Error> {
++        let active: i64 = sqlx::query_scalar(
++            "SELECT EXISTS(SELECT 1 FROM session_commands \
++             WHERE execution_process_id = ? AND state = 'claimed')",
++        )
++        .bind(execution_process_id)
++        .fetch_one(pool)
++        .await?;
++        Ok(active == 0)
++    }
++
+     pub async fn cancel_pending(pool: &SqlitePool, session_id: Uuid) -> Result<(), sqlx::Error> {
+         sqlx::query(
+             "UPDATE session_commands SET state = 'cancelled', finished_at = datetime('now', 'subsec') \
+@@ -332,6 +366,15 @@ mod tests {
+                 config TEXT,
+                 state TEXT NOT NULL DEFAULT 'pending',
+                 execution_process_id BLOB,
++                attempt INTEGER NOT NULL DEFAULT 1,
++                route_id TEXT,
++                auth_binding_id TEXT,
++                account_alias TEXT,
++                executor TEXT,
++                model TEXT,
++                billing_class TEXT,
++                policy_digest TEXT,
++                predecessor_execution_process_id BLOB,
+                 created_at TEXT NOT NULL DEFAULT (datetime('now', 'subsec')),
+                 finished_at TEXT
+             )"#,
+@@ -360,6 +403,7 @@ mod tests {
+                     executors::executors::BaseCodingAgent::ClaudeCode,
+                 ),
+                 selected_provider_id: None,
++                auth_binding_id: None,
+             },
+         }
+     }
+diff --git a/crates/executors/src/actions/mod.rs b/crates/executors/src/actions/mod.rs
+index d20a5d28..7dba0e57 100644
+--- a/crates/executors/src/actions/mod.rs
++++ b/crates/executors/src/actions/mod.rs
+@@ -48,6 +48,10 @@ pub struct ExecutorAction {
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     #[ts(skip)]
+     pub provider_codex: Option<CodexProviderInjection>,
++    /// Opaque binding identifier carried to the spawned executor, never a secret.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    #[ts(skip)]
++    pub auth_binding_id: Option<String>,
+     /// Provider ID selected for this message; persisted to coding_agent_turns
+     /// for recents query and transcript markers (§4/§6).
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+@@ -66,6 +70,7 @@ impl ExecutorAction {
+             next_action,
+             provider_env: None,
+             provider_codex: None,
++            auth_binding_id: None,
+             selected_provider_id: None,
+             selected_model_id: None,
+         }
+@@ -81,6 +86,11 @@ impl ExecutorAction {
+         self
+     }
+ 
++    pub fn with_auth_binding_id(mut self, auth_binding_id: Option<String>) -> Self {
++        self.auth_binding_id = auth_binding_id;
++        self
++    }
++
+     pub fn with_provider_selection(
+         mut self,
+         provider_id: Option<String>,
+diff --git a/crates/executors/src/env.rs b/crates/executors/src/env.rs
+index 7efcf924..f884131c 100644
+--- a/crates/executors/src/env.rs
++++ b/crates/executors/src/env.rs
+@@ -125,6 +125,8 @@ pub struct ExecutionEnv {
+     /// Codex-specific spawn injection (config overrides + model_provider id).
+     /// Populated only when the active session's provider record routes Codex.
+     pub provider_codex: Option<CodexProviderInjection>,
++    /// Opaque reference to the selected auth binding; never a secret value.
++    pub auth_binding_id: Option<String>,
+ }
+ 
+ impl ExecutionEnv {
+@@ -140,6 +142,7 @@ impl ExecutionEnv {
+             commit_reminder_prompt,
+             provider_vars: HashMap::new(),
+             provider_codex: None,
++            auth_binding_id: None,
+         }
+     }
+ 
+diff --git a/crates/executors/src/lib.rs b/crates/executors/src/lib.rs
+index 33a80456..6cea76e2 100644
+--- a/crates/executors/src/lib.rs
++++ b/crates/executors/src/lib.rs
+@@ -7,5 +7,6 @@ pub mod executors;
+ pub mod logs;
+ pub mod mcp_config;
+ pub mod model_selector;
++pub mod outcome;
+ pub mod profile;
+ pub mod stdout_dup;
+diff --git a/crates/local-deployment/src/container.rs b/crates/local-deployment/src/container.rs
+index 3b67ef7e..ea334b11 100644
+--- a/crates/local-deployment/src/container.rs
++++ b/crates/local-deployment/src/container.rs
+@@ -1282,6 +1282,7 @@ impl ContainerService for LocalContainerService {
+             );
+             env.provider_codex = Some(provider_codex.clone());
+         }
++        env.auth_binding_id = executor_action.auth_binding_id.clone();
+ 
+         // Create the child and stream, add to execution tracker with timeout
+         let mut spawned = tokio::time::timeout(
+diff --git a/crates/server/src/routes/routines.rs b/crates/server/src/routes/routines.rs
+index 9e176472..24f1330c 100644
+--- a/crates/server/src/routes/routines.rs
++++ b/crates/server/src/routes/routines.rs
+@@ -354,8 +354,7 @@ pub(crate) async fn spawn_routine_run(
+         .map(Uuid::parse_str)
+         .transpose()
+         .map_err(|_| ApiError::BadRequest("Routine has invalid provider id".into()))?;
+-    let injection =
+-        build_injection_for_provider(pool, provider_uuid, &mut executor_config).await?;
++    let injection = build_injection_for_provider(pool, provider_uuid, &mut executor_config).await?;
+     let selected_model_id = executor_config.model_id.clone().or(selected_model_id);
+ 
+     let workspace =
+diff --git a/crates/server/src/routes/sessions/mod.rs b/crates/server/src/routes/sessions/mod.rs
+index 16f88ee7..17d983a0 100644
+--- a/crates/server/src/routes/sessions/mod.rs
++++ b/crates/server/src/routes/sessions/mod.rs
+@@ -332,6 +332,7 @@ pub async fn follow_up(
+             config: SessionCommandConfig {
+                 executor_config,
+                 selected_provider_id: payload.selected_provider_id,
++                auth_binding_id: None,
+             },
+         },
+     )
+diff --git a/crates/server/src/routes/sessions/queue.rs b/crates/server/src/routes/sessions/queue.rs
+index 983c31dd..a1492af9 100644
+--- a/crates/server/src/routes/sessions/queue.rs
++++ b/crates/server/src/routes/sessions/queue.rs
+@@ -46,6 +46,7 @@ async fn queue_message(
+             config: SessionCommandConfig {
+                 executor_config: data.executor_config,
+                 selected_provider_id: None,
++                auth_binding_id: None,
+             },
+         },
+     )
+diff --git a/crates/services/src/services/container.rs b/crates/services/src/services/container.rs
+index 2d86a786..f9b6a8de 100644
+--- a/crates/services/src/services/container.rs
++++ b/crates/services/src/services/container.rs
+@@ -355,7 +355,11 @@ pub trait ContainerService {
+                 );
+                 continue;
+             }
+-            SessionCommand::release_execution(&self.db().pool, process.id).await?;
++            if SessionCommand::is_stale_attempt(&self.db().pool, process.id).await? {
++                tracing::info!(process_id = %process.id, "orphaned process is a stale attempt; not releasing a newer claim");
++            } else {
++                SessionCommand::release_execution(&self.db().pool, process.id).await?;
++            }
+             // Capture after-head commit OID per repository
+             if let Ok(ctx) = ExecutionProcess::load_context(&self.db().pool, process.id).await {
+                 for repo in &ctx.repos {
+@@ -414,6 +418,7 @@ pub trait ContainerService {
+         let SessionCommandConfig {
+             mut executor_config,
+             selected_provider_id,
++            auth_binding_id,
+         } = first.config.0.clone();
+         let prompt = commands
+             .iter()
+@@ -508,6 +513,7 @@ pub trait ContainerService {
+                 selected_provider_id.map(|id| id.to_string()),
+                 executor_config.model_id.clone(),
+             );
++            action = action.with_auth_binding_id(auth_binding_id);
+             self.start_execution_with_id(
+                 &workspace,
+                 &session,
+@@ -1483,6 +1489,7 @@ pub trait ContainerService {
+                             .selected_provider_id
+                             .as_deref()
+                             .and_then(|id| id.parse().ok()),
++                        auth_binding_id: None,
+                     },
+                 )
+                 .await

@@ -1,0 +1,6 @@
+?? .context/lane-a-contract-successor-prompt.md
+?? .context/lane-a1-recovery-handoff.md
+?? .context/lane-c2-routing-corrections-prompt.md
+?? .context/lane-e-dashboard-shell-prompt.md
+?? .context/lane-f-adversarial-review-prompt.md
+?? .context/lane-h-docs-prompt.md

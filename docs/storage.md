@@ -20,6 +20,8 @@ SightMesh keeps orchestration data local and separates durable source state from
 
 Archive is the ordinary retirement action. It stops execution, disables message routing, releases the ownership lease, and preserves the cdesktop workspace record and session history. SightMesh refuses to archive a dirty cdesktop-managed worktree because cdesktop may reclaim that directory after about one hour. A worktree cdesktop has already reclaimed holds no uncommitted work, so it never counts as dirty. A direct workspace may preserve reconciled dirty state only with `--preserve-dirty`; cdesktop never owns or removes its repository.
 
+Archive and reclamation are separate transitions. cdesktop is the sole owner of physical managed-worktree removal and retries a failed cleanup without marking it reclaimed. A completed session does not archive its workspace: an active terminal workspace remains available under cdesktop's 72-hour inactivity window, and workspace access can restart that window.
+
 Restore reactivates the same cdesktop record, reacquires its ownership lease, and re-enables routing. If cdesktop already reclaimed a clean managed worktree, it recreates the worktree from the preserved Git branch when execution resumes.
 
 Delete is deliberately separate from archive. It requires an archived workspace plus `--confirm-delete`, removes the cdesktop record, session history, process logs, and any cdesktop-owned worktree, and preserves the Git branch. Branch removal is a later explicit Git operation after reconciliation. Direct repositories are never deleted by this command.

@@ -28,6 +28,21 @@ def test_register_repo_reuses_exact_path() -> None:
     assert client.calls == []
 
 
+def test_closeout_report_is_redacted_to_classified_paths() -> None:
+    class Client(FakeClient):
+        def request(self, method, path, payload=None, query=None, headers=None):
+            assert (method, path) == ("GET", "/workspaces/workspace-a/closeout")
+            return {"agent_changes": ["repo/file.py"], "managed_inputs_modified": ["repo/.env"]}
+
+    report = Client().closeout_report("workspace-a")
+    assert report == {
+        "agent_changes": ["repo/file.py"],
+        "managed_inputs_removed": [],
+        "managed_inputs_modified": ["repo/.env"],
+        "missing": [],
+    }
+
+
 def test_success_false_is_a_typed_server_rejection(monkeypatch) -> None:
     class Response:
         status = 200

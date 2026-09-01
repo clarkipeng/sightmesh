@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "executionRouting": {
+    "enabled": true,
+    "routes": [
+      {
+        "id": "codex-subscriptions",
+        "executor": "CODEX",
+        "model": "gpt-5.6-luna",
+        "billingClass": "subscription",
+        "accountPool": "codex"
+      },
+      {
+        "id": "claude-subscriptions",
+        "executor": "CLAUDE_CODE",
+        "model": "opus",
+        "billingClass": "subscription",
+        "accountPool": "claude"
+      },
+      {
+        "id": "codex-metered-api",
+        "executor": "CODEX",
+        "model": "gpt-5.6-luna",
+        "billingClass": "metered",
+        "account": "codex-api-primary"
+      }
+    ],
+    "meteredFallback": "ask",
+    "sameRouteRetries": 2,
+    "transientBackoffSeconds": [
+      5,
+      20
+    ],
+    "approvalTimeoutMinutes": 0,
+    "allRoutesExhausted": "block",
+    "notifyOnSwap": true,
+    "exposeAccountAlias": true
+  }
+}

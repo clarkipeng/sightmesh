@@ -1,0 +1,30 @@
+ D crates/db/.sqlx/query-0c7b20643f119afd3e233105b0fa2920e8e940bdad86cdc95d01e485a20d6ed4.json
+ D crates/db/.sqlx/query-13826fc6fdd367255cb921640e5972f30905ac7a81ad477cf8bbcfc24f06f39b.json
+ D crates/db/.sqlx/query-3266b6a544952177f84e2e7c31be9dba212c92d91b997de7f6aa811e08ed6c72.json
+ D crates/db/.sqlx/query-3f4b2179dcd8857fc18f1e5f6e6cf10f152eebbb141b2d3604dd4191e0c2f367.json
+ D crates/db/.sqlx/query-5d9739705372b113b1bb45d441ebdf2846dc4cd83b8547128c733cd282b5b4f2.json
+ D crates/db/.sqlx/query-7d12bf106e68365fc1aa239b8b39065430f30ad658d0bf9801c81e3ced2127da.json
+ D crates/db/.sqlx/query-80e6cfb4e27fcaa79b7dbd37ac16aac255f46a646c75aa65111b2f58ec03f892.json
+ D crates/db/.sqlx/query-d7a11078522c029b71a75f4a45abc941536d3ce08d8ee0fcbde3eacf6360b7d5.json
+ M crates/db/src/models/execution_process.rs
+ M crates/db/src/models/provider.rs
+ M crates/db/src/models/session_command.rs
+ M crates/executors/src/actions/mod.rs
+ M crates/executors/src/env.rs
+ M crates/executors/src/lib.rs
+ M crates/local-deployment/src/container.rs
+ M crates/server/src/routes/routines.rs
+ M crates/server/src/routes/sessions/mod.rs
+ M crates/server/src/routes/sessions/queue.rs
+ M crates/services/src/services/container.rs
+?? crates/db/.sqlx/query-3f679712f3cb97b9993bb16d6a7bf54ee76a469d37d66031675ed4a95abc4cd4.json
+?? crates/db/.sqlx/query-4c2dd347c38a7fe83a58923cd4c9908e6d0828bb2f8b0b509a21def9684a0e3f.json
+?? crates/db/.sqlx/query-621b3f92fd484b9f160aa449a34b54b7a8749c7e89580d9620ac9611608a458f.json
+?? crates/db/.sqlx/query-a431e3cc0fcbb5e05f4bd2c8ed96526f1671b3da3fb7e1a7f9c13c8d725fe401.json
+?? crates/db/.sqlx/query-dc593c733dde192289909cdbb9eba70616435b079e60614646eeea43663a84b5.json
+?? crates/db/.sqlx/query-df5add3c2012ac32d1802324cb8b1ab2834f06a122aaf22ac81b42731d1d26ff.json
+?? crates/db/.sqlx/query-eb222e119136911774425dc2a41b732041cb457b328a783c38872a63b65f2e8c.json
+?? crates/db/.sqlx/query-f747b836ffd0e45ed3c83e6794a5644611c514c417ec9a60b3dfa1ad98348595.json
+?? crates/db/migrations/20260818120000_add_execution_outcome_to_execution_processes.sql
+?? crates/db/migrations/20260818120100_add_attempt_metadata_to_session_commands.sql
+?? crates/executors/src/outcome.rs

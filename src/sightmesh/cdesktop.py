@@ -146,18 +146,22 @@ class CdesktopClient:
         display_name: str | None = None,
         *,
         setup_script: str | None = None,
+        managed_inputs: list[str] | None = None,
         configure_setup: bool = False,
     ) -> dict[str, Any]:
         resolved = path.expanduser().resolve()
         for repo in self.repos():
             if Path(repo["path"]).expanduser().resolve() == resolved:
-                if configure_setup:
+                if configure_setup or managed_inputs is not None:
                     return self.request(
                         "PUT",
                         f"/repos/{repo['id']}",
                         {
                             "setup_script": setup_script,
                             "parallel_setup_script": False,
+                            # cdesktop's persisted field is retained for API compatibility;
+                            # its materialiser records these as managed inputs.
+                            "copy_files": ",".join(managed_inputs or []),
                         },
                     )
                 return repo
@@ -172,6 +176,8 @@ class CdesktopClient:
                     "parallel_setup_script": False,
                 }
             )
+        if managed_inputs is not None:
+            payload["copy_files"] = ",".join(managed_inputs)
         return self.request(
             "POST",
             "/repos",
@@ -424,6 +430,23 @@ class CdesktopClient:
     def workspace_repos(self, workspace_id: str) -> list[dict[str, Any]]:
         return self.request("GET", f"/workspaces/{workspace_id}/repos")
 
+    def closeout_report(self, workspace_id: str) -> dict[str, list[str]]:
+        """Return cdesktop's redacted classification for managed-worktree closeout."""
+        result = self.request("GET", f"/workspaces/{workspace_id}/closeout")
+        if not isinstance(result, dict):
+            raise CdesktopError("cdesktop closeout response is invalid")
+        keys = (
+            "agent_changes",
+            "managed_inputs_removed",
+            "managed_inputs_modified",
+            "missing",
+        )
+        return {
+            key: [str(path) for path in result.get(key, [])]
+            for key in keys
+            if isinstance(result.get(key, []), list)
+        }
+
     def _git_repository_paths(self, workspace_id: str) -> list[Path]:
         """The on-disk path cdesktop uses for each Git repository, existing or not.
 
@@ -492,11 +515,13 @@ class CdesktopClient:
         reasoning: str | None,
         provider_id: str | None,
         setup_script: str | None = None,
+        managed_inputs: list[str] | None = None,
         auth_binding_id: str | None = None,
     ) -> dict[str, Any]:
         repo = self.register_repo(
             repo_path,
             setup_script=setup_script,
+            managed_inputs=managed_inputs,
             configure_setup=use_worktree and setup_script is not None,
         )
         executor_config: dict[str, Any] = {

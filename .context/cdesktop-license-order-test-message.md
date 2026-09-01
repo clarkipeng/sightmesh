@@ -1,0 +1,1 @@
+Queued contract-test correction before final checkpoint: the new license ordering assertion can pass when the copy command is absent because `indexOf(...)` returns `-1`, and `-1 < npmPackIndex` is true. Assert both markers are present before asserting copy index is less than pack index. Keep the current scope and focused checks.

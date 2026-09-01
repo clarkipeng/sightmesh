@@ -1,0 +1,82 @@
+diff --git a/README.md b/README.md
+index 3989746..62dcdb0 100644
+--- a/README.md
++++ b/README.md
+@@ -6,7 +6,7 @@ Delegated work remains visible and interruptible in cdesktop. SightMesh does not
+ 
+ The interface is deliberately native-first. `.context` remains a normal workspace-local, Git-ignored directory. cdesktop remains the source of truth for sessions and transcripts, Git remains the source of truth for worktrees and changes, and Repowire remains the cross-workspace contact layer. SightMesh does not build a global context mirror or copy every conversation into another agent-specific format.
+ 
+-See [compatibility](docs/compatibility.md), [operations](docs/operations.md), the [trace-efficiency audit](docs/trace-efficiency.md), and the [source-derived competitive bake-off](docs/competitive-bakeoff.md) for tested versions, limitations, and alternatives.
++See [execution routing](docs/execution-routing.md), [compatibility](docs/compatibility.md), [operations](docs/operations.md), [security](docs/security.md), the [trace-efficiency audit](docs/trace-efficiency.md), and the [source-derived competitive bake-off](docs/competitive-bakeoff.md) for tested versions, limitations, and alternatives.
+ 
+ The replacement v0.9 contract is defined in [architecture](docs/architecture.md).
+ 
+@@ -219,6 +219,8 @@ Use `--new-worktree` only for a clean committed handoff that needs a separate wo
+ 
+ Every account in a pool is one the operator owns and logged into through the provider's own interface, and each worker runs on that account's own normal credentials. SightMesh observes quota and selects the next owned account. It does not print, extract, or replay credentials; copy cookies or tokens; share one account's session with another worker; or evade rate limits.
+ 
++Execution routing documents the frozen subscription-first settings schema for cross-provider and cross-model selection. Routes contain safe aliases only, prefer subscription pools before metered accounts, and let operators choose `meteredFallback` as `auto`, `ask`, or `never`. See [execution routing](docs/execution-routing.md) and the secret-free [example settings](examples/execution-routing.subscription-first.json).
++
+ ## Conductor comparison
+ 
+ SightMesh is not better than Conductor in every dimension. Conductor currently has a more polished native Mac experience, integrated review and merge flows, repository setup and run scripts, file copying, managed settings, cloud workspaces, iOS control, and a hosted API.
+diff --git a/docs/compatibility.md b/docs/compatibility.md
+index 60be789..9650391 100644
+--- a/docs/compatibility.md
++++ b/docs/compatibility.md
+@@ -38,6 +38,12 @@ The isolated bridge run on 2026-08-12 proved both transports. A blocking `repowi
+ 
+ ## Current constraints
+ 
++### Execution-routing integration boundary
++
++The Lane C selector persists and validates the frozen execution-routing settings schema, walks subscription-first routes in order, and returns a safe `resolved`, `approval_needed`, or `blocked` outcome. It does not yet launch an executor, resolve a credential, create a durable cdesktop approval for `meteredFallback=ask`, or recover a route swap after an executor boundary. Do not treat those integration behaviors as shipped.
++
++The standalone pool UI remains a loopback compatibility and recovery view for account-pool diagnostics only. cdesktop remains the primary visible workspace and session UI.
++
+ ### Codex protocol boundary
+ 
+ Upstream cdesktop 0.2.3 uses Codex app-server protocol types from Codex 0.121. An explicit `service_tier = "default"` in current Codex configuration causes that build to reject the thread-start response because its older enum understands only `fast` and `flex`.
+diff --git a/docs/migration.md b/docs/migration.md
+index cbd01b6..6f78b46 100644
+--- a/docs/migration.md
++++ b/docs/migration.md
+@@ -84,3 +84,9 @@ Rollback archives only cdesktop workspaces created by that run and releases thei
+ Open cdesktop with `sightmesh service open`, select the migrated workspace, and create a Claude Code or Codex session. Before writing, read `.context/sightmesh-migration.json` when present and then read the referenced handoff. Context-only archived workspaces open their archived directory directly.
+ 
+ Because the imported workspace uses the original checkout, do not resume the corresponding Conductor session after cutover. Keep one visible owner and one active tool per checkout.
++
++## Execution-routing upgrade note
++
++Execution routing is separate local policy. It does not migrate provider credentials, alter imported cdesktop sessions, or copy Conductor transcript state. After migration, keep launching and supervising work in cdesktop. Configure routes only after the operator-owned account pool is healthy, then use `sightmesh routing validate` and `sightmesh routing explain` to inspect the selector without launching work.
++
++The current selector does not yet execute a selected route or recover/approve a route swap in cdesktop. `sightmesh pool serve` remains a loopback compatibility view for account-pool diagnostics, not a primary session UI or approval surface.
+diff --git a/docs/release.md b/docs/release.md
+index 9157203..d1f2036 100644
+--- a/docs/release.md
++++ b/docs/release.md
+@@ -5,10 +5,23 @@ Before publishing:
+ 1. Run `pytest`.
+ 2. Run `scripts/recovery-smoke.sh` and only set `DRY_RUN=0` when a disposable local restart is intended.
+ 3. Run `scripts/package-smoke.sh`.
+-4. Inspect the generated `dist/` artifacts and keep the exact commit SHA in the release notes.
++4. Validate documentation links and JSON examples touched by the release.
++5. Inspect the generated `dist/` artifacts and keep the exact commit SHA in the release notes.
+ 
+ `scripts/package-smoke.sh` builds standard source and wheel artifacts with `python -m build`, installs the wheel into an isolated virtual environment, verifies the `sightmesh` entry point and packaged migration command, and runs `twine check`.
+ 
+ The compatibility workflow validates Python 3.11 through 3.13 and runs package smoke on each supported version. Tag releases build wheel and sdist artifacts, write SHA-256 checksums, use `actions/attest@v4` with GitHub OIDC provenance, and upload all artifacts to the matching GitHub release.
+ 
+ GitHub artifact attestations provide signed Sigstore provenance for the published release assets. Publishing to PyPI or another package index remains a separate maintainer decision and is not performed by the release workflow.
++
++## Execution-routing release notes
++
++When release notes mention execution routing, describe only the shipped boundary:
++
++- frozen local settings schema version `1` under `executionRouting`;
++- subscription-first route ordering across `CODEX` and `CLAUDE_CODE` models;
++- `meteredFallback` values `auto`, `ask`, and `never`;
++- safe aliases and opaque `auth_binding_id` values only;
++- non-launching `show`, `validate`, `routes`, `set-metered`, and `explain` CLI behavior.
++
++Do not claim executor launch integration, durable cdesktop approval for `meteredFallback=ask`, route-swap recovery, credential resolution, or standalone pool UI routing. Those are integration boundaries for a later release. Keep examples secret-free and aligned with [execution routing](execution-routing.md) and [example settings](../examples/execution-routing.subscription-first.json).

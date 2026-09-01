@@ -686,6 +686,15 @@ class FakeSpawnClient:
         assert workspace_id == "workspace-a"
         return list(self.dirty)
 
+    def closeout_report(self, workspace_id):
+        assert workspace_id == "workspace-a"
+        return {
+            "agent_changes": [],
+            "managed_inputs_removed": [],
+            "managed_inputs_modified": [],
+            "missing": [],
+        }
+
     def missing_repositories(self, workspace_id):
         assert workspace_id == "workspace-a"
         return []
@@ -1738,6 +1747,23 @@ def test_archive_refuses_dirty_managed_worktree_even_when_preserve_requested(
     )
 
     with pytest.raises(ValueError, match="dirty managed worktree"):
+        args.func(args)
+
+
+def test_archive_refuses_modified_managed_input(monkeypatch) -> None:
+    class ModifiedInputClient(FakeSpawnClient):
+        def __init__(self, _url=None) -> None:
+            super().__init__(_url)
+            self.workspace_data["use_worktree"] = True
+
+        def closeout_report(self, _workspace_id):
+            return {"managed_inputs_modified": ["repo/.env"]}
+
+    monkeypatch.setattr(cli, "CdesktopClient", ModifiedInputClient)
+    args = parser().parse_args(
+        ["workspace", "archive", "workspace-a", "--confirm-reconciled"]
+    )
+    with pytest.raises(ValueError, match="human reconciliation"):
         args.func(args)
 
 

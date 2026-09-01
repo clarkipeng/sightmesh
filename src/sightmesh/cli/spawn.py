@@ -219,6 +219,25 @@ def _repository_setup_script(repo_path: Path, base: str) -> str | None:
     return setup.strip() or None
 
 
+def _repository_managed_inputs(repo_path: Path, base: str) -> list[str]:
+    """Read only tracked relative input names; values remain local to cdesktop."""
+    result = subprocess.run(
+        ["git", "show", f"{base}:.conductor/settings.toml"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        return []
+    data = tomllib.loads(result.stdout)
+    worktree = data.get("worktree")
+    inputs = worktree.get("managed_inputs") if isinstance(worktree, dict) else []
+    if not isinstance(inputs, list) or not all(isinstance(item, str) and item and not Path(item).is_absolute() for item in inputs):
+        raise ValueError(".conductor/settings.toml: worktree.managed_inputs must be relative paths")
+    return inputs
+
+
 EPHEMERAL_BASE_MARKERS = ("conductor/workspaces/", ".cdesktop-workspaces/")
 
 
@@ -257,6 +276,7 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
     setup_script = (
         _repository_setup_script(repo_path, base_ref) if args.worktree else None
     )
+    managed_inputs = _repository_managed_inputs(repo_path, base_ref) if args.worktree else []
     if args.unattended and not args.worktree:
         raise ValueError("--unattended requires --worktree")
     if args.unattended:
@@ -297,6 +317,7 @@ def _spawn_workspace(args: argparse.Namespace) -> dict[str, Any]:
             reasoning=selection.reasoning,
             provider_id=selection.provider_id,
             setup_script=setup_script,
+            managed_inputs=managed_inputs,
             auth_binding_id=selection.auth_binding_id,
         )
     except Exception as spawn_error:

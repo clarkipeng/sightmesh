@@ -47,6 +47,8 @@ Pool state is local under `~/.config/agent-pool` by default. Do not add accounts
 
 The full setup additionally installs the cdesktop release and checksum recorded in the authoritative [runtime lock](src/sightmesh/runtime-lock.json), Repowire (`0.17.0`), local LaunchAgents, and shared Claude/Codex skills. The live behavior record and feature boundary are documented in [Compatibility](docs/compatibility.md).
 
+Choose a worker profile from the scope and risk of the assignment, not its title. As a rule of thumb, use Luna for bounded research and mechanical work, Terra for normal implementation, debugging, audits, and planning, and Fable, Opus, or Sol when ambiguity, cross-system reasoning, security, or release risk warrants the stronger model. These are operator guidelines, not hardcoded task classifications. Provider quota, authentication, or availability failures may move the work to another owned account or configured fallback; repository and test failures should stay with the same lane.
+
 ```sh
 ./scripts/bootstrap-local.sh
 sightmesh doctor
