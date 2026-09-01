@@ -65,6 +65,7 @@ class FakeCdesktop:
         self.commands: dict[str, list[dict[str, Any]]] = {}
 
         self._effects: dict[tuple[str, int], dict[str, Any]] = {}
+        self._effect_errors: list[Exception] = []
         self._effects_lock = threading.Lock()
         self._sent_dedupe: dict[str, Any] = {}
         self._sent_lock = threading.Lock()
@@ -204,6 +205,17 @@ class FakeCdesktop:
         self._hook("activate")
         return dict(effect)
 
+    def fail_managed_effect(self, *errors: Exception) -> None:
+        """Queue transient ``managed_effect`` failures, one per subsequent call.
+
+        Stands in for an executor that cannot answer the adopt-or-lose probe -
+        a 5xx, a ``URLError``, a timeout - as opposed to a definitive 404. Each
+        queued error is raised once, in order, so a scenario can make one tick
+        unknowable and let the next tick see the live session (G3 / S27).
+        """
+        with self._effects_lock:
+            self._effect_errors.extend(errors)
+
     def managed_effect(self, task_id: str, epoch: int) -> dict[str, Any]:
         """Look up the native effect behind a task epoch, or 404 if absent.
 
@@ -214,6 +226,10 @@ class FakeCdesktop:
         self._log("managed_effect", task_id, epoch)
         key = (str(task_id), int(epoch))
         with self._effects_lock:
+            if self._effect_errors:
+                # An executor that cannot confirm or deny the session this tick;
+                # not a 404, so the caller must not treat it as absence.
+                raise self._effect_errors.pop(0)
             effect = self._effects.get(key)
         if effect is None:
             raise CdesktopError(

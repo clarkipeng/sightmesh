@@ -24,6 +24,8 @@ from pathlib import Path
 
 import pytest
 
+from sightmesh.cdesktop import CdesktopRejectedError
+from sightmesh.durable import DurableExecutionReconciler
 from sightmesh.effects import EffectJournal, request_hash
 from sightmesh.sdk import BatchError, SightMesh
 from sightmesh.task_store import (
@@ -863,3 +865,155 @@ def test_s24_activate_readback_shares_its_own_transaction(store):
     writer_done.wait(timeout=30)
     # The competing terminal transition still lands, just not inside the gap.
     assert store.get_by_id(task.task_id).state == "lost"
+
+
+def test_s25_a_reconciler_rescan_re_arms_a_wake_resolved_while_undeliverable(
+    client, store, ownership
+):
+    """S25 (G1): a resolved wake poisoned re-arm and hung the manager.
+
+    Round-2 finding G1: `record_wakes` suppressed a new wake if any row - a
+    `resolved` one included - covered the cohort, so once F6 resolved a wake
+    for a transiently-undeliverable parent, the unchanged cohort never re-armed.
+    The watermark makes re-arm correct by construction: a resolve never advances
+    `last_woken_seq`, so `child_event_seq` still outruns it and the next
+    reconciler re-scan of the same cohort arms a fresh wake and delivers it.
+    """
+    parent = _manager(store, children=2)
+    a1 = _reserve_child(store, parent.task_id, "a1", "session-a1")
+    a2 = _reserve_child(store, parent.task_id, "a2", "session-a2")
+
+    # The parent holder is transiently undeliverable as the cohort finishes.
+    ownership.retire(
+        parent.holder_session_id, state="retired", reason="superseded", logical_key="k"
+    )
+    finish_with_wake(store, a1.task_id, "completed", "one")
+    finish_with_wake(store, a2.task_id, "completed", "two")
+
+    reconciler = DurableExecutionReconciler(
+        client, task_store=store, ownership=ownership
+    )
+    first = reconciler.reconcile_kernel()
+    assert first["wakes_delivered"] == 0
+    resolved = query(store, "SELECT state FROM task_wakes", ())
+    assert [row["state"] for row in resolved] == ["resolved"]
+    assert [row for row in client.sent if row[0] == parent.holder_session_id] == []
+
+    # Deliverability is restored; a re-scan of the UNCHANGED cohort re-arms
+    # (the watermark never advanced past the resolve) and delivers exactly once.
+    ownership.records.clear()
+    second = reconciler.reconcile_kernel()
+    assert second["wakes_inserted"] == 1
+    assert second["wakes_delivered"] == 1
+    assert [row for row in client.sent if row[0] == parent.holder_session_id]
+
+
+def test_s26_a_replaced_then_reblocked_child_arms_a_distinct_second_wake(client, store):
+    """S26 (G2): an identical repeated roster never re-woke the manager.
+
+    Round-2 finding G2: `cohort_signature` hashed only child ids + state, so
+    `a1` blocking, being `replace()`d, then blocking again produced an identical
+    fingerprint and the delivered wave-one wake suppressed the second forever.
+    Each child terminal/blocked event now bumps the parent watermark, so the
+    second block outruns `last_woken_seq` and arms a distinct wake.
+    """
+    parent = _manager(store, children=1)
+    a1 = _reserve_child(store, parent.task_id, "a1", "session-a1")
+    finish_with_wake(store, a1.task_id, "blocked", "need input one")
+
+    delivery = WakeDelivery(client, store)
+    assert delivery.pump() == 1
+    assert len([row for row in client.sent if row[0] == parent.holder_session_id]) == 1
+
+    # replace(a1): bump the epoch, re-activate, then block again on a new reason.
+    store.prepare_replacement(a1.task_id)
+    store.activate(a1.task_id, workspace_id="ws-a1", session_id="session-a1-2")
+    _record, second_wave = finish_with_wake(
+        store, a1.task_id, "blocked", "need input two"
+    )
+    assert len(second_wave) == 1
+
+    assert delivery.pump() == 1
+    assert len([row for row in client.sent if row[0] == parent.holder_session_id]) == 2
+
+
+def test_s27_a_transient_executor_failure_keeps_an_expired_reservation(client, store):
+    """S27 (G3): an unknowable executor error orphaned a live launch.
+
+    Round-2 finding G3: `_native_effect` caught bare `CdesktopError` and reported
+    "absent", so a 5xx/timeout during the expiry sweep retired a reservation
+    whose native session was still alive. Only a definitive 404 may retire;
+    an unknowable error leaves the reservation intact for the next tick, which
+    then adopts the live session once the executor answers.
+    """
+    ((task, _inserted),) = store.reserve_all(
+        scope="operator",
+        parent_task_id=None,
+        specs=[{"key": "flighted", "children": 0}],
+        max_attempts=3,
+    )
+    journal = EffectJournal(store)
+    launch = {"kind": "workspace", "request": {"name": "flighted"}}
+    # ttl < 0 makes the lease already expired the moment it is taken.
+    journal.reserve(task.task_id, task.epoch, request_hash(launch), "owner-a", ttl=-1.0)
+    client.create_native_session(
+        task.task_id, task.epoch, workspace_id="ws-x", session_id="sess-x"
+    )
+
+    # This tick the executor cannot answer (HTTP 500): not proof of death.
+    client.fail_managed_effect(
+        CdesktopRejectedError("GET managed effect: HTTP 500: server error", status=500)
+    )
+    assert journal.expire_reservations(client) == []
+    effect = journal.get(task.task_id, task.epoch)
+    assert effect is not None and effect.state == "reserved"
+    assert store.get_by_id(task.task_id).state == "reserved"
+
+    # Next tick the executor is reachable; the live native session is adopted.
+    assert journal.expire_reservations(client) == []
+    effect = journal.get(task.task_id, task.epoch)
+    assert effect is not None and effect.state == "launched"
+    assert (effect.workspace_id, effect.session_id) == ("ws-x", "sess-x")
+    assert store.get_by_id(task.task_id).state == "active"
+
+
+def test_s28_a_reconciler_rescan_of_an_unchanged_delivered_cohort_arms_nothing(
+    client, store, ownership
+):
+    """S28 (G1 invariant, the key one): re-scanning a delivered cohort must
+    create ZERO new wakes.
+
+    A reconciler runs `record_wakes` over every parent every tick. Once a
+    cohort's wake is delivered, `last_woken_seq` equals `child_event_seq`; an
+    unchanged cohort therefore has `child_event_seq == last_woken_seq` and arms
+    nothing, no matter how many times the reconciler re-scans it. This is the
+    invariant the content-hash design kept getting wrong and the watermark makes
+    true by construction.
+    """
+    parent = _manager(store, children=2)
+    a1 = _reserve_child(store, parent.task_id, "a1", "session-a1")
+    a2 = _reserve_child(store, parent.task_id, "a2", "session-a2")
+    finish_with_wake(store, a1.task_id, "completed", "one")
+    finish_with_wake(store, a2.task_id, "completed", "two")
+
+    reconciler = DurableExecutionReconciler(
+        client, task_store=store, ownership=ownership
+    )
+    first = reconciler.reconcile_kernel()
+    assert first["wakes_delivered"] == 1
+    to_parent = [row for row in client.sent if row[0] == parent.holder_session_id]
+    assert len(to_parent) == 1
+
+    # Re-scan the unchanged, already-delivered cohort several times: no new wake
+    # arms, nothing is re-delivered, and no live wake is left behind.
+    for _ in range(3):
+        again = reconciler.reconcile_kernel()
+        assert again["wakes_inserted"] == 0
+        assert again["wakes_delivered"] == 0
+    assert len([row for row in client.sent if row[0] == parent.holder_session_id]) == 1
+    live = query(
+        store,
+        "SELECT COUNT(*) AS n FROM task_wakes WHERE state IN ('pending', 'claimed')",
+        (),
+    )
+    assert live[0]["n"] == 0

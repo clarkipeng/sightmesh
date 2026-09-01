@@ -13,12 +13,17 @@ Scope is the SightMesh repository only.
 
 ## Schema (migration in `migration.py`)
 
-Rebuild `managed_tasks` with two additions and the existing columns unchanged:
+Rebuild `managed_tasks` with these additions and the existing columns unchanged:
 
 ```sql
 version INTEGER NOT NULL DEFAULT 0,
+child_event_seq INTEGER NOT NULL DEFAULT 0,
+last_woken_seq INTEGER NOT NULL DEFAULT 0,
 CHECK (parent_task_id IS NULL OR parent_task_id != task_id)
 ```
+
+`child_event_seq` counts child terminal/blocked events a parent has seen; `last_woken_seq` records how far its manager has been woken.
+Both carry a constant `DEFAULT 0`, so they are added with `ALTER TABLE ADD COLUMN` (re-reading `table_info` under the same `BEGIN IMMEDIATE` lock the rest of the migration holds) rather than a table rebuild.
 
 New tables:
 
@@ -43,7 +48,7 @@ CREATE TABLE IF NOT EXISTS task_wakes (
     parent_task_id TEXT NOT NULL,
     predicate TEXT NOT NULL CHECK (predicate IN ('all_children_terminal', 'any_child_blocked')),
     dedupe_key TEXT NOT NULL,
-    cohort_signature TEXT,
+    event_seq INTEGER,
     state TEXT NOT NULL CHECK (state IN ('pending', 'claimed', 'delivered', 'resolved')),
     claim_expires_at REAL,
     payload TEXT,
@@ -55,9 +60,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_task_wakes_live
     ON task_wakes(dedupe_key) WHERE state IN ('pending', 'claimed');
 ```
 
-`dedupe_key` is `{parent_task_id}:{parent_epoch}:{predicate}`; `INSERT OR IGNORE` makes wake creation idempotent.
+`dedupe_key` is `{parent_task_id}:{predicate}`; `INSERT OR IGNORE` makes wake creation idempotent.
 Uniqueness binds only *live* wakes (the partial index), so a delivered or resolved wake's key can arm again for the next cohort transition; a manager waits once per cohort event, not once per predicate per epoch for the row's lifetime.
-`cohort_signature` fingerprints the satisfying cohort state, so a genuinely new transition re-arms exactly once while a reconciler re-scanning an unchanged satisfied cohort never re-creates a wake.
+`event_seq` is the parent's `child_event_seq` at wake creation, and a wake arms only while `child_event_seq > last_woken_seq`.
+Each child terminal/blocked transition bumps `child_event_seq` in the same transaction as the child's finish; a successful delivery advances `last_woken_seq` to the wake's `event_seq`, while a resolved (suppressed) wake leaves it untouched.
+A genuinely new child event therefore outruns the watermark and re-arms exactly once, a resolved wake re-arms on the next pass because the watermark never moved, and a reconciler re-scanning an unchanged, already-delivered cohort finds `child_event_seq == last_woken_seq` and creates nothing.
 
 ## Guarded transitions (`task_store.py`)
 
@@ -163,7 +170,7 @@ Suppressed deliveries (parent gone, no holder, holder == child session) mark the
 Add one pass alongside the existing command reconciliation:
 
 - deliver `task_wakes` rows pending or claim-expired (crash between commit and pump);
-- for parents whose predicate is satisfied but no wake row exists (pre-migration history), insert one;
+- re-arm any parent whose watermark still trails its child events (`child_event_seq > last_woken_seq`) and whose predicate holds, so a wake resolved while the parent was undeliverable arms again on the next pass;
 - expire `task_effects` reservations past their lease with no native session (mark terminal `lost:reservation-expired`).
 
 ## Capability check (`sdk.py` `_require_contract`)
