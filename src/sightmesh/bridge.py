@@ -12,17 +12,11 @@ from typing import Any
 
 import websockets
 
-from . import leases
 from .cdesktop import CdesktopClient, CdesktopError
 from .durable import DurableExecutionReconciler
 from .execution_routing import ExecutionRoutingError
 from .pool.core import PoolError
-from .routing import (
-    clear_peer_identity,
-    enabled_workspaces,
-    peer_identity,
-    set_peer_identity,
-)
+from .routing import clear_peer_identity, peer_identity, set_peer_identity
 from .sdk import SightMesh, SightMeshError
 from .succession import SuccessionError
 from .task_store import TaskStore, TaskStoreError
@@ -248,67 +242,37 @@ class BridgeSupervisor:
             await asyncio.sleep(2)
 
     async def reconcile(self) -> None:
-        enabled = enabled_workspaces()
         desired: dict[str, BridgedSession] = {}
         try:
-            await asyncio.to_thread(
-                leases.sync_active_workspaces,
-                self.client,
-                on_error=lambda detail: LOGGER.warning(
-                    "Cannot reconcile one cdesktop workspace: %s", detail
-                ),
-            )
-            workspaces = await asyncio.to_thread(self.client.workspaces)
-            for workspace in workspaces:
-                if workspace.get("archived"):
-                    continue
+            store = self.managed_tasks.store
+            # The store is the dirty set and bounds the two-second loop.  No
+            # archived/terminal workspace or unrelated session is inspected.
+            tasks = await asyncio.to_thread(store.reconciliation_tasks)
+            for task in tasks:
                 try:
-                    sessions = await asyncio.to_thread(
-                        self.client.sessions, workspace["id"]
-                    )
-                except CdesktopError as exc:
-                    LOGGER.warning(
-                        "Cannot inspect workspace %s sessions: %s", workspace["id"], exc
-                    )
-                    continue
-                await asyncio.to_thread(self.reconciler.reconcile_sessions, sessions)
-                for session in sessions:
-                    try:
-                        await asyncio.to_thread(
-                            self.managed_tasks.reconcile_quota_failure,
-                            str(session["id"]),
-                        )
-                    except (
-                        CdesktopError,
-                        ExecutionRoutingError,
-                        PoolError,
-                        SightMeshError,
-                        SuccessionError,
-                        TaskStoreError,
-                    ) as exc:
-                        LOGGER.warning(
-                            "Cannot reconcile managed task %s: %s",
-                            session.get("id"),
-                            exc,
-                        )
-                if workspace["id"] not in enabled:
-                    continue
-                try:
-                    path = await asyncio.to_thread(_repo_path, self.client, workspace)
-                except CdesktopError as exc:
-                    LOGGER.warning(
-                        "Cannot bridge workspace %s: %s", workspace["id"], exc
-                    )
-                    continue
-                for session in sessions:
-                    # A quarantined (retired/superseded) session never gets a
-                    # peer bridge; injected follow-ups would auto-resume it
-                    # into a worktree its successor now owns.
-                    if self.reconciler.ownership.is_quarantined(session["id"]):
+                    session = await asyncio.to_thread(self.client.session, task.holder_session_id)
+                    workspace = await asyncio.to_thread(self.client.workspace, task.workspace_id)
+                    if workspace.get("archived"):
                         continue
-                    desired[session["id"]] = BridgedSession(workspace, session, path)
-        except (CdesktopError, leases.LeaseError) as exc:
-            LOGGER.warning("Cannot reconcile cdesktop ownership: %s", exc)
+                    await asyncio.to_thread(self.reconciler.reconcile_session, session, managed=True)
+                    if task.state == "active":
+                        await asyncio.to_thread(
+                            self.managed_tasks.reconcile_quota_failure, task.holder_session_id
+                        )
+                except (
+                    CdesktopError, ExecutionRoutingError, PoolError, SightMeshError,
+                    SuccessionError, TaskStoreError,
+                ) as exc:
+                    LOGGER.warning("Cannot reconcile managed task %s: %s", task.task_id, exc)
+                    continue
+                if self.reconciler.ownership.is_quarantined(task.holder_session_id):
+                    continue
+                path = await asyncio.to_thread(_repo_path, self.client, workspace)
+                desired[task.holder_session_id] = BridgedSession(workspace, session, path)
+            for parent_task_id in await asyncio.to_thread(store.pending_wake_parent_ids):
+                await asyncio.to_thread(self.managed_tasks.reconcile_delivery, parent_task_id)
+        except (CdesktopError, TaskStoreError) as exc:
+            LOGGER.warning("Cannot reconcile managed tasks: %s", exc)
             return
 
         for session_id in set(self.tasks) - set(desired):

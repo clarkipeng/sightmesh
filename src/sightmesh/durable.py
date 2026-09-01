@@ -176,7 +176,7 @@ def _idle_seconds(processes: Iterable[dict[str, Any]], now: float) -> float | No
                 break
             if isinstance(value, str):
                 try:
-                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    parsed = datetime.fromisoformat(value)
                 except ValueError:
                     continue
                 timestamps.append(
@@ -249,7 +249,7 @@ class DurableExecutionReconciler:
                     "Cannot reconcile durable session %s: %s", session.get("id"), exc
                 )
 
-    def reconcile_session(self, session: dict[str, Any]) -> None:
+    def reconcile_session(self, session: dict[str, Any], *, managed: bool = False) -> None:
         session_id = str(session["id"])
         commands = self.queue.commands(session_id)
         if self.ownership.is_quarantined(session_id):
@@ -267,8 +267,12 @@ class DurableExecutionReconciler:
             for command in commands
             if command.state == "claimed" and command.execution_process_id
         }
-        self._wake_parent_for_terminal_commands(session, commands)
-        self._reconcile_signal_policy(session, commands, processes)
+        # Managed task lifecycle notifications are owned by SightMesh's task
+        # store.  Letting this legacy path emit them too causes per-command
+        # wakes and can feed a child's completion back into itself.
+        if not managed:
+            self._wake_parent_for_terminal_commands(session, commands)
+            self._reconcile_signal_policy(session, commands, processes)
         for command in commands:
             if command.state != "claimed":
                 continue
@@ -286,9 +290,10 @@ class DurableExecutionReconciler:
                 elif self.liveness.stale(str(process["id"]), snapshot):
                     self.recover_stalled_process(session, process, command)
                 continue
-            self.reconcile_child_terminal(
-                session, status=str(process.get("status") or "terminal")
-            )
+            if not managed:
+                self.reconcile_child_terminal(
+                    session, status=str(process.get("status") or "terminal")
+                )
             self._interrupt_and_requeue(command)
 
         # A running child can be observed before the command list is visible;
@@ -310,7 +315,7 @@ class DurableExecutionReconciler:
                     execution_process_id=process_id,
                 )
                 self.recover_stalled_process(session, process, synthetic)
-                if process.get("status") != "running":
+                if not managed and process.get("status") != "running":
                     self.reconcile_child_terminal(session, status="interrupted")
 
         # The native dispatcher remains the only claimant.  The gate prevents

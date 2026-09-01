@@ -37,6 +37,19 @@ class TaskRecord:
     updated_at: float
 
 
+@dataclass(frozen=True)
+class ParentWake:
+    dedupe_key: str
+    parent_task_id: str
+    task_id: str
+    epoch: int
+    state: str
+    detail: str | None
+    sender_session_id: str | None
+    intent: str
+    acknowledged_at: float | None
+
+
 class TaskStore:
     """Persist semantic parentage and budgets cdesktop cannot reconstruct."""
 
@@ -83,6 +96,25 @@ class TaskStore:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_managed_tasks_parent "
                     "ON managed_tasks(parent_task_id, created_at)"
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS task_parent_wakes (
+                        dedupe_key TEXT PRIMARY KEY,
+                        parent_task_id TEXT NOT NULL,
+                        task_id TEXT NOT NULL,
+                        epoch INTEGER NOT NULL,
+                        state TEXT NOT NULL,
+                        detail TEXT,
+                        sender_session_id TEXT,
+                        intent TEXT NOT NULL CHECK (intent IN ('continue', 'replace')),
+                        acknowledged_at REAL
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_task_parent_wakes_pending "
+                    "ON task_parent_wakes(parent_task_id, acknowledged_at)"
                 )
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(f"Cannot initialize managed tasks: {exc}") from exc
@@ -203,6 +235,39 @@ class TaskStore:
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(f"Cannot list managed tasks: {exc}") from exc
 
+    def reconciliation_tasks(self, limit: int = 100) -> list[TaskRecord]:
+        """Return the bounded, nonterminal set that needs native observation.
+
+        This is intentionally an index-backed task-store query: the bridge must
+        never discover managed work by walking every cdesktop workspace.
+        """
+        try:
+            with self._database._connect() as conn:
+                rows = conn.execute(
+                    """SELECT * FROM managed_tasks
+                    WHERE state IN ('active', 'replacing', 'blocked')
+                      AND holder_session_id IS NOT NULL
+                    ORDER BY updated_at, task_id LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+            return [self._decode(row) for row in rows]
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(f"Cannot list reconciliation tasks: {exc}") from exc
+
+    def pending_wake_parent_ids(self, limit: int = 100) -> list[str]:
+        """Return parents with unacknowledged wakes, once and in delivery order."""
+        try:
+            with self._database._connect() as conn:
+                rows = conn.execute(
+                    """SELECT parent_task_id, MIN(rowid) AS first_wake
+                    FROM task_parent_wakes WHERE acknowledged_at IS NULL
+                    GROUP BY parent_task_id ORDER BY first_wake LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+            return [str(row["parent_task_id"]) for row in rows]
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(f"Cannot list pending parent wakes: {exc}") from exc
+
     def activate(
         self, task_id: str, *, workspace_id: str, session_id: str
     ) -> TaskRecord:
@@ -267,14 +332,102 @@ class TaskStore:
             (checkpoint, time.time()),
         )
 
-    def finish(self, task_id: str, state: str, result: str | None = None) -> TaskRecord:
+    def finish(
+        self,
+        task_id: str,
+        state: str,
+        result: str | None = None,
+        *,
+        epoch: int | None = None,
+    ) -> TaskRecord:
+        """Make one legal state transition and its parent wake atomically.
+
+        Terminal observations are fenced by epoch and only accepted from an
+        active or blocked task.  Once terminal, every retry returns the first
+        winner without changing it or adding a second terminal wake.
+        """
         if state not in {"completed", "blocked", "cancelled", "lost"}:
             raise ValueError(f"Unsupported task finish state: {state}")
-        return self._update(
-            task_id,
-            "state = ?, result = ?, updated_at = ?",
-            (state, result, time.time()),
-        )
+        terminal = state in {"completed", "cancelled", "lost"}
+        try:
+            with self._database._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM managed_tasks WHERE task_id = ?", (str(task_id),)
+                ).fetchone()
+                if row is None:
+                    raise TaskStoreError("Managed task not found")
+                task = self._decode(row)
+                expected_epoch = task.epoch if epoch is None else epoch
+                if task.epoch != expected_epoch:
+                    conn.execute("COMMIT")
+                    return task
+                allowed = ("active",) if state == "blocked" else ("active", "blocked")
+                if task.state not in allowed:
+                    conn.execute("COMMIT")
+                    return task
+                updated = conn.execute(
+                    f"""UPDATE managed_tasks SET state = ?, result = ?, updated_at = ?
+                    WHERE task_id = ? AND epoch = ? AND state IN ({', '.join('?' for _ in allowed)})""",
+                    (state, result, time.time(), str(task_id), expected_epoch, *allowed),
+                ).rowcount
+                if updated and task.parent_task_id:
+                    key = (
+                        f"terminal-wake:{task.parent_task_id}:{task.task_id}:{task.epoch}"
+                        if terminal
+                        else f"task-blocked:{task.parent_task_id}:{task.task_id}:{task.epoch}"
+                    )
+                    conn.execute(
+                        """INSERT OR IGNORE INTO task_parent_wakes
+                        (dedupe_key, parent_task_id, task_id, epoch, state, detail,
+                         sender_session_id, intent, acknowledged_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)""",
+                        (
+                            key,
+                            task.parent_task_id,
+                            task.task_id,
+                            task.epoch,
+                            state,
+                            result,
+                            task.holder_session_id,
+                            "continue" if state == "completed" else "replace",
+                        ),
+                    )
+                row = conn.execute(
+                    "SELECT * FROM managed_tasks WHERE task_id = ?", (str(task_id),)
+                ).fetchone()
+                conn.execute("COMMIT")
+            return self._decode(row)
+        except TaskStoreError:
+            raise
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(f"Cannot finish managed task: {exc}") from exc
+
+    def pending_parent_wakes(self, parent_task_id: str) -> list[ParentWake]:
+        try:
+            with self._database._connect() as conn:
+                rows = conn.execute(
+                    """SELECT * FROM task_parent_wakes
+                    WHERE parent_task_id = ? AND acknowledged_at IS NULL
+                    ORDER BY rowid""",
+                    (str(parent_task_id),),
+                ).fetchall()
+            return [self._decode_wake(row) for row in rows]
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(f"Cannot read task parent wakes: {exc}") from exc
+
+    def acknowledge_parent_wake(self, dedupe_key: str) -> bool:
+        try:
+            with self._database._connect() as conn:
+                return bool(
+                    conn.execute(
+                        """UPDATE task_parent_wakes SET acknowledged_at = ?
+                        WHERE dedupe_key = ? AND acknowledged_at IS NULL""",
+                        (time.time(), dedupe_key),
+                    ).rowcount
+                )
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(f"Cannot acknowledge task parent wake: {exc}") from exc
 
     def _one(self, where: str, params: tuple[object, ...]) -> TaskRecord | None:
         try:
@@ -329,3 +482,10 @@ class TaskStore:
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise TaskStoreError(f"Corrupt managed task record: {exc}") from exc
+
+    @staticmethod
+    def _decode_wake(row: sqlite3.Row) -> ParentWake:
+        try:
+            return ParentWake(**dict(row))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TaskStoreError(f"Corrupt task parent wake: {exc}") from exc

@@ -163,7 +163,7 @@ def test_unidentified_messages_still_dedupe_deterministically() -> None:
     assert first == second
 
 
-def test_no_bridge_child_still_gets_stall_recovery(monkeypatch) -> None:
+def test_reconcile_is_task_local_and_skips_legacy_child_delivery(monkeypatch, tmp_path) -> None:
     class StallClient(FakeClient):
         def __init__(self):
             super().__init__()
@@ -175,10 +175,21 @@ def test_no_bridge_child_still_gets_stall_recovery(monkeypatch) -> None:
             }
 
         def workspaces(self):
-            return [{"id": "child-workspace", "archived": False}]
+            raise AssertionError("bridge must not scan every workspace")
 
         def sessions(self, _workspace_id):
-            return [{"id": "child", "parent_session_id": "parent"}]
+            raise AssertionError("bridge must not scan every session")
+
+        def session(self, _session_id):
+            return {"id": "child", "parent_session_id": "parent"}
+
+        @staticmethod
+        def workspace(_workspace_id):
+            return {"id": "child-workspace", "archived": False, "use_worktree": False}
+
+        @staticmethod
+        def workspace_repos(_workspace_id):
+            return [{"name": "repo", "path": "/tmp/repo"}]
 
         def execution_processes(self, _session_id):
             return [self.process]
@@ -196,6 +207,15 @@ def test_no_bridge_child_still_gets_stall_recovery(monkeypatch) -> None:
     client = StallClient()
     client.stopped = []
     supervisor = BridgeSupervisor(client, "ws://127.0.0.1:8377/ws")
+    store = bridge_module.TaskStore(tmp_path / "tasks.sqlite3")
+    supervisor.managed_tasks.store = store
+    [(task, _)] = store.reserve_all(
+        scope="operator",
+        parent_task_id=None,
+        specs=[{"key": "child", "repo": "repo", "base": "main", "children": 0}],
+        max_attempts=3,
+    )
+    store.activate(task.task_id, workspace_id="child-workspace", session_id="child")
     reconciled = []
 
     def reconcile_quota_failure(session_id):
@@ -205,18 +225,14 @@ def test_no_bridge_child_still_gets_stall_recovery(monkeypatch) -> None:
 
     supervisor.managed_tasks.reconcile_quota_failure = reconcile_quota_failure
     supervisor.stalls.threshold = timedelta(0)
-    monkeypatch.setattr(bridge_module, "enabled_workspaces", lambda: set())
-    monkeypatch.setattr(
-        bridge_module.leases, "sync_active_workspaces", lambda *_args, **_kwargs: []
-    )
-
     asyncio.run(supervisor.reconcile())
     asyncio.run(supervisor.reconcile())
 
     assert client.stopped == ["process-1"]
-    assert client.sent[0][0] == "parent"
+    assert client.sent == []
     assert reconciled == ["child", "child"]
-    assert supervisor.tasks == {}
+    for bridge_task in supervisor.tasks.values():
+        bridge_task.cancel()
 
 
 def test_each_executor_maps_to_its_own_repowire_backend() -> None:

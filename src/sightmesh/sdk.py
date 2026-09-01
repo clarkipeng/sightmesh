@@ -6,9 +6,8 @@ import re
 import subprocess
 import tempfile
 import tomllib
-import uuid
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generic, TypeVar
 
@@ -57,9 +56,6 @@ class WorkerSpec:
 class Command:
     worker: str
     prompt: str
-    _operation_id: str = field(
-        default_factory=lambda: uuid.uuid4().hex, init=False, repr=False, compare=False
-    )
 
 
 @dataclass(frozen=True)
@@ -203,8 +199,12 @@ class SightMesh:
         results: dict[str, Any] = {}
         errors: dict[str, str] = {}
         for entry, task in targets:
+            # Same task epoch plus same bytes is one continuation.  cdesktop
+            # retains ordering across distinct keys, while retries/replays do
+            # not create another turn.
             dedupe_key = (
-                f"task-command:{task.task_id}:{task.epoch}:{entry._operation_id}"
+                f"task-command:{task.task_id}:{task.epoch}:"
+                f"{hashlib.sha256(entry.prompt.encode('utf-8')).hexdigest()}"
             )
             try:
                 results[entry.worker] = self.client.send(
@@ -248,23 +248,60 @@ class SightMesh:
 
     def complete(self, summary: str | None = None, worker: str | None = None) -> Worker:
         task = self._current() if worker is None else self._find(worker)
-        updated = self.store.finish(task.task_id, "completed", summary)
-        self._notify_parent(updated, "completed", summary)
+        updated = self.store.finish(
+            task.task_id, "completed", summary, epoch=task.epoch
+        )
+        if updated.parent_task_id:
+            self.reconcile_delivery(updated.parent_task_id)
         return Worker.from_record(updated)
 
     def blocked(self, reason: str, worker: str | None = None) -> Worker:
         if not reason.strip():
             raise SightMeshError("Blocked reason must not be empty")
         task = self._current() if worker is None else self._find(worker)
-        updated = self.store.finish(task.task_id, "blocked", reason)
-        self._notify_parent(updated, "blocked", reason)
+        updated = self.store.finish(task.task_id, "blocked", reason, epoch=task.epoch)
+        if updated.parent_task_id:
+            self.reconcile_delivery(updated.parent_task_id)
         return Worker.from_record(updated)
 
     def cancel(self, worker: str) -> Worker:
         task = self._find(worker)
         if task.workspace_id:
             self.client.stop_workspace(task.workspace_id)
-        return Worker.from_record(self.store.finish(task.task_id, "cancelled"))
+        updated = self.store.finish(task.task_id, "cancelled", epoch=task.epoch)
+        if updated.parent_task_id:
+            self.reconcile_delivery(updated.parent_task_id)
+        return Worker.from_record(updated)
+
+    def reconcile_delivery(self, parent_task_id: str) -> int:
+        """Deliver and acknowledge wakes for one managed parent task only."""
+        parent = self.store.get_by_id(parent_task_id)
+        if parent is None or not parent.holder_session_id:
+            return 0
+        delivered = 0
+        for wake in self.store.pending_parent_wakes(parent.task_id):
+            child = self.store.get_by_id(wake.task_id)
+            if child is None:
+                self.store.acknowledge_parent_wake(wake.dedupe_key)
+                continue
+            if parent.holder_session_id == wake.sender_session_id:
+                # A corrupt/native self-parent link must not turn a terminal
+                # child observation into a fresh command on that same child.
+                self.store.acknowledge_parent_wake(wake.dedupe_key)
+                continue
+            message = f"{wake.state.upper()}: {child.key}"
+            if wake.detail:
+                message += f"\n{wake.detail}"
+            self.client.send(
+                parent.holder_session_id,
+                message,
+                wake.sender_session_id,
+                dedupe_key=wake.dedupe_key,
+                intent=wake.intent,
+            )
+            self.store.acknowledge_parent_wake(wake.dedupe_key)
+            delivered += 1
+        return delivered
 
     def replace(self, worker: str, prompt: str | None = None) -> Worker:
         task = self._find(worker)
@@ -304,8 +341,11 @@ class SightMesh:
         )
         if selection.status != "resolved" or selection.target is None:
             reason = f"Quota exhausted for route {route_id}; {selection.reason}"
-            blocked = self.store.finish(task.task_id, "blocked", reason)
-            self._notify_parent(blocked, "blocked", reason)
+            blocked = self.store.finish(
+                task.task_id, "blocked", reason, epoch=task.epoch
+            )
+            if blocked.parent_task_id:
+                self.reconcile_delivery(blocked.parent_task_id)
             return Worker.from_record(blocked)
 
         selected = selection.target
@@ -612,27 +652,6 @@ class SightMesh:
             return path.read_text(encoding="utf-8")
         except OSError as exc:
             raise SightMeshError(f"Cannot read checkpoint {path}: {exc}") from exc
-
-    def _notify_parent(self, task: TaskRecord, state: str, detail: str | None) -> None:
-        if not task.parent_task_id:
-            return
-        parent = self.store.get_by_id(task.parent_task_id)
-        if (
-            parent is None
-            or not parent.holder_session_id
-            or parent.holder_session_id == task.holder_session_id
-        ):
-            return
-        message = f"{state.upper()}: {task.key}"
-        if detail:
-            message += f"\n{detail}"
-        self.client.send(
-            parent.holder_session_id,
-            message,
-            task.holder_session_id,
-            dedupe_key=f"task-{state}:{task.task_id}",
-            intent="continue" if state == "completed" else "replace",
-        )
 
     def _require_contract(self) -> None:
         if self._contract_checked:

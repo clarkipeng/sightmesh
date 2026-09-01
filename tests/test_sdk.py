@@ -24,6 +24,7 @@ class FakeClient:
         self.repo_rows = None
         self.processes = {}
         self.snapshots = {}
+        self.native_commands = {}
 
     def info(self):
         return {"service_capabilities": {"managed_task_launch": 1}}
@@ -87,6 +88,8 @@ class FakeClient:
     ):
         row = (session_id, prompt, sender_session, dedupe_key, intent)
         self.sent.append(row)
+        if dedupe_key:
+            self.native_commands.setdefault((session_id, dedupe_key), row)
         return {"queued": True}
 
     def session_commands(self, _session_id):
@@ -225,7 +228,7 @@ def test_command_batch_validates_every_target_before_sending(system):
     assert client.sent == []
 
 
-def test_command_identity_is_internal_and_allows_intentional_repeats(system):
+def test_equivalent_commands_coalesce_to_one_ordered_continuation(system):
     mesh, client, _store, _ownership = system
     mesh.start(spec())
     command = Command("audit", "Run it again")
@@ -235,7 +238,10 @@ def test_command_identity_is_internal_and_allows_intentional_repeats(system):
     mesh.send("audit", "Run it again")
 
     assert client.sent[0][3] == client.sent[1][3]
-    assert client.sent[2][3] != client.sent[0][3]
+    assert client.sent[2][3] == client.sent[0][3]
+
+    mesh.send("audit", "Run a different continuation")
+    assert client.sent[3][3] != client.sent[0][3]
 
 
 def test_parent_child_limit_is_fixed_when_parent_starts(system):
@@ -498,3 +504,109 @@ def test_completion_notifies_only_the_recorded_parent(system):
     assert len(client.sent) == 1
     assert client.sent[0][0] == parent.session_id
     assert client.sent[0][0] != child.session_id
+
+
+def test_terminal_winner_cannot_be_overwritten_and_creates_one_wake(system):
+    mesh, _client, store, _ownership = system
+    parent = mesh.start(spec("manager", children=1))
+    child = SightMesh(
+        client=mesh.client,
+        store=store,
+        ownership=mesh.ownership,
+        environment={"CDESKTOP_SESSION_ID": parent.session_id},
+    ).start(spec("child"))
+    task = store.get_by_session(child.session_id)
+    assert task is not None
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        winners = list(
+            pool.map(
+                lambda state: store.finish(task.task_id, state, epoch=task.epoch),
+                ("completed", "cancelled"),
+            )
+        )
+
+    assert {winner.state for winner in winners} == {store.get_by_id(task.task_id).state}
+    assert len(store.pending_parent_wakes(task.parent_task_id)) == 1
+
+
+def test_restart_after_commit_before_delivery_replays_one_keyed_parent_command(system):
+    mesh, client, store, ownership = system
+    parent = mesh.start(spec("manager", children=1))
+    child = SightMesh(
+        client=client,
+        store=store,
+        ownership=ownership,
+        environment={"CDESKTOP_SESSION_ID": parent.session_id},
+    ).start(spec("child"))
+    task = store.get_by_session(child.session_id)
+    assert task is not None
+    store.finish(task.task_id, "completed", "done", epoch=task.epoch)
+
+    parent_id = parent_key(store, parent.session_id)
+    restarted = SightMesh(
+        client=client, store=TaskStore(store.path), ownership=ownership, environment={}
+    )
+    assert restarted.reconcile_delivery(parent_task_id=parent_id) == 1
+    assert restarted.reconcile_delivery(parent_task_id=parent_id) == 0
+    assert list(client.native_commands) == [
+        (parent.session_id, f"terminal-wake:{parent_id}:{task.task_id}:{task.epoch}")
+    ]
+
+
+def test_delivery_retry_after_send_before_ack_keeps_one_native_command(system, monkeypatch):
+    mesh, client, store, ownership = system
+    parent = mesh.start(spec("manager", children=1))
+    child = SightMesh(
+        client=client,
+        store=store,
+        ownership=ownership,
+        environment={"CDESKTOP_SESSION_ID": parent.session_id},
+    ).start(spec("child"))
+    task = store.get_by_session(child.session_id)
+    assert task is not None
+    store.finish(task.task_id, "completed", epoch=task.epoch)
+    parent_id = parent_key(store, parent.session_id)
+    monkeypatch.setattr(
+        store,
+        "acknowledge_parent_wake",
+        lambda _key: (_ for _ in ()).throw(RuntimeError("crash")),
+    )
+    with pytest.raises(RuntimeError, match="crash"):
+        mesh.reconcile_delivery(parent_id)
+
+    SightMesh(
+        client=client, store=TaskStore(store.path), ownership=ownership
+    ).reconcile_delivery(parent_id)
+    assert len(client.native_commands) == 1
+
+
+def test_terminal_wake_never_delivers_a_child_completion_to_itself(system):
+    mesh, client, store, ownership = system
+    parent = mesh.start(spec("manager", children=1))
+    child = SightMesh(
+        client=client,
+        store=store,
+        ownership=ownership,
+        environment={"CDESKTOP_SESSION_ID": parent.session_id},
+    ).start(spec("child"))
+    child_task = store.get_by_session(child.session_id)
+    parent_task = store.get_by_session(parent.session_id)
+    assert child_task is not None and parent_task is not None
+    store.finish(child_task.task_id, "completed", epoch=child_task.epoch)
+    # Model a corrupt/native self-parent link after the child has terminalized.
+    with store._database._connect() as conn:
+        conn.execute(
+            "UPDATE managed_tasks SET holder_session_id = ? WHERE task_id = ?",
+            (child.session_id, parent_task.task_id),
+        )
+
+    assert mesh.reconcile_delivery(parent_task.task_id) == 0
+    assert client.sent == []
+    assert store.pending_parent_wakes(parent_task.task_id) == []
+
+
+def parent_key(store, session_id):
+    task = store.get_by_session(session_id)
+    assert task is not None
+    return task.task_id
