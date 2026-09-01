@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from sightmesh import wakes
 from sightmesh.cdesktop import (
     CdesktopInterruptedError,
     CdesktopPendingError,
@@ -10,7 +11,9 @@ from sightmesh.durable import (
     NativeCommandQueue,
     supports_durable_recovery,
 )
+from sightmesh.effects import EffectJournal
 from sightmesh.runtime_lock import RUNTIME_LOCK
+from sightmesh.task_store import TaskStore
 
 
 class Queue:
@@ -96,8 +99,7 @@ def test_025_gate_fails_closed_once_without_recovery_calls(caplog) -> None:
         def info(self):
             self.info_calls += 1
             return {
-                "version": "cdesktop/"
-                + RUNTIME_LOCK.cdesktop.compatibility.minimum
+                "version": "cdesktop/" + RUNTIME_LOCK.cdesktop.compatibility.minimum
             }
 
         def execution_processes(self, _session):
@@ -391,3 +393,104 @@ def test_425_retries_the_same_command_key():
         ("process-1", "durable:command-1:stop"),
         ("process-1", "durable:command-1:stop"),
     ]
+
+
+class KernelClient:
+    """Only the send seam the wake outbox uses."""
+
+    def __init__(self):
+        self.sent = []
+
+    def send(self, session_id, prompt, sender=None, *, dedupe_key=None, intent=None):
+        self.sent.append((session_id, prompt, dedupe_key, intent))
+        return {"queued": True}
+
+
+def _kernel_cohort(tmp_path):
+    store = TaskStore(tmp_path / "state.sqlite3")
+    ((parent, _),) = store.reserve_all(
+        scope="operator",
+        parent_task_id=None,
+        specs=[{"key": "manager", "children": 2}],
+        max_attempts=3,
+    )
+    store.activate(
+        parent.task_id, workspace_id="ws-manager", session_id="session-manager"
+    )
+    ((child, _),) = store.reserve_all(
+        scope="operator",
+        parent_task_id=parent.task_id,
+        specs=[{"key": "child", "children": 0}],
+        max_attempts=3,
+    )
+    store.activate(child.task_id, workspace_id="ws-child", session_id="session-child")
+    return store, parent, child
+
+
+def test_the_reconciler_delivers_a_wake_left_pending_by_a_dead_pump(tmp_path):
+    """Delivery is best effort at the call site; this pass is what makes it
+    at-least-once, so a wake committed by a process that then died must be
+    delivered on the next tick without any human noticing."""
+    store, _parent, child = _kernel_cohort(tmp_path)
+    client = KernelClient()
+    store.finish(child.task_id, "completed", "done")
+    with store.connect() as conn:
+        wakes.record_wakes(conn, child.parent_task_id)
+
+    result = DurableExecutionReconciler(
+        client, Queue([]), task_store=store
+    ).reconcile_kernel()
+
+    assert result["wakes_delivered"] == 1
+    assert client.sent[0][0] == "session-manager"
+    assert client.sent[0][3] == "continue"
+
+
+def test_the_reconciler_inserts_a_wake_missing_from_pre_migration_history(tmp_path):
+    """Tasks that reached a terminal state before the outbox existed have a
+    satisfied predicate and no wake row; their managers would wait forever."""
+    store, parent, child = _kernel_cohort(tmp_path)
+    client = KernelClient()
+    store.finish(child.task_id, "completed", "done")
+
+    result = DurableExecutionReconciler(
+        client, Queue([]), task_store=store
+    ).reconcile_kernel()
+
+    assert result["wakes_inserted"] == 1
+    assert result["wakes_delivered"] == 1
+    with store.connect() as conn:
+        row = conn.execute("SELECT * FROM task_wakes").fetchone()
+    assert row["dedupe_key"] == wakes.dedupe_key(
+        parent.task_id, parent.epoch, "all_children_terminal"
+    )
+
+
+def test_the_reconciler_does_not_manufacture_a_second_wake(tmp_path):
+    """It runs every tick over every parent; repairing an already repaired
+    cohort must be a no-op or a manager gets re-woken forever."""
+    store, _parent, child = _kernel_cohort(tmp_path)
+    client = KernelClient()
+    store.finish(child.task_id, "completed", "done")
+    reconciler = DurableExecutionReconciler(client, Queue([]), task_store=store)
+
+    reconciler.reconcile_kernel()
+    second = reconciler.reconcile_kernel()
+
+    assert second == {"wakes_inserted": 0, "wakes_delivered": 0, "effects_expired": 0}
+    assert len(client.sent) == 1
+
+
+def test_the_reconciler_retires_a_reservation_whose_owner_died(tmp_path):
+    """A lease that expired with no native session behind it is a task that
+    will never run; leaving it 'reserved' hides that from every status view."""
+    store, _parent, _child = _kernel_cohort(tmp_path)
+    journal = EffectJournal(store)
+    journal.reserve("orphan", 1, "hash", "owner-a", ttl=-1.0)
+
+    result = DurableExecutionReconciler(
+        KernelClient(), Queue([]), task_store=store
+    ).reconcile_kernel()
+
+    assert result["effects_expired"] == 1
+    assert journal.get("orphan", 1).outcome == "lost:reservation-expired"

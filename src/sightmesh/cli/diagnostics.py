@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ..sdk import SightMesh, SightMeshError
 from .common import *
 from .fleet import _fleet_sessions, _idle_unmet_orders, _latest_process, _normalized_snapshot_with_retry, _process_event_time, _session_processes
 
@@ -38,6 +39,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             }
         )
         failures += int(not runtime_fork_ok)
+        # An advertised capability with no executed probe is the failure mode
+        # this check exists to surface, so the probe kind is always reported.
+        try:
+            probe = SightMesh(client=client)._require_contract()
+            checks.append(
+                {
+                    "check": "managed-task-launch",
+                    "ok": True,
+                    "detail": {"probe": probe},
+                }
+            )
+        except (CdesktopError, SightMeshError) as exc:
+            checks.append(
+                {"check": "managed-task-launch", "ok": False, "detail": str(exc)}
+            )
+            failures += 1
     except CdesktopError as exc:
         checks.append({"check": "cdesktop", "ok": False, "detail": str(exc)})
         failures += 1

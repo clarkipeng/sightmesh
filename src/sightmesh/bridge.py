@@ -25,7 +25,7 @@ from .routing import (
 )
 from .sdk import SightMesh, SightMeshError
 from .succession import SuccessionError
-from .task_store import TaskStore, TaskStoreError
+from .task_store import TaskStoreError
 
 LOGGER = logging.getLogger("sightmesh.bridge")
 
@@ -235,7 +235,7 @@ class BridgeSupervisor:
         self.reconciler = DurableExecutionReconciler(client)
         self.managed_tasks = SightMesh(
             client=client,
-            store=TaskStore(self.reconciler.signal_store.path),
+            store=self.reconciler.task_store,
             ownership=self.reconciler.ownership,
         )
         # Read-only compatibility surface for callers that tuned PR #9's
@@ -250,6 +250,9 @@ class BridgeSupervisor:
     async def reconcile(self) -> None:
         enabled = enabled_workspaces()
         desired: dict[str, BridgedSession] = {}
+        # Wake delivery reads task rows, not workspaces, so it runs once per
+        # tick and cannot be starved behind a slow or failing workspace scan.
+        await asyncio.to_thread(self.reconciler.reconcile_kernel)
         try:
             await asyncio.to_thread(
                 leases.sync_active_workspaces,
