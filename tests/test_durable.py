@@ -7,6 +7,7 @@ from sightmesh.cdesktop import (
 from sightmesh.durable import (
     DurableCommand,
     DurableExecutionReconciler,
+    NativeCommandQueue,
     supports_durable_recovery,
 )
 from sightmesh.runtime_lock import RUNTIME_LOCK
@@ -182,7 +183,7 @@ def test_restart_terminal_wake_uses_native_dedupe_and_does_not_loop():
     ]
 
 
-def test_terminal_wake_refuses_self_delivery_and_parks_once(tmp_path, caplog):
+def test_terminal_wake_refuses_self_delivery_once_across_restarts(tmp_path, caplog):
     client = Client({"id": "process-1", "status": "completed"}, {})
     queue = Queue([command("done")])
     from sightmesh.escalation import EscalationStore
@@ -196,11 +197,30 @@ def test_terminal_wake_refuses_self_delivery_and_parks_once(tmp_path, caplog):
         ).reconcile_session(session)
 
     assert queue.notifications == []
-    parked = signal_store.pending()
-    assert len(parked) == 1
-    assert parked[0].recorded_parent_session_id == "child"
-    assert parked[0].dedupe_key == "child-command:command-1:done"
-    assert "is its own parent" in caplog.text
+    assert signal_store.pending() == []
+    assert signal_store.has_terminal_dedupe_key("child-command:command-1:done")
+    assert caplog.text.count("is its own parent") == 1
+
+
+def test_parent_notification_is_attributed_to_child():
+    class SendingClient:
+        def __init__(self) -> None:
+            self.sent = []
+
+        def send(self, *args, **kwargs):
+            self.sent.append((args, kwargs))
+
+    client = SendingClient()
+    NativeCommandQueue(client).notify_parent(
+        "parent", "child", "CHILD_DELIVERY: child command-1 done", "delivery-key"
+    )
+
+    assert client.sent == [
+        (
+            ("parent", "CHILD_DELIVERY: child command-1 done", "child"),
+            {"dedupe_key": "delivery-key", "intent": "continue"},
+        )
+    ]
 
 
 def test_lifecycle_notification_completion_does_not_generate_another_wake():

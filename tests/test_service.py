@@ -10,7 +10,16 @@ def test_service_definition_is_local_and_uses_native_cleanup(
     monkeypatch.setattr(service, "state_dir", lambda: tmp_path)
     monkeypatch.setattr(service, "command_path", lambda: "/user/bin:/usr/bin")
     definition = service.definition(4321)
-    assert definition["ProgramArguments"] == ["/tmp/cdesktop"]
+    assert definition["ProgramArguments"] == [
+        "/tmp/cdesktop",
+        "service-run",
+        "--stdout",
+        str(tmp_path / "cdesktop.stdout.log"),
+        "--stderr",
+        str(tmp_path / "cdesktop.stderr.log"),
+        "--",
+        "/tmp/cdesktop",
+    ]
     assert definition["EnvironmentVariables"]["CDESKTOP_NO_BROWSER"] == "1"
     assert definition["EnvironmentVariables"]["HOST"] == "127.0.0.1"
     assert definition["EnvironmentVariables"]["PORT"] == "4321"
@@ -19,6 +28,8 @@ def test_service_definition_is_local_and_uses_native_cleanup(
     assert "DISABLE_WORKTREE_CLEANUP" not in definition["EnvironmentVariables"]
     assert definition["Umask"] == 0o077
     assert definition["Label"] == "io.sightmesh.cdesktop"
+    assert definition["StandardOutPath"] == "/dev/null"
+    assert definition["StandardErrorPath"] == "/dev/null"
 
 
 def test_bridge_definition_targets_managed_local_cdesktop(
@@ -29,6 +40,13 @@ def test_bridge_definition_targets_managed_local_cdesktop(
     monkeypatch.setattr(service, "command_path", lambda: "/user/bin:/usr/bin")
     definition = service.bridge_definition(4321)
     assert definition["ProgramArguments"] == [
+        "/tmp/sightmesh",
+        "service-run",
+        "--stdout",
+        str(tmp_path / "bridge.stdout.log"),
+        "--stderr",
+        str(tmp_path / "bridge.stderr.log"),
+        "--",
         "/tmp/sightmesh",
         "--url",
         "http://127.0.0.1:4321",

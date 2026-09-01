@@ -110,7 +110,7 @@ class NativeCommandQueue:
         self.client.send(
             parent_session_id,
             message,
-            None,
+            child_session_id,
             dedupe_key=key,
             intent="continue",
         )
@@ -459,7 +459,7 @@ class DurableExecutionReconciler:
         dedupe key keeps repeated ticks to one parked record and lets a later
         delivery resolve it.
         """
-        if key in self._notified:
+        if key in self._notified or self.signal_store.has_terminal_dedupe_key(key):
             return
         if parent_session_id == child_session_id:
             LOGGER.error(
@@ -467,13 +467,8 @@ class DurableExecutionReconciler:
                 key,
                 child_session_id,
             )
-            self.signal_store.park(
-                child_session_id=child_session_id,
-                child_workspace_id=None,
-                recorded_parent_session_id=parent_session_id,
-                reason="parent_unreachable",
-                message=message,
-                dedupe_key=key,
+            self._reject_invalid_route(
+                child_session_id, parent_session_id, message, key
             )
             return
         destination = resolve_live_successor(self.ownership, parent_session_id)
@@ -494,18 +489,32 @@ class DurableExecutionReconciler:
                 key,
                 child_session_id,
             )
-            self.signal_store.park(
-                child_session_id=child_session_id,
-                child_workspace_id=None,
-                recorded_parent_session_id=parent_session_id,
-                reason="parent_unreachable",
-                message=message,
-                dedupe_key=key,
+            self._reject_invalid_route(
+                child_session_id, parent_session_id, message, key
             )
             return
         self.queue.notify_parent(destination, child_session_id, message, key)
         self._notified.add(key)
         self.signal_store.resolve_dedupe_key(key)
+
+    def _reject_invalid_route(
+        self,
+        child_session_id: str,
+        parent_session_id: str,
+        message: str,
+        key: str,
+    ) -> None:
+        parked = self.signal_store.park(
+            child_session_id=child_session_id,
+            child_workspace_id=None,
+            recorded_parent_session_id=parent_session_id,
+            reason="parent_unreachable",
+            message=message,
+            dedupe_key=key,
+        )
+        if parked.status == "parked":
+            self.signal_store.resolve(parked.escalation_id)
+        self._notified.add(key)
 
     def _interrupt_and_requeue(self, command: DurableCommand) -> None:
         # Lifecycle writes are idempotent in cdesktop; duplicate ticks cannot

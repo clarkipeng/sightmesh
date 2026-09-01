@@ -498,6 +498,22 @@ class EscalationStore:
             raise EscalationStoreError(f"Cannot read delivery dedupe state: {exc}") from exc
         return row is not None
 
+    def has_terminal_dedupe_key(self, dedupe_key: str) -> bool:
+        """Whether delivery for this logical signal is conclusively finished."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM acknowledgments WHERE dedupe_key = ? "
+                    "UNION SELECT 1 FROM escalations "
+                    "WHERE dedupe_key = ? AND status = 'resolved' LIMIT 1",
+                    (dedupe_key, dedupe_key),
+                ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise EscalationStoreError(
+                f"Cannot read terminal delivery dedupe state: {exc}"
+            ) from exc
+        return row is not None
+
     def park(
         self,
         *,
