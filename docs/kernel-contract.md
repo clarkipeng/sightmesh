@@ -44,6 +44,8 @@ Worker results carry a small manifest: task, outcome, artifacts, checks, continu
 ## Wakes (owner: kernel)
 
 Managers wait on durable predicates: `all_children_terminal`, `any_child_blocked`, or `external_receipt_present`.
+Liveness predicates `any_child_lost`, `any_child_stalled`, and `any_child_over_budget` extend this set; their detection rules, episode dedupe, and executor prerequisites are specified in `liveness-spec.md`.
+The kernel never kills and never respawns on a liveness signal; it wakes the owning manager.
 One wake per satisfied predicate, claimed atomically under a lease; delivery is at-least-once and idempotent by predicate identity.
 A reconciler scans tasks (not commands) for satisfied-but-undelivered predicates, repairing any crash between state change and notification.
 Lifecycle continuation has bounded latency and cannot be starved behind ordinary backlog.
