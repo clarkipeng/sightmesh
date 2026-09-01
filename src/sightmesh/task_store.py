@@ -21,7 +21,11 @@ LIVE_STATES = frozenset({"reserved", "active", "replacing", "blocked"})
 #: the first legal terminal transition wins and every later one is stale.
 FINISH_PREDECESSORS: dict[str, frozenset[str]] = {
     "completed": frozenset({"active", "replacing", "blocked"}),
-    "blocked": frozenset({"active", "replacing"}),
+    # ``reserved`` is a legal predecessor because a definitive launch rejection
+    # blocks the epoch before it ever activates: the task must land in a
+    # replaceable terminal rather than stay ``reserved`` and relaunchable (a
+    # retry is an explicit new epoch via ``replace()``).
+    "blocked": frozenset({"reserved", "active", "replacing"}),
     "cancelled": frozenset({"reserved", "active", "replacing", "blocked"}),
     "lost": frozenset({"reserved", "active", "replacing"}),
 }
@@ -78,6 +82,45 @@ _MANAGED_TASKS_COLUMNS = (
 _SELF_PARENT_CHECK = "parent_task_id != task_id"
 _REBUILD_TABLE = "managed_tasks_kernel_v1"
 
+#: ``dedupe_key`` carries no column-level ``UNIQUE``: uniqueness binds only
+#: *live* wakes through ``idx_task_wakes_live`` below, so a consumed wake's key
+#: can arm again for the next cohort transition instead of once per epoch ever.
+#: ``cohort_signature`` records *which* satisfied cohort state produced the wake
+#: so a re-armed key signals a genuinely new transition exactly once and never
+#: re-fires for a state a delivered wake already covered.
+_TASK_WAKES_DDL = """
+    CREATE TABLE {name} (
+        wake_id TEXT PRIMARY KEY,
+        parent_task_id TEXT NOT NULL,
+        predicate TEXT NOT NULL CHECK (predicate IN
+            ('all_children_terminal', 'any_child_blocked')),
+        dedupe_key TEXT NOT NULL,
+        cohort_signature TEXT,
+        state TEXT NOT NULL CHECK (state IN
+            ('pending', 'claimed', 'delivered', 'resolved')),
+        claim_expires_at REAL,
+        payload TEXT,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+"""
+_TASK_WAKES_REBUILD_TABLE = "task_wakes_kernel_v1"
+#: Columns a pre-fix ``task_wakes`` carries, in order, for a rebuild carry-over.
+_TASK_WAKES_LEGACY_COLUMNS = (
+    "wake_id",
+    "parent_task_id",
+    "predicate",
+    "dedupe_key",
+    "state",
+    "claim_expires_at",
+    "payload",
+    "created_at",
+    "updated_at",
+)
+#: The exact fragment a pre-fix ``task_wakes`` carries; its presence is what
+#: tells the migration a lifetime-unique ``dedupe_key`` still needs unbinding.
+_TASK_WAKES_LEGACY_UNIQUE = "dedupe_key TEXT NOT NULL UNIQUE"
+
 
 class TaskStoreError(RuntimeError):
     pass
@@ -132,6 +175,12 @@ class TaskStore:
     def _initialize(self) -> None:
         try:
             with self._database._connect() as conn:
+                # Take the write lock BEFORE reading any schema state. Two
+                # processes racing a first-run migration would otherwise both
+                # observe a pre-kernel database and P2's rebuild would wipe the
+                # rows P1 just preserved; serializing here means P2 re-reads the
+                # schema under the lock and sees P1's completed rebuild.
+                conn.execute("BEGIN IMMEDIATE")
                 self._migrate_managed_tasks(conn)
                 conn.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_tasks_holder "
@@ -162,27 +211,8 @@ class TaskStore:
                     )
                     """
                 )
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS task_wakes (
-                        wake_id TEXT PRIMARY KEY,
-                        parent_task_id TEXT NOT NULL,
-                        predicate TEXT NOT NULL CHECK (predicate IN
-                            ('all_children_terminal', 'any_child_blocked')),
-                        dedupe_key TEXT NOT NULL UNIQUE,
-                        state TEXT NOT NULL CHECK (state IN
-                            ('pending', 'claimed', 'delivered', 'resolved')),
-                        claim_expires_at REAL,
-                        payload TEXT,
-                        created_at REAL NOT NULL,
-                        updated_at REAL NOT NULL
-                    )
-                    """
-                )
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_task_wakes_pending "
-                    "ON task_wakes(state, created_at)"
-                )
+                self._migrate_task_wakes(conn)
+                conn.execute("COMMIT")
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(f"Cannot initialize managed tasks: {exc}") from exc
 
@@ -193,7 +223,9 @@ class TaskStore:
         SQLite cannot add a CHECK constraint in place, so an existing table
         without the self-parent constraint or the ``version`` column is
         rebuilt. Running this twice is a no-op: the second pass sees both
-        additions and returns before touching any row.
+        additions and returns before touching any row. The caller holds
+        ``BEGIN IMMEDIATE``, so this reads the schema under the write lock and
+        never races a peer process into a double rebuild.
         """
         existing = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'managed_tasks'"
@@ -211,7 +243,6 @@ class TaskStore:
         carried = ", ".join(
             name for name in _MANAGED_TASKS_COLUMNS if name != "parent_task_id"
         )
-        conn.execute("BEGIN IMMEDIATE")
         conn.execute(f"DROP TABLE IF EXISTS {_REBUILD_TABLE}")
         conn.execute(_MANAGED_TASKS_DDL.format(name=_REBUILD_TABLE))
         conn.execute(
@@ -229,7 +260,52 @@ class TaskStore:
         )
         conn.execute("DROP TABLE managed_tasks")
         conn.execute(f"ALTER TABLE {_REBUILD_TABLE} RENAME TO managed_tasks")
-        conn.execute("COMMIT")
+
+    @staticmethod
+    def _migrate_task_wakes(conn: sqlite3.Connection) -> None:
+        """Create ``task_wakes`` and bind uniqueness to *live* wakes only.
+
+        A pre-fix table carries a column-level ``UNIQUE`` on ``dedupe_key`` that
+        makes a manager wake once per predicate per epoch for the lifetime of
+        the row, so multi-wave managers hang after wave one. The constraint
+        cannot be dropped in place, so the table is rebuilt without it and a
+        partial unique index rebinds uniqueness to un-consumed wakes. The caller
+        holds ``BEGIN IMMEDIATE``; running this twice is a no-op.
+        """
+        existing = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'task_wakes'"
+        ).fetchone()
+        if existing is None:
+            conn.execute(_TASK_WAKES_DDL.format(name="task_wakes"))
+        else:
+            columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(task_wakes)").fetchall()
+            }
+            needs_rebuild = (
+                _TASK_WAKES_LEGACY_UNIQUE in str(existing["sql"])
+                or "cohort_signature" not in columns
+            )
+            if needs_rebuild:
+                carried = ", ".join(_TASK_WAKES_LEGACY_COLUMNS)
+                conn.execute(f"DROP TABLE IF EXISTS {_TASK_WAKES_REBUILD_TABLE}")
+                conn.execute(_TASK_WAKES_DDL.format(name=_TASK_WAKES_REBUILD_TABLE))
+                conn.execute(
+                    f"INSERT INTO {_TASK_WAKES_REBUILD_TABLE} ({carried}) "
+                    f"SELECT {carried} FROM task_wakes"
+                )
+                conn.execute("DROP TABLE task_wakes")
+                conn.execute(
+                    f"ALTER TABLE {_TASK_WAKES_REBUILD_TABLE} RENAME TO task_wakes"
+                )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_wakes_pending "
+            "ON task_wakes(state, created_at)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_wakes_live "
+            "ON task_wakes(dedupe_key) WHERE state IN ('pending', 'claimed')"
+        )
 
     @staticmethod
     def task_id(scope: str, key: str) -> str:
@@ -442,9 +518,12 @@ class TaskStore:
     def activate(
         self, task_id: str, *, workspace_id: str, session_id: str
     ) -> TaskRecord:
-        return self.transition(
-            task_id,
+        # BEGIN IMMEDIATE so the guarded UPDATE and its readback share one
+        # transaction; otherwise a competing terminal writer can slip between
+        # them and the returned record describes a row this call never wrote.
+        return self._transaction(
             expect_states=ACTIVATE_PREDECESSORS,
+            task_id=task_id,
             expect_version=None,
             assign="state = 'active', workspace_id = ?, holder_session_id = ?",
             values=(str(workspace_id), str(session_id)),
@@ -493,14 +572,46 @@ class TaskStore:
             raise TaskStoreError(f"Cannot prepare task replacement: {exc}") from exc
 
     def checkpoint(self, task_id: str, checkpoint: str) -> TaskRecord:
-        return self.transition(
-            task_id,
+        # Same atomicity as activate(): the readback must see this call's own
+        # write, not a row a concurrent transition moved after the UPDATE.
+        return self._transaction(
             expect_states=LIVE_STATES,
+            task_id=task_id,
             expect_version=None,
             assign="checkpoint = ?",
             values=(checkpoint,),
             attempted="checkpoint",
         )
+
+    def _transaction(
+        self,
+        *,
+        task_id: str,
+        expect_states: frozenset[str],
+        expect_version: int | None,
+        assign: str,
+        values: tuple[object, ...],
+        attempted: str,
+    ) -> TaskRecord:
+        """Run one guarded transition inside its own ``BEGIN IMMEDIATE``."""
+        try:
+            with self._database._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                record = self._transition(
+                    conn,
+                    task_id,
+                    expect_states,
+                    expect_version,
+                    assign,
+                    values,
+                    attempted,
+                )
+                conn.execute("COMMIT")
+                return record
+        except TaskStoreError:
+            raise
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(f"Cannot update managed task: {exc}") from exc
 
     def finish(
         self,

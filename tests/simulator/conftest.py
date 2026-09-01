@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from sightmesh.sdk import SightMesh, WorkerSpec
+from sightmesh.succession import QuarantinedSessionError, TerminalOwnership
 from sightmesh.task_store import TaskStore
 
 from .fake_cdesktop import FakeCdesktop
@@ -38,9 +39,25 @@ class FakeOwnership:
         return self.records.get(session_id)
 
     def assert_deliverable(self, session_id: str) -> None:
-        assert session_id not in self.records
+        record = self.records.get(session_id)
+        if record is not None:
+            # Match the real OwnershipStore so the wake outbox's deliverability
+            # guard (F6) can catch a retired holder by one exception type.
+            raise QuarantinedSessionError(
+                TerminalOwnership(
+                    session_id=record.session_id,
+                    state=record.state,
+                    reason=record.reason,
+                    retired_at="2026-09-01T00:00:00+00:00",
+                    logical_key=record.logical_key,
+                    successor_session_id=record.successor_session_id,
+                )
+            )
 
-    def retire(self, session_id: str, *, state: str, reason: str, logical_key: str):
+    def retire(
+        self, session_id: str, *, state: str = "retired", reason: str = "retired",
+        logical_key: str | None = None,
+    ):
         return self.records.setdefault(
             session_id,
             SimpleNamespace(

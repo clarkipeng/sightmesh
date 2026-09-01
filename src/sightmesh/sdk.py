@@ -149,7 +149,7 @@ class SightMesh:
         self.environment = environment if environment is not None else os.environ
         self.owner_instance = new_owner_instance()
         self.journal = EffectJournal(self.store)
-        self.wakes = wakes.WakeDelivery(self.client, self.store)
+        self.wakes = wakes.WakeDelivery(self.client, self.store, self.ownership)
         self.contract_probe: str | None = None
 
     def start(self, spec: WorkerSpec | None = None, **kwargs: Any) -> Worker:
@@ -485,11 +485,13 @@ class SightMesh:
             # 424/425 mean the outcome is unknowable or still owned; the
             # reservation must stay adoptable for a retry. Anything else is a
             # definitive rejection: record the typed outcome on this epoch's
-            # effect so callers never have to grep error text.
+            # effect so callers never have to grep error text, and block the
+            # task so it is not left `reserved` and relaunchable - a retry is an
+            # explicit new epoch via replace().
             if not isinstance(exc, (CdesktopInterruptedError, CdesktopPendingError)):
-                self.journal.mark_terminal(
-                    task.task_id, task.epoch, _rejection_outcome(exc.status)
-                )
+                outcome = _rejection_outcome(exc.status)
+                self.journal.mark_terminal(task.task_id, task.epoch, outcome)
+                self._finish(task, "blocked", f"launch rejected: {outcome}")
             raise
         workspace_id, session_id = self._effect_ids(task, native)
         self.journal.mark_launched(task.task_id, task.epoch, workspace_id, session_id)

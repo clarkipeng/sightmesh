@@ -278,9 +278,11 @@ class DurableExecutionReconciler:
                         wakes.record_wakes(conn, parent_task_id)
                     )
                 conn.execute("COMMIT")
-            repaired["wakes_delivered"] = wakes.WakeDelivery(self.client, store).pump()
+            repaired["wakes_delivered"] = wakes.WakeDelivery(
+                self.client, store, self.ownership
+            ).pump()
             repaired["effects_expired"] = len(
-                EffectJournal(store).expire_reservations()
+                EffectJournal(store).expire_reservations(self.client)
             )
         except TaskStoreError as exc:
             LOGGER.warning("Cannot reconcile the task kernel: %s", exc)

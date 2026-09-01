@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from sightmesh.cdesktop import CdesktopRejectedError
+from sightmesh.cdesktop import CdesktopError, CdesktopRejectedError
 
 
 class SimulatedCrash(RuntimeError):
@@ -203,6 +203,38 @@ class FakeCdesktop:
         # the activation. That is exactly the gap S3 probes.
         self._hook("activate")
         return dict(effect)
+
+    def managed_effect(self, task_id: str, epoch: int) -> dict[str, Any]:
+        """Look up the native effect behind a task epoch, or 404 if absent.
+
+        Mirrors ``CdesktopClient.managed_effect`` (a ``GET`` that raises on a
+        not-found response) so F3's adopt-or-lose expiry can distinguish a live
+        native session from one that is genuinely gone.
+        """
+        self._log("managed_effect", task_id, epoch)
+        key = (str(task_id), int(epoch))
+        with self._effects_lock:
+            effect = self._effects.get(key)
+        if effect is None:
+            raise CdesktopError(
+                f"GET managed effect {task_id}/{epoch} failed: HTTP 404: not found"
+            )
+        return dict(effect)
+
+    def create_native_session(
+        self, task_id: str, epoch: int, *, workspace_id: str, session_id: str
+    ) -> None:
+        """Seed a native session with no kernel activation behind it.
+
+        Stands in for the ordinary "session created but ``mark_launched`` never
+        ran" window a 15s launch timeout opens (F3 / S20).
+        """
+        with self._effects_lock:
+            self._effects[(str(task_id), int(epoch))] = {
+                "state": "active",
+                "workspace_id": workspace_id,
+                "session_id": session_id,
+            }
 
     def send(
         self,

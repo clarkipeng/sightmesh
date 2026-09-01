@@ -22,6 +22,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from .cdesktop import CdesktopError
 from .task_store import TaskStore, TaskStoreError
 
 RESERVATION_TTL_SECONDS = 120.0
@@ -33,6 +34,15 @@ class EffectBusy(TaskStoreError):
 
 class EffectConflict(TaskStoreError):
     """The same task epoch was already reserved for a different launch spec."""
+
+
+class EffectTerminal(TaskStoreError):
+    """This task epoch already reached a typed terminal outcome.
+
+    A terminal effect is a launch barrier, not an adoptable reservation: the
+    epoch is finished and the caller must advance to a new epoch (``replace``)
+    rather than relaunch the one that ended.
+    """
 
 
 def request_hash(launch: Mapping[str, Any]) -> str:
@@ -75,8 +85,17 @@ class EffectJournal:
     ) -> tuple[Effect, bool]:
         """Claim the right to launch this epoch; report whether we took over.
 
-        Returns the existing effect untouched when it is already launched or
-        terminal, so the caller adopts rather than relaunches.
+        The checks are ordered by *state first*, then hash, so a finished or
+        launched epoch is resolved before drift is even considered:
+
+        * ``terminal`` -> ``EffectTerminal`` (a launch barrier, whatever the
+          hash: this epoch is over and must be advanced, never relaunched);
+        * ``launched`` -> adopt the existing native identifiers, whatever the
+          hash (the launch already happened);
+        * ``reserved`` + expired lease -> fenced takeover;
+        * ``reserved`` + live lease + other owner -> ``EffectBusy``;
+        * ``reserved`` + live lease + different hash -> ``EffectConflict``;
+        * ``reserved`` + live lease + same owner and hash -> adopt.
         """
         now = time.time()
         try:
@@ -105,20 +124,27 @@ class EffectJournal:
                     conn.execute("COMMIT")
                     return effect, False
                 existing = _decode(row)
-                if existing.request_hash != request_hash:
-                    raise EffectConflict(
-                        f"Task {task_id} epoch {epoch} was reserved for a different "
-                        "launch specification"
+                if existing.state == "terminal":
+                    raise EffectTerminal(
+                        f"Task {task_id} epoch {epoch} already reached the terminal "
+                        f"outcome {existing.outcome!r}; advance the epoch to relaunch"
                     )
-                if existing.state != "reserved":
+                if existing.state == "launched":
                     conn.execute("COMMIT")
                     return existing, False
-                mine = existing.owner_instance == owner
-                if not mine and existing.lease_expires_at > now:
-                    raise EffectBusy(
-                        f"Task {task_id} epoch {epoch} is reserved by another live "
-                        "SightMesh instance"
-                    )
+                # Only a live ``reserved`` row remains.
+                if existing.lease_expires_at > now:
+                    if existing.owner_instance != owner:
+                        raise EffectBusy(
+                            f"Task {task_id} epoch {epoch} is reserved by another "
+                            "live SightMesh instance"
+                        )
+                    if existing.request_hash != request_hash:
+                        raise EffectConflict(
+                            f"Task {task_id} epoch {epoch} was reserved for a "
+                            "different launch specification"
+                        )
+                took_over = existing.lease_expires_at <= now
                 conn.execute(
                     "UPDATE task_effects SET owner_instance = ?, "
                     "lease_expires_at = ?, updated_at = ? "
@@ -127,7 +153,7 @@ class EffectJournal:
                 )
                 effect = self._require(conn, task_id, epoch)
                 conn.execute("COMMIT")
-                return effect, not mine
+                return effect, took_over
         except TaskStoreError:
             raise
         except sqlite3.DatabaseError as exc:
@@ -163,36 +189,95 @@ class EffectJournal:
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(f"Cannot read task effect: {exc}") from exc
 
-    def expire_reservations(self, *, now: float | None = None) -> list[Effect]:
-        """Retire leases whose owner died before it reached the native call."""
+    def expire_reservations(
+        self, client: Any | None = None, *, now: float | None = None
+    ) -> list[Effect]:
+        """Adopt-or-lose every reservation whose lease has run out.
+
+        A 15s native-launch timeout makes the "session created but
+        ``mark_launched`` never ran" window ordinary, so an expired reservation
+        is not evidence the native session is gone. For each expired row the
+        journal asks the executor: if it reports an active session, the effect
+        is adopted (``launched`` + the task activated); only a genuinely absent
+        or lost session is retired ``lost:reservation-expired``.
+        """
         moment = time.time() if now is None else now
         try:
             with self.store.connect() as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                rows = conn.execute(
-                    "SELECT * FROM task_effects WHERE state = 'reserved' "
-                    "AND lease_expires_at < ? AND session_id IS NULL",
-                    (moment,),
-                ).fetchall()
-                for row in rows:
-                    conn.execute(
-                        "UPDATE task_effects SET state = 'terminal', outcome = ?, "
-                        "updated_at = ? WHERE task_id = ? AND epoch = ?",
-                        (
-                            "lost:reservation-expired",
-                            moment,
-                            str(row["task_id"]),
-                            int(row["epoch"]),
-                        ),
-                    )
-                expired = [
-                    self._require(conn, str(row["task_id"]), int(row["epoch"]))
-                    for row in rows
+                candidates = [
+                    (str(row["task_id"]), int(row["epoch"]))
+                    for row in conn.execute(
+                        "SELECT task_id, epoch FROM task_effects "
+                        "WHERE state = 'reserved' AND lease_expires_at < ?",
+                        (moment,),
+                    ).fetchall()
                 ]
-                conn.execute("COMMIT")
-                return expired
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(f"Cannot expire task effects: {exc}") from exc
+
+        lost: list[Effect] = []
+        for task_id, epoch in candidates:
+            native = self._native_effect(client, task_id, epoch)
+            if native is not None:
+                workspace_id = native.get("workspace_id")
+                session_id = native.get("session_id")
+                if native.get("state") == "active" and workspace_id and session_id:
+                    # Native is live behind the lease: adopt it rather than
+                    # orphan the running session.
+                    self.mark_launched(
+                        task_id, epoch, str(workspace_id), str(session_id)
+                    )
+                    self.store.activate(
+                        task_id,
+                        workspace_id=str(workspace_id),
+                        session_id=str(session_id),
+                    )
+                    continue
+            retired = self._retire_reservation(task_id, epoch, moment)
+            if retired is not None:
+                lost.append(retired)
+        return lost
+
+    @staticmethod
+    def _native_effect(
+        client: Any | None, task_id: str, epoch: int
+    ) -> dict[str, Any] | None:
+        """Ask the executor whether a native session stands behind this epoch."""
+        lookup = getattr(client, "managed_effect", None) if client else None
+        if lookup is None:
+            return None
+        try:
+            native = lookup(task_id, epoch)
+        except CdesktopError:
+            # A not-found (404) or unreachable executor is not proof of life;
+            # treat it as absent so the reservation is retired, not adopted.
+            return None
+        if not isinstance(native, Mapping):
+            return None
+        if str(native.get("state") or "") in {"", "missing", "not_found", "lost"}:
+            return None
+        return dict(native)
+
+    def _retire_reservation(
+        self, task_id: str, epoch: int, moment: float
+    ) -> Effect | None:
+        """Mark one still-reserved, still-expired effect lost; skip if it moved."""
+        try:
+            with self.store.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute(
+                    "UPDATE task_effects SET state = 'terminal', outcome = ?, "
+                    "updated_at = ? WHERE task_id = ? AND epoch = ? "
+                    "AND state = 'reserved' AND lease_expires_at < ?",
+                    ("lost:reservation-expired", moment, task_id, epoch, moment),
+                )
+                effect = self._require(conn, task_id, epoch) if cursor.rowcount else None
+                conn.execute("COMMIT")
+                return effect
+        except TaskStoreError:
+            raise
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(f"Cannot expire task effect: {exc}") from exc
 
     def _advance(
         self,
@@ -208,11 +293,22 @@ class EffectJournal:
         try:
             with self.store.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                conn.execute(
+                cursor = conn.execute(
                     f"UPDATE task_effects SET {assign}, updated_at = ? "
                     f"WHERE task_id = ? AND epoch = ? AND state IN ({placeholders})",
                     (*values, now, str(task_id), int(epoch), *states),
                 )
+                if cursor.rowcount != 1:
+                    # A no-op UPDATE means the row is missing or already past the
+                    # states this advance is allowed to move; surfacing it stops
+                    # a terminal effect from being silently relaunched or
+                    # re-marked.
+                    effect = self.get_within(conn, task_id, epoch)
+                    raise EffectTerminal(
+                        f"Task {task_id} epoch {epoch} is "
+                        f"{effect.state if effect else 'missing'}; "
+                        "this effect transition no longer applies"
+                    )
                 effect = self._require(conn, task_id, epoch)
                 conn.execute("COMMIT")
                 return effect
@@ -220,6 +316,13 @@ class EffectJournal:
             raise
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(f"Cannot update task effect: {exc}") from exc
+
+    @classmethod
+    def get_within(
+        cls, conn: sqlite3.Connection, task_id: str, epoch: int
+    ) -> Effect | None:
+        row = cls._row(conn, task_id, epoch)
+        return _decode(row) if row is not None else None
 
     @staticmethod
     def _row(conn: sqlite3.Connection, task_id: str, epoch: int) -> sqlite3.Row | None:

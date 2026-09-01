@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS task_wakes (
     wake_id TEXT PRIMARY KEY,
     parent_task_id TEXT NOT NULL,
     predicate TEXT NOT NULL CHECK (predicate IN ('all_children_terminal', 'any_child_blocked')),
-    dedupe_key TEXT NOT NULL UNIQUE,
+    dedupe_key TEXT NOT NULL,
+    cohort_signature TEXT,
     state TEXT NOT NULL CHECK (state IN ('pending', 'claimed', 'delivered', 'resolved')),
     claim_expires_at REAL,
     payload TEXT,
@@ -50,9 +51,13 @@ CREATE TABLE IF NOT EXISTS task_wakes (
     updated_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_task_wakes_pending ON task_wakes(state, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_wakes_live
+    ON task_wakes(dedupe_key) WHERE state IN ('pending', 'claimed');
 ```
 
 `dedupe_key` is `{parent_task_id}:{parent_epoch}:{predicate}`; `INSERT OR IGNORE` makes wake creation idempotent.
+Uniqueness binds only *live* wakes (the partial index), so a delivered or resolved wake's key can arm again for the next cohort transition; a manager waits once per cohort event, not once per predicate per epoch for the row's lifetime.
+`cohort_signature` fingerprints the satisfying cohort state, so a genuinely new transition re-arms exactly once while a reconciler re-scanning an unchanged satisfied cohort never re-creates a wake.
 
 ## Guarded transitions (`task_store.py`)
 

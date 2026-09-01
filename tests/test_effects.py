@@ -5,14 +5,16 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from sightmesh.cdesktop import CdesktopError
 from sightmesh.effects import (
     EffectBusy,
     EffectConflict,
     EffectJournal,
+    EffectTerminal,
     new_owner_instance,
     request_hash,
 )
-from sightmesh.task_store import TaskStore
+from sightmesh.task_store import TaskStore, TaskStoreError
 
 
 @pytest.fixture
@@ -93,14 +95,21 @@ def test_a_launched_effect_is_returned_for_adoption(journal):
 
 def test_the_first_terminal_outcome_wins(journal):
     """A typed provider outcome must not be overwritten by a later generic
-    one, or the reason a task died becomes unrecoverable."""
+    one, or the reason a task died becomes unrecoverable.
+
+    The first terminal write wins by *rejecting* a second advance rather than
+    silently swallowing it: a terminal effect is a barrier, so ``mark_terminal``
+    on an already-terminal row raises (rowcount 0 is no longer a silent no-op),
+    and the recorded outcome is unchanged.
+    """
     journal.reserve("task-1", 1, request_hash(LAUNCH), "owner-a")
     journal.mark_launched("task-1", 1, "workspace-1", "session-1")
 
     journal.mark_terminal("task-1", 1, "quota:retry_at=60")
-    later = journal.mark_terminal("task-1", 1, "lost:unknown")
+    with pytest.raises(EffectTerminal):
+        journal.mark_terminal("task-1", 1, "lost:unknown")
 
-    assert later.outcome == "quota:retry_at=60"
+    assert journal.get("task-1", 1).outcome == "quota:retry_at=60"
 
 
 def test_expired_reservations_that_never_launched_are_retired(journal):
@@ -132,6 +141,102 @@ def test_a_hundred_concurrent_reservations_yield_one_effect(journal):
 
     assert {(effect.task_id, effect.epoch) for effect in effects} == {("task-1", 1)}
     assert journal.get("task-1", 1) is not None
+
+
+def test_a_terminal_effect_refuses_a_relaunch(journal):
+    """A terminal epoch is a launch barrier: reserving it again must raise, not
+    hand back an adoptable row, or a finished epoch relaunches under an
+    identity that promised it was done."""
+    journal.reserve("task-1", 1, request_hash(LAUNCH), "owner-a")
+    journal.mark_launched("task-1", 1, "workspace-1", "session-1")
+    journal.mark_terminal("task-1", 1, "completed")
+
+    with pytest.raises(EffectTerminal):
+        journal.reserve("task-1", 1, request_hash(LAUNCH), "owner-a")
+
+
+def test_a_terminal_effect_outranks_a_hash_conflict(journal):
+    """State is checked before the hash: a terminal row raises EffectTerminal
+    whatever the request hash, so a drifted retry can never dead-end an already
+    finished epoch behind an unclearable EffectConflict."""
+    journal.reserve("task-1", 1, request_hash(LAUNCH), "owner-a")
+    journal.mark_launched("task-1", 1, "workspace-1", "session-1")
+    journal.mark_terminal("task-1", 1, "completed")
+
+    with pytest.raises(EffectTerminal):
+        journal.reserve("task-1", 1, request_hash({"kind": "session"}), "owner-a")
+
+
+def test_a_launched_effect_adopts_despite_a_hash_conflict(journal):
+    """The launch already happened, so a launched row is adopted whatever the
+    hash; only a live reserved row with a different hash is a conflict."""
+    journal.reserve("task-1", 1, request_hash(LAUNCH), "owner-a")
+    journal.mark_launched("task-1", 1, "workspace-1", "session-1")
+
+    effect, took_over = journal.reserve(
+        "task-1", 1, request_hash({"kind": "session"}), "owner-a"
+    )
+
+    assert (effect.state, took_over) == ("launched", False)
+
+
+def test_marking_a_terminal_effect_again_raises_instead_of_no_op(journal):
+    """A no-op UPDATE used to pass silently; the rowcount check turns a lost
+    write into a raised error so a terminal effect is never re-marked."""
+    journal.reserve("task-1", 1, request_hash(LAUNCH), "owner-a")
+    journal.mark_launched("task-1", 1, "workspace-1", "session-1")
+    journal.mark_terminal("task-1", 1, "completed")
+
+    with pytest.raises(TaskStoreError):
+        journal.mark_launched("task-1", 1, "workspace-2", "session-2")
+
+
+class _NativeReports:
+    """Minimal cdesktop double answering only the managed-effect lookup."""
+
+    def __init__(self, effect):
+        self._effect = effect
+
+    def managed_effect(self, task_id, epoch):
+        if self._effect is None:
+            raise CdesktopError(f"GET {task_id}/{epoch}: HTTP 404: not found")
+        return dict(self._effect)
+
+
+def test_expiry_adopts_a_reservation_a_live_native_session_stands_behind(tmp_path):
+    """The 15s launch window makes 'session created, mark_launched never ran'
+    ordinary; expiry must adopt a live native session, not orphan it."""
+    store = TaskStore(tmp_path / "state.sqlite3")
+    ((task, _inserted),) = store.reserve_all(
+        scope="operator",
+        parent_task_id=None,
+        specs=[{"key": "adopted", "children": 0}],
+        max_attempts=3,
+    )
+    journal = EffectJournal(store)
+    journal.reserve(task.task_id, task.epoch, request_hash(LAUNCH), "owner-a", ttl=-1.0)
+    client = _NativeReports(
+        {"state": "active", "workspace_id": "ws-x", "session_id": "sess-x"}
+    )
+
+    lost = journal.expire_reservations(client)
+
+    assert lost == []
+    assert journal.get(task.task_id, task.epoch).state == "launched"
+    assert store.get_by_id(task.task_id).state == "active"
+
+
+def test_expiry_loses_a_reservation_no_native_session_stands_behind(tmp_path):
+    """A genuinely absent native session is the only case that still retires
+    the reservation lost:reservation-expired."""
+    store = TaskStore(tmp_path / "state.sqlite3")
+    journal = EffectJournal(store)
+    journal.reserve("gone", 1, request_hash(LAUNCH), "owner-a", ttl=-1.0)
+
+    lost = journal.expire_reservations(_NativeReports(None))
+
+    assert [effect.task_id for effect in lost] == ["gone"]
+    assert journal.get("gone", 1).outcome == "lost:reservation-expired"
 
 
 def test_get_returns_none_for_an_unreserved_epoch(journal):

@@ -14,6 +14,8 @@ to interrupt a manager's turn whenever a child blocked.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import sqlite3
 import time
@@ -22,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .cdesktop import CdesktopClient, CdesktopError
+from .succession import OwnershipStore, QuarantinedSessionError
 from .task_store import LIVE_STATES, TaskRecord, TaskStore, TaskStoreError
 
 LOGGER = logging.getLogger("sightmesh.wakes")
@@ -95,8 +98,41 @@ def satisfied_predicates(conn: sqlite3.Connection, parent_task_id: str) -> list[
     return predicates
 
 
+def cohort_signature(
+    conn: sqlite3.Connection, parent_task_id: str, predicate: str
+) -> str:
+    """Fingerprint the cohort state that satisfies ``predicate`` right now.
+
+    Re-arm across waves and idempotent gap-filling are the same requirement
+    seen from two sides: a genuinely new cohort transition must wake the
+    manager again, while a reconciler re-scanning an unchanged satisfied cohort
+    must not. Keying the wake to the satisfying state makes both true by
+    construction - an identical state hashes the same and is signalled once,
+    a changed roster hashes differently and arms afresh.
+    """
+    rows = conn.execute(
+        "SELECT task_id, state FROM managed_tasks WHERE parent_task_id = ? "
+        "ORDER BY task_id",
+        (str(parent_task_id),),
+    ).fetchall()
+    if predicate == "any_child_blocked":
+        material: Any = [
+            str(row["task_id"]) for row in rows if str(row["state"]) == "blocked"
+        ]
+    else:  # all_children_terminal
+        material = [(str(row["task_id"]), str(row["state"])) for row in rows]
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def record_wakes(conn: sqlite3.Connection, parent_task_id: str) -> list[str]:
-    """Insert one pending wake per satisfied predicate; duplicates are ignored."""
+    """Insert one pending wake per newly satisfied cohort state; else nothing.
+
+    The partial unique index collapses concurrent duplicate signals for the
+    same un-consumed cohort event; the signature check keeps a delivered or
+    resolved wake from being re-created for a cohort state it already covered.
+    """
     row = conn.execute(
         "SELECT epoch FROM managed_tasks WHERE task_id = ?", (str(parent_task_id),)
     ).fetchone()
@@ -106,16 +142,23 @@ def record_wakes(conn: sqlite3.Connection, parent_task_id: str) -> list[str]:
     created: list[str] = []
     for predicate in satisfied_predicates(conn, parent_task_id):
         key = dedupe_key(parent_task_id, parent_epoch, predicate)
+        signature = cohort_signature(conn, parent_task_id, predicate)
+        already = conn.execute(
+            "SELECT 1 FROM task_wakes WHERE dedupe_key = ? AND cohort_signature = ?",
+            (key, signature),
+        ).fetchone()
+        if already is not None:
+            continue
         wake_id = str(uuid.uuid4())
         now = time.time()
         cursor = conn.execute(
             """
             INSERT OR IGNORE INTO task_wakes
-            (wake_id, parent_task_id, predicate, dedupe_key, state,
-             created_at, updated_at)
-            VALUES (?, ?, ?, ?, 'pending', ?, ?)
+            (wake_id, parent_task_id, predicate, dedupe_key, cohort_signature,
+             state, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
             """,
-            (wake_id, str(parent_task_id), predicate, key, now, now),
+            (wake_id, str(parent_task_id), predicate, key, signature, now, now),
         )
         if cursor.rowcount:
             created.append(wake_id)
@@ -129,11 +172,13 @@ class WakeDelivery:
         self,
         client: CdesktopClient,
         store: TaskStore,
+        ownership: OwnershipStore | None = None,
         *,
         claim_seconds: float = CLAIM_SECONDS,
     ) -> None:
         self.client = client
         self.store = store
+        self.ownership = ownership if ownership is not None else OwnershipStore()
         self.claim_seconds = claim_seconds
 
     def pump(self) -> int:
@@ -177,6 +222,17 @@ class WakeDelivery:
             return self._resolve(wake, "parent task no longer exists")
         if not parent.holder_session_id:
             return self._resolve(wake, f"parent {parent.key} has no holder session")
+        if parent.state not in LIVE_STATES:
+            # A terminal parent refuses machine mail; delivering here would send
+            # a continuation into a session that has already ended.
+            return self._resolve(wake, f"parent {parent.key} is {parent.state}")
+        try:
+            self.ownership.assert_deliverable(parent.holder_session_id)
+        except QuarantinedSessionError as exc:
+            # A retired or superseded holder session can never resume; parking
+            # the wake (and, with live re-arm, letting a fresh cohort event wake
+            # the successor) is the only safe outcome.
+            return self._resolve(wake, f"parent {parent.key} session is retired: {exc}")
         children = self.store.children(parent.task_id)
         if any(
             child.holder_session_id == parent.holder_session_id for child in children

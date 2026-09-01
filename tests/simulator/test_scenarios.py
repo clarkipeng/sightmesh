@@ -14,20 +14,109 @@ These tests exercise the real ``TaskStore`` and ``SightMesh`` SDK wired to
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 
+from sightmesh.effects import EffectJournal, request_hash
 from sightmesh.sdk import BatchError, SightMesh
-from sightmesh.task_store import TaskStore, TaskStoreError
+from sightmesh.task_store import (
+    _MANAGED_TASKS_COLUMNS,
+    _MANAGED_TASKS_DDL,
+    _REBUILD_TABLE,
+    TaskStore,
+    TaskStoreError,
+)
+from sightmesh.wakes import WakeDelivery, finish_with_wake
 
 from .conftest import fail_missing_kernel_v1, make_mesh, query, table_exists, worker_spec
 from .fake_cdesktop import SimulatedCrash
 
 pytestmark = pytest.mark.simulator
+
+FORENSICS_SNAPSHOT = (
+    Path.home()
+    / "Documents"
+    / "sightmesh-forensics-2026-09-01"
+    / "escalations.sqlite3"
+)
+
+_LEGACY_MANAGED_TASKS_DDL = """
+    CREATE TABLE managed_tasks (
+        task_id TEXT PRIMARY KEY,
+        scope TEXT NOT NULL,
+        task_key TEXT NOT NULL,
+        parent_task_id TEXT,
+        state TEXT NOT NULL CHECK (state IN
+            ('reserved', 'active', 'replacing', 'blocked',
+             'completed', 'cancelled', 'lost')),
+        epoch INTEGER NOT NULL CHECK (epoch > 0),
+        attempts INTEGER NOT NULL CHECK (attempts > 0),
+        max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+        child_limit INTEGER NOT NULL CHECK (child_limit >= 0),
+        spec_json TEXT NOT NULL,
+        workspace_id TEXT,
+        holder_session_id TEXT,
+        checkpoint TEXT,
+        result TEXT,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        UNIQUE(scope, task_key),
+        FOREIGN KEY(parent_task_id) REFERENCES managed_tasks(task_id)
+    )
+"""
+
+
+def _manager(store: TaskStore, *, children: int) -> object:
+    ((parent, _inserted),) = store.reserve_all(
+        scope="operator",
+        parent_task_id=None,
+        specs=[{"key": "manager", "children": children}],
+        max_attempts=3,
+    )
+    return store.activate(
+        parent.task_id, workspace_id="ws-manager", session_id="session-manager"
+    )
+
+
+def _reserve_child(store: TaskStore, parent_task_id: str, key: str, session: str):
+    ((child, _inserted),) = store.reserve_all(
+        scope="operator",
+        parent_task_id=parent_task_id,
+        specs=[{"key": key, "children": 0}],
+        max_attempts=3,
+    )
+    return store.activate(
+        child.task_id, workspace_id=f"ws-{key}", session_id=session
+    )
+
+
+def _rebuild_managed_tasks_kernel_v1(conn: sqlite3.Connection) -> None:
+    """Stand in for a peer process P1 that completes the kernel-v1 rebuild.
+
+    Produces the exact table SQL the production migration checks for, so a
+    second initializer reading under its own lock recognizes the schema as
+    already migrated and returns without touching a row.
+    """
+    carried = ", ".join(
+        name
+        for name in _MANAGED_TASKS_COLUMNS
+        if name not in ("parent_task_id", "version")
+    )
+    conn.execute(f"DROP TABLE IF EXISTS {_REBUILD_TABLE}")
+    conn.execute(_MANAGED_TASKS_DDL.format(name=_REBUILD_TABLE))
+    conn.execute(
+        f"INSERT INTO {_REBUILD_TABLE} (parent_task_id, version, {carried}) "
+        f"SELECT parent_task_id, 0, {carried} FROM managed_tasks"
+    )
+    conn.execute("DROP TABLE managed_tasks")
+    conn.execute(f"ALTER TABLE {_REBUILD_TABLE} RENAME TO managed_tasks")
 
 
 def test_s1_duplicate_late_complete_on_a_blocked_task(mesh: SightMesh) -> None:
@@ -418,3 +507,359 @@ def test_s12_two_concurrent_replace_on_one_task_yield_one_winner_one_stale(
     assert len(results) == 1
     assert len(errors) == 1
     assert isinstance(errors[0], StaleTransition)
+
+
+def test_s18_a_second_cohort_transition_re_arms_the_wake(client, store, ownership):
+    """S18 (F1): wakes never re-arm.
+
+    Review finding F1: `dedupe_key = {parent}:{parent_epoch}:{predicate}` under a
+    lifetime-UNIQUE index means a manager wakes once per predicate per epoch,
+    ever, so a multi-wave manager hangs after wave one. Uniqueness must bind
+    only live wakes, so a delivered wake's key arms again for the next cohort
+    transition. (Fails today: the second `record_wakes` returns [], pump 0.)
+    """
+    parent = _manager(store, children=4)
+    a1 = _reserve_child(store, parent.task_id, "a1", "session-a1")
+    a2 = _reserve_child(store, parent.task_id, "a2", "session-a2")
+    finish_with_wake(store, a1.task_id, "completed", "one")
+    _record, first_wave = finish_with_wake(store, a2.task_id, "completed", "two")
+    assert len(first_wave) == 1
+
+    # WakeDelivery's default ownership is a real (never-retired) store; the
+    # manager session is deliverable, so the wake leaves the outbox.
+    delivery = WakeDelivery(client, store)
+    assert delivery.pump() == 1
+
+    # Wave two: dispatch and complete two more children of the same parent
+    # epoch. The predicate goes false then true again, a genuinely new cohort
+    # transition that must re-arm the wake (the delivered wave-one row no longer
+    # blocks the dedupe key). Pre-fix, this second record_wakes returns [].
+    a3 = _reserve_child(store, parent.task_id, "a3", "session-a3")
+    a4 = _reserve_child(store, parent.task_id, "a4", "session-a4")
+    finish_with_wake(store, a3.task_id, "completed", "three")
+    _record2, second_wave = finish_with_wake(store, a4.task_id, "completed", "four")
+    assert len(second_wave) == 1
+
+    assert delivery.pump() == 1
+    sent_to_parent = [row for row in client.sent if row[0] == parent.holder_session_id]
+    assert len(sent_to_parent) == 2
+
+
+def test_s19_a_terminal_effect_is_a_launch_barrier(store):
+    """S19 (F2): terminal effect is not a launch barrier.
+
+    Review finding F2: `reserve()` folded `launched` and `terminal` into
+    `(existing, False)` and `_advance` never checked its rowcount, so a
+    terminal epoch could relaunch and `mark_launched` silently no-op. A second
+    `reserve()` on a terminal `(task, epoch)` must raise `EffectTerminal`, and
+    `mark_launched` on a terminal row must raise, not no-op.
+    """
+    try:
+        from sightmesh.effects import EffectTerminal
+    except ImportError:
+        fail_missing_kernel_v1("sightmesh.effects.EffectTerminal does not exist yet")
+        return
+
+    journal = EffectJournal(store)
+    launch = {"kind": "workspace", "request": {"name": "t19"}}
+    journal.reserve("t19", 1, request_hash(launch), "owner-a")
+    journal.mark_launched("t19", 1, "ws-19", "sess-19")
+    journal.mark_terminal("t19", 1, "completed")
+
+    with pytest.raises(EffectTerminal):
+        journal.reserve("t19", 1, request_hash(launch), "owner-a")
+
+    with pytest.raises(TaskStoreError):
+        journal.mark_launched("t19", 1, "ws-19", "sess-19")
+
+
+def test_s20_expiry_adopts_an_in_flight_launch(client, store):
+    """S20 (F3): expiry buries an in-flight launch.
+
+    Review finding F3: `expire_reservations` marked any past-lease reservation
+    `lost:reservation-expired` using only `session_id IS NULL`, orphaning a
+    live native session created inside the 15s launch window. Expiry must
+    adopt-or-lose: reserve, simulate a native session created but never marked,
+    advance the clock past the lease, run expiry -> the effect ends `launched`
+    (adopted), the task is active, and nothing is lost.
+    """
+    ((task, _inserted),) = store.reserve_all(
+        scope="operator",
+        parent_task_id=None,
+        specs=[{"key": "orphaned", "children": 0}],
+        max_attempts=3,
+    )
+    journal = EffectJournal(store)
+    launch = {"kind": "workspace", "request": {"name": "orphaned"}}
+    # ttl < 0 makes the lease already expired the moment it is taken.
+    journal.reserve(task.task_id, task.epoch, request_hash(launch), "owner-a", ttl=-1.0)
+    client.create_native_session(
+        task.task_id, task.epoch, workspace_id="ws-x", session_id="sess-x"
+    )
+
+    lost = journal.expire_reservations(client)
+
+    assert lost == []
+    effect = journal.get(task.task_id, task.epoch)
+    assert effect is not None
+    assert effect.state == "launched"
+    assert (effect.workspace_id, effect.session_id) == ("ws-x", "sess-x")
+    assert effect.outcome is None
+    adopted = store.get_by_id(task.task_id)
+    assert adopted is not None
+    assert adopted.state == "active"
+    assert adopted.holder_session_id == "sess-x"
+
+
+def test_s21_terminal_outranks_conflict_when_the_hash_differs(store):
+    """S21 (F4): EffectConflict outranks terminal, dead-ending an epoch.
+
+    Review finding F4: `reserve()` checked `request_hash` before `state`, so a
+    terminal row with a different hash raised `EffectConflict` that nothing
+    could clear. A terminal row must raise `EffectTerminal` regardless of hash.
+    """
+    try:
+        from sightmesh.effects import EffectTerminal
+    except ImportError:
+        fail_missing_kernel_v1("sightmesh.effects.EffectTerminal does not exist yet")
+        return
+
+    journal = EffectJournal(store)
+    journal.reserve("t21", 1, request_hash({"kind": "workspace"}), "owner-a")
+    journal.mark_launched("t21", 1, "ws-21", "sess-21")
+    journal.mark_terminal("t21", 1, "completed")
+
+    with pytest.raises(EffectTerminal):
+        journal.reserve("t21", 1, request_hash({"kind": "session"}), "owner-a")
+
+
+def _run_concurrent_first_run_migration(database, path: Path) -> object:
+    """Drive the F5 interleaving: P2 reads schema while P1 holds the lock.
+
+    A gate connection holds ``BEGIN IMMEDIATE`` while a second thread enters the
+    real ``TaskStore`` migration. A pre-fix initializer reads ``has_version`` on
+    the still-pre-kernel snapshot before it can lock, then blocks; the fixed one
+    blocks on ``BEGIN IMMEDIATE`` first and only reads after the gate commits.
+    The gate then completes the rebuild and bumps a version, so the pre-fix
+    thread wipes it and the fixed thread preserves it.
+    """
+    started = threading.Event()
+    errors: list[BaseException] = []
+
+    def initialize_under_race() -> None:
+        started.set()
+        try:
+            TaskStore(path)
+        except BaseException as exc:  # noqa: BLE001 - surfaced to the test
+            errors.append(exc)
+
+    gate = database._open()
+    gate.execute("BEGIN IMMEDIATE")
+    thread = threading.Thread(target=initialize_under_race)
+    thread.start()
+    started.wait(timeout=10)
+    # Give P2 time to reach its pre-lock read (fix: to block on BEGIN IMMEDIATE).
+    time.sleep(0.4)
+    _rebuild_managed_tasks_kernel_v1(gate)
+    first_task_id = str(
+        gate.execute("SELECT task_id FROM managed_tasks LIMIT 1").fetchone()[0]
+    )
+    gate.execute(
+        "UPDATE managed_tasks SET version = 5 WHERE task_id = ?", (first_task_id,)
+    )
+    gate.execute("COMMIT")
+    gate.close()
+    thread.join(timeout=30)
+    if errors:
+        raise errors[0]
+    return first_task_id
+
+
+def test_s22_concurrent_first_run_migration_preserves_a_bumped_version(tmp_path):
+    """S22 (F5): concurrent first-run migration resets version to 0.
+
+    Review finding F5: `_initialize` read `sqlite_master`/`PRAGMA table_info`
+    before `BEGIN IMMEDIATE`, so two processes on a pre-kernel DB both saw
+    `has_version=False` and P2's rebuild wiped P1's preserved counters. Schema
+    detection must move inside the lock: a version bumped between them must
+    survive (final version >= 1, never reset to 0).
+    """
+    from sightmesh.escalation import EscalationStore
+
+    path = tmp_path / "state.sqlite3"
+    database = EscalationStore(path)
+    now = time.time()
+    with database._connect() as conn:
+        conn.execute(_LEGACY_MANAGED_TASKS_DDL)
+        conn.execute(
+            "INSERT INTO managed_tasks VALUES "
+            "('task-a', 'operator', 'one', NULL, 'active', 1, 1, 3, 0, '{}', "
+            "NULL, 'sess-a', NULL, NULL, ?, ?)",
+            (now, now),
+        )
+
+    task_id = _run_concurrent_first_run_migration(database, path)
+
+    final = TaskStore(path).get_by_id(task_id)
+    assert final is not None
+    assert final.version >= 1
+    assert final.version == 5
+
+
+@pytest.mark.skipif(
+    not FORENSICS_SNAPSHOT.exists(),
+    reason="real escalations.sqlite3 forensics snapshot is not present",
+)
+def test_s22_forensics_snapshot_concurrent_migration_preserves_a_bumped_version(
+    tmp_path,
+):
+    """S22 (F5): re-prove the concurrency fix against the real 28-row store.
+
+    Runs the same interleaving against a COPY of the forensic
+    `escalations.sqlite3` (28 pre-kernel `managed_tasks` rows); the original
+    snapshot is never touched.
+    """
+    from sightmesh.escalation import EscalationStore
+
+    path = tmp_path / "escalations.sqlite3"
+    shutil.copy2(FORENSICS_SNAPSHOT, path)
+    database = EscalationStore(path)
+    with database._connect() as conn:
+        before = int(
+            conn.execute("SELECT COUNT(*) FROM managed_tasks").fetchone()[0]
+        )
+    assert before == 28
+
+    task_id = _run_concurrent_first_run_migration(database, path)
+
+    reopened = TaskStore(path)
+    final = reopened.get_by_id(task_id)
+    assert final is not None
+    assert final.version == 5
+    with database._connect() as conn:
+        after = int(conn.execute("SELECT COUNT(*) FROM managed_tasks").fetchone()[0])
+    assert after == before  # no rows lost to the rebuild race
+
+
+def test_s23_a_wake_for_a_retired_parent_resolves_and_re_arms(client, store, ownership):
+    """S23 (F6): wake delivery skips the deliverability + parent-state guard.
+
+    Review finding F6: `WakeDelivery.deliver` checked only that the parent row
+    exists and has a holder; it never called `ownership.assert_deliverable` nor
+    checked `parent.state`, so it could send into a retired session and consume
+    the dedupe key. A child completing while the parent holder is retired must
+    resolve the wake with a reason and send nothing; with F1's re-arm, a later
+    live cohort event still wakes the (successor) parent.
+    """
+    parent = _manager(store, children=4)
+    a1 = _reserve_child(store, parent.task_id, "a1", "session-a1")
+    a2 = _reserve_child(store, parent.task_id, "a2", "session-a2")
+
+    # The parent's holder session is retired/superseded before the cohort ends.
+    ownership.retire(
+        parent.holder_session_id, state="retired", reason="superseded", logical_key="k"
+    )
+
+    finish_with_wake(store, a1.task_id, "completed", "one")
+    finish_with_wake(store, a2.task_id, "completed", "two")
+
+    delivery = WakeDelivery(client, store, ownership)
+    assert delivery.pump() == 0
+    resolved = query(store, "SELECT state, payload FROM task_wakes", ())
+    assert len(resolved) == 1
+    assert resolved[0]["state"] == "resolved"
+    assert "retired" in resolved[0]["payload"]
+    assert [row for row in client.sent if row[0] == parent.holder_session_id] == []
+
+    # A live successor adopts the parent; a fresh cohort transition re-arms.
+    revived = store.activate(
+        parent.task_id, workspace_id="ws-manager", session_id="session-manager-2"
+    )
+    a3 = _reserve_child(store, parent.task_id, "a3", "session-a3")
+    a4 = _reserve_child(store, parent.task_id, "a4", "session-a4")
+    finish_with_wake(store, a3.task_id, "completed", "three")
+    finish_with_wake(store, a4.task_id, "completed", "four")
+
+    assert delivery.pump() == 1
+    assert [row for row in client.sent if row[0] == revived.holder_session_id]
+
+
+def test_s24_activate_readback_shares_its_own_transaction(store):
+    """S24 (F7): guarded readback outside its transaction for activate.
+
+    Review finding F7: `transition()` opens a no-BEGIN connection, so with
+    `isolation_level=None` the UPDATE and the readback SELECT autocommit
+    separately; a competing terminal transition landing between them makes the
+    returned record describe a row the caller never wrote. With activate wrapped
+    in `BEGIN IMMEDIATE`, the readback must match the row its own UPDATE
+    produced. Pre-fix, the competing writer slips into the gap and activate
+    reports `lost`.
+    """
+    ((task, _inserted),) = store.reserve_all(
+        scope="operator",
+        parent_task_id=None,
+        specs=[{"key": "racer", "children": 0}],
+        max_attempts=3,
+    )
+
+    writer_done = threading.Event()
+    fired = {"value": False}
+
+    def compete() -> None:
+        conn = store._database._open()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE managed_tasks SET state = 'lost', version = version + 1, "
+                "updated_at = ? WHERE task_id = ? AND state IN "
+                "('reserved', 'active', 'replacing')",
+                (time.time(), task.task_id),
+            )
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+        writer_done.set()
+
+    class _SpyConnection:
+        """Fire a competing terminal writer in the UPDATE -> SELECT gap once."""
+
+        def __init__(self, conn: sqlite3.Connection) -> None:
+            self._conn = conn
+
+        def execute(self, sql: str, *args: object):
+            cursor = self._conn.execute(sql, *args)
+            if "state = 'active'" in sql and not fired["value"]:
+                fired["value"] = True
+                threading.Thread(target=compete).start()
+                # Pre-fix (autocommit): the competing writer commits into the
+                # gap fast and sets the event. Post-fix: activate holds the
+                # write lock, the competing writer blocks, the event stays
+                # clear and we fall through after the timeout.
+                writer_done.wait(timeout=1.5)
+            return cursor
+
+        def __getattr__(self, name: str):
+            return getattr(self._conn, name)
+
+    original_connect = store._database._connect
+
+    @contextmanager
+    def spy_connect():
+        with original_connect() as conn:
+            yield _SpyConnection(conn)
+
+    store._database._connect = spy_connect
+    try:
+        activated = store.activate(
+            task.task_id, workspace_id="ws-1", session_id="sess-1"
+        )
+    finally:
+        store._database._connect = original_connect
+
+    # The record activate returns must be the row its own UPDATE produced.
+    assert activated.state == "active"
+    assert activated.holder_session_id == "sess-1"
+
+    writer_done.wait(timeout=30)
+    # The competing terminal transition still lands, just not inside the gap.
+    assert store.get_by_id(task.task_id).state == "lost"

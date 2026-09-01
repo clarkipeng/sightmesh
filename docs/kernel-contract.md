@@ -46,7 +46,9 @@ Worker results carry a small manifest: task, outcome, artifacts, checks, continu
 Managers wait on durable predicates: `all_children_terminal`, `any_child_blocked`, or `external_receipt_present`.
 Liveness predicates `any_child_lost`, `any_child_stalled`, and `any_child_over_budget` extend this set; their detection rules, episode dedupe, and executor prerequisites are specified in `liveness-spec.md`.
 The kernel never kills and never respawns on a liveness signal; it wakes the owning manager.
-One wake per satisfied predicate, claimed atomically under a lease; delivery is at-least-once and idempotent by predicate identity.
+One wake per satisfied predicate *per cohort transition*, claimed atomically under a lease; delivery is at-least-once and idempotent by predicate identity.
+Uniqueness binds only un-consumed wakes: once a wake is delivered or resolved, the same predicate re-arms for the next cohort transition, so a multi-wave manager is woken each wave rather than once per epoch for the row's lifetime.
+A terminal parent refuses machine mail, and a wake for a retired or otherwise undeliverable holder resolves with a reason instead of sending; re-arm makes that safe, because a later live cohort event wakes the successor.
 A reconciler scans tasks (not commands) for satisfied-but-undelivered predicates, repairing any crash between state change and notification.
 Lifecycle continuation has bounded latency and cannot be starved behind ordinary backlog.
 
