@@ -14,8 +14,6 @@ to interrupt a manager's turn whenever a child blocked.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import sqlite3
 import time
@@ -38,13 +36,14 @@ class Wake:
     parent_task_id: str
     predicate: str
     dedupe_key: str
+    event_seq: int | None
     state: str
     claim_expires_at: float | None
     payload: str | None
 
 
-def dedupe_key(parent_task_id: str, parent_epoch: int, predicate: str) -> str:
-    return f"{parent_task_id}:{parent_epoch}:{predicate}"
+def dedupe_key(parent_task_id: str, predicate: str) -> str:
+    return f"{parent_task_id}:{predicate}"
 
 
 def finish_with_wake(
@@ -62,11 +61,18 @@ def finish_with_wake(
             record = store.finish(
                 task_id, state, result, expect_version=expect_version, conn=conn
             )
-            created = (
-                record_wakes(conn, record.parent_task_id)
-                if record.parent_task_id
-                else []
-            )
+            created: list[str] = []
+            if record.parent_task_id:
+                # One child terminal/blocked transition is one cohort event:
+                # bump the parent's monotonic counter in the same transaction
+                # so a wake's watermark can prove, later, whether the manager
+                # has already been woken for it.
+                conn.execute(
+                    "UPDATE managed_tasks SET child_event_seq = child_event_seq + 1 "
+                    "WHERE task_id = ?",
+                    (str(record.parent_task_id),),
+                )
+                created = record_wakes(conn, record.parent_task_id)
             conn.execute("COMMIT")
             return record, created
     except TaskStoreError:
@@ -98,67 +104,40 @@ def satisfied_predicates(conn: sqlite3.Connection, parent_task_id: str) -> list[
     return predicates
 
 
-def cohort_signature(
-    conn: sqlite3.Connection, parent_task_id: str, predicate: str
-) -> str:
-    """Fingerprint the cohort state that satisfies ``predicate`` right now.
-
-    Re-arm across waves and idempotent gap-filling are the same requirement
-    seen from two sides: a genuinely new cohort transition must wake the
-    manager again, while a reconciler re-scanning an unchanged satisfied cohort
-    must not. Keying the wake to the satisfying state makes both true by
-    construction - an identical state hashes the same and is signalled once,
-    a changed roster hashes differently and arms afresh.
-    """
-    rows = conn.execute(
-        "SELECT task_id, state FROM managed_tasks WHERE parent_task_id = ? "
-        "ORDER BY task_id",
-        (str(parent_task_id),),
-    ).fetchall()
-    if predicate == "any_child_blocked":
-        material: Any = [
-            str(row["task_id"]) for row in rows if str(row["state"]) == "blocked"
-        ]
-    else:  # all_children_terminal
-        material = [(str(row["task_id"]), str(row["state"])) for row in rows]
-    return hashlib.sha256(
-        json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-
-
 def record_wakes(conn: sqlite3.Connection, parent_task_id: str) -> list[str]:
-    """Insert one pending wake per newly satisfied cohort state; else nothing.
+    """Arm one pending wake per satisfied predicate past the watermark; else nothing.
 
-    The partial unique index collapses concurrent duplicate signals for the
-    same un-consumed cohort event; the signature check keeps a delivered or
-    resolved wake from being re-created for a cohort state it already covered.
+    A wake is due only while the parent has seen a child event its manager has
+    not yet been woken for: ``child_event_seq > last_woken_seq``. That single
+    comparison is what makes both invariants true by construction. A reconciler
+    re-scanning an unchanged, already-delivered cohort finds the counters equal
+    and arms nothing; a genuinely new child event (or a resolved, never
+    -delivered wake that left the watermark where it was) leaves the counter
+    ahead and re-arms. The partial unique index still collapses concurrent
+    duplicate signals for the same un-consumed cohort event to one live row.
     """
     row = conn.execute(
-        "SELECT epoch FROM managed_tasks WHERE task_id = ?", (str(parent_task_id),)
+        "SELECT child_event_seq, last_woken_seq FROM managed_tasks WHERE task_id = ?",
+        (str(parent_task_id),),
     ).fetchone()
     if row is None:
         return []
-    parent_epoch = int(row["epoch"])
+    child_event_seq = int(row["child_event_seq"])
+    if child_event_seq <= int(row["last_woken_seq"]):
+        return []
     created: list[str] = []
     for predicate in satisfied_predicates(conn, parent_task_id):
-        key = dedupe_key(parent_task_id, parent_epoch, predicate)
-        signature = cohort_signature(conn, parent_task_id, predicate)
-        already = conn.execute(
-            "SELECT 1 FROM task_wakes WHERE dedupe_key = ? AND cohort_signature = ?",
-            (key, signature),
-        ).fetchone()
-        if already is not None:
-            continue
+        key = dedupe_key(parent_task_id, predicate)
         wake_id = str(uuid.uuid4())
         now = time.time()
         cursor = conn.execute(
             """
             INSERT OR IGNORE INTO task_wakes
-            (wake_id, parent_task_id, predicate, dedupe_key, cohort_signature,
+            (wake_id, parent_task_id, predicate, dedupe_key, event_seq,
              state, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
             """,
-            (wake_id, str(parent_task_id), predicate, key, signature, now, now),
+            (wake_id, str(parent_task_id), predicate, key, child_event_seq, now, now),
         )
         if cursor.rowcount:
             created.append(wake_id)
@@ -261,11 +240,24 @@ class WakeDelivery:
         now = time.time()
         try:
             with self.store.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
                 conn.execute(
                     "UPDATE task_wakes SET state = ?, payload = ?, "
                     "claim_expires_at = NULL, updated_at = ? WHERE wake_id = ?",
                     (state, payload, now, wake.wake_id),
                 )
+                if state == "delivered" and wake.event_seq is not None:
+                    # Only a real delivery advances the watermark. A resolved
+                    # (suppressed) wake leaves it where it was, so the same
+                    # cohort event re-arms on the next pass. MAX keeps an
+                    # out-of-order delivery from ever moving it backwards.
+                    conn.execute(
+                        "UPDATE managed_tasks SET "
+                        "last_woken_seq = MAX(last_woken_seq, ?), updated_at = ? "
+                        "WHERE task_id = ?",
+                        (int(wake.event_seq), now, wake.parent_task_id),
+                    )
+                conn.execute("COMMIT")
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(f"Cannot settle task wake: {exc}") from exc
 
@@ -286,6 +278,7 @@ def _decode(row: Any) -> Wake:
         parent_task_id=str(row["parent_task_id"]),
         predicate=str(row["predicate"]),
         dedupe_key=str(row["dedupe_key"]),
+        event_seq=row["event_seq"],
         state=str(row["state"]),
         claim_expires_at=row["claim_expires_at"],
         payload=row["payload"],

@@ -53,6 +53,8 @@ _MANAGED_TASKS_DDL = """
         checkpoint TEXT,
         result TEXT,
         version INTEGER NOT NULL DEFAULT 0,
+        child_event_seq INTEGER NOT NULL DEFAULT 0,
+        last_woken_seq INTEGER NOT NULL DEFAULT 0,
         created_at REAL NOT NULL,
         updated_at REAL NOT NULL,
         UNIQUE(scope, task_key),
@@ -82,12 +84,13 @@ _MANAGED_TASKS_COLUMNS = (
 _SELF_PARENT_CHECK = "parent_task_id != task_id"
 _REBUILD_TABLE = "managed_tasks_kernel_v1"
 
-#: ``dedupe_key`` carries no column-level ``UNIQUE``: uniqueness binds only
-#: *live* wakes through ``idx_task_wakes_live`` below, so a consumed wake's key
-#: can arm again for the next cohort transition instead of once per epoch ever.
-#: ``cohort_signature`` records *which* satisfied cohort state produced the wake
-#: so a re-armed key signals a genuinely new transition exactly once and never
-#: re-fires for a state a delivered wake already covered.
+#: ``dedupe_key`` (``{parent}:{predicate}``) carries no column-level
+#: ``UNIQUE``: uniqueness binds only *live* wakes through ``idx_task_wakes_live``
+#: below, so a consumed wake's key can arm again for the next cohort transition
+#: instead of once per epoch ever. ``event_seq`` records the parent's
+#: ``child_event_seq`` at wake creation; delivery advances the parent's
+#: ``last_woken_seq`` to it, so a re-scan of an unchanged cohort (same seq) arms
+#: nothing while a genuinely new child event (higher seq) arms afresh.
 _TASK_WAKES_DDL = """
     CREATE TABLE {name} (
         wake_id TEXT PRIMARY KEY,
@@ -95,7 +98,7 @@ _TASK_WAKES_DDL = """
         predicate TEXT NOT NULL CHECK (predicate IN
             ('all_children_terminal', 'any_child_blocked')),
         dedupe_key TEXT NOT NULL,
-        cohort_signature TEXT,
+        event_seq INTEGER,
         state TEXT NOT NULL CHECK (state IN
             ('pending', 'claimed', 'delivered', 'resolved')),
         claim_expires_at REAL,
@@ -239,6 +242,10 @@ class TaskStore:
         }
         has_version = "version" in columns
         if has_version and _SELF_PARENT_CHECK in str(existing["sql"]):
+            # The table is already at the kernel-v1 shape; only the watermark
+            # columns may still be missing. Re-read table_info under the same
+            # write lock and add them forward-only, never a pre-lock read.
+            TaskStore._ensure_watermark_columns(conn)
             return
         carried = ", ".join(
             name for name in _MANAGED_TASKS_COLUMNS if name != "parent_task_id"
@@ -260,6 +267,28 @@ class TaskStore:
         )
         conn.execute("DROP TABLE managed_tasks")
         conn.execute(f"ALTER TABLE {_REBUILD_TABLE} RENAME TO managed_tasks")
+
+    @staticmethod
+    def _ensure_watermark_columns(conn: sqlite3.Connection) -> None:
+        """Add the wake watermark columns forward-only, under the write lock.
+
+        ``child_event_seq`` counts child terminal/blocked events observed by a
+        parent; ``last_woken_seq`` records how far its manager has already been
+        woken. A wake arms only while the former outruns the latter, so the two
+        counters are all the state re-arm and idempotent re-scan need. Both
+        carry a constant ``DEFAULT 0``, so ``ADD COLUMN`` is a legal forward
+        migration where a CHECK-adding change would need a full rebuild.
+        """
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(managed_tasks)").fetchall()
+        }
+        for column in ("child_event_seq", "last_woken_seq"):
+            if column not in columns:
+                conn.execute(
+                    f"ALTER TABLE managed_tasks ADD COLUMN {column} "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
 
     @staticmethod
     def _migrate_task_wakes(conn: sqlite3.Connection) -> None:
@@ -284,7 +313,7 @@ class TaskStore:
             }
             needs_rebuild = (
                 _TASK_WAKES_LEGACY_UNIQUE in str(existing["sql"])
-                or "cohort_signature" not in columns
+                or "event_seq" not in columns
             )
             if needs_rebuild:
                 carried = ", ".join(_TASK_WAKES_LEGACY_COLUMNS)

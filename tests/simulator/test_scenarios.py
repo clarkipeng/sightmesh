@@ -173,7 +173,7 @@ def test_s2_crash_between_state_change_and_notify_is_impossible_by_construction(
     child = store.get(parent_record.task_id, "child")
     assert child is not None and child.state == "completed"
 
-    dedupe_key = f"{parent_record.task_id}:{parent_record.epoch}:all_children_terminal"
+    dedupe_key = f"{parent_record.task_id}:all_children_terminal"
     rows = query(
         store,
         "SELECT state FROM task_wakes WHERE dedupe_key = ?",

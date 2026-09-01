@@ -74,7 +74,7 @@ def test_no_wake_until_the_whole_cohort_is_terminal(cohort):
     assert len(created) == 1
     assert _wakes(store)[0]["predicate"] == "all_children_terminal"
     assert _wakes(store)[0]["dedupe_key"] == dedupe_key(
-        parent.task_id, parent.epoch, "all_children_terminal"
+        parent.task_id, "all_children_terminal"
     )
 
 

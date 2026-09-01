@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import time
 import uuid
@@ -22,10 +23,22 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .cdesktop import CdesktopError
+from .cdesktop import CdesktopError, CdesktopRejectedError
 from .task_store import TaskStore, TaskStoreError
 
+LOGGER = logging.getLogger("sightmesh.effects")
+
 RESERVATION_TTL_SECONDS = 120.0
+
+
+class _UnknowableEffect(RuntimeError):
+    """The executor could neither confirm nor deny a native session this tick.
+
+    A 5xx, a ``URLError``, or a timeout is absence of proof of life, not proof
+    of death. Raising it (rather than reporting "absent") is what stops the
+    expiry sweep from retiring a reservation whose native session is still
+    running; only a definitive 404 is treated as real absence.
+    """
 
 
 class EffectBusy(TaskStoreError):
@@ -217,41 +230,78 @@ class EffectJournal:
 
         lost: list[Effect] = []
         for task_id, epoch in candidates:
-            native = self._native_effect(client, task_id, epoch)
-            if native is not None:
-                workspace_id = native.get("workspace_id")
-                session_id = native.get("session_id")
-                if native.get("state") == "active" and workspace_id and session_id:
-                    # Native is live behind the lease: adopt it rather than
-                    # orphan the running session.
-                    self.mark_launched(
-                        task_id, epoch, str(workspace_id), str(session_id)
-                    )
-                    self.store.activate(
-                        task_id,
-                        workspace_id=str(workspace_id),
-                        session_id=str(session_id),
-                    )
-                    continue
-            retired = self._retire_reservation(task_id, epoch, moment)
-            if retired is not None:
-                lost.append(retired)
+            try:
+                native = self._native_effect(client, task_id, epoch)
+            except _UnknowableEffect as exc:
+                # The executor could not answer. Leave the reservation intact
+                # for the next tick rather than orphan a possibly-live session.
+                LOGGER.info(
+                    "Leaving reservation %s/%s reserved: executor unreachable: %s",
+                    task_id,
+                    epoch,
+                    exc,
+                )
+                continue
+            # Each candidate settles in its own try/except: one row that moved
+            # out from under the sweep (a racing terminal or a task that left
+            # ACTIVATE_PREDECESSORS mid-adopt) must never skip the rest.
+            try:
+                if native is not None:
+                    workspace_id = native.get("workspace_id")
+                    session_id = native.get("session_id")
+                    if native.get("state") == "active" and workspace_id and session_id:
+                        # Native is live behind the lease: adopt it rather than
+                        # orphan the running session.
+                        self.mark_launched(
+                            task_id, epoch, str(workspace_id), str(session_id)
+                        )
+                        self.store.activate(
+                            task_id,
+                            workspace_id=str(workspace_id),
+                            session_id=str(session_id),
+                        )
+                        continue
+                retired = self._retire_reservation(task_id, epoch, moment)
+                if retired is not None:
+                    lost.append(retired)
+            except TaskStoreError as exc:
+                LOGGER.info(
+                    "Skipping expired reservation %s/%s this tick: %s",
+                    task_id,
+                    epoch,
+                    exc,
+                )
+                continue
         return lost
 
     @staticmethod
     def _native_effect(
         client: Any | None, task_id: str, epoch: int
     ) -> dict[str, Any] | None:
-        """Ask the executor whether a native session stands behind this epoch."""
+        """Ask the executor whether a native session stands behind this epoch.
+
+        Returns the native effect when one is live, ``None`` only on a
+        definitive not-found (404) - real absence that may retire the
+        reservation - and raises :class:`_UnknowableEffect` on any error that
+        cannot prove absence (5xx, ``URLError``, timeout), so the caller leaves
+        the reservation intact instead of orphaning a running session.
+        """
         lookup = getattr(client, "managed_effect", None) if client else None
         if lookup is None:
             return None
         try:
             native = lookup(task_id, epoch)
-        except CdesktopError:
-            # A not-found (404) or unreachable executor is not proof of life;
-            # treat it as absent so the reservation is retired, not adopted.
-            return None
+        except CdesktopRejectedError as exc:
+            if exc.status == 404 or "404" in str(exc):
+                return None
+            raise _UnknowableEffect(str(exc)) from exc
+        except CdesktopError as exc:
+            # A typed 404 is real absence; anything else (unreachable executor,
+            # 5xx, timeout) is not proof of death - reuse ``_probe_managed_launch``'s
+            # ``"404" not in str(exc)`` test.
+            if "404" in str(exc):
+                return None
+            raise _UnknowableEffect(str(exc)) from exc
         if not isinstance(native, Mapping):
             return None
         if str(native.get("state") or "") in {"", "missing", "not_found", "lost"}:

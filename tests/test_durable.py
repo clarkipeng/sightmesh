@@ -433,9 +433,10 @@ def test_the_reconciler_delivers_a_wake_left_pending_by_a_dead_pump(tmp_path):
     delivered on the next tick without any human noticing."""
     store, _parent, child = _kernel_cohort(tmp_path)
     client = KernelClient()
-    store.finish(child.task_id, "completed", "done")
-    with store.connect() as conn:
-        wakes.record_wakes(conn, child.parent_task_id)
+    # finish_with_wake commits the child transition, the parent's event-seq
+    # bump, and the pending wake row in one transaction; the process then dies
+    # before it can pump, leaving the wake for this pass to deliver.
+    wakes.finish_with_wake(store, child.task_id, "completed", "done")
 
     result = DurableExecutionReconciler(
         client, Queue([]), task_store=store
@@ -446,32 +447,67 @@ def test_the_reconciler_delivers_a_wake_left_pending_by_a_dead_pump(tmp_path):
     assert client.sent[0][3] == "continue"
 
 
-def test_the_reconciler_inserts_a_wake_missing_from_pre_migration_history(tmp_path):
-    """Tasks that reached a terminal state before the outbox existed have a
-    satisfied predicate and no wake row; their managers would wait forever."""
-    store, parent, child = _kernel_cohort(tmp_path)
+def test_the_reconciler_re_arms_a_wake_resolved_while_undeliverable(tmp_path):
+    """A wake resolved because its parent was briefly undeliverable must not
+    poison re-arm (G1): a resolve never advances ``last_woken_seq``, so the
+    watermark still trails the child event and the next reconciler pass arms a
+    fresh wake once the parent is reachable, then delivers it exactly once."""
+    store = TaskStore(tmp_path / "state.sqlite3")
+    # A parent that has not been activated yet has no holder session, so its
+    # first wake resolves as undeliverable rather than being sent anywhere.
+    ((parent, _),) = store.reserve_all(
+        scope="operator",
+        parent_task_id=None,
+        specs=[{"key": "manager", "children": 2}],
+        max_attempts=3,
+    )
+    ((child, _),) = store.reserve_all(
+        scope="operator",
+        parent_task_id=parent.task_id,
+        specs=[{"key": "child", "children": 0}],
+        max_attempts=3,
+    )
+    store.activate(child.task_id, workspace_id="ws-child", session_id="session-child")
     client = KernelClient()
-    store.finish(child.task_id, "completed", "done")
+    wakes.finish_with_wake(store, child.task_id, "completed", "done")
 
-    result = DurableExecutionReconciler(
+    resolved_pass = DurableExecutionReconciler(
+        client, Queue([]), task_store=store
+    ).reconcile_kernel()
+    assert resolved_pass["wakes_delivered"] == 0
+    assert client.sent == []
+    with store.connect() as conn:
+        assert conn.execute(
+            "SELECT state FROM task_wakes"
+        ).fetchone()["state"] == "resolved"
+
+    # The parent comes online; a fresh reconciler pass arms a new wake for the
+    # unchanged, still-satisfied cohort and delivers it.
+    store.activate(
+        parent.task_id, workspace_id="ws-manager", session_id="session-manager"
+    )
+    revived = DurableExecutionReconciler(
         client, Queue([]), task_store=store
     ).reconcile_kernel()
 
-    assert result["wakes_inserted"] == 1
-    assert result["wakes_delivered"] == 1
+    assert revived["wakes_inserted"] == 1
+    assert revived["wakes_delivered"] == 1
     with store.connect() as conn:
-        row = conn.execute("SELECT * FROM task_wakes").fetchone()
+        row = conn.execute(
+            "SELECT dedupe_key FROM task_wakes WHERE state = 'delivered'"
+        ).fetchone()
     assert row["dedupe_key"] == wakes.dedupe_key(
-        parent.task_id, parent.epoch, "all_children_terminal"
+        parent.task_id, "all_children_terminal"
     )
 
 
 def test_the_reconciler_does_not_manufacture_a_second_wake(tmp_path):
     """It runs every tick over every parent; repairing an already repaired
-    cohort must be a no-op or a manager gets re-woken forever."""
+    cohort must be a no-op (S28) or a manager gets re-woken forever: once the
+    watermark caught up to the child event, an unchanged cohort arms nothing."""
     store, _parent, child = _kernel_cohort(tmp_path)
     client = KernelClient()
-    store.finish(child.task_id, "completed", "done")
+    wakes.finish_with_wake(store, child.task_id, "completed", "done")
     reconciler = DurableExecutionReconciler(client, Queue([]), task_store=store)
 
     reconciler.reconcile_kernel()
