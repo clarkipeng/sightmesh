@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 import os
 import re
 import subprocess
@@ -14,8 +15,15 @@ from pathlib import Path
 from typing import Any, Generic, TypeVar
 
 from . import execution_routing, wakes
-from .cdesktop import CdesktopClient, CdesktopError, latest_execution_process
-from .effects import EffectJournal, new_owner_instance, request_hash
+from .cdesktop import (
+    CdesktopClient,
+    CdesktopError,
+    CdesktopInterruptedError,
+    CdesktopPendingError,
+    CdesktopRejectedError,
+    latest_execution_process,
+)
+from .effects import EffectBusy, EffectJournal, new_owner_instance, request_hash
 from .escalation import CDESKTOP_SESSION_ENV, EscalationStore, LauncherIdentity
 from .pool import core as pool_core
 from .profiles import ProfileStore, validate_provider
@@ -451,12 +459,38 @@ class SightMesh:
         it, so a crash anywhere in between is resolved on the next run by
         adopting the reserved epoch instead of forking a second session.
         """
-        effect, _took_over = self.journal.reserve(
-            task.task_id, task.epoch, request_hash(launch), self.owner_instance
-        )
+        # A concurrent starter that loses the reservation race waits for the
+        # winner and adopts its launch: duplicate start() converges on one
+        # worker instead of erroring (contract: "duplicate insert returns the
+        # existing effect"). The wait is bounded well under the reservation
+        # lease so a crashed winner is recovered by retry, not by takeover here.
+        deadline = time.monotonic() + ADOPT_TIMEOUT_SECONDS
+        delay = 0.05
+        while True:
+            try:
+                effect, _took_over = self.journal.reserve(
+                    task.task_id, task.epoch, request_hash(launch), self.owner_instance
+                )
+                break
+            except EffectBusy:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 0.5)
         if effect.state == "launched" and effect.workspace_id and effect.session_id:
             return effect.workspace_id, effect.session_id
-        native = self.client.managed_launch(task.task_id, task.epoch, dict(launch))
+        try:
+            native = self.client.managed_launch(task.task_id, task.epoch, dict(launch))
+        except CdesktopRejectedError as exc:
+            # 424/425 mean the outcome is unknowable or still owned; the
+            # reservation must stay adoptable for a retry. Anything else is a
+            # definitive rejection: record the typed outcome on this epoch's
+            # effect so callers never have to grep error text.
+            if not isinstance(exc, (CdesktopInterruptedError, CdesktopPendingError)):
+                self.journal.mark_terminal(
+                    task.task_id, task.epoch, _rejection_outcome(exc.status)
+                )
+            raise
         workspace_id, session_id = self._effect_ids(task, native)
         self.journal.mark_launched(task.task_id, task.epoch, workspace_id, session_id)
         return workspace_id, session_id
@@ -747,3 +781,12 @@ class SightMesh:
                 ".conductor/settings.toml scripts.setup must be a string"
             )
         return setup.strip() if setup and setup.strip() else None
+ADOPT_TIMEOUT_SECONDS = 30.0
+
+
+def _rejection_outcome(status: int | None) -> str:
+    if status == 429:
+        return "rate_limited"
+    if status in (401, 403):
+        return "auth"
+    return f"rejected:{status if status is not None else 'unknown'}"

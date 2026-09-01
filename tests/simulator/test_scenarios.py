@@ -116,7 +116,7 @@ def test_s3_kill_between_native_launch_and_activation_retries_onto_the_same_effe
         fail_missing_kernel_v1("sightmesh.effects.EffectJournal does not exist yet")
         return
 
-    journal = EffectJournal(store.path)
+    journal = EffectJournal(store)
     task_id, epoch, owner = "task-3", 1, "owner-a"
     request_hash = "deadbeef"
 
@@ -289,6 +289,7 @@ def test_s8_stale_epoch_writer_after_transfer_is_rejected(store: TaskStore) -> N
             expect_version=stale_version,
             assign="state = 'completed', result = ?",
             values=("stale write",),
+            attempted="completed",
         )
 
 
@@ -338,7 +339,7 @@ def test_s10_typed_429_is_recorded_as_a_typed_outcome_never_inferred_from_text(
     assert task is not None
     from sightmesh.effects import EffectJournal
 
-    journal = EffectJournal(store.path)
+    journal = EffectJournal(store)
     effect = journal.get(task.task_id, task.epoch)
     assert effect is not None
     assert effect.outcome in {"quota", "rate_limited"}
@@ -360,7 +361,9 @@ def test_s11_show_with_a_thousand_terminal_tasks_performs_zero_fleet_scans(
         scope="operator", parent_task_id=None, specs=specs, max_attempts=3
     )
     for record, _inserted in reservations:
-        store.finish(record.task_id, "completed", "done")
+        # 'cancelled' is the legal terminal from 'reserved'; guarded
+        # transitions correctly refuse reserved -> completed.
+        store.finish(record.task_id, "cancelled")
 
     before = len(client.call_log)
     mesh.show("terminal-500")
