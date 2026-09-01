@@ -33,3 +33,5 @@ Do not place secrets in prompts, transcripts, `.context`, handoffs, command argu
 Approval decisions are stored in `~/.local/state/sightmesh/approvals.sqlite3`. The database and its WAL files are owner-only. Rejection text is not copied into this store; SightMesh records only its SHA-256 digest so an audit can correlate a decision without creating another transcript.
 
 Parent return addresses and queued commands live in cdesktop's application database. During the v0.9 update, legacy SightMesh delivery and relationship databases are imported, copied to `~/.local/state/sightmesh/legacy`, and removed from the active state directory.
+
+Managed cdesktop and bridge output keeps at most two 16 MiB generations per stream by default. Set `SIGHTMESH_MAX_SERVICE_LOG_BYTES` before service installation to choose another positive per-generation limit. Oversized logs from an earlier release are reduced to their newest bounded tail when the managed service next starts.

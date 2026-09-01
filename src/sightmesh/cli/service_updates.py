@@ -2,6 +2,22 @@ from __future__ import annotations
 
 from .common import *
 
+
+def cmd_service_run(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from .. import service_process
+
+    command = args.service_command
+    if command and command[0] == "--":
+        command = command[1:]
+    return service_process.run(
+        command,
+        stdout_path=Path(args.stdout),
+        stderr_path=Path(args.stderr),
+    )
+
+
 def cmd_service(args: argparse.Namespace) -> int:
     if args.action == "install":
         path = service.install(args.port, start_now=not args.no_start)
@@ -67,6 +83,12 @@ def cmd_update(args: argparse.Namespace) -> int:
 
 
 def add_parser(sub: argparse._SubParsersAction[Any]) -> None:
+    runner = sub.add_parser("service-run", help=argparse.SUPPRESS)
+    runner.add_argument("--stdout", required=True)
+    runner.add_argument("--stderr", required=True)
+    runner.add_argument("service_command", nargs=argparse.REMAINDER)
+    runner.set_defaults(func=cmd_service_run)
+
     managed = sub.add_parser("service", help="Manage the local cdesktop service")
     managed.add_argument(
         "action",

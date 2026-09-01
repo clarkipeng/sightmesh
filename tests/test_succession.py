@@ -340,10 +340,10 @@ def test_child_terminal_notification_never_resolves_back_to_child(tmp_path) -> N
     )
 
     assert client.sent == []
-    parked = signal_store.pending()
-    assert len(parked) == 1
-    assert parked[0].recorded_parent_session_id == "parent-1"
-    assert parked[0].dedupe_key == "child-terminal:child-1:completed"
+    assert signal_store.pending() == []
+    assert signal_store.has_terminal_dedupe_key(
+        "child-terminal:child-1:completed"
+    )
 
 
 def test_undeliverable_parent_wake_is_parked_then_resolved_on_delivery(

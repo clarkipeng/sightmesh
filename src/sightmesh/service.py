@@ -12,6 +12,7 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
 
+from .service_process import MAX_LOG_ENV, max_log_bytes
 from .stall_settings import THRESHOLD_ENV, threshold_minutes
 
 LABEL = "io.sightmesh.cdesktop"
@@ -127,11 +128,23 @@ def definition(
     resolved_executable = str(executable) if executable else shutil.which("cdesktop")
     if not resolved_executable:
         raise RuntimeError("cdesktop is not installed")
+    supervisor = shutil.which("sightmesh")
+    if not supervisor:
+        raise RuntimeError("sightmesh is not installed")
     logs = state_dir()
     logs.mkdir(parents=True, exist_ok=True)
     return {
         "Label": LABEL,
-        "ProgramArguments": [resolved_executable],
+        "ProgramArguments": [
+            supervisor,
+            "service-run",
+            "--stdout",
+            str(logs / "cdesktop.stdout.log"),
+            "--stderr",
+            str(logs / "cdesktop.stderr.log"),
+            "--",
+            resolved_executable,
+        ],
         "RunAtLoad": True,
         "KeepAlive": True,
         "ProcessType": "Interactive",
@@ -142,9 +155,10 @@ def definition(
             "HOST": "127.0.0.1",
             "PORT": str(port),
             "PATH": command_path(),
+            MAX_LOG_ENV: str(max_log_bytes()),
         },
-        "StandardOutPath": str(logs / "cdesktop.stdout.log"),
-        "StandardErrorPath": str(logs / "cdesktop.stderr.log"),
+        "StandardOutPath": "/dev/null",
+        "StandardErrorPath": "/dev/null",
     }
 
 
@@ -158,6 +172,13 @@ def bridge_definition(port: int = DEFAULT_PORT) -> dict[str, Any]:
         "Label": BRIDGE_LABEL,
         "ProgramArguments": [
             executable,
+            "service-run",
+            "--stdout",
+            str(logs / "bridge.stdout.log"),
+            "--stderr",
+            str(logs / "bridge.stderr.log"),
+            "--",
+            executable,
             "--url",
             service_url(port),
             "bridge",
@@ -169,9 +190,10 @@ def bridge_definition(port: int = DEFAULT_PORT) -> dict[str, Any]:
         "EnvironmentVariables": {
             "PATH": command_path(),
             THRESHOLD_ENV: str(threshold_minutes()),
+            MAX_LOG_ENV: str(max_log_bytes()),
         },
-        "StandardOutPath": str(logs / "bridge.stdout.log"),
-        "StandardErrorPath": str(logs / "bridge.stderr.log"),
+        "StandardOutPath": "/dev/null",
+        "StandardErrorPath": "/dev/null",
     }
 
 
@@ -394,6 +416,12 @@ def _remove_obsolete_updater() -> None:
 
 
 def status(port: int = DEFAULT_PORT) -> dict[str, Any]:
+    logs = state_dir()
+    log_sizes = {
+        path.name: path.stat().st_size
+        for path in logs.glob("*.log*")
+        if path.is_file()
+    }
     return {
         "installed": plist_path().exists(),
         "loaded": _loaded(LABEL),
@@ -403,8 +431,25 @@ def status(port: int = DEFAULT_PORT) -> dict[str, Any]:
         "url": service_url(port),
         "plist": str(plist_path()),
         "bridge_plist": str(bridge_plist_path()),
-        "logs": str(state_dir()),
+        "logs": str(logs),
+        "log_limit_bytes": _installed_log_limit(),
+        "log_bytes": log_sizes,
+        "log_total_bytes": sum(log_sizes.values()),
     }
+
+
+def _installed_log_limit() -> int:
+    target = plist_path()
+    if target.exists():
+        try:
+            definition = plistlib.loads(target.read_bytes())
+            value = definition["EnvironmentVariables"][MAX_LOG_ENV]
+            limit = int(value)
+            if limit > 0:
+                return limit
+        except (KeyError, OSError, TypeError, ValueError, plistlib.InvalidFileException):
+            pass
+    return max_log_bytes()
 
 
 def open_ui(port: int = DEFAULT_PORT) -> None:

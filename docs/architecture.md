@@ -26,6 +26,20 @@ Prompts, follow-ups, UI actions, and bridged messages enter cdesktop's durable c
 
 Successor routing is append-only and acyclic. SightMesh validates the complete proposed successor chain in the same serialized transaction that records an edge, so a direct or transitive self-successor is rejected without changing durable ownership state.
 
+### Lifecycle delivery safety contract
+
+SightMesh and cdesktop enforce the same lifecycle boundary from opposite sides:
+
+1. SightMesh attributes every child lifecycle command to the child session that caused it.
+2. SightMesh never treats a lifecycle command as a new child event.
+3. SightMesh resolves invalid self or successor routes once and records that terminal decision before another reconciliation tick.
+4. cdesktop rejects any peer command whose sender and recipient are the same before it creates a command row or execution.
+5. cdesktop owns exact-once managed task effects and rejects a reused or stale task epoch.
+
+The two independent consumers are SightMesh's durable reconciler and cdesktop's follow-up endpoint. The shared field is the existing sender session header, not a new orchestration ID a human must supply. A malformed graph, duplicate wakeup, bridge restart, or response loss can therefore produce at most one native effect for the same logical event.
+
+Managed launch attempts remain limited by the task's fixed attempt budget. Codex rollout size and free-disk guards belong to cdesktop, where they apply even if SightMesh fails. SightMesh-managed service logs rotate at a fixed byte limit so logging cannot bypass that storage boundary.
+
 Durability here means the command record survives a process boundary and can be reconciled. It does not yet prove that every manager wake and delivery is acknowledged during prolonged real-world load. That is the current experimental release gate.
 
 ## Stall and recovery model
