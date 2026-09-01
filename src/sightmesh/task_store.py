@@ -267,6 +267,37 @@ class TaskStore:
         )
         conn.execute("DROP TABLE managed_tasks")
         conn.execute(f"ALTER TABLE {_REBUILD_TABLE} RENAME TO managed_tasks")
+        # Carried rows inherit the DDL ``DEFAULT 0`` watermark columns, so a
+        # cohort already satisfied before this upgrade must be backfilled or it
+        # can never arm.
+        TaskStore._backfill_child_event_seq(conn)
+
+    @staticmethod
+    def _backfill_child_event_seq(conn: sqlite3.Connection) -> None:
+        """Seed ``child_event_seq`` from durable history for pre-watermark rows.
+
+        The counter only ever counts child terminal/blocked events. A database
+        upgraded from before the watermark starts every parent at ``0``, so a
+        parent whose cohort was already satisfied but whose wake was never
+        delivered (the exact crash gap the reconciler heals) would stay at
+        ``0 <= last_woken_seq(0)`` and never arm. Setting the counter to the
+        count of children already in a blocked-or-terminal state makes the
+        first reconciler pass arm any genuinely satisfied pre-migration cohort;
+        ``last_woken_seq`` stays ``0``, and the live predicate check still gates
+        an unsatisfied cohort, so the only effect on an already-delivered cohort
+        is one harmless re-wake. Runs once, only when the columns were just
+        added, so it never clobbers a live counter.
+        """
+        conn.execute(
+            "UPDATE managed_tasks SET child_event_seq = ("
+            "  SELECT COUNT(*) FROM managed_tasks AS child"
+            "  WHERE child.parent_task_id = managed_tasks.task_id"
+            "    AND child.state IN ('blocked', 'completed', 'cancelled', 'lost')"
+            ") WHERE EXISTS ("
+            "  SELECT 1 FROM managed_tasks AS child"
+            "  WHERE child.parent_task_id = managed_tasks.task_id"
+            ")"
+        )
 
     @staticmethod
     def _ensure_watermark_columns(conn: sqlite3.Connection) -> None:
@@ -283,12 +314,18 @@ class TaskStore:
             str(row["name"])
             for row in conn.execute("PRAGMA table_info(managed_tasks)").fetchall()
         }
+        added = False
         for column in ("child_event_seq", "last_woken_seq"):
             if column not in columns:
                 conn.execute(
                     f"ALTER TABLE managed_tasks ADD COLUMN {column} "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+                added = True
+        if added:
+            # Only on the first upgrade, when the counter was just introduced -
+            # never on a re-open, which would clobber live counters.
+            TaskStore._backfill_child_event_seq(conn)
 
     @staticmethod
     def _migrate_task_wakes(conn: sqlite3.Connection) -> None:

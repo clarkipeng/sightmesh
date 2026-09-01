@@ -87,6 +87,92 @@ def _active(store, key, *, parent_task_id=None, children=0):
     )
 
 
+ROUND1_KERNEL_DDL = """
+    CREATE TABLE managed_tasks (
+        task_id TEXT PRIMARY KEY,
+        scope TEXT NOT NULL,
+        task_key TEXT NOT NULL,
+        parent_task_id TEXT,
+        state TEXT NOT NULL CHECK (state IN
+            ('reserved', 'active', 'replacing', 'blocked',
+             'completed', 'cancelled', 'lost')),
+        epoch INTEGER NOT NULL CHECK (epoch > 0),
+        attempts INTEGER NOT NULL CHECK (attempts > 0),
+        max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+        child_limit INTEGER NOT NULL CHECK (child_limit >= 0),
+        spec_json TEXT NOT NULL,
+        workspace_id TEXT,
+        holder_session_id TEXT,
+        checkpoint TEXT,
+        result TEXT,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        version INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(scope, task_key),
+        CHECK (parent_task_id IS NULL OR parent_task_id != task_id),
+        FOREIGN KEY(parent_task_id) REFERENCES managed_tasks(task_id)
+    )
+"""
+
+
+def _round1_kernel_store(path, rows):
+    """The round-1 kernel shape: version + self-parent CHECK, NO watermark.
+
+    This is the shape a live 0.11.x database is in at upgrade time, so it routes
+    through ``_ensure_watermark_columns`` (add-column path), not the rebuild.
+    """
+    database = EscalationStore(path)
+    with database._connect() as conn:
+        conn.execute(ROUND1_KERNEL_DDL)
+        now = time.time()
+        for row in rows:
+            conn.execute(
+                "INSERT INTO managed_tasks "
+                "(task_id, scope, task_key, parent_task_id, state, epoch, "
+                " attempts, max_attempts, child_limit, spec_json, "
+                " holder_session_id, created_at, updated_at, version) "
+                "VALUES (?, ?, ?, ?, ?, 1, 1, 3, 0, '{}', ?, ?, ?, 0)",
+                (*row, now, now),
+            )
+    return database
+
+
+def test_upgrade_backfills_seq_so_a_satisfied_cohort_still_wakes(tmp_path):
+    """Round-3 review HIGH: a cohort already satisfied before the watermark
+    upgrade must still arm its manager.
+
+    Without backfill, ``child_event_seq``/``last_woken_seq`` both start at 0, so
+    ``0 <= 0`` short-circuits ``record_wakes`` before the predicate is even
+    checked, and the reconciler - whose whole job is closing the child-terminal
+    to wake gap - is silently defeated for pre-migration rows. This guards the
+    backfill that seeds the counter from durable child history.
+    """
+    from sightmesh.wakes import record_wakes
+
+    path = tmp_path / "round1.sqlite3"
+    # Parent mid-wait; both children already completed but no wake was delivered
+    # (the exact crash gap). row = (task_id, scope, task_key, parent, state, holder)
+    _round1_kernel_store(
+        path,
+        rows=[
+            ("p", "operator", "mgr", None, "active", "session-p"),
+            ("c1", "operator", "c1", "p", "completed", None),
+            ("c2", "operator", "c2", "p", "completed", None),
+        ],
+    )
+
+    store = TaskStore(path)  # opening runs the forward migration + backfill
+    with store._database._connect() as conn:
+        seq, woken = conn.execute(
+            "SELECT child_event_seq, last_woken_seq FROM managed_tasks "
+            "WHERE task_id = 'p'"
+        ).fetchone()
+        assert seq == 2  # backfilled from the two terminal children
+        assert woken == 0
+        armed = record_wakes(conn, "p")
+    assert armed, "a satisfied pre-migration cohort must arm after upgrade"
+
+
 def test_migration_preserves_rows_and_runs_twice_without_effect(tmp_path):
     """The rebuild only exists to add a CHECK, so it must not lose history.
 
