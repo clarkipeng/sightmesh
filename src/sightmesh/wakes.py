@@ -484,7 +484,12 @@ class WakeDelivery:
             return self._resolve(
                 wake, f"parent {parent.key} holds one of its own child sessions"
             )
-        payload = _payload(wake.predicate, parent, children, escalation=is_escalation(wake.dedupe_key))
+        payload = _payload(
+            wake.predicate,
+            parent,
+            children,
+            escalation=is_escalation(wake.dedupe_key),
+        )
         self.client.send(
             parent.holder_session_id,
             payload,

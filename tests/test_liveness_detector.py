@@ -713,3 +713,70 @@ def test_a_large_fleet_is_covered_across_ticks_rather_than_starving_delivery(sto
     assert all(
         store.get_by_id(child.task_id).liveness == "stalled" for child in children
     ), "the cursor has to actually advance"
+
+
+def test_a_suppressed_one_shot_wake_can_arm_again(store):
+    """Repro (A5ii): the one-shot pre-check for `lost` and `over_budget` asked
+    whether a wake with that key had ever existed, in any state. A wake
+    resolved at delivery - the holder was quarantined, no successor was linked
+    yet - counts as never told, but the pre-check counted it as told, so the
+    only notification that incident would ever get was dropped permanently.
+    Same re-arm rule as the cohort wakes."""
+    manager = task(store, "manager", session="s-manager", children=4)
+    child = task(
+        store,
+        "child",
+        parent=manager.task_id,
+        session="s-child",
+        budget=Budget(max_turns=1).to_dict(),
+    )
+    client = FakeClient()
+    client.run("s-child", last_activity=NOW)
+    pass_ = reconciler(client, store, lambda: NOW)
+
+    pass_.detect_liveness()
+    armed = wake_rows(store, "any_child_over_budget")
+    assert len(armed) == 1
+
+    # Delivery suppressed it: the manager was never actually told.
+    with store._database._connect() as conn:  # noqa: SLF001 - test-only introspection
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE task_wakes SET state = 'resolved', "
+            "payload = 'suppressed: parent session is retired' WHERE wake_id = ?",
+            (str(armed[0]["wake_id"]),),
+        )
+        conn.execute("COMMIT")
+
+    pass_.detect_liveness()
+
+    rearmed = [
+        row for row in wake_rows(store, "any_child_over_budget") if row["state"] == "pending"
+    ]
+    assert len(rearmed) == 1, "a wake nobody received is a wake still owed"
+    assert store.get_by_id(child.task_id).over_budget is True
+
+
+def test_a_replacement_in_flight_is_never_classified_from_its_predecessor(store):
+    """Why: a `replacing` task still carries the predecessor's holder session,
+    which is by definition about to die. Reading it would classify the
+    successor from its predecessor's corpse - and `lost` is a legal terminal
+    out of `replacing`, so the detector could kill a handoff mid-flight."""
+    manager = task(store, "manager", session="s-manager", children=4)
+    child = task(store, "child", parent=manager.task_id, session="s-child")
+    store.prepare_replacement(child.task_id)
+    client = FakeClient()
+    client.add_process(
+        "s-child",
+        id="dying",
+        status="killed",
+        exit_reason="restart",
+        run_reason="codingagent",
+        updated_at=NOW - 10,
+    )
+
+    reconciler(client, store, lambda: NOW).detect_liveness()
+
+    mid_handoff = store.get_by_id(child.task_id)
+    assert mid_handoff.state == "replacing"
+    assert wake_rows(store, "any_child_lost") == []

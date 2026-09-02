@@ -1325,7 +1325,7 @@ def test_s16b_output_bytes_are_progress_when_an_executor_reports_them(
     healthy 5KB-per-tick emitter on the first tick after every restart.
     """
     clock = _Clock()
-    parent, child, _mesh = _liveness_cohort(client, store, ownership, progress_timeout=1500.0)
+    _parent, child, _mesh = _liveness_cohort(client, store, ownership, progress_timeout=1500.0)
     # Timestamps freeze at t0 and never move again: bytes are the only evidence.
     process = client.run_process(
         child.session_id, last_activity=clock.now, output_bytes=4_096
