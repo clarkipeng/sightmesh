@@ -423,12 +423,17 @@ def test_a_typed_rate_limit_moves_once_to_the_next_hop(system, monkeypatch):
     assert record.spec["target"]["route_class"] == "standard"
 
 
-def test_a_code_failure_never_reroutes_however_it_reads(system):
+def test_a_code_failure_blocks_visibly_and_never_reroutes(system):
     """The regression this exists for: the old path scraped the transcript, so
     a worker whose failing test output merely mentioned a rate limit was
-    rerouted onto a fresh account. A code or test failure produces no provider
-    outcome at all, so it cannot reach the reroute path by construction."""
-    mesh, client, _store, _ownership = system
+    rerouted onto a fresh account. A code or test failure carries no typed
+    provider outcome, so it cannot reach the reroute path by construction.
+
+    It must not vanish either. A failed worker process that reports no provider
+    signal blocks the task with its typed reason, which wakes the manager -
+    the alternative is a task that is neither running nor finished and that
+    nobody is told about."""
+    mesh, client, store, _ownership = system
     started = mesh.start(spec())
     client.processes[started.session_id] = [
         {"id": "failed-build", "run_reason": "codingagent", "status": "failed"}
@@ -444,8 +449,13 @@ def test_a_code_failure_never_reroutes_however_it_reads(system):
         ]
     }
 
-    assert mesh.reconcile_provider_outcome(started.session_id) is None
+    settled = mesh.reconcile_provider_outcome(started.session_id)
+
+    assert settled is not None and settled.state == "blocked"
+    assert "worker process failed" in str(store.get("operator", "audit").result)
+    # Blocked, not rerouted: no second epoch and no second launch.
     assert mesh.reconcile_provider_outcomes() == []
+    assert store.get("operator", "audit").epoch == 1
     assert len(client.launches) == 1
 
 
