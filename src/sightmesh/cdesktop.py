@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -137,6 +138,80 @@ def execution_process_event_time(process: dict[str, Any]) -> datetime | None:
     except ValueError:
         return None
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+#: An execution process in one of these statuses has stopped without finishing
+#: its work (``ExecutionProcessStatus`` in cdesktop's execution_process model).
+PROCESS_FAILURE_STATUSES = frozenset({"failed", "killed"})
+
+#: cdesktop's own normalized outcome classes (``ExecutionOutcomeClass``) mapped
+#: onto the routing outcomes a route chain advances on. Only capacity and auth
+#: are here: every other class describes the work failing, not the binding, and
+#: rerouting it would just fail the same way on a fresh account.
+#:
+#: The pinned seam does not surface this classification yet, so today the map
+#: matches nothing and a failed process blocks its task visibly. Reading it by
+#: name means the mid-run reroute starts working the moment the seam does,
+#: without anyone going back to guess from transcript text.
+PROCESS_OUTCOME_CLASSES = {
+    "quota_exhausted": "rate_limited",
+    "rate_limited_transient": "rate_limited",
+    "auth_expired": "auth",
+    "auth_invalid": "auth",
+}
+
+
+def process_provider_outcome(
+    process: Mapping[str, Any],
+) -> tuple[str | None, float | None]:
+    """The typed provider outcome a stopped process reports, and its reset.
+
+    Reads only typed fields - the outcome's class name and its advertised
+    reset. Transcript text is never consulted, which is the whole point: a
+    worker whose test output merely mentions a rate limit must be
+    indistinguishable, to this function, from one that printed nothing.
+    """
+    outcome = process.get("outcome")
+    if isinstance(outcome, str):
+        outcome = {"class": outcome}
+    if not isinstance(outcome, Mapping):
+        return None, None
+    routing_outcome = PROCESS_OUTCOME_CLASSES.get(str(outcome.get("class") or ""))
+    if routing_outcome is None:
+        return None, None
+    return routing_outcome, _outcome_reset(outcome)
+
+
+def _outcome_reset(outcome: Mapping[str, Any]) -> float | None:
+    resets_at = outcome.get("resets_at")
+    if isinstance(resets_at, str):
+        try:
+            return datetime.fromisoformat(resets_at).timestamp()
+        except ValueError:
+            return None
+    try:
+        return time.time() + float(outcome["retry_after_seconds"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def process_failure_reason(process: Mapping[str, Any]) -> str:
+    """Why a stopped process stopped, from typed fields only.
+
+    Deliberately not the transcript. This becomes a blocked task's reason, and
+    a reason built from provider text is both a leak risk and an invitation to
+    parse it back out again later.
+    """
+    status = str(process.get("status") or "failed")
+    outcome = process.get("outcome")
+    detail = (
+        str(outcome.get("class") or "")
+        if isinstance(outcome, Mapping)
+        else str(outcome or "")
+    )
+    exit_code = process.get("exit_code")
+    parts = [part for part in (detail, f"exit {exit_code}" if exit_code else "") if part]
+    return f"worker process {status}" + (f" ({', '.join(parts)})" if parts else "")
 
 
 def latest_execution_process(
