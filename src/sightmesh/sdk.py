@@ -494,6 +494,14 @@ class SightMesh:
         target = task.spec.get("target", {})
         effect = self.journal.get(task.task_id, task.epoch)
         if task.state == "replacing":
+            # Only a replacement this path opened is one it can finish. A
+            # manual ``replace()`` carries a prompt that lives nowhere but its
+            # caller's hands, so resuming it here would quietly re-run the
+            # original work instead - and its failure is already visible to the
+            # human who invoked it. ``replace()`` clears the marker, so the two
+            # can never be confused.
+            if routing_outcome(target.get("recovery")) is None:
+                return None
             return self._resume_replacement(task, effect)
         if task.state not in {"active", "blocked"}:
             return None
