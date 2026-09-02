@@ -63,8 +63,18 @@ class TaskView:
 
     @property
     def breaker_tripped(self) -> bool:
-        """Attempts have reached the budget, so no further epoch is allowed."""
-        return self.attempts >= self.max_attempts
+        """Attempts have reached the budget, so no further epoch is allowed.
+
+        Answered by the one classifier the attention queue also uses, so a
+        count and a queue row can never describe the same task differently.
+        """
+        return fleet.breaker_tripped(
+            {
+                "state": self.state,
+                "attempts": self.attempts,
+                "max_attempts": self.max_attempts,
+            }
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -118,11 +128,12 @@ def read_tasks(store: TaskStore, *, scope: str | None = None) -> list[TaskView]:
 
 
 def task_counts(views: Iterable[TaskView]) -> dict[str, int]:
+    """Count states and tripped breakers with the shared classifier."""
     counts: dict[str, int] = {}
     tripped = 0
     for view in views:
         counts[view.state] = counts.get(view.state, 0) + 1
-        tripped += int(view.breaker_tripped and view.state not in fleet.TASK_DONE_STATES)
+        tripped += int(view.breaker_tripped)
     counts["breaker_tripped"] = tripped
     return counts
 

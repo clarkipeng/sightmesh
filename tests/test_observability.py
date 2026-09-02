@@ -19,7 +19,7 @@ import pytest
 from sightmesh import cli, fleet, observability
 from sightmesh.escalation import EscalationStore
 from sightmesh.leases import LeaseStore
-from sightmesh.task_store import TaskStore
+from sightmesh.task_store import TaskStore, TaskStoreError
 
 NOW = datetime(2026, 9, 1, tzinfo=UTC)
 
@@ -83,6 +83,61 @@ def test_breaker_headroom_is_derived_not_stored(store: TaskStore) -> None:
     view = observability.read_tasks(store)[0]
     assert view.breaker_tripped is True
     assert observability.task_counts([view])["breaker_tripped"] == 1
+
+
+def test_an_exhausted_task_is_never_told_to_replace_itself(store: TaskStore) -> None:
+    """The shipped queue classified by state first, so a lost or blocked task
+    that had already spent its budget was advised to "replace the task" -
+    and `TaskStore.prepare_replacement` refuses exactly that. The only
+    action the operator was offered could not be carried out.
+    """
+    reservations = store.reserve_all(
+        scope="operator", parent_task_id=None, specs=[spec("spent")], max_attempts=1
+    )
+    record, _inserted = reservations[0]
+    store.activate(record.task_id, workspace_id="w-s", session_id="s-s")
+    store.finish(record.task_id, "lost")
+
+    rows = tuple(view.to_dict() for view in observability.read_tasks(store))
+    queue = fleet.attention(fleet.AttentionFacts(tasks=rows), now=NOW)
+
+    assert [item.kind for item in queue.items] == ["tripped_breaker"]
+    assert queue.items[0].next_action.startswith("Raise the budget")
+    assert "cannot be replaced" in queue.items[0].next_action
+    with pytest.raises(TaskStoreError, match="circuit breaker"):
+        store.prepare_replacement(record.task_id)
+
+
+def test_counts_and_the_attention_queue_agree_on_one_breaker(
+    store: TaskStore,
+) -> None:
+    """Two surfaces reading the same store cannot disagree (kernel-contract,
+    "Observability"). They did: `status` counted every unfinished task at its
+    budget while the queue only recognised running ones, so one blocked task
+    was simultaneously a tripped breaker in the count and "blocked on an
+    approval" in the queue. A finished task counts in neither.
+    """
+    reservations = store.reserve_all(
+        scope="operator",
+        parent_task_id=None,
+        specs=[spec("stuck"), spec("finished")],
+        max_attempts=1,
+    )
+    by_key = {record.key: record for record, _inserted in reservations}
+    store.activate(by_key["stuck"].task_id, workspace_id="w-s", session_id="s-s")
+    store.finish(by_key["stuck"].task_id, "blocked", "waiting on approval to merge")
+    store.activate(by_key["finished"].task_id, workspace_id="w-f", session_id="s-f")
+    store.finish(by_key["finished"].task_id, "completed", "shipped")
+
+    views = observability.read_tasks(store)
+    counts = observability.task_counts(views)
+    queue = fleet.attention(
+        fleet.AttentionFacts(tasks=tuple(view.to_dict() for view in views)), now=NOW
+    )
+
+    assert counts["breaker_tripped"] == 1
+    assert [item.kind for item in queue.items] == ["tripped_breaker"]
+    assert queue.items[0].task_key == "stuck"
 
 
 def test_attention_reports_executor_owned_gaps_as_degraded() -> None:

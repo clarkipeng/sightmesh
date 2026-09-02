@@ -274,15 +274,35 @@ def task_groups(
     )
 
 
+def breaker_tripped(task: Mapping[str, Any]) -> bool:
+    """The one definition of an exhausted attempt budget, for every surface.
+
+    ``status`` counts breakers, the attention queue classifies them and
+    ``to_dict`` reports them. While each answered the question its own way
+    the surfaces disagreed: ``status`` counted a tripped breaker that the
+    queue described as merely "blocked" and advised replacing - which
+    ``TaskStore.prepare_replacement`` rejects outright. A finished task never
+    counts, however many attempts it spent.
+    """
+    if str(task.get("state") or "") in TASK_DONE_STATES:
+        return False
+    try:
+        return int(task["attempts"]) >= int(task["max_attempts"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def _task_attention_kind(task: Mapping[str, Any]) -> str | None:
+    # Budget first: an exhausted task cannot be replaced, so classifying it
+    # by its state would hand the operator advice the store refuses.
+    if breaker_tripped(task):
+        return "tripped_breaker"
     state = str(task.get("state") or "")
     if state == "blocked":
         reason = str(task.get("result") or "").casefold()
         return "blocked_approval" if "approval" in reason else "blocked"
     if state == "lost":
         return "lost"
-    if state in TASK_RUNNING_STATES and bool(task.get("breaker_tripped")):
-        return "tripped_breaker"
     return None
 
 
@@ -301,7 +321,7 @@ _ATTENTION_COPY = {
     ),
     "tripped_breaker": (
         "Task has spent its whole attempt budget.",
-        "Raise the budget deliberately or cancel the task.",
+        "Raise the budget deliberately or cancel the task; it cannot be replaced.",
     ),
 }
 
