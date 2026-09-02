@@ -147,3 +147,91 @@ def test_uninstall_removes_a_tool_owned_by_this_repo(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "tool uninstall sightmesh" in log.read_text(encoding="utf-8")
+
+
+def test_install_refuses_before_it_installs_anything(tmp_path: Path) -> None:
+    """Validate first, act second.
+
+    Install used to run `uv tool install` and only then discover a skill
+    path it does not own, so a refusal left a half-installed machine: the
+    tool present, the skills missing, and nothing recording either. Every
+    ownership check now runs before the first side effect.
+    """
+    home = tmp_path / "home"
+    destination = home / ".codex/skills/reconcile-agent-work"
+    destination.parent.mkdir(parents=True)
+    destination.symlink_to(tmp_path / "someone-elses-skill")
+
+    result, log = run_script("install-local.sh", tmp_path)
+
+    assert result.returncode != 0
+    assert "does not own" in result.stderr
+    assert not log.exists()
+    assert not (home / ".local/state/sightmesh/install-manifest.json").exists()
+    # The check that failed is the second skill, so the first must not have
+    # been linked either.
+    assert not (home / ".claude/skills/orchestrate-visible-agents").exists()
+
+
+def test_the_manifest_is_moved_into_place_not_written_in_pieces(
+    tmp_path: Path,
+) -> None:
+    """The manifest is the record uninstall acts on, so a half-written one is
+    worse than none: it would name a subset of the paths to remove.
+    """
+    home = tmp_path / "home"
+
+    result, _ = run_script("install-local.sh", tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    state = home / ".local/state/sightmesh"
+    assert [path.name for path in state.iterdir()] == ["install-manifest.json"]
+    assert json.loads((state / "install-manifest.json").read_text(encoding="utf-8"))
+
+
+def test_uninstall_removes_exactly_what_the_manifest_records(tmp_path: Path) -> None:
+    """Install promised the manifest was what uninstall reverses while
+    uninstall actually reversed a hardcoded list; a path install recorded
+    under any other name survived forever.
+    """
+    home = tmp_path / "home"
+    install, _ = run_script("install-local.sh", tmp_path)
+    assert install.returncode == 0, install.stderr
+
+    manifest_path = home / ".local/state/sightmesh/install-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    recorded = home / ".claude/skills/renamed-skill"
+    recorded.symlink_to(ROOT / "skills" / "orchestrate-visible-agents")
+    manifest["created_paths"] = [*manifest["created_paths"], str(recorded)]
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    result, _ = run_script("uninstall-local.sh", tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert not recorded.is_symlink()
+    assert not list(home.glob(".claude/skills/*"))
+    assert not list(home.glob(".codex/skills/*"))
+    assert not manifest_path.exists()
+
+
+def test_uninstall_refuses_a_recorded_path_that_is_no_longer_ours(
+    tmp_path: Path,
+) -> None:
+    """A recorded path someone replaced with their own link is not ours to
+    delete, however the manifest describes it.
+    """
+    home = tmp_path / "home"
+    install, _ = run_script("install-local.sh", tmp_path)
+    assert install.returncode == 0, install.stderr
+    hijacked = home / ".claude/skills/orchestrate-visible-agents"
+    hijacked.unlink()
+    hijacked.symlink_to(tmp_path / "someone-else")
+
+    result, log = run_script("uninstall-local.sh", tmp_path)
+
+    assert result.returncode != 0
+    assert "Refusing to remove unrelated" in result.stderr
+    assert hijacked.is_symlink()
+    # Nothing was removed, and the tool was never touched.
+    assert (home / ".codex/skills/orchestrate-visible-agents").is_symlink()
+    assert "uninstall" not in log.read_text(encoding="utf-8")

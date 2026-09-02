@@ -158,8 +158,8 @@ Managed service operations remain scoped to `io.sightmesh.cdesktop` and `io.sigh
 
 ## Install ownership
 
-`scripts/install-local.sh` never displaces a path it does not own. A skill link belonging to another product makes install refuse with that path named; remove it with its own uninstaller first. Because nothing is ever displaced, uninstall is a pure delete of created paths and has nothing to restore.
+`scripts/install-local.sh` never displaces a path it does not own. A skill link belonging to another product makes install refuse with that path named; remove it with its own uninstaller first. Every ownership check runs before the first side effect, so a refusal leaves the host exactly as it was rather than half installed. Because nothing is ever displaced, uninstall is a pure delete of created paths and has nothing to restore.
 
-Install records what it created in `~/.local/state/sightmesh/install-manifest.json` (0600): the `uv tool` entry, the `~/.claude/skills` and `~/.codex/skills` links, and the state roots (`~/.local/share/sightmesh`, `~/.local/state/sightmesh`, the `io.sightmesh.*` LaunchAgent plists).
+Install records what it created in `~/.local/state/sightmesh/install-manifest.json` (0600, written to a temporary file and moved into place): the `uv tool` entry, the `~/.claude/skills` and `~/.codex/skills` links, and the state roots (`~/.local/share/sightmesh`, `~/.local/state/sightmesh`, the `io.sightmesh.*` LaunchAgent plists).
 
-`scripts/uninstall-local.sh` removes only ownership-verified links, plists, and the `uv tool` install, then removes the manifest. Durable state under `~/.local/share/sightmesh` and `~/.local/state/sightmesh` is kept on purpose; delete it explicitly to finish.
+`scripts/uninstall-local.sh` reads the manifest's `created_paths` and removes only those links once each is ownership-verified, plus the plists and the `uv tool` install, then removes the manifest. An installation with no manifest falls back to the paths install has always created. Durable state under `~/.local/share/sightmesh` and `~/.local/state/sightmesh` is kept on purpose; delete it explicitly to finish.
