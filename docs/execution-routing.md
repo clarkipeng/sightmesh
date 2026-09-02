@@ -60,13 +60,19 @@ Exactly three typed provider outcomes move a task along its chain, and they are 
 
 Anything else - a definitive rejection, a lost launch, and every repository, test, or code failure - carries no provider outcome at all, so it cannot reroute. A worker whose failing test output happens to mention a rate limit is not a rate limit.
 
-The condemned accounts are cooled once, at the moment the outcome is recorded, into pool `state.json` - the single source of account truth, so the cooldown survives a restart and every later selection observes it. The reroute itself is then a pure read: it excludes the failed binding and re-walks the same class chain, which lands on the next eligible *account of the same route* before it ever reaches the next route. Retrying one model on a second account before switching models therefore needs no retry counter.
+An outcome is observed in two places: a launch cdesktop rejects, and the process record of a session that was already running. The second is what covers a task refused hours after it started, and it reads typed fields only - process status and cdesktop's own outcome classification. A worker process that stopped without reporting one failed at its work, so its task blocks with that typed reason and wakes its manager rather than being rerouted on a guess.
+
+`provider_down` is not produced today. The status on a rejected launch belongs to SightMesh's own localhost call to cdesktop, so reading a 5xx as the model provider being down would cool a whole account pool for a cdesktop restart. It can only come from an upstream signal cdesktop reports, and the pinned seam exposes none.
+
+The condemned accounts are cooled before the outcome is recorded, into pool `state.json` - the single source of account truth, so the cooldown survives a restart and every later selection observes it. Cooling only ever extends a window, never shortens one, which is what makes that order safe and what stops a short `Retry-After` from erasing a live multi-hour limit. Only `sightmesh pool clear` ends a window early. The reroute itself is then a pure read: it excludes the failed binding and re-walks the same class chain, which lands on the next eligible *account of the same route* before it ever reaches the next route. Retrying one model on a second account before switching models therefore needs no retry counter.
 
 The new target opens a new epoch that fences the old one. The task epoch, active lease, and attempt budget make repeated observations idempotent and bounded. An explicit profile or `--executor` override still records its class, so it stays recoverable; a profile with `automatic_failover` off blocks with a reason instead of failing over. A route that requires metered approval or a fully exhausted chain leaves the task blocked for a human decision.
 
 Use the non-launching commands to review the policy:
 
-`routing validate` proves a usable path per class before dispatch, and dispatch gates on it: a class whose chain is empty or whose every hop is ineligible is refused before any epoch, effect row, or native call exists. A metered hop awaiting approval still counts as usable - the work has somewhere to go, it just needs a human first.
+`routing validate` proves a usable path per class before dispatch, and dispatch gates on it: a class whose chain is empty or whose every hop is ineligible is refused before any epoch, effect row, or native call exists. A metered hop awaiting approval still counts as usable - the work has somewhere to go, it just needs a human first. It checks every class, configured or not, because an unconfigured class is exactly the state it exists to catch.
+
+There is one deliberate exception to failing closed. Scope and risk can *promote* a task onto `deep`; that is SightMesh's own judgement, not an instruction, so if `deep` has no usable chain the work runs on the default class and logs that it did. An explicit `--class` is an instruction and is refused as given, and a default class that is itself unusable still fails closed.
 
 ```sh
 sightmesh routing show
@@ -113,6 +119,6 @@ With `exposeAccountAlias=true`, the selected target includes that safe alias for
 
 ## Upgrade and compatibility
 
-This settings file is versioned independently and starts with routing enabled, no chains, and `meteredFallback: auto`. No chain for a class means dispatch of that class is refused by `validate`, not silently degraded. Add routes deliberately, validate them, and inspect the non-launching explanation before connecting later execution integration.
+This settings file is versioned independently and starts with routing enabled, no chains, and `meteredFallback: auto`. With no chain at all nothing can dispatch, and `routing validate` says so per class. Add routes deliberately, validate them, and inspect the non-launching explanation before connecting later execution integration.
 
 Existing cdesktop workspaces, profiles, and active sessions continue to be managed in cdesktop. Do not use this policy to imply that an existing session will be interrupted, recovered, or approved automatically. cdesktop is the primary UI for those activities. `sightmesh pool serve` is retained only as a loopback recovery/compatibility view of pool state; it is not a route launcher, route-approval UI, or substitute for cdesktop.

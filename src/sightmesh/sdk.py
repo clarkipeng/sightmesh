@@ -35,10 +35,13 @@ from .effects import (
     request_hash,
 )
 from .escalation import CDESKTOP_SESSION_ENV, EscalationStore, LauncherIdentity
+<<<<<<< HEAD
 from .liveness import Budget, resolve_policy, trusted_policy
-from .profiles import ProfileStore, validate_provider
+=======
+>>>>>>> 2c935b5 (docs(routing): describe the fallback, monotonic cooling, and the mid-run observer)
 from .execution_routing import ExecutionRoutingError
 from .pool.core import PoolError
+from .profiles import ProfileStore, validate_provider
 from .succession import (
     REROUTE_OUTCOMES,
     SWEEPABLE_OUTCOMES,
@@ -372,6 +375,9 @@ class SightMesh:
         replacement that never got filled - which is where both actually live.
         """
         advanced: list[Worker] = []
+        # The two queries cannot overlap: an outcome is only swept while its
+        # task is active or blocked, so a `replacing` task is reachable through
+        # the second and only the second.
         pending: list[TaskRecord] = [
             task
             for task in (
@@ -379,13 +385,7 @@ class SightMesh:
                 for effect in self.journal.with_outcomes(SWEEPABLE_OUTCOMES)
             )
             if task is not None
-        ]
-        seen = {task.task_id for task in pending}
-        pending.extend(
-            task
-            for task in self.store.list_state("replacing")
-            if task.task_id not in seen
-        )
+        ] + self.store.list_state("replacing")
         for task in pending:
             # Each task settles on its own: one whose replacement launch is
             # itself rejected must not stop the sweep from reaching the rest.
