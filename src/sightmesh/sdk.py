@@ -16,12 +16,16 @@ from typing import Any, Generic, TypeVar
 
 from . import execution_routing, wakes
 from .cdesktop import (
+    PROCESS_FAILURE_STATUSES,
     CdesktopClient,
     CdesktopError,
     CdesktopInterruptedError,
     CdesktopPendingError,
     CdesktopRejectedError,
     is_effect_not_found,
+    latest_execution_process,
+    process_failure_reason,
+    process_provider_outcome,
 )
 from .effects import (
     Effect,
@@ -32,11 +36,16 @@ from .effects import (
 )
 from .escalation import CDESKTOP_SESSION_ENV, EscalationStore, LauncherIdentity
 from .profiles import ProfileStore, validate_provider
+from .execution_routing import ExecutionRoutingError
+from .pool.core import PoolError
 from .succession import (
     REROUTE_OUTCOMES,
+    SWEEPABLE_OUTCOMES,
     OwnershipStore,
+    SuccessionError,
     advance_route_after_outcome,
     cool_provider_outcome,
+    routing_outcome,
     transfer_ownership,
 )
 from .task_store import StaleTransition, TaskRecord, TaskStore, TaskStoreError
@@ -332,61 +341,145 @@ class SightMesh:
         return updated
 
     def reconcile_provider_outcome(self, session_id: str) -> Worker | None:
-        """Advance the task holding this session past a typed provider outcome."""
+        """Settle the task holding this session against what its worker did.
+
+        Two things can have happened since the last tick. The session's own
+        process may have stopped - the only place a *mid-run* provider refusal
+        is ever visible, since a task that launched fine and was cut off hours
+        later has no launch rejection to read - or a typed outcome may already
+        be on the journal, waiting to be advanced past.
+        """
         task = self.store.get_by_session(session_id)
-        return self._advance_past_outcome(task) if task is not None else None
+        if task is None:
+            return None
+        blocked = self._observe_session_failure(task, session_id)
+        if blocked is not None:
+            return blocked
+        return self._advance_past_outcome(self.store.get_by_id(task.task_id) or task)
 
     def reconcile_provider_outcomes(self) -> list[Worker]:
-        """Advance every task whose current epoch ended on a typed outcome.
+        """Advance every task the journal shows is stuck, session or no session.
 
         A launch rejected before the task ever activated holds no session, so
-        no session-keyed sweep can ever reach it. This one is keyed on the
-        journal instead, which is where the outcome actually lives.
+        no session-keyed sweep can ever reach it, and a task mid-replacement
+        holds no *live* session either. This one is keyed on durable state
+        instead - the journal for typed outcomes, the task's own state for a
+        replacement that never got filled - which is where both actually live.
         """
         advanced: list[Worker] = []
-        for effect in self.journal.with_outcomes(REROUTE_OUTCOMES):
-            task = self.store.get_by_id(effect.task_id)
-            if task is None:
-                continue
+        pending: list[TaskRecord] = [
+            task
+            for task in (
+                self.store.get_by_id(effect.task_id)
+                for effect in self.journal.with_outcomes(SWEEPABLE_OUTCOMES)
+            )
+            if task is not None
+        ]
+        seen = {task.task_id for task in pending}
+        pending.extend(
+            task
+            for task in self.store.list_state("replacing")
+            if task.task_id not in seen
+        )
+        for task in pending:
             # Each task settles on its own: one whose replacement launch is
             # itself rejected must not stop the sweep from reaching the rest.
+            # The isolation covers every error the advance can raise, since
+            # SuccessionError, ExecutionRoutingError, and PoolError are plain
+            # RuntimeErrors that would otherwise escape and skip the remainder.
             try:
-                worker = self._advance_past_outcome(task, effect)
-            except (CdesktopError, SightMeshError, TaskStoreError) as exc:
+                worker = self._advance_past_outcome(task)
+            except (
+                CdesktopError,
+                ExecutionRoutingError,
+                PoolError,
+                SightMeshError,
+                SuccessionError,
+                TaskStoreError,
+            ) as exc:
                 LOGGER.info("Cannot advance task %s this tick: %s", task.key, exc)
                 continue
             if worker is not None:
                 advanced.append(worker)
         return advanced
 
-    def _advance_past_outcome(
-        self, task: TaskRecord, effect: Effect | None = None
+    def _observe_session_failure(
+        self, task: TaskRecord, session_id: str
     ) -> Worker | None:
+        """Record what a stopped worker process reports, so a live run can move.
+
+        Without this, only a *launch* rejection could ever reroute: a task that
+        started fine and hit a rate limit an hour in has no rejection anywhere,
+        its effect stays ``launched`` forever, and the task hangs silently.
+
+        Only typed fields are read - the process status and cdesktop's own
+        outcome classification - never the transcript. A capacity or auth
+        signal becomes a typed outcome on the journal, which the ordinary
+        advance path then acts on. A process that failed with no such signal
+        failed at its work, so the task blocks with the process's typed reason
+        and wakes its manager, rather than hanging or being rerouted on a
+        guess.
+        """
+        if task.state != "active":
+            return None
+        effect = self.journal.get(task.task_id, task.epoch)
+        if effect is None or effect.state != "launched":
+            # Nothing launched under this epoch, or its outcome is already
+            # recorded; either way the process tells us nothing new.
+            return None
+        process = latest_execution_process(
+            [
+                item
+                for item in self.client.execution_processes(session_id)
+                if item.get("run_reason") == "codingagent"
+            ]
+        )
+        if (
+            process is None
+            or str(process.get("status") or "") not in PROCESS_FAILURE_STATUSES
+        ):
+            return None
+        outcome, retry_at = process_provider_outcome(process)
+        if outcome is not None:
+            self._record_provider_outcome(task, outcome, retry_at)
+            return None
+        return self._block_unroutable(task, process_failure_reason(process))
+
+    def _advance_past_outcome(self, task: TaskRecord) -> Worker | None:
         """Move one task past a typed capacity, auth, or provider outcome.
 
         The typed outcome on the effect journal is the only trigger. A task
         that failed to build, failed its tests, or blocked itself carries no
         provider outcome at all, so it can never enter this path - however
         much its transcript may look like a rate limit.
+
+        The effect is read here, from the task row this call was handed, rather
+        than accepted from the caller. A caller that found the effect first
+        holds a task row that may since have advanced an epoch, and acting on a
+        superseded epoch's outcome reroutes a run that already moved on; taking
+        no effect as an argument makes that pairing impossible to get wrong.
         """
         target = task.spec.get("target", {})
-        if task.state == "replacing" and target.get("recovery") in REROUTE_OUTCOMES:
-            # A crashed replacement: resume the epoch already prepared rather
-            # than burn another one.
-            self._require_contract()
-            return Worker.from_record(
-                self._launch_prepared(task, str(task.spec["prompt"]))
-            )
+        effect = self.journal.get(task.task_id, task.epoch)
+        if task.state == "replacing":
+            return self._resume_replacement(task, effect)
         if task.state not in {"active", "blocked"}:
             return None
-        if effect is None:
-            effect = self.journal.get(task.task_id, task.epoch)
-        if (
-            effect is None
-            or effect.state != "terminal"
-            or effect.outcome not in REROUTE_OUTCOMES
-        ):
+        outcome = (
+            routing_outcome(effect.outcome)
+            if effect is not None and effect.state == "terminal"
+            else None
+        )
+        if outcome is None:
             return None
+        if task.attempts >= task.max_attempts:
+            # The circuit breaker has tripped. Saying so once is the whole
+            # difference between a stopped task and a hung one.
+            return self._block_unroutable(
+                task,
+                f"{outcome} on route {target.get('route_id')}; "
+                f"{task.max_attempts}-attempt circuit breaker tripped",
+            )
 
         route_id = target.get("route_id")
         route_class = target.get("route_class") or execution_routing.DEFAULT_ROUTE_CLASS
@@ -396,19 +489,19 @@ class SightMesh:
             # silently going nowhere, so `replace()` remains a human's call.
             return self._block_unroutable(
                 task,
-                f"{effect.outcome} on {route_id}; automatic failover is off",
+                f"{outcome} on {route_id}; automatic failover is off",
             )
 
         selection = advance_route_after_outcome(
             execution_routing.ExecutionRoutingStore().load(),
-            outcome=str(effect.outcome),
+            outcome=outcome,
             route_class=route_class,
             failed_binding_id=target.get("auth_binding_id"),
         )
         if selection.status != "resolved" or selection.target is None:
             return self._block_unroutable(
                 task,
-                f"{effect.outcome} on route {route_id} "
+                f"{outcome} on route {route_id} "
                 f"({route_class}); {selection.reason}",
             )
 
@@ -423,7 +516,7 @@ class SightMesh:
             "route_id": selected.route_id,
             "billing_class": selected.billing_class,
             "failover": "auto",
-            "recovery": effect.outcome,
+            "recovery": outcome,
         }
         self._require_contract()
         prepared = self.store.prepare_replacement(
@@ -432,6 +525,32 @@ class SightMesh:
         return Worker.from_record(
             self._launch_prepared(prepared, str(task.spec["prompt"]))
         )
+
+    def _resume_replacement(
+        self, task: TaskRecord, effect: Effect | None
+    ) -> Worker | None:
+        """Settle a task whose replacement epoch was opened but never filled.
+
+        ``prepare_replacement`` and the launch that fills it are two steps, so
+        anything between them - a crash, an unreachable executor, a rejected
+        replacement launch - leaves the task in ``replacing``. Neither
+        reconciler used to look at that state, so such a task was invisible to
+        both and simply stopped.
+
+        The already-open epoch's effect says which of the two things to do, and
+        nothing here needs to know how the task got here: an epoch that is
+        merely unfilled gets filled, and one that already ended blocks with its
+        outcome. Blocking is the whole settlement even for a typed outcome,
+        because a *blocked* task with a terminal outcome is exactly what the
+        ordinary advance path handles - so the chain moves on the next tick
+        through one code path rather than two.
+        """
+        if effect is not None and effect.state == "terminal":
+            return self._block_unroutable(
+                task, f"replacement epoch ended: {effect.outcome}"
+            )
+        self._require_contract()
+        return Worker.from_record(self._launch_prepared(task, str(task.spec["prompt"])))
 
     def _block_unroutable(self, task: TaskRecord, reason: str) -> Worker | None:
         """Block a task that cannot advance, and report only a real change.
