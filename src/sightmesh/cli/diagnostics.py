@@ -199,6 +199,39 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def _task_limit(args: argparse.Namespace) -> int | None:
+    """Newest-N bound for one task read; ``--all`` is the explicit opt-out."""
+    return None if args.all else int(args.limit)
+
+
+def _bounded_tasks(
+    store: Any, args: argparse.Namespace
+) -> tuple[list[observability.TaskView], bool]:
+    """Newest-N managed tasks, plus whether the bound actually hid anything.
+
+    Reading one row past the bound is what makes the notice exact: printing
+    "showing the newest N" whenever N rows come back cries wolf on a host
+    that happens to hold exactly N tasks.
+    """
+    limit = _task_limit(args)
+    if limit is None:
+        return observability.read_tasks(store, limit=None), False
+    views = observability.read_tasks(store, limit=limit + 1)
+    if len(views) > limit:
+        return views[-limit:], True
+    return views, False
+
+
+def _note_truncation(args: argparse.Namespace, truncated: bool) -> None:
+    """Say so on stderr, so a bounded read is never mistaken for the whole."""
+    if truncated:
+        print(
+            f"Showing the newest {_task_limit(args)} managed tasks; "
+            "pass --all for every task.",
+            file=sys.stderr,
+        )
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     """List managed tasks from the kernel store, never the native fleet.
 
@@ -206,16 +239,15 @@ def cmd_list(args: argparse.Namespace) -> int:
     surfaces apart is what stops a routine `list` from fanning out.
     """
     store = observability.task_store()
-    _emit(
-        [view.to_dict() for view in observability.read_tasks(store)],
-        args.json,
-    )
+    views, truncated = _bounded_tasks(store, args)
+    _emit([view.to_dict() for view in views], args.json)
+    _note_truncation(args, truncated)
     return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     store = observability.task_store()
-    views = observability.read_tasks(store)
+    views, truncated = _bounded_tasks(store, args)
     _emit(
         {
             "service": service.status(args.port),
@@ -227,6 +259,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         },
         args.json,
     )
+    _note_truncation(args, truncated)
     return 0
 
 
@@ -249,9 +282,14 @@ def _release_version(release: Any) -> str | None:
 def cmd_attention(args: argparse.Namespace) -> int:
     """One queue of everything a human must act on, answered by the kernel."""
     store = observability.task_store()
-    queue = fleet.attention(observability.attention_facts(store), now=datetime.now(UTC))
+    views, truncated = _bounded_tasks(store, args)
+    facts = observability.attention_facts(
+        store, tasks=[view.to_dict() for view in views]
+    )
+    queue = fleet.attention(facts, now=datetime.now(UTC))
     if args.json:
         _emit(queue.to_dict(), True)
+        _note_truncation(args, truncated)
         return 0
     if not queue.items:
         print("(nothing needs attention)")
@@ -259,6 +297,7 @@ def cmd_attention(args: argparse.Namespace) -> int:
         print(f"  {item.selector} - {item.reason} Next: {item.next_action}")
     for entry in queue.degraded:
         print(f"  degraded: {entry['source']} - {entry['reason']}")
+    _note_truncation(args, truncated)
     return 0
 
 
@@ -497,11 +536,15 @@ def cmd_overview(args: argparse.Namespace) -> int:
     now = datetime.now(UTC)
     viewed_at = _viewed_at(args) or now - timedelta(hours=DEFAULT_OVERVIEW_HOURS)
     store = observability.task_store()
-    facts = observability.attention_facts(store)
+    views, truncated = _bounded_tasks(store, args)
+    facts = observability.attention_facts(
+        store, tasks=[view.to_dict() for view in views]
+    )
     queue = fleet.attention(facts, now=now)
     groups = fleet.task_groups(facts.tasks, now=now, viewed_at=viewed_at)
     if args.json:
         _emit({**groups.to_dict(), "attention": queue.to_dict()}, True)
+        _note_truncation(args, truncated)
         return 0
     print("Needs attention")
     if not queue.items:
@@ -519,8 +562,25 @@ def cmd_overview(args: argparse.Namespace) -> int:
             print(f"  task/{row.get('scope')}/{row.get('key')} - {row.get('state')}")
     for entry in queue.degraded:
         print(f"  degraded: {entry['source']} - {entry['reason']}")
+    _note_truncation(args, truncated)
     return 0
 
+
+
+def _add_task_bounds(command: argparse.ArgumentParser) -> None:
+    """Bound every task read the same way, with one explicit opt-out."""
+    bound = command.add_mutually_exclusive_group()
+    bound.add_argument(
+        "--limit",
+        type=int,
+        default=observability.DEFAULT_TASK_LIMIT,
+        help="Show only the newest N managed tasks",
+    )
+    bound.add_argument(
+        "--all",
+        action="store_true",
+        help="Show every managed task, however many there are",
+    )
 
 
 def add_initial_parser(sub: argparse._SubParsersAction[Any]) -> None:
@@ -528,6 +588,7 @@ def add_initial_parser(sub: argparse._SubParsersAction[Any]) -> None:
     doctor.set_defaults(func=cmd_doctor)
 
     listing = sub.add_parser("list", help="List managed tasks from the kernel store")
+    _add_task_bounds(listing)
     listing.set_defaults(func=cmd_list)
 
 
@@ -538,11 +599,13 @@ def add_status_parser(sub: argparse._SubParsersAction[Any]) -> None:
         "status", help="Show managed task, service, and lease state"
     )
     fleet_status.add_argument("--port", type=int, default=service.DEFAULT_PORT)
+    _add_task_bounds(fleet_status)
     fleet_status.set_defaults(func=cmd_status)
 
     attention = sub.add_parser(
         "attention", help="List everything that needs a human decision"
     )
+    _add_task_bounds(attention)
     attention.set_defaults(func=cmd_attention)
 
     overview = sub.add_parser(
@@ -552,6 +615,7 @@ def add_status_parser(sub: argparse._SubParsersAction[Any]) -> None:
         "--since",
         help="ISO-8601 lower bound for inactive items; defaults to the last 24 hours",
     )
+    _add_task_bounds(overview)
     overview.set_defaults(func=cmd_overview)
 
     workspaces = sub.add_parser(

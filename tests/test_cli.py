@@ -1175,9 +1175,8 @@ def test_status_redacts_lease_capability(monkeypatch, tmp_path: Path, capsys) ->
             return []
 
     monkeypatch.setattr(cli, "CdesktopClient", StatusClient)
-    args = argparse.Namespace(url=None, port=8377, include_archived=False, json=True)
 
-    assert cli.cmd_status(args) == 0
+    assert cli.cmd_status(cli.parser().parse_args(["--json", "status"])) == 0
     assert lease.token not in capsys.readouterr().out
 
 

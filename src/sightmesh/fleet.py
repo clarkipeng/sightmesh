@@ -31,6 +31,7 @@ _ATTENTION_PRIORITY = {
     "dirty_closeout": 4,
     "failing_check": 5,
     "unacked_delivery": 6,
+    "suppressed_unacked": 7,
 }
 _QUOTA_FIELDS = ("known", "remaining", "resetsAt", "resetsIn", "reason")
 _EVENT_FIELDS = ("at", "kind", "status", "summary")
@@ -352,11 +353,18 @@ def _task_attention_item(
 def _delivery_attention_item(row: Mapping[str, Any], now: datetime) -> AttentionItem:
     kind = _text(row.get("kind")) or "delivery"
     identifier = _text(row.get("id")) or "unknown"
+    # The bounded read summarizes its own overflow in one row rather than
+    # emitting rows a human will never work through.
+    suppressed = kind == "suppressed_unacked"
     return AttentionItem(
         selector=f"delivery/{quote(kind, safe='')}/{quote(identifier, safe='')}",
-        kind="unacked_delivery",
-        reason=f"Delivery is unacknowledged ({kind}).",
-        next_action="Resolve the escalation or collect the outstanding report.",
+        kind="suppressed_unacked" if suppressed else "unacked_delivery",
+        reason=f"{_text(row.get('summary'))}."
+        if suppressed
+        else f"Delivery is unacknowledged ({kind}).",
+        next_action="Re-read with a higher limit, or --all, to see them."
+        if suppressed
+        else "Resolve the escalation or collect the outstanding report.",
         scope=None,
         task_key=None,
         state=kind,

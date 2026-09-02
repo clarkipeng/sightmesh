@@ -24,6 +24,12 @@ from sightmesh.task_store import TaskStore, TaskStoreError
 NOW = datetime(2026, 9, 1, tzinfo=UTC)
 
 
+def _args(*command: str) -> argparse.Namespace:
+    """Build args through the real parser, so a command and its flags cannot
+    drift apart in a test that hand-rolls a Namespace."""
+    return cli.parser().parse_args(["--json", *command])
+
+
 class ExplodingClient:
     """Any construction is a failure: a task surface must not hold a client."""
 
@@ -238,6 +244,57 @@ def test_unacked_deliveries_cover_parked_escalations_and_unmet_orders(
     assert sorted(kinds) == ["parked_escalation", "unmet_order"]
 
 
+def test_unmet_orders_are_filtered_to_recipients_that_can_act(
+    store: TaskStore,
+) -> None:
+    """The old `cli/fleet.py` projection surfaced an unmet order only while
+    its recipient was live and not mid-turn. The kernel queue dropped that
+    filter and started reporting orders for sessions that no longer exist.
+    Liveness is an executor fact, so a caller that holds it supplies it, and
+    then only those recipients' orders are anyone's business.
+    """
+    escalations = EscalationStore(store.path)
+    for recipient in ("s-idle", "s-busy", "s-gone"):
+        escalations.expect_order(
+            order_id=None,
+            sender_session_id="s-lead",
+            recipient_session_id=recipient,
+            body=f"report back, {recipient}",
+        )
+
+    rows = observability.unacked_deliveries(escalations, idle_recipients={"s-idle"})
+
+    assert [row["session_id"] for row in rows] == ["s-idle"]
+    assert observability.unacked_deliveries(escalations, idle_recipients=set()) == []
+
+
+def test_unacked_deliveries_stop_at_the_bound_and_summarize_the_rest(
+    store: TaskStore,
+) -> None:
+    """`pending()` was bounded but `orders(unmet_only=True)` was not, so one
+    read emitted every unmet order the host had ever recorded (33k rows,
+    10.8MB measured). A queue nobody can read is not a queue: past the bound
+    it reports one honest count instead of the rows themselves.
+    """
+    escalations = EscalationStore(store.path)
+    for index in range(250):
+        escalations.expect_order(
+            order_id=None,
+            sender_session_id="s-lead",
+            recipient_session_id="s-2",
+            body=f"report {index}",
+        )
+
+    rows = observability.unacked_deliveries(escalations)
+
+    assert len(rows) == observability.DEFAULT_UNACKED_LIMIT + 1
+    summary = rows[0]
+    assert summary["kind"] == "suppressed_unacked"
+    assert summary["summary"] == "150 older unacknowledged deliveries suppressed"
+    # What survives the bound is the newest work, not the oldest history.
+    assert rows[-1]["summary"] == "report 249"
+
+
 def test_a_satisfied_order_leaves_the_attention_queue(store: TaskStore) -> None:
     """Otherwise the queue only grows and operators learn to ignore it."""
     escalations = EscalationStore(store.path)
@@ -295,15 +352,15 @@ def test_status_list_and_attention_never_construct_a_client(
     """
     seed(task_cli, [spec(f"task-{index}") for index in range(5)])
 
-    assert cli.cmd_list(argparse.Namespace(url=None, json=True)) == 0
+    assert cli.cmd_list(_args("list")) == 0
     listed = json.loads(capsys.readouterr().out)
     assert len(listed) == 5
 
-    assert cli.cmd_status(argparse.Namespace(url=None, port=8377, json=True)) == 0
+    assert cli.cmd_status(_args("status")) == 0
     status = json.loads(capsys.readouterr().out)
     assert status["task_counts"]["reserved"] == 5
 
-    assert cli.cmd_attention(argparse.Namespace(url=None, json=True)) == 0
+    assert cli.cmd_attention(_args("attention")) == 0
     attention = json.loads(capsys.readouterr().out)
     assert attention["items"] == []
     assert [entry["source"] for entry in attention["degraded"]] == [
@@ -312,14 +369,72 @@ def test_status_list_and_attention_never_construct_a_client(
     ]
 
 
+def test_attention_bounds_its_output_at_the_command(
+    task_cli: TaskStore, capsys
+) -> None:
+    """End to end: the emitted queue is bounded, not merely the helper.
+
+    A measured `sightmesh attention` printed 33k rows / 10.8MB because the
+    unmet-order read had no LIMIT. The command now emits at most the bound
+    plus one row saying how much it withheld.
+    """
+    escalations = EscalationStore(task_cli.path)
+    for index in range(250):
+        escalations.expect_order(
+            order_id=None,
+            sender_session_id="s-lead",
+            recipient_session_id="s-2",
+            body=f"report {index}",
+        )
+
+    assert cli.cmd_attention(_args("attention")) == 0
+    queue = json.loads(capsys.readouterr().out)
+
+    kinds = [item["kind"] for item in queue["items"]]
+    assert kinds.count("unacked_delivery") == observability.DEFAULT_UNACKED_LIMIT
+    assert kinds.count("suppressed_unacked") == 1
+    suppressed = next(
+        item for item in queue["items"] if item["kind"] == "suppressed_unacked"
+    )
+    assert "150 older unacknowledged deliveries suppressed" in suppressed["reason"]
+    assert "--all" in suppressed["next_action"]
+
+
+def test_task_reads_are_bounded_to_the_newest_unless_all_is_asked_for(
+    task_cli: TaskStore, capsys
+) -> None:
+    """`list`, `status`, `overview` and `attention` all read the task table
+    with no LIMIT, so a long-lived host answered a routine `list` with its
+    entire history. The default is the newest N, `--limit` narrows it, and
+    `--all` is the named way to ask for everything.
+    """
+    seed(task_cli, [spec(f"old-{index}") for index in range(250)])
+    seed(task_cli, [spec("newest")])
+
+    assert cli.cmd_list(_args("list")) == 0
+    bounded = capsys.readouterr()
+    rows = json.loads(bounded.out)
+    assert len(rows) == observability.DEFAULT_TASK_LIMIT
+    assert "newest" in {row["key"] for row in rows}
+    # A bounded read that looks complete is worse than a small one.
+    assert "pass --all" in bounded.err
+
+    assert cli.cmd_list(_args("list", "--all")) == 0
+    everything = capsys.readouterr()
+    assert len(json.loads(everything.out)) == 251
+    assert everything.err == ""
+
+    assert cli.cmd_status(_args("status", "--limit", "5")) == 0
+    assert len(json.loads(capsys.readouterr().out)["tasks"]) == 5
+
+
 def test_overview_is_task_local_too(task_cli: TaskStore, capsys) -> None:
     """`overview` was the third fan-out surface; it reads the same store as
     `status` so the two can never disagree (kernel-contract, Observability).
     """
     seed(task_cli, [spec("only")])
 
-    args = argparse.Namespace(url=None, json=True, since=None)
-    assert cli.cmd_overview(args) == 0
+    assert cli.cmd_overview(_args("overview")) == 0
     output = json.loads(capsys.readouterr().out)
 
     assert [row["key"] for row in output["running"]] == ["only"]

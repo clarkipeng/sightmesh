@@ -6,7 +6,9 @@ Task surfaces answer from the kernel store and never call cdesktop. Native inven
 
 `sightmesh status` shows managed service state, managed task rows and counts, staged/active update versions, ownership leases, and named profiles.
 `sightmesh list` lists managed tasks across every scope; `sightmesh tasks` lists the caller's scope.
-`sightmesh attention` is the single queue of work needing a human: blocked approvals, tripped breakers, lost tasks, and unacknowledged deliveries. Dirty closeouts and failing checks are cdesktop-owned facts; when no caller supplies them the queue reports them as `reported-degraded` rather than implying a clean fleet.
+`sightmesh attention` is the single queue of work needing a human: blocked approvals, tripped breakers, lost tasks, and unacknowledged deliveries. A task that has spent its attempt budget is reported as a tripped breaker whatever state it is in, because it cannot be replaced. Dirty closeouts and failing checks are cdesktop-owned facts; when no caller supplies them the queue reports them as `reported-degraded` rather than implying a clean fleet.
+
+`status`, `list`, `attention`, and `overview` read the newest 200 managed tasks. Use `--limit N` to narrow that and `--all` to read every task; a bounded read says on stderr that it was bounded. Unacknowledged deliveries are bounded the same way, and everything past the bound is reported as one `suppressed_unacked` row carrying the count rather than as rows nobody will read.
 `sightmesh workspaces` is the explicit native inventory (workspaces, sessions, providers, profiles) and fans out on purpose. Add `--include-archived` for history and `--overview` for the native execution projection.
 
 Use `sightmesh peers` for the compact agent-facing roster and `sightmesh peek @AGENT` for a coalesced current-activity snapshot.

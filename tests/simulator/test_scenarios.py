@@ -1060,11 +1060,14 @@ def test_s13_task_surfaces_at_a_thousand_tasks_perform_zero_fleet_scans(
         cli.leases.LeaseStore, "list", lambda _self, include_stale=True: []
     )
 
+    def args(*command: str) -> argparse.Namespace:
+        return cli.parser().parse_args(["--json", *command])
+
     before = len(client.call_log)
-    assert cli.cmd_list(argparse.Namespace(url=None, json=True)) == 0
-    assert cli.cmd_status(argparse.Namespace(url=None, port=8377, json=True)) == 0
-    assert cli.cmd_attention(argparse.Namespace(url=None, json=True)) == 0
-    assert cli.cmd_overview(argparse.Namespace(url=None, json=True, since=None)) == 0
+    assert cli.cmd_list(args("list", "--all")) == 0
+    assert cli.cmd_status(args("status", "--all")) == 0
+    assert cli.cmd_attention(args("attention", "--all")) == 0
+    assert cli.cmd_overview(args("overview", "--all")) == 0
     capsys.readouterr()
 
     assert len(client.call_log) == before

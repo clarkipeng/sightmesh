@@ -25,7 +25,7 @@ import re
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -722,25 +722,92 @@ class EscalationStore:
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(f"Cannot satisfy order expectation: {exc}") from exc
 
-    def orders(
-        self, *, recipient_session_id: str | None = None, unmet_only: bool = False
-    ) -> list[OrderExpectation]:
-        query = "SELECT * FROM order_expectations"
-        values: tuple[str, ...] = ()
-        where = []
+    def _order_filter(
+        self,
+        *,
+        recipient_session_id: str | None,
+        unmet_only: bool,
+        recipient_session_ids: Collection[str] | None,
+    ) -> tuple[str, list[object]]:
+        where: list[str] = []
+        values: list[object] = []
         if recipient_session_id is not None:
             where.append("recipient_session_id = ?")
-            values = (recipient_session_id,)
+            values.append(recipient_session_id)
+        if recipient_session_ids is not None:
+            recipients = sorted({str(item) for item in recipient_session_ids})
+            if not recipients:
+                return " WHERE 0", []
+            placeholders = ", ".join("?" for _ in recipients)
+            where.append(f"recipient_session_id IN ({placeholders})")
+            values.extend(recipients)
         if unmet_only:
             where.append("satisfied_at IS NULL")
-        if where:
-            query += " WHERE " + " AND ".join(where)
+        return (" WHERE " + " AND ".join(where)) if where else "", values
+
+    def orders(
+        self,
+        *,
+        recipient_session_id: str | None = None,
+        unmet_only: bool = False,
+        recipient_session_ids: Collection[str] | None = None,
+        limit: int | None = None,
+    ) -> list[OrderExpectation]:
+        """Read order expectations, oldest first.
+
+        ``limit`` keeps the *newest* rows and still returns them oldest
+        first: an unbounded read of this table emitted every unmet order the
+        host had ever recorded (33k rows in one measured case), and the old
+        ones are stale noise while the recent ones are the live question.
+        """
+        if limit is not None and limit < 1:
+            raise ValueError("Order expectation limit must be positive")
+        clause, values = self._order_filter(
+            recipient_session_id=recipient_session_id,
+            unmet_only=unmet_only,
+            recipient_session_ids=recipient_session_ids,
+        )
+        query = f"SELECT * FROM order_expectations{clause} ORDER BY created_at"
+        if limit is None:
+            query += " ASC"
+        else:
+            query += " DESC LIMIT ?"
+            values = [*values, limit]
         try:
             with self._connect() as conn:
-                rows = conn.execute(query + " ORDER BY created_at ASC", values).fetchall()
+                rows = conn.execute(query, values).fetchall()
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(f"Cannot read order expectations: {exc}") from exc
+        if limit is not None:
+            rows = list(reversed(rows))
         return [_order_from_row(row) for row in rows]
+
+    def unacked_counts(
+        self, *, recipient_session_ids: Collection[str] | None = None
+    ) -> dict[str, int]:
+        """Total parked escalations and unmet orders.
+
+        A bounded read needs these to say how much it suppressed, instead of
+        showing a truncated list as if it were the whole queue.
+        """
+        clause, values = self._order_filter(
+            recipient_session_id=None,
+            unmet_only=True,
+            recipient_session_ids=recipient_session_ids,
+        )
+        try:
+            with self._connect() as conn:
+                parked = conn.execute(
+                    "SELECT COUNT(*) FROM escalations WHERE status = 'parked'"
+                ).fetchone()[0]
+                unmet = conn.execute(
+                    f"SELECT COUNT(*) FROM order_expectations{clause}", values
+                ).fetchone()[0]
+        except sqlite3.DatabaseError as exc:
+            raise EscalationStoreError(
+                f"Cannot count unacknowledged deliveries: {exc}"
+            ) from exc
+        return {"parked_escalation": int(parked), "unmet_order": int(unmet)}
 
     def pending(self, *, limit: int = 100) -> list[ParkedEscalation]:
         if limit < 1 or limit > 1000:
