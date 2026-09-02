@@ -314,7 +314,7 @@ class FakeCdesktop:
         process_id: str | None = None,
         last_activity: float,
         run_reason: str = "codingagent",
-        output_bytes: int = 0,
+        output_bytes: int | None = None,
         stream_alive: bool = True,
         **snapshot: Any,
     ) -> str:
@@ -322,17 +322,23 @@ class FakeCdesktop:
 
         ``last_activity`` is an epoch timestamp, not an age, so a scenario can
         place a task exactly N seconds into silence without sleeping.
+
+        ``output_bytes`` defaults to *absent*, not zero, because that is the
+        shape every real cdesktop process row has: the field does not exist.
+        A fake that invented it gave the detector a progress source production
+        does not have, and hid the fact that the timestamp path - the only one
+        that actually runs out there - was never under test.
         """
         pid = process_id or f"proc-{session_id}-{len(self.processes.get(session_id, []))}"
-        self.processes.setdefault(session_id, []).append(
-            {
-                "id": pid,
-                "status": "running",
-                "run_reason": run_reason,
-                "updated_at": last_activity,
-                "output_bytes": output_bytes,
-            }
-        )
+        row: dict[str, Any] = {
+            "id": pid,
+            "status": "running",
+            "run_reason": run_reason,
+            "updated_at": last_activity,
+        }
+        if output_bytes is not None:
+            row["output_bytes"] = output_bytes
+        self.processes.setdefault(session_id, []).append(row)
         self.snapshots[pid] = {"entries": [], "stream_alive": stream_alive, **snapshot}
         return pid
 
