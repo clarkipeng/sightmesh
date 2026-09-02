@@ -1,4 +1,4 @@
-"""Routing failover scenarios S-D1..S-D8 (root cause D).
+"""Routing failover scenarios S-D1..S-D15 (root cause D).
 
 Each one pins a behaviour the typed-outcome failover design is required to
 hold, over the *real* pool, routing settings, task store, and effect journal
