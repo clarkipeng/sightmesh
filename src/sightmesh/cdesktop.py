@@ -68,7 +68,14 @@ class CdesktopPendingError(CdesktopRejectedError):
 #: HTTP statuses that carry a typed meaning routing acts on. Everything else
 #: stays an untyped ``CdesktopError``: routing must never infer a provider
 #: outcome from a status it was not told the meaning of.
-_REJECTION_STATUSES = (401, 403, 409, 429, 500, 502, 503, 504)
+#:
+#: 5xx is deliberately absent. This status belongs to SightMesh's own localhost
+#: request to cdesktop, not to the model provider behind it, so a cdesktop
+#: process that is restarting, out of disk, or panicking would be read as the
+#: provider being down - and the whole account pool cooled for a fault that has
+#: nothing to do with any account. An unreachable local service leaves the task
+#: reserved and retryable, which is what it is.
+_REJECTION_STATUSES = (401, 403, 409, 429)
 
 
 def _rejection_type(status: int) -> type[CdesktopRejectedError] | None:

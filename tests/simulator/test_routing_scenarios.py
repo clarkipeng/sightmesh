@@ -19,6 +19,7 @@ import time
 import pytest
 
 from sightmesh import execution_routing
+from sightmesh.cdesktop import CdesktopError
 from sightmesh.cli import parser
 from sightmesh.pool import core as pool_core
 from sightmesh.profiles import Profile, ProfileStore
@@ -269,12 +270,17 @@ def test_sd5_an_auth_outcome_reroutes_on_a_short_cooldown(
 def test_sd6_provider_down_cools_the_whole_provider_and_falls_to_the_next_hop(
     mesh: SightMesh, store: TaskStore, pool_root, routing_settings
 ) -> None:
-    """S-D6: a 5xx is the provider failing, not the account, so every account in
-    that route's pool cools together and the chain skips straight past its
-    remaining hops on the same provider.
+    """S-D6: a provider that is down is not a failure of one account, so every
+    account in that route's pool cools together and the chain skips straight
+    past its remaining hops on the same provider.
 
     Cooling one account at a time here would walk the chain through the whole
     pool, one doomed launch per account, before reaching a provider that works.
+
+    The outcome is written onto the journal directly because nothing produces
+    it yet: it can only come from an upstream signal cdesktop reports, and the
+    pinned seam exposes none (see `_rejection_outcome`). This scenario is what
+    keeps the handling correct and exercised until the seam does.
     """
     seed_pool(
         claude_account("acct-a"), claude_account("acct-b"), metered_account("codex-api")
@@ -287,16 +293,48 @@ def test_sd6_provider_down_cools_the_whole_provider_and_falls_to_the_next_hop(
         )
     )
 
-    start_rejected(mesh, 503)
+    started = mesh.start(routed_spec())
     task = store.get("operator", "audit")
-    assert mesh.journal.get(task.task_id, 1).outcome == "provider_down"
+    assert target_of(store)["auth_binding_id"] == "acct-a"
+    mesh._record_provider_outcome(task, "provider_down", None)
 
-    mesh.reconcile_provider_outcomes()
+    advanced = mesh.reconcile_provider_outcome(started.session_id)
 
+    assert advanced is not None and advanced.state == "active"
     assert cooling("acct-a") > 0 and cooling("acct-b") > 0
     assert cooling("acct-a") <= pool_core.SHORT_COOLDOWN
     assert target_of(store)["route_id"] == "sol"
     assert target_of(store)["auth_binding_id"] == "codex-api"
+
+
+def test_sd6_a_local_cdesktop_5xx_never_cools_an_account(
+    mesh: SightMesh, store: TaskStore, pool_root, routing_settings
+) -> None:
+    """S-D6 (contrast): a 5xx from the localhost cdesktop call is a local fault
+    and must not be read as the model provider being down.
+
+    That status describes cdesktop restarting, out of disk, or panicking - none
+    of which is evidence about any account. Typing it as a rejection cooled the
+    entire pool for the short window and blocked the task; it is an ordinary
+    unreachable-service error, so the reservation stays adoptable and the next
+    tick simply retries.
+    """
+    seed_pool(claude_account("acct-a"), claude_account("acct-b"))
+    configure_chains(standard=(subscription("terra", "terra", "claude"),))
+
+    mesh.client.fail_launch(CdesktopError("PUT /task-launches failed: HTTP 503: down"))
+    with pytest.raises(BatchError):
+        mesh.start(routed_spec())
+
+    task = store.get("operator", "audit")
+    assert task is not None and task.state == "reserved"
+    effect = mesh.journal.get(task.task_id, task.epoch)
+    assert effect.state == "reserved" and effect.outcome is None
+    assert cooling("acct-a") == 0 and cooling("acct-b") == 0
+
+    # The local service comes back and the same reservation is filled.
+    assert mesh.start(routed_spec()).state == "active"
+    assert store.get("operator", "audit").epoch == 1
 
 
 # ---------------------------------------------------------------- S-D7
