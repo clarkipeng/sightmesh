@@ -801,3 +801,56 @@ def test_a_lagging_global_cli_is_a_warning_not_a_doctor_failure(monkeypatch) -> 
     )
     assert running_skew["ok"] is False
     assert running_skew["warning_only"] is False
+
+
+def test_a_released_or_expired_lease_takes_its_capability_file_with_it(
+    tmp_path: Path, capsys
+) -> None:
+    """`acquire` writes a live bearer token to disk; nothing ever deleted it.
+
+    The token outlived the lease it authorized, so a directory of valid-
+    looking capabilities accumulated for leases nobody held. Removal is the
+    one choke point release and the expiry sweep share, so the file cannot
+    survive either.
+    """
+    lease_dir = tmp_path / "leases"
+    acquire = _args(
+        "lease",
+        "--lease-dir",
+        str(lease_dir),
+        "acquire",
+        "--owner",
+        "owner",
+        "--repo",
+        str(tmp_path),
+        "--ttl-seconds",
+        "600",
+    )
+    assert cli.cmd_lease(acquire) == 0
+    capability = Path(json.loads(capsys.readouterr().out)["capability_path"])
+    assert capability.is_file()
+
+    store = LeaseStore(lease_dir)
+    lease = store.list()[0]
+    assert store.capability_path(lease) == capability
+
+    store.release(lease.token)
+    assert not capability.exists()
+
+
+def test_the_expiry_sweep_removes_capability_files_too(tmp_path: Path) -> None:
+    """A lease that simply times out is the common case: nobody runs
+    `release` on a crashed session, so the sweep is what has to clean up.
+    """
+    lease_dir = tmp_path / "leases"
+    store = LeaseStore(lease_dir)
+    lease = store.acquire("owner", tmp_path, ttl_seconds=1)
+    capability = store.capability_path(lease)
+    capability.parent.mkdir(parents=True, exist_ok=True)
+    capability.write_text(lease.token, encoding="utf-8")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cli.leases, "_now", lambda: time.time() + 3600)
+        assert [recovered.token for recovered in store.recover_stale()] == [lease.token]
+
+    assert not capability.exists()

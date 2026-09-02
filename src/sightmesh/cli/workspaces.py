@@ -190,11 +190,11 @@ def cmd_lease(args: argparse.Namespace) -> int:
         )
         # `acquire` is the only deliberate capability exit. Inside a managed
         # session stdout lands in a transcript, so the token goes to a 0600
-        # file and only its path is emitted.
+        # file and only its path is emitted. The store owns the location so
+        # that releasing or expiring the lease removes this exact file.
+        capability = store.capability_path(lease)
         path = emit_capability(
-            store.root / "capabilities",
-            leases._identity_key(lease.repo_path, lease.worktree_path),
-            lease.token,
+            capability.parent, capability.name.removesuffix(leases.CAPABILITY_SUFFIX), lease.token
         )
         _emit({**lease.to_public_dict(), "capability_path": str(path)}, args.json)
     elif args.lease_action == "list":
