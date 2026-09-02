@@ -40,10 +40,14 @@ LIFECYCLE_NOTIFICATION_KEY_PREFIXES = (
     "child-terminal:",
     "signal-policy:",
 )
-#: Task states the detector reads evidence for. ``blocked`` is excluded (it has
-#: already explained itself) and so is ``reserved``, which has no session to
-#: read - an aged reservation is handled by :meth:`_scan_reserved` instead.
-DETECTABLE_STATES = ("active", "replacing")
+#: Task states the detector reads evidence for. Only ``active``: ``blocked``
+#: has already explained itself; ``reserved`` has no session to read, so an
+#: aged reservation goes through :meth:`_scan_reserved` instead; and
+#: ``replacing`` still points at the *predecessor's* dying session, so reading
+#: it would classify a successor from its predecessor's corpse - and ``lost``
+#: is a legal terminal from ``replacing``, which would kill the replacement
+#: mid-handoff.
+DETECTABLE_STATES = ("active",)
 #: How many tasks one detector pass may classify. The pass is synchronous
 #: inside the two-second bridge tick and costs up to two executor round-trips
 #: per task, so an unbounded fleet scan is how the detector starves wake
@@ -507,6 +511,9 @@ class DurableExecutionReconciler:
                     f"BLOCKED: {task.key} has been reserved without ever launching "
                     f"for {now - task.created_at:.0f}s.",
                     f"liveness:reserved:{task.task_id}:{task.epoch}",
+                    # A reservation has no session yet - that is the whole
+                    # complaint - so the task id is the only stable subject
+                    # the attention item can be filed against.
                     session_id=task.holder_session_id or task.task_id,
                 )
         except TaskStoreError as exc:
