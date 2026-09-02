@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -44,9 +45,21 @@ IDLE_UNREPORTED_GRACE = 120.0
 #: policy names one. A parked approval never dies of it - it becomes
 #: ``blocked(approval)`` plus a human attention item.
 DEFAULT_APPROVAL_TIMEOUT = 1800.0
+#: How far a supplied timestamp may lead our own clock before it is refused.
+#: Small clock skew between the executor and the kernel is ordinary; a
+#: timestamp minutes in the future is a unit or clock bug, and treating it as
+#: "just active" is a permanent bypass of the whole detector.
+MAX_CLOCK_SKEW_SECONDS = 300.0
+#: Seconds-since-epoch values above this are not seconds. ``1e11`` is the year
+#: 5138 read as seconds and 1973 read as milliseconds, so anything at or above
+#: it is a unit error rather than a date.
+IMPLAUSIBLE_TIMESTAMP = 1e11
 
 PROGRESS_TIMEOUT_ENV = "SIGHTMESH_PROGRESS_TIMEOUT_SECONDS"
 APPROVAL_TIMEOUT_ENV = "SIGHTMESH_APPROVAL_TIMEOUT_SECONDS"
+MAX_TURNS_ENV = "SIGHTMESH_MAX_TURNS"
+MAX_TOKENS_ENV = "SIGHTMESH_MAX_TOKENS"
+MAX_COST_ENV = "SIGHTMESH_MAX_COST"
 
 #: Classifications that arm nothing. ``live`` means progress was *observed*
 #: and closes an open episode; ``unknown`` means nothing was observed either
@@ -56,6 +69,16 @@ INERT = frozenset({"live", "unknown"})
 
 class BudgetError(ValueError):
     """A budget that cannot be satisfied by any run."""
+
+
+class DetectionPolicyError(ValueError):
+    """A stored detection policy no classification can be trusted against.
+
+    Raised on read, never on the hot path of a classification: a task whose
+    policy row is malformed becomes an ``unknown`` finding plus a human
+    attention item, because a zero or negative ``progress_timeout`` would
+    otherwise make every silence instantly, permanently ``stalled``.
+    """
 
 
 @dataclass(frozen=True)
@@ -75,7 +98,9 @@ class Budget:
     def __post_init__(self) -> None:
         for name in ("max_turns", "max_tokens", "max_cost"):
             value = getattr(self, name)
-            if value is not None and value <= 0:
+            if value is None:
+                continue
+            if not _is_positive_number(value):
                 raise BudgetError(f"Budget {name} must be positive, not {value!r}")
 
     def to_dict(self) -> dict[str, Any]:
@@ -117,11 +142,31 @@ class Budget:
 
 @dataclass(frozen=True)
 class DetectionPolicy:
-    """The resolved, trusted detection settings for one task."""
+    """The resolved, trusted detection settings for one task.
+
+    Both timeouts are validated at construction. A stored ``0`` or ``-1``
+    ``progress_timeout`` would make ``silent >= progress_timeout`` true on the
+    first tick of every task forever, so an unusable value is refused here
+    rather than quietly flagging the fleet.
+    """
 
     progress_timeout: float = DEFAULT_PROGRESS_TIMEOUT
     approval_timeout: float | None = None
     budget: Budget | None = None
+
+    def __post_init__(self) -> None:
+        if not _is_positive_number(self.progress_timeout):
+            raise DetectionPolicyError(
+                f"progress_timeout must be a positive number of seconds, "
+                f"not {self.progress_timeout!r}"
+            )
+        if self.approval_timeout is not None and not _is_positive_number(
+            self.approval_timeout
+        ):
+            raise DetectionPolicyError(
+                f"approval_timeout must be a positive number of seconds, "
+                f"not {self.approval_timeout!r}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"progress_timeout": self.progress_timeout}
@@ -130,6 +175,39 @@ class DetectionPolicy:
         if self.budget is not None:
             payload["budget"] = self.budget.to_dict()
         return payload
+
+    @classmethod
+    def from_dict(cls, value: Any) -> DetectionPolicy:
+        """Rebuild a stored policy, refusing anything unusable.
+
+        The task row is durable and hand-editable, and a poisoned
+        ``spec_json`` must not be able to raise through a fleet-wide detector
+        pass. Callers catch :class:`DetectionPolicyError` and turn it into one
+        attention item for that task.
+        """
+        if not isinstance(value, dict):
+            raise DetectionPolicyError(
+                f"Detection policy must be an object, not {type(value).__name__}"
+            )
+        raw_budget = value.get("budget")
+        try:
+            budget = Budget.from_dict(raw_budget)
+        except BudgetError as exc:
+            raise DetectionPolicyError(str(exc)) from exc
+        if raw_budget is not None and budget is None and raw_budget != {}:
+            raise DetectionPolicyError(f"Unreadable budget: {raw_budget!r}")
+        return cls(
+            progress_timeout=_required_positive(
+                value.get("progress_timeout", DEFAULT_PROGRESS_TIMEOUT),
+                "progress_timeout",
+            ),
+            approval_timeout=(
+                None
+                if value.get("approval_timeout") is None
+                else _required_positive(value["approval_timeout"], "approval_timeout")
+            ),
+            budget=budget,
+        )
 
     @property
     def effective_approval_timeout(self) -> float:
@@ -149,9 +227,21 @@ class ProgressEvidence:
     """
 
     last_activity_at: float | None = None
+    #: True only when the executor answered the process read with a usable,
+    #: non-empty list. False covers both a failed read and a session the
+    #: executor reports nothing about, which are indistinguishable and equally
+    #: uninformative - no negative verdict may rest on either.
+    observed: bool = False
     process_alive: bool = False
-    stream_alive: bool = True
+    #: ``None`` means the snapshot could not be read. A failed read used to
+    #: default to ``True``, which let one flaky endpoint flip a task between
+    #: ``stalled`` and ``limbo`` on alternate ticks.
+    stream_alive: bool | None = None
     output_growing: bool = False
+    #: The executor reports output bytes but this tick has no comparable
+    #: baseline (first observation, or a restart). Growth is unmeasured, so
+    #: silence is unproven and the honest answer is ``unknown``.
+    output_unmeasured: bool = False
     parked: bool = False
     turn_ended: bool = False
     lifecycle_called: bool = False
@@ -160,7 +250,10 @@ class ProgressEvidence:
     turns: int = 0
     tokens: int = 0
     cost: float | None = None
-    output_bytes: int = 0
+    #: ``None`` means the executor's process rows carry no ``output_bytes``
+    #: field at all - the shape every real cdesktop row has today. Absence is
+    #: not zero: a zero would manufacture "no growth" evidence out of nothing.
+    output_bytes: int | None = None
     confidence: str = "degraded"
     sources: tuple[str, ...] = field(default_factory=tuple)
 
@@ -173,13 +266,14 @@ class ProgressEvidence:
         return {
             "confidence": self.confidence,
             "sources": list(self.sources),
-            "silent_for": self.silent_for(now),
+            "silent_for": _finite(self.silent_for(now)),
+            "observed": self.observed,
             "process_alive": self.process_alive,
             "stream_alive": self.stream_alive,
             "output_growing": self.output_growing,
             "turns": self.turns,
             "tokens": self.tokens,
-            "cost": self.cost,
+            "cost": _finite(self.cost),
         }
 
 
@@ -197,11 +291,21 @@ class Finding:
         return self.reason not in INERT
 
     def payload(self) -> str:
+        """Render the evidence as JSON a manager - and a reader - can trust.
+
+        ``allow_nan=False`` because Python's default emits bare ``NaN`` and
+        ``Infinity`` tokens, which are not JSON: one non-finite number from a
+        hostile or buggy executor would produce a payload that every strict
+        parser downstream rejects. Values are sanitized to ``None`` first, so
+        the flag can only ever be a tripwire, never a raise on the hot path.
+        """
         body = self.evidence.to_dict(self.now)
         body["reason"] = self.reason
         if self.over_budget:
             body["over_budget"] = True
-        return json.dumps(body, sort_keys=True, separators=(",", ":"))
+        return json.dumps(
+            body, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
 
 
 def trusted_policy(environment: dict[str, str] | None = None) -> DetectionPolicy:
@@ -212,19 +316,29 @@ def trusted_policy(environment: dict[str, str] | None = None) -> DetectionPolicy
     can only tighten what this returns (see :func:`resolve_policy`).
     """
     env = os.environ if environment is None else environment
+    ceilings = {
+        "max_turns": _positive_int_or_none(env.get(MAX_TURNS_ENV), MAX_TURNS_ENV),
+        "max_tokens": _positive_int_or_none(env.get(MAX_TOKENS_ENV), MAX_TOKENS_ENV),
+        "max_cost": _positive_float_or_none(env.get(MAX_COST_ENV), MAX_COST_ENV),
+    }
     return DetectionPolicy(
         progress_timeout=_positive_float(
             env.get(PROGRESS_TIMEOUT_ENV), DEFAULT_PROGRESS_TIMEOUT, PROGRESS_TIMEOUT_ENV
         ),
-        approval_timeout=(
-            _positive_float(
-                env.get(APPROVAL_TIMEOUT_ENV),
-                DEFAULT_APPROVAL_TIMEOUT,
-                APPROVAL_TIMEOUT_ENV,
-            )
-            if env.get(APPROVAL_TIMEOUT_ENV)
-            else None
+        # Every axis of the floor carries a value, including the approval
+        # timeout. Leaving it ``None`` made the floor unenforceable on that
+        # axis: ``resolve_policy`` takes the smaller of the two, and the
+        # smaller of "nothing" and a worker's requested ten days is ten days.
+        approval_timeout=_positive_float(
+            env.get(APPROVAL_TIMEOUT_ENV),
+            DEFAULT_APPROVAL_TIMEOUT,
+            APPROVAL_TIMEOUT_ENV,
         ),
+        # Budget ceilings are opt-in by design: a fleet-wide default turn or
+        # token cap would flag every long-running task the day it shipped,
+        # and a budget is evidence rather than enforcement. Operators set the
+        # floor through the environment; a worker can then only tighten it.
+        budget=Budget(**ceilings) if any(value for value in ceilings.values()) else None,
     )
 
 
@@ -243,12 +357,27 @@ def resolve_policy(
     manager allows is silently narrowed instead of honoured.
     """
     floor = trusted_policy() if trusted is None else trusted
+    requested_progress = (
+        float(progress_timeout)
+        if _is_positive_number(progress_timeout)
+        else floor.progress_timeout
+    )
+    requested_approval = (
+        float(approval_timeout) if _is_positive_number(approval_timeout) else None
+    )
+    if progress_timeout is not None and not _is_positive_number(progress_timeout):
+        raise DetectionPolicyError(
+            f"progress_timeout must be a positive number of seconds, "
+            f"not {progress_timeout!r}"
+        )
+    if approval_timeout is not None and requested_approval is None:
+        raise DetectionPolicyError(
+            f"approval_timeout must be a positive number of seconds, "
+            f"not {approval_timeout!r}"
+        )
     return DetectionPolicy(
-        progress_timeout=min(
-            floor.progress_timeout,
-            progress_timeout if progress_timeout is not None else floor.progress_timeout,
-        ),
-        approval_timeout=_smaller(floor.approval_timeout, approval_timeout),
+        progress_timeout=min(floor.progress_timeout, requested_progress),
+        approval_timeout=_smaller(floor.approval_timeout, requested_approval),
         budget=budget.tightest(floor.budget) if budget else floor.budget,
     )
 
@@ -261,23 +390,36 @@ def classify(
     Ordered by how definitive the signal is, most definitive first, so a
     weaker inference can never overrule a typed fact:
 
-    1. a typed loss marker is a terminal fact the executor already owns;
+    1. a typed loss marker over a process that is *not* running is terminal;
     2. a parked approval is excluded from stall detection by contract;
-    3. a process the executor cannot vouch for is ``unknown``, not ``lost`` -
-       guessing an attribution is how "infrastructure failure" got recorded as
-       "result failure";
-    4. growing output bytes are progress, however long the command runs (S16);
+    3. measured output growth is progress, however long the command runs;
+    4. no timestamp from any source is ``unknown``, never a verdict;
     5. a turn that ended with no lifecycle call and no queued mail is
        ``idle_unreported`` once the grace lapses;
-    6. a dead stream over a live process is ``limbo``;
-    7. otherwise, silence past ``progress_timeout`` is ``stalled``.
+    6. silence inside ``progress_timeout`` is ``live``;
+    7. past it, an unobserved or unmeasurable task is ``unknown``, a dead
+       stream over a live process is ``limbo``, and everything else is
+       ``stalled``.
+
+    Two vetoes make the difference between this and a fleet-wrecker.
+
+    *A running process vetoes ``lost``.* Loss evidence is read from the
+    current execution only, but a stale ``killed`` row that survived that
+    filter still cannot outrank a process the executor says is running right
+    now: a live task marked irreversibly lost gets replaced, and the fleet
+    ends up with two workers on one branch.
+
+    *A process that is merely not running does not veto ``stalled``.* On the
+    current client a coding-agent process is ``running`` only during a turn,
+    so "no running process" is the ordinary between-turns shape and is the
+    single most important thing degraded mode has to be able to judge. What
+    it needs is a *timestamp*, not a live pid; what it must never do is judge
+    a task the executor said nothing about at all (``observed``).
     """
-    if evidence.lost_reason:
+    if evidence.lost_reason and not evidence.process_alive:
         return "lost"
     if evidence.parked:
         return "parked"
-    if not evidence.process_alive:
-        return "unknown"
     if evidence.output_growing:
         return "live"
     silent = evidence.silent_for(now)
@@ -287,14 +429,23 @@ def classify(
         # the failure this spec exists to prevent.
         return "unknown"
     if evidence.turn_ended and not evidence.lifecycle_called and not evidence.queued_mail:
-        return "idle_unreported" if silent >= IDLE_UNREPORTED_GRACE else "live"
-    if not evidence.stream_alive:
+        if silent < IDLE_UNREPORTED_GRACE:
+            return "live"
+        return "idle_unreported" if evidence.observed else "unknown"
+    if silent < policy.progress_timeout:
+        return "live"
+    if not evidence.observed or evidence.output_unmeasured:
+        # Past the timeout, but nothing here is a *reading*: either the
+        # executor told us nothing, or it reports an output-byte counter this
+        # tick cannot compare against. Silence is unproven, so nothing is said.
+        return "unknown"
+    if evidence.stream_alive is False and evidence.process_alive:
         # Cause 3: the executor re-attaches through its durable handle, so
         # limbo is only *reported* once it has stayed unattachable for a full
         # progress_timeout. In degraded mode there is no attach signal to read,
         # so continued silence is the honest proxy for "unattachable".
-        return "limbo" if silent >= policy.progress_timeout else "live"
-    return "stalled" if silent >= policy.progress_timeout else "live"
+        return "limbo"
+    return "stalled"
 
 
 def over_budget(evidence: ProgressEvidence, budget: Budget | None) -> bool:
@@ -335,60 +486,84 @@ def gather_evidence(
     needing a rewrite.
     """
     sources: list[str] = []
-    processes = _safe(lambda: client.execution_processes(session_id), []) or []
-    live = [item for item in processes if str(item.get("status") or "") == "running"]
-    timestamps = [
-        value
-        for item in processes
-        for value in [_timestamp(item)]
-        if value is not None
-    ]
-    if timestamps:
-        sources.append("execution_processes")
-    if checkpoint_at is not None:
-        sources.append("checkpoint")
-        timestamps.append(checkpoint_at)
+    rows = _eligible_processes(_safe(lambda: client.execution_processes(session_id)))
+    if not rows:
+        # A failed read and an empty list are the same evidence: none. Return
+        # the kernel-owned checkpoint (if any) and nothing else, so a task can
+        # still be seen to be alive but can never be judged silent.
+        return ProgressEvidence(
+            last_activity_at=_plausible(checkpoint_at, now),
+            sources=("checkpoint",) if checkpoint_at is not None else (),
+        )
+    sources.append("execution_processes")
 
-    turns = sum(1 for item in processes if item.get("run_reason") == "codingagent")
-    output_bytes = sum(int(item.get("output_bytes") or 0) for item in processes)
-    if any("output_bytes" in item for item in processes):
+    live = [item for item in rows if _status(item) == "running"]
+    timestamps = [
+        value for item in rows for value in [_timestamp(item, now)] if value is not None
+    ]
+    checkpoint = _plausible(checkpoint_at, now)
+    if checkpoint is not None:
+        sources.append("checkpoint")
+        timestamps.append(checkpoint)
+
+    turns = sum(1 for item in rows if item.get("run_reason") == "codingagent")
+    output_bytes = _output_bytes(rows)
+    if output_bytes is not None:
         sources.append("output_bytes")
 
-    stream_alive = True
+    # One snapshot per task, for the current execution only. Reading every
+    # live process multiplied the detector's executor calls by the fleet's
+    # concurrency for no extra signal, and mixing a retired execution's
+    # stream state into the current one is how a finished command's dead
+    # stream became the running command's "limbo".
+    current = _current_execution(rows, now)
+    stream_alive: bool | None = None
     tokens = 0
     typed: dict[str, Any] = {}
-    for item in live or processes[-1:]:
-        snapshot = _read_snapshot(client, str(item.get("id") or ""))
-        if snapshot is None:
-            continue
+    snapshot = (
+        _read_snapshot(client, str(current.get("id") or "")) if current else None
+    )
+    if snapshot is not None:
         sources.append("normalized_snapshot")
-        stream_alive = stream_alive and bool(snapshot.get("stream_alive", True))
-        tokens = max(tokens, _snapshot_tokens(snapshot))
-        activity = snapshot.get("last_activity_at")
-        if isinstance(activity, (int, float)):
-            timestamps.append(float(activity))
+        raw_stream = snapshot.get("stream_alive", True)
+        stream_alive = bool(raw_stream) if isinstance(raw_stream, bool) else None
+        tokens = _snapshot_tokens(snapshot)
+        activity = _plausible(snapshot.get("last_activity_at"), now)
+        if activity is not None:
+            timestamps.append(activity)
             sources.append("transcript")
         for marker in ("turn_ended", "parked", "lifecycle_called", "lost_reason"):
             if marker in snapshot:
                 typed[marker] = snapshot[marker]
 
-    queued_mail = _queued_mail(client, session_id)
-    if queued_mail is not None:
-        sources.append("queue_status")
+    # Queued mail matters to exactly one cause: a turn that ended is not idle
+    # while work is waiting to be dispatched into it. Asking otherwise spent
+    # one executor round-trip per task per tick to answer a question nothing
+    # was going to read.
+    queued_mail: bool | None = None
+    if typed.get("turn_ended"):
+        queued_mail = _queued_mail(client, session_id)
+        if queued_mail is not None:
+            sources.append("queue_status")
 
     lost_reason = typed.get("lost_reason")
-    if lost_reason is None:
-        lost_reason = _degraded_loss(processes)
+    if lost_reason is None and current is not None:
+        lost_reason = _degraded_loss(current)
         if lost_reason:
             sources.append("process_status")
 
+    growing = (
+        previous_output_bytes is not None
+        and output_bytes is not None
+        and output_bytes > previous_output_bytes
+    )
     return ProgressEvidence(
         last_activity_at=max(timestamps) if timestamps else None,
+        observed=True,
         process_alive=bool(live),
         stream_alive=stream_alive,
-        output_growing=(
-            previous_output_bytes is not None and output_bytes > previous_output_bytes
-        ),
+        output_growing=growing,
+        output_unmeasured=output_bytes is not None and previous_output_bytes is None,
         parked=bool(typed.get("parked")),
         turn_ended=bool(typed.get("turn_ended")),
         lifecycle_called=bool(typed.get("lifecycle_called")),
@@ -403,35 +578,110 @@ def gather_evidence(
     )
 
 
+def _eligible_processes(value: Any) -> list[dict[str, Any]]:
+    """Keep only the process rows this epoch's liveness may be judged from.
+
+    Two filters, both of them the established ones (``cdesktop.py``'s
+    ``latest_execution_process``): a ``dropped`` row is a row the executor has
+    already disowned, and a ``devserver`` row is infrastructure the task did
+    not author. A dev server humming along is not the worker making progress,
+    and a dropped row's stale status is not the worker dying.
+
+    Everything that is not a mapping is discarded rather than parsed. A
+    hostile or half-written payload - a list of ``None``, of strings, of
+    nested lists - must cost this task its evidence, never the whole pass.
+    """
+    if not isinstance(value, list):
+        return []
+    return [
+        item
+        for item in value
+        if isinstance(item, dict)
+        and not item.get("dropped")
+        and item.get("run_reason") != "devserver"
+    ]
+
+
+def _current_execution(
+    rows: list[dict[str, Any]], now: float
+) -> dict[str, Any] | None:
+    """The one execution this epoch's liveness is read from.
+
+    A running row always wins: whatever the history says, the thing running
+    now is what the task is doing now. Among equals the newest plausible
+    timestamp wins, with the row id as a stable tie-break so two ticks over
+    an unchanged list never disagree.
+    """
+    if not rows:
+        return None
+    running = [item for item in rows if _status(item) == "running"]
+    return max(
+        running or rows,
+        key=lambda item: (
+            _timestamp(item, now) or 0.0,
+            str(item.get("id") or ""),
+        ),
+    )
+
+
+def _status(process: dict[str, Any]) -> str:
+    status = process.get("status")
+    return status.strip().lower() if isinstance(status, str) else ""
+
+
+def _output_bytes(rows: list[dict[str, Any]]) -> int | None:
+    """Total reported output bytes, or ``None`` when no row reports any.
+
+    Presence is the whole point. No cdesktop row carries ``output_bytes``
+    today, and summing a missing field to ``0`` invented a progress signal
+    that does not exist in production - the baseline then said "no growth"
+    every tick and the timestamp path, which is what actually has to work,
+    was never exercised.
+    """
+    total: int | None = None
+    for item in rows:
+        if "output_bytes" not in item:
+            continue
+        value = _non_negative_int(item.get("output_bytes"))
+        if value is None:
+            continue
+        total = value if total is None else total + value
+    return total
+
+
 def _read_snapshot(client: Any, process_id: str) -> dict[str, Any] | None:
-    snapshot = _safe(lambda: client.normalized_snapshot(process_id), None)
+    snapshot = _safe(lambda: client.normalized_snapshot(process_id))
     return snapshot if isinstance(snapshot, dict) else None
 
 
-def _degraded_loss(processes: list[dict[str, Any]]) -> str | None:
-    """Infer a loss attribution only from a typed executor field, never a guess.
+def _degraded_loss(process: dict[str, Any]) -> str | None:
+    """Infer a loss attribution only from a typed field on the *current* run.
+
+    Scoped to one process row on purpose. A session accumulates a process
+    history, and scanning all of it meant a single ``killed`` row from a turn
+    that ended hours ago marked a healthy, running task irreversibly lost -
+    which is a replacement, which is a duplicate session on one branch.
 
     On the current client the only honest signal is an explicit ``exit_reason``
     or a ``killed`` status. A process row that has simply vanished from the
     list proves nothing - a partial read looks identical - so it yields
     ``None`` and the task stays whatever it already was.
     """
-    for item in processes:
-        reason = item.get("exit_reason")
-        if reason:
-            return str(reason)
-        if str(item.get("status") or "") == "killed":
-            return "killed"
-    return None
+    reason = process.get("exit_reason")
+    if isinstance(reason, str) and reason.strip():
+        return reason.strip()
+    return "killed" if _status(process) == "killed" else None
 
 
 def _queued_mail(client: Any, session_id: str) -> bool | None:
-    status = _safe(lambda: client.queue_status(session_id), None)
+    status = _safe(lambda: client.queue_status(session_id))
     if not isinstance(status, dict):
         return None
     for key in ("pending", "queued", "depth"):
         value = status.get(key)
-        if isinstance(value, (int, float)):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and math.isfinite(value):
             return value > 0
         if isinstance(value, list):
             return bool(value)
@@ -439,46 +689,111 @@ def _queued_mail(client: Any, session_id: str) -> bool | None:
 
 
 def _snapshot_tokens(snapshot: dict[str, Any]) -> int:
-    for wrapped in snapshot.get("entries", []):
+    entries = snapshot.get("entries")
+    if not isinstance(entries, list):
+        return 0
+    for wrapped in entries:
         content = wrapped.get("content") if isinstance(wrapped, dict) else None
         entry = content.get("entry_type") if isinstance(content, dict) else None
         if isinstance(entry, dict) and entry.get("type") == "token_usage_info":
-            used = entry.get("total_tokens")
-            if isinstance(used, (int, float)):
-                return int(used)
+            used = _non_negative_int(entry.get("total_tokens"))
+            if used is not None:
+                return used
     return 0
 
 
-def _timestamp(process: dict[str, Any]) -> float | None:
+def _timestamp(process: dict[str, Any], now: float) -> float | None:
     for name in ("completed_at", "updated_at", "started_at", "created_at"):
         value = process.get(name)
-        if isinstance(value, (int, float)):
-            return float(value)
         if isinstance(value, str):
             try:
                 parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
             except ValueError:
                 continue
-            return (
+            value = (
                 parsed.replace(tzinfo=UTC).timestamp()
                 if parsed.tzinfo is None
                 else parsed.timestamp()
             )
+        checked = _plausible(value, now)
+        if checked is not None:
+            return checked
     return None
 
 
-def _safe(call: Any, fallback: Any) -> Any:
+def _plausible(value: Any, now: float) -> float | None:
+    """Accept a timestamp only if it can actually be a moment in this run.
+
+    Three rejections, all of which otherwise read as "just active" and give a
+    task a permanent exemption from detection, because ``silent_for`` floors
+    the age at zero:
+
+    * ``NaN`` and infinities, which lose every comparison silently;
+    * a value far in the future, which is a clock or a bug, not a heartbeat;
+    * a magnitude that can only be milliseconds, the classic unit error.
+
+    An implausible timestamp is *absent* evidence, never proof of life.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number) or number <= 0 or number >= IMPLAUSIBLE_TIMESTAMP:
+        LOGGER.warning("Ignoring implausible liveness timestamp %r", value)
+        return None
+    if number > now + MAX_CLOCK_SKEW_SECONDS:
+        LOGGER.warning(
+            "Ignoring liveness timestamp %r from %.0fs in the future",
+            value,
+            number - now,
+        )
+        return None
+    return number
+
+
+def _non_negative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return int(value)
+
+
+def _finite(value: float | None) -> float | None:
+    """Drop a non-finite number so the payload stays strict JSON."""
+    return value if isinstance(value, (int, float)) and math.isfinite(value) else None
+
+
+def _is_positive_number(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
+def _required_positive(value: Any, name: str) -> float:
+    if not _is_positive_number(value):
+        raise DetectionPolicyError(
+            f"{name} must be a positive number of seconds, not {value!r}"
+        )
+    return float(value)
+
+
+def _safe(call: Any) -> Any:
     """Run one executor read; a failed read is missing evidence, not a fault.
 
     The detector is a best-effort observer inside a reconciler tick. An
     endpoint that errors must degrade the finding (usually to ``unknown``),
-    never abort the pass and starve the other tasks in it.
+    never abort the pass and starve the other tasks in it. ``None`` is the
+    single "nothing was read" answer, so a caller can never confuse a failure
+    with an empty but successful result.
     """
     try:
         return call()
     except Exception as exc:  # noqa: BLE001 - any executor read failure is absence
         LOGGER.debug("Liveness evidence read failed: %s", exc)
-        return fallback
+        return None
 
 
 def _smaller(left: float | None, right: float | None) -> float | None:
@@ -496,7 +811,25 @@ def _positive_float(raw: str | None, fallback: float, name: str) -> float:
         value = float(raw)
     except ValueError:
         value = 0.0
-    if value <= 0:
+    if not _is_positive_number(value):
         LOGGER.warning("%s must be a positive number of seconds; using %s", name, fallback)
         return fallback
     return value
+
+
+def _positive_float_or_none(raw: str | None, name: str) -> float | None:
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        value = 0.0
+    if not _is_positive_number(value):
+        LOGGER.warning("%s must be a positive number; ignoring %r", name, raw)
+        return None
+    return value
+
+
+def _positive_int_or_none(raw: str | None, name: str) -> int | None:
+    value = _positive_float_or_none(raw, name)
+    return None if value is None else int(value)
