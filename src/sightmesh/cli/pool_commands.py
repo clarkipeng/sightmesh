@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from .common import *
 
 def _pool_quota_text(usage: dict[str, Any]) -> str:
@@ -378,8 +380,14 @@ def cmd_pool(args: argparse.Namespace) -> int:
         if not pool_core.find(pool_core.load_pool(), args.name):
             raise PoolError(f"Unknown account: {args.name}")
         seconds = pool_core.parse_duration(args.duration)
-        pool_core.set_cooldown(args.name, seconds)
-        _emit(f"{args.name} cooling for {pool_core.fmt_delta(seconds)}", args.json)
+        # Cooling is monotonic, so a shorter request cannot cut a longer live
+        # cooldown short. Report the deadline that actually holds rather than
+        # the one that was asked for; `pool clear` is how a window is ended.
+        until = pool_core.set_cooldown(args.name, seconds)
+        _emit(
+            f"{args.name} cooling for {pool_core.fmt_delta(until - time.time())}",
+            args.json,
+        )
         return 0
 
     if action == "clear":
