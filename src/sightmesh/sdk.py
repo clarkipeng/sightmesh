@@ -746,15 +746,27 @@ class SightMesh:
         being a dead end the reconciler cannot advance.
         """
         settings = execution_routing.ExecutionRoutingStore().load()
-        route_class = execution_routing.class_for(
+        decision = execution_routing.resolve_class(
+            settings,
             execution_routing.ScopeRisk(
                 route_class=spec.route_class,
                 permission=spec.permission,
                 top_level=top_level,
                 children=spec.children,
             ),
-            settings,
         )
+        route_class = decision.route_class
+        if decision.demoted_from:
+            # Scope and risk wanted a stronger chain than this install has
+            # configured. Refusing the work would make an upgrade that adds a
+            # class break every dispatch that class now claims, so the work
+            # runs on the default chain and says so.
+            LOGGER.warning(
+                "Route class %r has no usable chain for %r; falling back to %r",
+                decision.demoted_from,
+                spec.key,
+                route_class,
+            )
         if spec.profile:
             profile = ProfileStore().get(spec.profile)
             validate_provider(profile, self.client.providers())
@@ -781,13 +793,14 @@ class SightMesh:
                 "route_id": f"executor:{spec.executor}",
                 "failover": "auto",
             }
-        validation = execution_routing.validate_chain(settings, route_class)
-        if not validation.valid:
+        if not decision.validation.valid:
             # The explicit fail-closed gate: no epoch, no effect row, and no
-            # native call happen for a class that has nowhere to run.
+            # native call happen for a class that has nowhere to run. Reached
+            # only when no class is usable, since a promoted class that is
+            # empty was already demoted onto the default chain above.
             raise SightMeshError(
                 f"Route class {route_class!r} cannot start {spec.key!r}: "
-                f"{validation.reason}"
+                f"{decision.validation.reason}"
             )
         selection = execution_routing.select_route(
             settings, route_class=route_class, preferred_model=spec.model
