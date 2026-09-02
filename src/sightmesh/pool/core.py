@@ -18,7 +18,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import math
 import os
 import re
 import subprocess
@@ -190,10 +189,7 @@ def cool_until_timestamp(account_id: str, when: float) -> float:
     """
     state = load_state()
     cooldowns = state.setdefault("cooldowns", {})
-    requested = float(when)
-    if not math.isfinite(requested):
-        requested = time.time() + DEFAULT_COOLDOWN
-    until = max(requested, float(cooldowns.get(account_id) or 0))
+    until = max(float(when), float(cooldowns.get(account_id) or 0))
     cooldowns[account_id] = until
     state.setdefault("probes", {}).pop(account_id, None)
     save_state(state)
