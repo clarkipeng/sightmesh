@@ -537,6 +537,36 @@ def test_sd11_a_failed_process_with_no_provider_signal_blocks_the_task(
     assert mesh.reconcile_provider_outcomes() == []
 
 
+def test_sd11_a_failure_the_native_queue_will_retry_is_left_alone(
+    mesh: SightMesh, store: TaskStore, pool_root, routing_settings
+) -> None:
+    """S-D11 (contrast): cdesktop's own durable recovery requeues a claimed
+    command whose execution died, so that failure is one it is about to retry.
+
+    Blocking it here would be unrecoverable, not merely noisy: `blocked` is not
+    a legal predecessor of `active`, so a task settled out from under a live
+    retry can never be put back. A provider refusal is different - no retry
+    fixes one - so it is still recorded even with work queued.
+    """
+    seed_pool(claude_account("acct-a"), claude_account("acct-b"))
+    configure_chains(standard=(subscription("terra", "terra", "claude"),))
+
+    started = mesh.start(routed_spec())
+    mesh.client.commands[started.session_id] = [
+        {"id": "cmd-1", "state": "claimed", "body": "keep going"}
+    ]
+    mesh.client.fail_process(started.session_id)
+
+    assert mesh.reconcile_provider_outcome(started.session_id) is None
+    assert store.get("operator", "audit").state == "active"
+
+    mesh.client.fail_process(started.session_id, outcome_class="quota_exhausted")
+    advanced = mesh.reconcile_provider_outcome(started.session_id)
+
+    assert advanced is not None and advanced.state == "active"
+    assert target_of(store)["auth_binding_id"] == "acct-b"
+
+
 def test_sd11_a_running_process_is_left_alone(
     mesh: SightMesh, store: TaskStore, pool_root, routing_settings
 ) -> None:
@@ -587,6 +617,37 @@ def test_sd12_a_task_stranded_mid_replacement_is_resumed_by_the_sweep(
     # Resumed into the epoch that was already open, not a third one.
     assert task.epoch == 2 and task.state == "active"
     assert target_of(store)["auth_binding_id"] == "acct-b"
+
+
+def test_sd12_a_replacement_epoch_that_already_ended_blocks_and_then_advances(
+    mesh: SightMesh, store: TaskStore, pool_root, routing_settings
+) -> None:
+    """S-D12 (contrast): a ``replacing`` task whose new epoch already ended
+    settles by blocking, and the ordinary advance path takes it from there.
+
+    A crash between recording that epoch's outcome and blocking the task leaves
+    exactly this shape. Resuming would refill an epoch that is already spent;
+    advancing straight from ``replacing`` is a transition the store rejects.
+    Blocking first is the one settlement that both reconcilers already
+    understand, so the chain moves next tick through one code path.
+    """
+    seed_pool(claude_account("acct-a"), claude_account("acct-b"))
+    configure_chains(standard=(subscription("terra", "terra", "claude"),))
+
+    start_rejected(mesh, 429)
+    mesh.client.fail_launch(CdesktopError("PUT /task-launches failed: HTTP 503: down"))
+    assert mesh.reconcile_provider_outcomes() == []
+    stranded = store.get("operator", "audit")
+    assert stranded.state == "replacing"
+    mesh.journal.mark_terminal(stranded.task_id, stranded.epoch, "rejected:400")
+
+    assert [worker.state for worker in mesh.reconcile_provider_outcomes()] == ["blocked"]
+    blocked = store.get("operator", "audit")
+    assert blocked.epoch == 2 and "rejected:400" in str(blocked.result)
+
+    # A definitive rejection is not a reroute, so it stays put from here.
+    assert mesh.reconcile_provider_outcomes() == []
+    assert store.get("operator", "audit").epoch == 2
 
 
 # ---------------------------------------------------------------- S-D13
