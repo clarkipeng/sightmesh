@@ -614,3 +614,153 @@ def test_doctor_passes_when_every_reported_version_agrees(monkeypatch) -> None:
 
     assert check["ok"] is True
     assert check["detail"]["staged"] == "0.2.5-sightmesh.1"
+
+
+class ApprovalClient:
+    """A cdesktop whose pending tool action carries a nested credential.
+
+    Agents author these action dicts; the CLI only relays them. The header
+    below is exactly the shape that took the whole inbox down.
+    """
+
+    def __init__(self, _url=None) -> None:
+        self.responses: list[tuple] = []
+        self.approval_response: object = {"status": "approved"}
+
+    def workspace_summaries(self, _archived=False):
+        return [{"workspace_id": "workspace-a", "latest_process_status": "running"}]
+
+    def workspaces(self):
+        return [{"id": "workspace-a", "name": "catapult", "archived": False}]
+
+    def sessions(self, _workspace_id):
+        return [{"id": "session-a", "name": "lead", "executor": "CLAUDE_CODE"}]
+
+    def execution_processes(self, _session_id):
+        return [{"id": "process-a", "status": "completed", "run_reason": "codingagent"}]
+
+    def pending_approvals(self):
+        return [
+            {
+                "approval_id": "approval-a",
+                "execution_process_id": "process-a",
+                "tool_name": "Bash",
+                "is_question": False,
+            }
+        ]
+
+    def execution_process(self, _process_id):
+        return {"session_id": "session-a"}
+
+    def session(self, _session_id):
+        return {"workspace_id": "workspace-a", "executor": "CLAUDE_CODE"}
+
+    def workspace(self, _workspace_id):
+        return {"name": "catapult", "archived": False}
+
+    def normalized_snapshot(self, _process_id):
+        return {
+            "complete": True,
+            "patch_count": 1,
+            "entries": [
+                {
+                    "content": {
+                        "content": "curl the deploy API",
+                        "entry_type": {
+                            "type": "tool_use",
+                            "status": {
+                                "status": "pending_approval",
+                                "approval_id": "approval-a",
+                            },
+                            "action_type": {
+                                "action": "run_command",
+                                "request": {
+                                    "headers": {"Authorization": "Bearer live-secret"}
+                                },
+                            },
+                        },
+                    }
+                }
+            ],
+        }
+
+    def respond_to_approval(self, approval_id, process_id, *, approved, reason=None):
+        self.responses.append((approval_id, process_id, approved, reason))
+        return self.approval_response
+
+
+@pytest.fixture
+def approval_cli(monkeypatch, tmp_path: Path) -> ApprovalClient:
+    client = ApprovalClient()
+    monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
+    monkeypatch.setattr(
+        cli.approvals, "approval_db_path", lambda: tmp_path / "audit.db"
+    )
+    monkeypatch.setattr(cli.escalation, "escalation_db_path", lambda: tmp_path / "e.db")
+    return client
+
+
+def test_a_credential_inside_a_relayed_payload_is_redacted_not_fatal(
+    approval_cli: ApprovalClient, capsys
+) -> None:
+    """One nested `Authorization` header killed the entire inbox.
+
+    The guard exists for dicts this CLI builds - a credential in one of
+    those is a defect here. An agent's tool action is a payload we merely
+    relay, and refusing to render it hides every other pending request on
+    the host. Redacting the value keeps the operator's view and still never
+    prints the credential.
+    """
+    assert cli.cmd_inbox(_args("inbox")) == 0
+    output = capsys.readouterr().out
+
+    assert "live-secret" not in output
+    assert cli.REDACTED in output
+    rows = json.loads(output)
+    assert rows[0]["approval_id"] == "approval-a"
+    headers = rows[0]["request"]["action"]["request"]["headers"]
+    assert headers == {"Authorization": cli.REDACTED}
+
+
+def test_an_approval_that_went_through_is_never_reported_as_an_error(
+    approval_cli: ApprovalClient, capsys
+) -> None:
+    """The approval succeeded and then `_emit` raised on the pass-through
+    payload, so the operator saw a failure for an action cdesktop had
+    already carried out - and could reasonably retry it. A completed action
+    reports its true result; rendering can only degrade to a warning.
+    """
+
+    # Anything cdesktop returns that the CLI cannot render: here a value
+    # json refuses to serialize, in the shipped defect a nested credential.
+    approval_cli.approval_response = {"finished_at": object()}
+    args = _args("approval", "approve", "approval-a", "--allow-non-plan")
+
+    assert cli.cmd_approval(args) == 0
+
+    captured = capsys.readouterr()
+    assert approval_cli.responses == [("approval-a", "process-a", True, None)]
+    assert "warning: the action succeeded" in captured.err
+    assert json.loads(captured.out) == {
+        "approval_id": "approval-a",
+        "decision": "approved",
+        "status": "responded",
+    }
+
+
+def test_approve_reports_the_answered_approval_with_the_credential_removed(
+    approval_cli: ApprovalClient, capsys
+) -> None:
+    """The result echoes the same relayed action the inbox showed, so it
+    needs the same treatment: the decision is reported in full, the
+    credential is not.
+    """
+    args = _args("approval", "approve", "approval-a", "--allow-non-plan")
+
+    assert cli.cmd_approval(args) == 0
+    output = capsys.readouterr().out
+
+    assert "live-secret" not in output
+    result = json.loads(output)
+    assert result["decision"]["decision"] == "approved"
+    assert result["cdesktop_response"] == {"status": "approved"}

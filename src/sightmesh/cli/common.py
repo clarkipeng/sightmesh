@@ -110,14 +110,72 @@ def _reject_secret_keys(data: Any, path: str = "") -> None:
             _reject_secret_keys(value, f"{path}[{index}]")
 
 
-def _emit(data: Any, as_json: bool) -> None:
-    _reject_secret_keys(data)
+#: What a pass-through payload's credential-shaped values are replaced with.
+REDACTED = "[redacted]"
+
+
+def _redact_secret_values(data: Any) -> Any:
+    """Return a copy of a pass-through payload with credential values removed.
+
+    External payloads are authored by agents and executors, not by this CLI:
+    the approval inbox attaches cdesktop's raw tool action verbatim, so one
+    nested ``Authorization`` header in one request would otherwise take down
+    the whole inbox. Refusing to emit is the right answer for a dict the
+    kernel built - that is a bug here - but for a payload we are only
+    relaying, the credential is what must go, not the operator's view of the
+    fleet.
+    """
+    if isinstance(data, dict):
+        return {
+            key: REDACTED
+            if str(key).casefold() in SECRET_KEYS
+            else _redact_secret_values(value)
+            for key, value in data.items()
+        }
+    if isinstance(data, (list, tuple)):
+        return [_redact_secret_values(item) for item in data]
+    return data
+
+
+def _emit(data: Any, as_json: bool, *, external: bool = False) -> None:
+    """Print one command result through the CLI's single output path.
+
+    ``external=True`` marks a payload the kernel did not construct and is
+    only relaying; its credential-shaped values are redacted. Kernel-built
+    dicts keep the loud guard, because a credential in one of those is a
+    defect in this repository and failing is how it gets found.
+    """
+    # The guard rejects on key name, so it is the kernel-payload rule; a
+    # redacted pass-through payload has already lost every value it names.
+    data = _redact_secret_values(data) if external else data
+    if not external:
+        _reject_secret_keys(data)
     if as_json:
         print(json.dumps(data, indent=2, sort_keys=True))
     elif isinstance(data, str):
         print(data)
     else:
         print(json.dumps(data, indent=2))
+
+
+def _emit_action_result(data: Any, as_json: bool, *, fallback: Any) -> None:
+    """Report a completed action's outcome without ever contradicting it.
+
+    The action already happened when this runs. An approval that went
+    through and then printed an error - because rendering its pass-through
+    payload raised - tells the operator the exact opposite of the truth, so
+    a rendering failure degrades to a warning plus the minimal kernel-owned
+    summary and the command still succeeds.
+    """
+    try:
+        _emit(data, as_json, external=True)
+    except Exception as exc:  # noqa: BLE001 - reported, never fatal
+        print(
+            f"warning: the action succeeded but its full result could not be "
+            f"rendered: {exc}",
+            file=sys.stderr,
+        )
+        _emit(fallback, as_json)
 
 
 def emit_capability(directory: Path, name: str, value: str) -> Path:
