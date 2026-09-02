@@ -39,6 +39,7 @@ from .execution_routing import ExecutionRoutingError
 from .pool.core import PoolError
 from .profiles import ProfileStore, validate_provider
 from .succession import (
+    COMMAND_TERMINAL_STATES,
     REROUTE_OUTCOMES,
     SWEEPABLE_OUTCOMES,
     OwnershipStore,
@@ -438,9 +439,28 @@ class SightMesh:
             return None
         outcome, retry_at = process_provider_outcome(process)
         if outcome is not None:
+            # A provider refusal is not something a retry fixes, so it is
+            # recorded whatever else the session has queued: the reroute
+            # fences this epoch and quarantines the session, which cancels
+            # that queue on the way out.
             self._record_provider_outcome(task, outcome, retry_at)
             return None
+        if self._queue_still_owns(session_id):
+            # cdesktop's own durable recovery requeues a claimed command whose
+            # execution died, so this failure is one it is about to retry.
+            # Blocking here would strand a task that is still being worked -
+            # and `blocked` is not a legal predecessor of `active`, so nothing
+            # could put it back.
+            return None
         return self._block_unroutable(task, process_failure_reason(process))
+
+    def _queue_still_owns(self, session_id: str) -> bool:
+        """Whether the native command queue has unfinished work for a session."""
+        return any(
+            str(row.get("state") or row.get("status") or "pending")
+            not in COMMAND_TERMINAL_STATES
+            for row in self.client.session_commands(session_id)
+        )
 
     def _advance_past_outcome(self, task: TaskRecord) -> Worker | None:
         """Move one task past a typed capacity, auth, or provider outcome.
