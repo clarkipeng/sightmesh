@@ -449,14 +449,15 @@ class SightMesh:
     def _record_provider_outcome(
         self, task: TaskRecord, outcome: str, retry_at: float | None
     ) -> str:
-        """Mark this epoch terminal and cool what the outcome condemns, once.
+        """Cool what the outcome condemns, then mark this epoch terminal.
 
-        The cooldown belongs with the write that records the outcome, not with
-        the reroute that later reads it: the first terminal write wins, so an
-        account is cooled exactly once however many times reconcile re-reads
-        the same outcome.
+        Cooling goes first because pool cooling is monotonic and therefore
+        idempotent: cooling an account that a later crash makes us cool again
+        costs nothing, while marking terminal first and crashing before the
+        cool leaves an exhausted account eligible forever - the reconcile that
+        reads the outcome sees a terminal effect and moves on without ever
+        looking at whether the binding was cooled.
         """
-        self.journal.mark_terminal(task.task_id, task.epoch, outcome, retry_at)
         if outcome in REROUTE_OUTCOMES:
             target = task.spec.get("target", {})
             binding_id = target.get("auth_binding_id")
@@ -472,6 +473,7 @@ class SightMesh:
                     route_id=target.get("route_id"),
                     retry_at=retry_at,
                 )
+        self.journal.mark_terminal(task.task_id, task.epoch, outcome, retry_at)
         return outcome
 
     def _launch_prepared(
