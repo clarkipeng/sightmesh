@@ -10,6 +10,7 @@ task brief, so scenarios never share state or race each other.
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +21,8 @@ import pytest
 # launch admission (#88) is a production default, not a simulated constraint.
 os.environ.setdefault("SIGHTMESH_MAX_ACTIVE_WORKERS", "100000")
 
+from sightmesh import execution_routing
+from sightmesh.pool import core as pool_core
 from sightmesh.sdk import SightMesh, WorkerSpec
 from sightmesh.succession import QuarantinedSessionError, TerminalOwnership
 from sightmesh.task_store import TaskStore
@@ -169,3 +172,94 @@ def fail_missing_kernel_v1(detail: str) -> None:
 def query(store: TaskStore, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
     with store._database._connect() as conn:  # noqa: SLF001 - test-only introspection
         return conn.execute(sql, params).fetchall()
+
+
+# ---------------------------------------------------------------- routing
+
+
+@pytest.fixture
+def pool_root(monkeypatch, tmp_path: Path) -> Path:
+    """Keep every scenario off the operator's real ~/.config/agent-pool."""
+    root = tmp_path / "agent-pool"
+    monkeypatch.setattr(pool_core, "default_pool_root", lambda: root)
+    return root
+
+
+@pytest.fixture
+def routing_settings(monkeypatch, tmp_path: Path) -> Path:
+    path = tmp_path / "execution_routing.json"
+    monkeypatch.setattr(execution_routing, "default_settings_path", lambda: path)
+    return path
+
+
+def claude_account(account_id: str, **overrides: object) -> dict:
+    """A subscription account with a real credential file behind it.
+
+    Eligibility reads the credential's *presence* from disk, so a scenario that
+    skipped this would see every account skipped for the wrong reason.
+    """
+    account = {"id": account_id, "provider": "claude", "kind": "oauth"}
+    account.update(overrides)
+    return account
+
+
+def metered_account(account_id: str) -> dict:
+    return {
+        "id": account_id,
+        "provider": "codex",
+        "kind": "apikey",
+        "codex_home": f"/tmp/{account_id}",
+    }
+
+
+def seed_pool(*accounts: dict) -> None:
+    pool_core.save_pool({"accounts": list(accounts)})
+    for account in accounts:
+        if account.get("provider") == "claude":
+            pool_core.write_token(account["id"], "sk-ant-oat01-" + "a" * 120)
+
+
+def subscription(route_id: str, model: str, pool: str) -> execution_routing.Route:
+    return execution_routing.Route(
+        id=route_id,
+        executor="CLAUDE_CODE" if pool == "claude" else "CODEX",
+        model=model,
+        billing_class="subscription",
+        account_pool=pool,
+    )
+
+
+def metered(route_id: str, model: str, account: str) -> execution_routing.Route:
+    return execution_routing.Route(
+        id=route_id,
+        executor="CODEX",
+        model=model,
+        billing_class="metered",
+        account=account,
+    )
+
+
+def configure_chains(
+    **chains: tuple[execution_routing.Route, ...]
+) -> execution_routing.ExecutionRoutingSettings:
+    """Persist one chain per named class, exactly as an operator would."""
+    return execution_routing.ExecutionRoutingStore().save(
+        execution_routing.ExecutionRoutingSettings(
+            chains=tuple(
+                execution_routing.RouteChain(route_class, routes)
+                for route_class, routes in chains.items()
+            )
+        )
+    )
+
+
+def target_of(store: TaskStore, key: str = "audit") -> dict:
+    task = store.get("operator", key)
+    assert task is not None
+    return task.spec["target"]
+
+
+def cooling(account_id: str) -> float:
+    """Seconds this account is still cooling for, per durable pool state."""
+    until = pool_core.cooling_until(pool_core.load_state(), account_id)
+    return max(0.0, until - time.time())
