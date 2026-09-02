@@ -128,6 +128,40 @@ class FakeCdesktop:
         with self._faults_lock:
             self._faults.launch_errors.append(error)
 
+    def fail_process(
+        self,
+        session_id: str,
+        *,
+        outcome_class: str | None = None,
+        retry_after: float | None = None,
+        status: str = "failed",
+        exit_code: int | None = 1,
+    ) -> str:
+        """Record that this session's coding agent process stopped.
+
+        Injects the *typed* process record the real seam returns - status, exit
+        code, and cdesktop's normalized outcome class - and nothing else. A
+        scenario cannot make this fake carry transcript text into the routing
+        decision, because the observer does not read any, which is exactly the
+        property the routing lane exists to hold.
+        """
+        process_id = f"process-{session_id}-{len(self.processes.get(session_id, []))}"
+        record: dict[str, Any] = {
+            "id": process_id,
+            "session_id": session_id,
+            "run_reason": "codingagent",
+            "status": status,
+            "exit_code": exit_code,
+        }
+        if outcome_class is not None:
+            record["outcome"] = {
+                "class": outcome_class,
+                "safe_message": "provider refused the request",
+                **({} if retry_after is None else {"retry_after_seconds": retry_after}),
+            }
+        self.processes.setdefault(session_id, []).append(record)
+        return process_id
+
     def _consume_duplicate(self, step: str) -> bool:
         with self._faults_lock:
             if step in self._faults.duplicate_steps:

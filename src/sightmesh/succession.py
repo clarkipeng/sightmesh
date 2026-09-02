@@ -407,6 +407,26 @@ def transfer_ownership(
 #: by construction rather than by pattern-matching what a worker printed.
 REROUTE_OUTCOMES = frozenset({"rate_limited", "auth", "provider_down"})
 
+#: Spellings written before the outcomes were typed. A task that was already
+#: mid-failover when the upgrade landed carries ``quota`` in its target and its
+#: journal, and refusing to read it would strand exactly the work an upgrade is
+#: most likely to interrupt.
+LEGACY_OUTCOMES = {"quota": "rate_limited"}
+
+#: Everything a reconcile sweep should look for, current and legacy alike.
+SWEEPABLE_OUTCOMES = REROUTE_OUTCOMES | frozenset(LEGACY_OUTCOMES)
+
+
+def routing_outcome(value: object) -> str | None:
+    """The reroute outcome a stored value names, or ``None`` if it names none.
+
+    One place decides what counts, so every caller reads legacy and current
+    spellings identically and no branch can be forgotten.
+    """
+    outcome = str(value or "")
+    outcome = LEGACY_OUTCOMES.get(outcome, outcome)
+    return outcome if outcome in REROUTE_OUTCOMES else None
+
 
 def cool_provider_outcome(
     settings: execution_routing.ExecutionRoutingSettings,

@@ -19,11 +19,13 @@ import time
 import pytest
 
 from sightmesh import execution_routing
+from sightmesh import sdk as sdk_module
 from sightmesh.cdesktop import CdesktopError
 from sightmesh.cli import parser
 from sightmesh.pool import core as pool_core
 from sightmesh.profiles import Profile, ProfileStore
 from sightmesh.sdk import BatchError, SightMesh, SightMeshError
+from sightmesh.succession import SuccessionError
 from sightmesh.task_store import TaskStore, TaskStoreError
 
 from .conftest import (
@@ -451,6 +453,248 @@ def test_sd8_a_profile_that_forbids_failover_blocks_with_a_reason(
     task = store.get("operator", "audit")
     assert task.epoch == 1
     assert "automatic failover is off" in str(task.result)
+
+
+# ---------------------------------------------------------------- S-D11
+
+
+def test_sd11_a_rate_limit_hit_mid_run_reroutes_onto_the_next_account(
+    mesh: SightMesh, store: TaskStore, pool_root, routing_settings
+) -> None:
+    """S-D11: a task that launched fine and was refused an hour later still
+    fails over.
+
+    This is the case a launch-time-only design cannot see at all. There is no
+    rejected launch to type: the epoch's effect is ``launched`` and stays that
+    way, so with nothing watching the running session the task hangs on a dead
+    account until a human notices. The session's own process record is the only
+    place the refusal appears, and its typed outcome class - not its transcript
+    - is what turns into a journal outcome the chain can act on.
+    """
+    seed_pool(claude_account("acct-a"), claude_account("acct-b"))
+    configure_chains(standard=(subscription("terra", "terra", "claude"),))
+
+    started = mesh.start(routed_spec())
+    assert target_of(store)["auth_binding_id"] == "acct-a"
+    mesh.client.fail_process(
+        started.session_id, outcome_class="quota_exhausted", retry_after=1800
+    )
+
+    advanced = mesh.reconcile_provider_outcome(started.session_id)
+
+    assert advanced is not None and advanced.state == "active"
+    task = store.get("operator", "audit")
+    assert task.epoch == 2
+    assert target_of(store)["auth_binding_id"] == "acct-b"
+    assert target_of(store)["recovery"] == "rate_limited"
+    # The provider's own reset was honoured, not the blunt capacity default.
+    assert 0 < cooling("acct-a") <= 1800
+    assert cooling("acct-b") == 0
+
+
+def test_sd11_a_mid_run_auth_failure_reroutes_on_the_short_cooldown(
+    mesh: SightMesh, store: TaskStore, pool_root, routing_settings
+) -> None:
+    """S-D11 (auth): the same observer covers a credential that expired while
+    the worker was running, and picks the duration from the outcome class
+    rather than from the mere fact of failure."""
+    seed_pool(claude_account("acct-a"), claude_account("acct-b"))
+    configure_chains(standard=(subscription("terra", "terra", "claude"),))
+
+    started = mesh.start(routed_spec())
+    mesh.client.fail_process(started.session_id, outcome_class="auth_expired")
+
+    advanced = mesh.reconcile_provider_outcome(started.session_id)
+
+    assert advanced is not None and advanced.state == "active"
+    assert target_of(store)["auth_binding_id"] == "acct-b"
+    assert 0 < cooling("acct-a") <= pool_core.SHORT_COOLDOWN
+
+
+def test_sd11_a_failed_process_with_no_provider_signal_blocks_the_task(
+    mesh: SightMesh, store: TaskStore, pool_root, routing_settings
+) -> None:
+    """S-D11 (contrast): a worker process that died with no typed provider
+    outcome failed at its work, so the task blocks and the manager is woken.
+
+    Two wrong answers are both ruled out here. Guessing a provider outcome from
+    a process that reported none is the transcript-scraping bug in another
+    costume, and returning quietly leaves a task that is neither running nor
+    finished with nobody told about it.
+    """
+    seed_pool(claude_account("acct-a"), claude_account("acct-b"))
+    configure_chains(standard=(subscription("terra", "terra", "claude"),))
+
+    started = mesh.start(routed_spec())
+    mesh.client.fail_process(started.session_id, status="killed", exit_code=137)
+
+    settled = mesh.reconcile_provider_outcome(started.session_id)
+
+    assert settled is not None and settled.state == "blocked"
+    task = store.get("operator", "audit")
+    assert task.epoch == 1 and "killed" in str(task.result)
+    assert cooling("acct-a") == 0 and cooling("acct-b") == 0
+    assert mesh.reconcile_provider_outcomes() == []
+
+
+def test_sd11_a_running_process_is_left_alone(
+    mesh: SightMesh, store: TaskStore, pool_root, routing_settings
+) -> None:
+    """S-D11 (contrast): the observer settles stopped processes only. Acting on
+    a running one would replace a worker that is still doing the work."""
+    seed_pool(claude_account("acct-a"), claude_account("acct-b"))
+    configure_chains(standard=(subscription("terra", "terra", "claude"),))
+
+    started = mesh.start(routed_spec())
+    mesh.client.fail_process(
+        started.session_id, status="running", exit_code=None, outcome_class=None
+    )
+
+    assert mesh.reconcile_provider_outcome(started.session_id) is None
+    assert store.get("operator", "audit").state == "active"
+
+
+# ---------------------------------------------------------------- S-D12
+
+
+def test_sd12_a_task_stranded_mid_replacement_is_resumed_by_the_sweep(
+    mesh: SightMesh, store: TaskStore, pool_root, routing_settings
+) -> None:
+    """S-D12: a replacement epoch that was opened but never filled is finished
+    by the sweep instead of stranding the task forever.
+
+    ``prepare_replacement`` and the launch that fills it are two steps, and a
+    failure in between leaves the task ``replacing`` - holding no live session
+    for the session-keyed pass and carrying no fresh terminal outcome for the
+    journal-keyed one. It was invisible to both, which made a transient
+    executor error during failover a permanent stop.
+    """
+    seed_pool(claude_account("acct-a"), claude_account("acct-b"))
+    configure_chains(standard=(subscription("terra", "terra", "claude"),))
+
+    start_rejected(mesh, 429)
+    # The replacement launch fails for a reason that carries no provider
+    # meaning, so nothing marks the new epoch terminal and the task stops here.
+    mesh.client.fail_launch(CdesktopError("PUT /task-launches failed: HTTP 503: down"))
+    assert mesh.reconcile_provider_outcomes() == []
+    stranded = store.get("operator", "audit")
+    assert stranded.state == "replacing" and stranded.epoch == 2
+
+    advanced = mesh.reconcile_provider_outcomes()
+
+    assert [worker.state for worker in advanced] == ["active"]
+    task = store.get("operator", "audit")
+    # Resumed into the epoch that was already open, not a third one.
+    assert task.epoch == 2 and task.state == "active"
+    assert target_of(store)["auth_binding_id"] == "acct-b"
+
+
+# ---------------------------------------------------------------- S-D13
+
+
+def test_sd13_a_task_at_its_attempt_limit_stops_instead_of_retrying_forever(
+    mesh: SightMesh, store: TaskStore, pool_root, routing_settings
+) -> None:
+    """S-D13: the attempt circuit breaker ends the sweep's interest in a task,
+    once, rather than every tick forever.
+
+    A terminal effect stays visible to the journal-keyed sweep for the life of
+    the task, so a task whose replacements have run out was re-attempted on
+    every single tick - each one a doomed `prepare_replacement`, logged and
+    discarded. It has to stop, and it has to say so.
+    """
+    seed_pool(
+        claude_account("acct-a"),
+        claude_account("acct-b"),
+        claude_account("acct-c"),
+        claude_account("acct-d"),
+    )
+    configure_chains(standard=(subscription("terra", "terra", "claude"),))
+
+    start_rejected(mesh, 429)
+    # Every replacement is refused too, and there is always another eligible
+    # account, so nothing but the attempt limit can stop the walk.
+    for _ in range(4):
+        mesh.client.reject_after("launch", 429)
+        mesh.reconcile_provider_outcomes()
+
+    task = store.get("operator", "audit")
+    assert task.attempts == task.max_attempts and task.state == "blocked"
+    assert cooling("acct-d") == 0
+    launches = len(mesh.client.calls("managed_launch"))
+
+    assert mesh.reconcile_provider_outcomes() == []
+    assert len(mesh.client.calls("managed_launch")) == launches
+    assert store.get("operator", "audit").attempts == task.attempts
+
+
+# ---------------------------------------------------------------- S-D15
+
+
+def test_sd15_one_task_that_cannot_advance_does_not_abort_the_sweep(
+    mesh: SightMesh, store: TaskStore, pool_root, routing_settings, monkeypatch
+) -> None:
+    """S-D15: the sweep isolates every task, whatever the failure type.
+
+    The routing lane's own errors - SuccessionError, ExecutionRoutingError,
+    PoolError - are plain RuntimeErrors, so an except tuple naming only the
+    cdesktop and task-store families let one of them escape the loop and skip
+    every task queued behind it. A corrupt settings read or an unreadable pool
+    file would take down failover for the whole fleet, one tick at a time.
+    """
+    seed_pool(
+        claude_account("acct-a"), claude_account("acct-b"), claude_account("acct-c")
+    )
+    configure_chains(standard=(subscription("terra", "terra", "claude"),))
+
+    for key in ("first", "second"):
+        mesh.client.reject_after("launch", 429)
+        with pytest.raises(BatchError):
+            mesh.start(routed_spec(key=key))
+
+    real_advance = sdk_module.advance_route_after_outcome
+    calls: list[int] = []
+
+    def advance(*args: object, **kwargs: object):
+        calls.append(1)
+        if len(calls) == 1:
+            raise SuccessionError("pool state is unreadable this tick")
+        return real_advance(*args, **kwargs)
+
+    monkeypatch.setattr(sdk_module, "advance_route_after_outcome", advance)
+
+    advanced = mesh.reconcile_provider_outcomes()
+
+    assert len(calls) == 2
+    assert [worker.state for worker in advanced] == ["active"]
+    states = {key: store.get("operator", key).state for key in ("first", "second")}
+    assert sorted(states.values()) == ["active", "blocked"]
+
+
+# ---------------------------------------------------------------- S-D14
+
+
+def test_sd14_a_legacy_quota_outcome_still_reroutes_after_the_upgrade(
+    mesh: SightMesh, store: TaskStore, pool_root, routing_settings
+) -> None:
+    """S-D14: a task written before the outcomes were typed still fails over.
+
+    Pre-upgrade code spelled the capacity outcome ``quota``. An upgrade is
+    exactly when a task is most likely to be caught mid-failover, so refusing
+    to read the old spelling would strand the tasks the change most affects.
+    """
+    seed_pool(claude_account("acct-a"), claude_account("acct-b"))
+    configure_chains(standard=(subscription("terra", "terra", "claude"),))
+
+    mesh.start(routed_spec())
+    task = store.get("operator", "audit")
+    mesh.journal.mark_terminal(task.task_id, task.epoch, "quota")
+
+    advanced = mesh.reconcile_provider_outcomes()
+
+    assert [worker.state for worker in advanced] == ["active"]
+    assert target_of(store)["auth_binding_id"] == "acct-b"
+    assert target_of(store)["recovery"] == "rate_limited"
 
 
 # ---------------------------------------------------------------- S-D10
