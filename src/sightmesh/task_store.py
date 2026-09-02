@@ -34,6 +34,29 @@ FINISH_PREDECESSORS: dict[str, frozenset[str]] = {
 ACTIVATE_PREDECESSORS = frozenset({"reserved", "active", "replacing"})
 REPLACE_PREDECESSORS = frozenset({"active", "blocked", "lost"})
 
+#: Typed liveness classifications a task row can carry (liveness-spec.md, the
+#: per-cause table). ``live`` is the absence of a finding, not a claim of
+#: health: a task the detector cannot judge keeps whatever value it had, so
+#: "no evidence" never masquerades as "progress observed".
+LIVENESS_STATES = ("live", "parked", "idle_unreported", "limbo", "stalled")
+#: The subset that satisfies ``any_child_stalled``. ``parked`` is deliberately
+#: absent: cause 2 is excluded from stall detection by contract.
+STALL_LIVENESS_STATES = frozenset({"idle_unreported", "limbo", "stalled"})
+_LIVENESS_CHECK = "liveness IN (" + ", ".join(f"'{v}'" for v in LIVENESS_STATES) + ")"
+#: Forward-only liveness columns, in ``ALTER TABLE ADD COLUMN`` form. Each
+#: carries a constant default so it is a legal in-place addition; the fresh
+#: DDL above lists the identical definitions, so an upgraded database and a
+#: newly created one are the same schema.
+_LIVENESS_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("liveness", f"TEXT NOT NULL DEFAULT 'live' CHECK ({_LIVENESS_CHECK})"),
+    ("liveness_episode", "INTEGER NOT NULL DEFAULT 0"),
+    ("liveness_since", "REAL"),
+    ("liveness_wakes", "INTEGER NOT NULL DEFAULT 0"),
+    ("liveness_evidence", "TEXT"),
+    ("over_budget", "INTEGER NOT NULL DEFAULT 0 CHECK (over_budget IN (0, 1))"),
+    ("checkpoint_at", "REAL"),
+)
+
 _MANAGED_TASKS_DDL = """
     CREATE TABLE {name} (
         task_id TEXT PRIMARY KEY,
@@ -55,6 +78,14 @@ _MANAGED_TASKS_DDL = """
         version INTEGER NOT NULL DEFAULT 0,
         child_event_seq INTEGER NOT NULL DEFAULT 0,
         last_woken_seq INTEGER NOT NULL DEFAULT 0,
+        liveness TEXT NOT NULL DEFAULT 'live' CHECK (liveness IN
+            ('live', 'parked', 'idle_unreported', 'limbo', 'stalled')),
+        liveness_episode INTEGER NOT NULL DEFAULT 0,
+        liveness_since REAL,
+        liveness_wakes INTEGER NOT NULL DEFAULT 0,
+        liveness_evidence TEXT,
+        over_budget INTEGER NOT NULL DEFAULT 0 CHECK (over_budget IN (0, 1)),
+        checkpoint_at REAL,
         created_at REAL NOT NULL,
         updated_at REAL NOT NULL,
         UNIQUE(scope, task_key),
@@ -96,7 +127,8 @@ _TASK_WAKES_DDL = """
         wake_id TEXT PRIMARY KEY,
         parent_task_id TEXT NOT NULL,
         predicate TEXT NOT NULL CHECK (predicate IN
-            ('all_children_terminal', 'any_child_blocked')),
+            ('all_children_terminal', 'any_child_blocked',
+             'any_child_lost', 'any_child_stalled', 'any_child_over_budget')),
         dedupe_key TEXT NOT NULL,
         event_seq INTEGER,
         state TEXT NOT NULL CHECK (state IN
@@ -123,6 +155,10 @@ _TASK_WAKES_LEGACY_COLUMNS = (
 #: The exact fragment a pre-fix ``task_wakes`` carries; its presence is what
 #: tells the migration a lifetime-unique ``dedupe_key`` still needs unbinding.
 _TASK_WAKES_LEGACY_UNIQUE = "dedupe_key TEXT NOT NULL UNIQUE"
+#: A predicate only kernel v1.1 can write. Its absence from the stored table
+#: SQL is what tells the migration the ``predicate`` CHECK still has to be
+#: widened - SQLite cannot alter a CHECK in place, so widening is a rebuild.
+_TASK_WAKES_V11_PREDICATE = "any_child_stalled"
 
 
 class TaskStoreError(RuntimeError):
@@ -165,6 +201,13 @@ class TaskRecord:
     version: int
     created_at: float
     updated_at: float
+    liveness: str = "live"
+    liveness_episode: int = 0
+    liveness_since: float | None = None
+    liveness_wakes: int = 0
+    liveness_evidence: str | None = None
+    over_budget: bool = False
+    checkpoint_at: float | None = None
 
 
 class TaskStore:
@@ -243,9 +286,11 @@ class TaskStore:
         has_version = "version" in columns
         if has_version and _SELF_PARENT_CHECK in str(existing["sql"]):
             # The table is already at the kernel-v1 shape; only the watermark
-            # columns may still be missing. Re-read table_info under the same
-            # write lock and add them forward-only, never a pre-lock read.
+            # and liveness columns may still be missing. Re-read table_info
+            # under the same write lock and add them forward-only, never a
+            # pre-lock read.
             TaskStore._ensure_watermark_columns(conn)
+            TaskStore._ensure_liveness_columns(conn)
             return
         carried = ", ".join(
             name for name in _MANAGED_TASKS_COLUMNS if name != "parent_task_id"
@@ -328,6 +373,35 @@ class TaskStore:
             TaskStore._backfill_child_event_seq(conn)
 
     @staticmethod
+    def _ensure_liveness_columns(conn: sqlite3.Connection) -> None:
+        """Add the kernel v1.1 liveness columns forward-only, under the write lock.
+
+        ``liveness`` is the typed classification the detector writes;
+        ``liveness_episode`` names the current stall episode, ``liveness_since``
+        marks when the current episode *phase* began (episode open, then reset
+        at each wake so the escalation clock is "one further progress_timeout
+        after the manager was told"), ``liveness_wakes`` caps an episode at two
+        wakes, and ``liveness_evidence`` carries the JSON the wake payload
+        quotes - including the detector's own confidence, so a degraded read is
+        never dressed up as a typed one. ``over_budget`` is a soft latch that
+        never changes a task's state.
+
+        Every column has a constant default, so ``ADD COLUMN`` is legal here
+        where the widened ``task_wakes`` CHECK needed a rebuild. No backfill:
+        the defaults ("no finding yet", episode 0) are exactly right for a task
+        the detector has never looked at.
+        """
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(managed_tasks)").fetchall()
+        }
+        for column, definition in _LIVENESS_COLUMNS:
+            if column not in columns:
+                conn.execute(
+                    f"ALTER TABLE managed_tasks ADD COLUMN {column} {definition}"
+                )
+
+    @staticmethod
     def _migrate_task_wakes(conn: sqlite3.Connection) -> None:
         """Create ``task_wakes`` and bind uniqueness to *live* wakes only.
 
@@ -335,8 +409,10 @@ class TaskStore:
         makes a manager wake once per predicate per epoch for the lifetime of
         the row, so multi-wave managers hang after wave one. The constraint
         cannot be dropped in place, so the table is rebuilt without it and a
-        partial unique index rebinds uniqueness to un-consumed wakes. The caller
-        holds ``BEGIN IMMEDIATE``; running this twice is a no-op.
+        partial unique index rebinds uniqueness to un-consumed wakes. Widening
+        the ``predicate`` CHECK for the v1.1 liveness predicates is the same
+        kind of change and rides the same rebuild. The caller holds
+        ``BEGIN IMMEDIATE``; running this twice is a no-op.
         """
         existing = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'task_wakes'"
@@ -351,9 +427,18 @@ class TaskStore:
             needs_rebuild = (
                 _TASK_WAKES_LEGACY_UNIQUE in str(existing["sql"])
                 or "event_seq" not in columns
+                or _TASK_WAKES_V11_PREDICATE not in str(existing["sql"])
             )
             if needs_rebuild:
-                carried = ", ".join(_TASK_WAKES_LEGACY_COLUMNS)
+                # Carry only what the old table actually has, in the new
+                # table's order: a database mid-way through the kernel-v1
+                # migrations has ``event_seq`` and one before it does not, and
+                # naming a missing column would fail the whole upgrade.
+                carried = ", ".join(
+                    name
+                    for name in (*_TASK_WAKES_LEGACY_COLUMNS, "event_seq")
+                    if name in columns
+                )
                 conn.execute(f"DROP TABLE IF EXISTS {_TASK_WAKES_REBUILD_TABLE}")
                 conn.execute(_TASK_WAKES_DDL.format(name=_TASK_WAKES_REBUILD_TABLE))
                 conn.execute(
@@ -640,14 +725,133 @@ class TaskStore:
     def checkpoint(self, task_id: str, checkpoint: str) -> TaskRecord:
         # Same atomicity as activate(): the readback must see this call's own
         # write, not a row a concurrent transition moved after the UPDATE.
+        # ``checkpoint_at`` is stamped alongside because it is the one piece of
+        # progress evidence the kernel owns rather than reads from the
+        # executor; ``updated_at`` cannot stand in for it, since the detector's
+        # own writes move that and a task would then look alive because it was
+        # being watched.
         return self._transaction(
             expect_states=LIVE_STATES,
             task_id=task_id,
             expect_version=None,
-            assign="checkpoint = ?",
-            values=(checkpoint,),
+            assign="checkpoint = ?, checkpoint_at = ?",
+            values=(checkpoint, time.time()),
             attempted="checkpoint",
         )
+
+    def record_liveness(
+        self,
+        task_id: str,
+        liveness: str,
+        *,
+        evidence: str | None = None,
+        now: float | None = None,
+        conn: sqlite3.Connection | None = None,
+    ) -> TaskRecord:
+        """Open, continue, or close a stall episode with one guarded transition.
+
+        An episode *opens* the first tick a classification holds and *closes*
+        when the classification returns to ``live``; the counter only ever
+        moves forward, so a child that stalls, recovers, and stalls again gets
+        a genuinely new dedupe key rather than colliding with the episode its
+        manager already handled. Continuing an episode refreshes the evidence
+        but never the episode number, the phase clock, or the wake count -
+        that is what makes "the same silent child cannot wake its manager twice
+        in one episode" true by construction rather than by a caller
+        remembering to check.
+
+        Two things this write deliberately does *not* do. It does not touch
+        ``version``: an observation about a task is not a change to the task,
+        and bumping the version would make every detector tick invalidate a
+        manager's in-flight ``expect_version`` read - the detector would cause
+        the conflicts it exists to report. It does not touch ``updated_at``
+        either, for the same reason ``checkpoint_at`` exists: a task must not
+        look recently active merely because something looked at it.
+
+        ``LIVE_STATES`` guards the write, so a terminal task cannot acquire a
+        new liveness finding and a late tick can never contradict a recorded
+        outcome.
+        """
+        if liveness not in LIVENESS_STATES:
+            raise ValueError(f"Unsupported liveness classification: {liveness}")
+        moment = time.time() if now is None else now
+        states = sorted(LIVE_STATES)
+        placeholders = ", ".join("?" for _ in states)
+
+        def apply(active: sqlite3.Connection) -> TaskRecord:
+            row = active.execute(
+                "SELECT liveness, liveness_episode FROM managed_tasks WHERE task_id = ?",
+                (str(task_id),),
+            ).fetchone()
+            if row is None:
+                raise TaskStoreError("Managed task not found")
+            if str(row["liveness"]) == liveness:
+                assign, values = "liveness_evidence = ?", (evidence,)
+            else:
+                closing = liveness == "live"
+                assign = (
+                    "liveness = ?, liveness_episode = ?, liveness_since = ?, "
+                    "liveness_wakes = 0, liveness_evidence = ?"
+                )
+                values = (
+                    liveness,
+                    int(row["liveness_episode"]) + (0 if closing else 1),
+                    None if closing else moment,
+                    None if closing else evidence,
+                )
+            active.execute(
+                f"UPDATE managed_tasks SET {assign} "
+                f"WHERE task_id = ? AND state IN ({placeholders})",
+                (*values, str(task_id), *states),
+            )
+            updated = active.execute(
+                "SELECT * FROM managed_tasks WHERE task_id = ?", (str(task_id),)
+            ).fetchone()
+            return self._decode(updated)
+
+        if conn is not None:
+            return apply(conn)
+        try:
+            with self._database._connect() as owned:
+                owned.execute("BEGIN IMMEDIATE")
+                record = apply(owned)
+                owned.execute("COMMIT")
+                return record
+        except TaskStoreError:
+            raise
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(f"Cannot record task liveness: {exc}") from exc
+
+    def record_over_budget(
+        self, task_id: str, *, conn: sqlite3.Connection | None = None
+    ) -> bool:
+        """Latch the soft budget flag; return whether this call set it.
+
+        A latch, not a level: budgets are evidence and only ever cross once per
+        epoch, so the ``0 -> 1`` edge is the whole signal and a manager is told
+        about it exactly once without any episode bookkeeping. The flag never
+        changes task state - an over-budget task stays active, as the contract
+        requires - and, like every liveness write, it leaves ``version`` alone.
+        """
+
+        def apply(active: sqlite3.Connection) -> bool:
+            cursor = active.execute(
+                "UPDATE managed_tasks SET over_budget = 1 "
+                "WHERE task_id = ? AND over_budget = 0",
+                (str(task_id),),
+            )
+            return bool(cursor.rowcount)
+
+        if conn is not None:
+            return apply(conn)
+        try:
+            with self._database._connect() as owned:
+                owned.execute("BEGIN IMMEDIATE")
+                latched = apply(owned)
+                owned.execute("COMMIT")
+                return latched
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(f"Cannot record task budget: {exc}") from exc
 
     def _transaction(
         self,
@@ -732,6 +936,21 @@ class TaskStore:
                 version=int(row["version"]),
                 created_at=float(row["created_at"]),
                 updated_at=float(row["updated_at"]),
+                liveness=str(row["liveness"]),
+                liveness_episode=int(row["liveness_episode"]),
+                liveness_since=(
+                    float(row["liveness_since"])
+                    if row["liveness_since"] is not None
+                    else None
+                ),
+                liveness_wakes=int(row["liveness_wakes"]),
+                liveness_evidence=row["liveness_evidence"],
+                over_budget=bool(row["over_budget"]),
+                checkpoint_at=(
+                    float(row["checkpoint_at"])
+                    if row["checkpoint_at"] is not None
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise TaskStoreError(f"Corrupt managed task record: {exc}") from exc

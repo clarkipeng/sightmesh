@@ -26,6 +26,7 @@ from .cdesktop import (
 )
 from .effects import EffectBusy, EffectJournal, new_owner_instance, request_hash
 from .escalation import CDESKTOP_SESSION_ENV, EscalationStore, LauncherIdentity
+from .liveness import Budget, resolve_policy, trusted_policy
 from .pool import core as pool_core
 from .profiles import ProfileStore, validate_provider
 from .succession import (
@@ -67,6 +68,14 @@ class WorkerSpec:
     reasoning: str | None = None
     permission: str = "SUPERVISED"
     children: int = 0
+    #: Liveness detection settings (docs/liveness-spec.md, "WorkerSpec
+    #: additions"). ``None`` means "inherit the trusted floor". These are
+    #: requests, not grants: ``liveness.resolve_policy`` takes the stricter of
+    #: the request and the manager's configured floor on every axis, so a
+    #: worker can tighten its own detection but never weaken it.
+    progress_timeout: float | None = None
+    approval_timeout: float | None = None
+    budget: Budget | None = None
 
 
 @dataclass(frozen=True)
@@ -533,6 +542,15 @@ class SightMesh:
             "reasoning": requested.reasoning,
             "permission": requested.permission,
             "children": requested.children,
+            # Resolved once, at reserve time, so the detector reads a settled
+            # policy off the durable row instead of re-deriving it - and so a
+            # worker cannot loosen its detection later by re-specifying.
+            **resolve_policy(
+                progress_timeout=requested.progress_timeout,
+                approval_timeout=requested.approval_timeout,
+                budget=requested.budget,
+                trusted=trusted_policy(dict(self.environment)),
+            ).to_dict(),
         }
         existing = self.store.get(scope, requested.key)
         if existing is not None:

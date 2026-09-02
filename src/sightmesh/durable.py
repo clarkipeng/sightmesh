@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from . import liveness as liveness_detector
 from . import wakes
 from .cdesktop import (
     CdesktopClient,
@@ -26,10 +27,11 @@ from .cdesktop import (
 )
 from .effects import EffectJournal
 from .escalation import EscalationStore, escalate
+from .liveness import DetectionPolicy
 from .runtime_lock import RUNTIME_LOCK
 from .stalls import is_active_suite_work, threshold_from_environment
 from .succession import COMMAND_TERMINAL_STATES, OwnershipStore, resolve_live_successor
-from .task_store import TaskStore, TaskStoreError
+from .task_store import TaskRecord, TaskStore, TaskStoreError
 
 LOGGER = logging.getLogger("sightmesh.durable")
 
@@ -221,6 +223,10 @@ class DurableExecutionReconciler:
         self._requeued: set[str] = set()
         self._cancelled: set[str] = set()
         self._notified: set[str] = set()
+        #: Last observed output-byte total per task. Growth between ticks is
+        #: progress even when every timestamp is stale, which is what keeps a
+        #: long-running command from being called stalled (S16).
+        self._output_bytes: dict[str, int] = {}
         self.liveness = liveness or SuiteLiveness()
         self._offline_until = 0.0
         self._backoff = 1.0
@@ -262,7 +268,12 @@ class DurableExecutionReconciler:
         heal on the next tick instead of waiting for a human.
         """
         store = self.task_store
-        repaired = {"wakes_inserted": 0, "wakes_delivered": 0, "effects_expired": 0}
+        repaired = {
+            "wakes_inserted": 0,
+            "wakes_delivered": 0,
+            "effects_expired": 0,
+            "liveness_findings": 0,
+        }
         try:
             with store.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -278,6 +289,12 @@ class DurableExecutionReconciler:
                         wakes.record_wakes(conn, parent_task_id)
                     )
                 conn.execute("COMMIT")
+            # The stall detector is one more pass over the same durable rows,
+            # not a second daemon: liveness findings arm into the same outbox
+            # the pump below drains, so there is exactly one delivery path.
+            detected = self.detect_liveness()
+            repaired["liveness_findings"] = detected["findings"]
+            repaired["wakes_inserted"] += detected["wakes_inserted"]
             repaired["wakes_delivered"] = wakes.WakeDelivery(
                 self.client, store, self.ownership
             ).pump()
@@ -287,6 +304,225 @@ class DurableExecutionReconciler:
         except TaskStoreError as exc:
             LOGGER.warning("Cannot reconcile the task kernel: %s", exc)
         return repaired
+
+    def detect_liveness(self) -> dict[str, int]:
+        """Classify every live task's progress evidence and arm what it satisfies.
+
+        The whole pass is observe-classify-record-arm. There is no branch in
+        it that stops a process, kills a tree, or launches a replacement:
+        every outcome is a durable observation plus, at most, a wake for the
+        owning manager. That is the contract's central promise ("the kernel
+        never kills and never respawns on a liveness signal") held by
+        construction rather than by review.
+        """
+        store = self.task_store
+        counts = {"findings": 0, "wakes_inserted": 0}
+        for task in self._live_tasks(store):
+            policy = self.detection_policy(task)
+            evidence = liveness_detector.gather_evidence(
+                self.client,
+                str(task.holder_session_id),
+                now=self.clock(),
+                checkpoint_at=task.checkpoint_at,
+                previous_output_bytes=self._output_bytes.get(task.task_id),
+            )
+            self._output_bytes[task.task_id] = evidence.output_bytes
+            now = self.clock()
+            reason = liveness_detector.classify(evidence, now=now, policy=policy)
+            if reason in {"idle_unreported", "stalled"} and self._yielding(task):
+                # Cause 1 nuance, extended to `stalled` for the same reason: a
+                # manager waiting on running children produces no evidence
+                # precisely because it is behaving correctly.
+                reason = "live"
+            finding = liveness_detector.Finding(
+                reason=reason,
+                evidence=evidence,
+                now=now,
+                over_budget=liveness_detector.over_budget(evidence, policy.budget),
+            )
+            if finding.actionable or finding.over_budget:
+                counts["findings"] += 1
+            counts["wakes_inserted"] += self._apply_finding(store, task, finding, policy)
+        return counts
+
+    def detection_policy(self, task: TaskRecord) -> DetectionPolicy:
+        """Resolve one task's detection settings, never weaker than the floor."""
+        return liveness_detector.resolve_policy(
+            progress_timeout=task.spec.get("progress_timeout"),
+            approval_timeout=task.spec.get("approval_timeout"),
+            budget=liveness_detector.Budget.from_dict(task.spec.get("budget")),
+        )
+
+    def _live_tasks(self, store: TaskStore) -> list[TaskRecord]:
+        try:
+            with store.connect() as conn:
+                rows = conn.execute(
+                    "SELECT task_id FROM managed_tasks WHERE state = 'active' "
+                    "AND holder_session_id IS NOT NULL"
+                ).fetchall()
+            tasks = [store.get_by_id(str(row["task_id"])) for row in rows]
+        except TaskStoreError as exc:
+            LOGGER.warning("Cannot scan tasks for liveness: %s", exc)
+            return []
+        return [task for task in tasks if task is not None]
+
+    def _yielding(self, task: TaskRecord) -> bool:
+        with self.task_store.connect() as conn:
+            return wakes.has_live_wait_predicate(conn, task.task_id)
+
+    def _apply_finding(
+        self,
+        store: TaskStore,
+        task: TaskRecord,
+        finding: liveness_detector.Finding,
+        policy: DetectionPolicy,
+    ) -> int:
+        """Persist one finding and arm whatever predicate it now satisfies."""
+        payload = finding.payload()
+        if finding.reason == "lost":
+            return self._record_loss(store, task, finding, payload)
+        if finding.reason == "unknown" and not finding.over_budget:
+            # Nothing was observed either way. Leave the row exactly as found:
+            # an unread task must not drift toward a verdict.
+            return 0
+        try:
+            with store.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                if finding.reason != "unknown":
+                    store.record_liveness(
+                        task.task_id,
+                        finding.reason,
+                        evidence=payload if finding.reason != "live" else None,
+                        now=finding.now,
+                        conn=conn,
+                    )
+                if finding.over_budget:
+                    store.record_over_budget(task.task_id, conn=conn)
+                armed = wakes.record_liveness_wakes(
+                    conn,
+                    task.task_id,
+                    now=finding.now,
+                    progress_timeout=policy.progress_timeout,
+                )
+                conn.execute("COMMIT")
+        except TaskStoreError as exc:
+            LOGGER.warning("Cannot record liveness for %s: %s", task.key, exc)
+            return 0
+        self._after_finding(store, task, finding, policy)
+        return len(armed)
+
+    def _after_finding(
+        self,
+        store: TaskStore,
+        task: TaskRecord,
+        finding: liveness_detector.Finding,
+        policy: DetectionPolicy,
+    ) -> None:
+        """Run the two human-facing consequences a finding can have."""
+        current = store.get_by_id(task.task_id)
+        if current is None:
+            return
+        if finding.reason == "parked":
+            self._resolve_parked_approval(store, current, finding, policy)
+            return
+        if wakes.episode_is_exhausted(current):
+            # Two wakes spent and still no progress: the manager either could
+            # not or did not fix it, so the incident becomes a human's.
+            self._raise_attention(
+                current,
+                f"BLOCKED: {current.key} is {current.liveness} after two manager "
+                f"wakes; no progress evidence. {finding.payload()}",
+                f"liveness:escalation:{current.task_id}:{current.epoch}:"
+                f"{current.liveness_episode}",
+            )
+
+    def _resolve_parked_approval(
+        self,
+        store: TaskStore,
+        task: TaskRecord,
+        finding: liveness_detector.Finding,
+        policy: DetectionPolicy,
+    ) -> None:
+        """Time out a parked approval into ``blocked(approval)``, never a kill.
+
+        The historical incident this replaces is a 30-minute SIGKILL of a
+        process that was doing nothing wrong except waiting for a human. The
+        process keeps running; only the task's recorded state changes, and the
+        human gets an attention item.
+        """
+        since = task.liveness_since
+        if since is None or finding.now - since < policy.effective_approval_timeout:
+            return
+        try:
+            wakes.finish_with_wake(store, task.task_id, "blocked", "approval")
+        except TaskStoreError as exc:
+            LOGGER.warning("Cannot block %s on its approval timeout: %s", task.key, exc)
+            return
+        self._raise_attention(
+            task,
+            f"BLOCKED: {task.key} is blocked(approval) after "
+            f"{policy.effective_approval_timeout:g}s parked. {finding.payload()}",
+            f"liveness:approval:{task.task_id}:{task.epoch}",
+        )
+
+    def _record_loss(
+        self,
+        store: TaskStore,
+        task: TaskRecord,
+        finding: liveness_detector.Finding,
+        payload: str,
+    ) -> int:
+        """Record a typed loss the executor already owns, and wake immediately.
+
+        Writing ``lost`` here is not a kill: the classifier only reaches this
+        branch when the executor supplied a typed loss marker, so the process
+        is already gone and the kernel is recording an attribution rather than
+        choosing one. ``finish_with_wake`` arms ``any_child_lost`` in the same
+        transaction, so the manager is told without waiting for the cohort.
+        """
+        reason = f"lost:{finding.evidence.lost_reason}"
+        try:
+            with store.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE managed_tasks SET liveness_evidence = ? WHERE task_id = ?",
+                    (payload, task.task_id),
+                )
+                conn.execute("COMMIT")
+            _record, armed = wakes.finish_with_wake(
+                store, task.task_id, "lost", reason
+            )
+        except TaskStoreError as exc:
+            LOGGER.warning("Cannot record loss for %s: %s", task.key, exc)
+            return 0
+        self._raise_attention(
+            task,
+            f"BLOCKED: {task.key} is {reason}. {payload}",
+            f"liveness:lost:{task.task_id}:{task.epoch}",
+        )
+        return len(armed)
+
+    def _raise_attention(self, task: TaskRecord, message: str, key: str) -> None:
+        """Park one durable attention item for a human; idempotent by key.
+
+        Parked with ``no_parent`` because that is precisely the situation: the
+        item exists because no machine recipient is left to handle it. The
+        manager's session is still recorded, so the trail from incident to
+        owner survives.
+        """
+        if not task.holder_session_id:
+            return
+        try:
+            self.signal_store.park(
+                child_session_id=task.holder_session_id,
+                child_workspace_id=task.workspace_id,
+                recorded_parent_session_id=None,
+                reason="no_parent",
+                message=message,
+                dedupe_key=key,
+            )
+        except Exception as exc:  # noqa: BLE001 - attention must never break the pass
+            LOGGER.warning("Cannot park attention item %s: %s", key, exc)
 
     def reconcile_sessions(self, sessions: Iterable[dict[str, Any]]) -> None:
         """Reconcile all sessions in one writer, tolerating partial reads."""
