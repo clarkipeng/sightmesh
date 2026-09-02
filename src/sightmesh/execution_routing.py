@@ -704,16 +704,46 @@ def validate_chain(
 
 
 def validate_all(settings: ExecutionRoutingSettings) -> tuple[ValidationResult, ...]:
-    """Validate every class that has a chain, plus the default class always.
+    """Validate every route class, configured or not.
 
-    The default class is checked even when unconfigured: a settings file with
-    no chain for the class dispatch will actually use is the exact state
-    ``routing validate`` exists to catch.
+    Iterating the closed set rather than the configured chains is the whole
+    point: a class dispatch can promote work onto but nobody has configured is
+    invisible to a check that only looks at what exists, and that invisible
+    empty chain is exactly what ``routing validate`` exists to catch.
     """
-    classes = [chain.route_class for chain in settings.chains]
-    if settings.default_class not in classes:
-        classes.append(settings.default_class)
-    return tuple(
-        validate_chain(settings, route_class)
-        for route_class in sorted(classes, key=ROUTE_CLASSES.index)
-    )
+    return tuple(validate_chain(settings, route_class) for route_class in ROUTE_CLASSES)
+
+
+@dataclass(frozen=True)
+class ClassDecision:
+    """Which class a task dispatches onto, and the proof it can run there."""
+
+    route_class: str
+    validation: ValidationResult
+    #: The class scope and risk promoted to, when it was unusable and the
+    #: default class took the work instead. ``None`` when nothing was demoted.
+    demoted_from: str | None = None
+
+
+def resolve_class(
+    settings: ExecutionRoutingSettings, scope_risk: ScopeRisk
+) -> ClassDecision:
+    """Decide the class, prove it, and fail open to the default when it is empty.
+
+    A promotion is this module's own judgement about scope and risk, so it may
+    not be the reason work cannot start: an operator who never configured the
+    deep chain still expects an ordinary manager to dispatch. When the promoted
+    class has no usable chain the default class takes the work, which is a
+    visible degradation rather than a refusal.
+
+    Two things never fail open. An explicit ``route_class`` is the operator's
+    instruction, not a promotion, so it is honoured or refused as given. And a
+    default class that is itself unusable is a real dead end - with nowhere
+    left to fall, the decision fails closed and dispatch never opens an epoch.
+    """
+    wanted = class_for(scope_risk, settings)
+    validation = validate_chain(settings, wanted)
+    if validation.valid or scope_risk.route_class or wanted == settings.default_class:
+        return ClassDecision(wanted, validation)
+    fallback = validate_chain(settings, settings.default_class)
+    return ClassDecision(settings.default_class, fallback, demoted_from=wanted)
