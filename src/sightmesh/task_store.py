@@ -612,6 +612,23 @@ class TaskStore:
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(f"Cannot list managed tasks: {exc}") from exc
 
+    def list_state(self, state: str) -> list[TaskRecord]:
+        """Every task in one lifecycle state, across every scope.
+
+        Reconcile sweeps are keyed on durable state rather than on a live
+        session, because the states that need sweeping are exactly the ones
+        where no live session exists to key on.
+        """
+        try:
+            with self._database._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM managed_tasks WHERE state = ? ORDER BY updated_at",
+                    (str(state),),
+                ).fetchall()
+            return [self._decode(row) for row in rows]
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(f"Cannot list managed tasks: {exc}") from exc
+
     def children(self, parent_task_id: str) -> list[TaskRecord]:
         try:
             with self._database._connect() as conn:

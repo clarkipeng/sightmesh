@@ -214,7 +214,10 @@ class EffectJournal:
         Joined against the task's own epoch so a superseded epoch's outcome can
         never re-trigger the reconcile that already advanced past it, and
         restricted to tasks that can still move: a completed or cancelled task
-        has nothing left to reroute.
+        has nothing left to reroute, and neither has one whose attempt circuit
+        breaker has tripped - a terminal effect stays visible forever, so
+        without that bound the sweep would re-attempt a doomed replacement on
+        every tick for the life of the task.
         """
         if not outcomes:
             return []
@@ -228,6 +231,7 @@ class EffectJournal:
                     "  ON t.task_id = e.task_id AND t.epoch = e.epoch "
                     f"WHERE e.state = 'terminal' AND e.outcome IN ({placeholders}) "
                     "AND t.state IN ('active', 'blocked') "
+                    "AND t.attempts < t.max_attempts "
                     "ORDER BY e.updated_at",
                     tuple(wanted),
                 ).fetchall()
