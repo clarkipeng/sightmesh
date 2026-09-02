@@ -23,7 +23,7 @@ from sightmesh.cli import parser
 from sightmesh.pool import core as pool_core
 from sightmesh.profiles import Profile, ProfileStore
 from sightmesh.sdk import BatchError, SightMesh, SightMeshError
-from sightmesh.task_store import TaskStore
+from sightmesh.task_store import TaskStore, TaskStoreError
 
 from .conftest import (
     claude_account,
@@ -413,6 +413,39 @@ def test_sd8_a_profile_that_forbids_failover_blocks_with_a_reason(
     task = store.get("operator", "audit")
     assert task.epoch == 1
     assert "automatic failover is off" in str(task.result)
+
+
+# ---------------------------------------------------------------- S-D10
+
+
+def test_sd10_a_crash_between_cooling_and_the_journal_still_cools(
+    mesh: SightMesh, store: TaskStore, pool_root, routing_settings, monkeypatch
+) -> None:
+    """S-D10: the exhausted account is cooled even if the process dies before
+    the outcome reaches the journal.
+
+    The two writes are to different stores and cannot be one transaction, so
+    one of them has to be safe to lose. Recording the outcome first is the
+    unsafe order: the reconcile that later reads a terminal outcome advances
+    the task without ever checking whether its binding was cooled, so the
+    account stays eligible forever and the chain walks straight back onto it.
+    Cooling first is safe precisely because cooling is monotonic - a repeat
+    after recovery is a no-op.
+    """
+    seed_pool(claude_account("acct-a"), claude_account("acct-b"))
+    configure_chains(standard=(subscription("terra", "terra", "claude"),))
+
+    def crash(*_args: object, **_kwargs: object):
+        raise TaskStoreError("simulated crash after cooling")
+
+    monkeypatch.setattr(mesh.journal, "mark_terminal", crash)
+    mesh.client.reject_after("launch", 429)
+    with pytest.raises(BatchError):
+        mesh.start(routed_spec())
+
+    task = store.get("operator", "audit")
+    assert mesh.journal.get(task.task_id, task.epoch).outcome is None
+    assert cooling("acct-a") > 0
 
 
 # ---------------------------------------------------------------- S-D9
