@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -9,7 +10,7 @@ ROOT = Path(__file__).parents[1]
 
 def fake_uv(tmp_path: Path) -> tuple[Path, Path]:
     bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
+    bin_dir.mkdir(exist_ok=True)
     log = tmp_path / "uv.log"
     uv = bin_dir / "uv"
     uv.write_text(
@@ -53,18 +54,55 @@ def test_install_does_not_uninstall_upstream_agent_deck(tmp_path: Path) -> None:
     assert "uninstall agent-deck" not in commands
 
 
-def test_install_migrates_only_the_documented_legacy_skill_path(tmp_path: Path) -> None:
+def test_install_refuses_to_steal_a_skill_link_it_does_not_own(tmp_path: Path) -> None:
+    """Install used to silently `rm` agent-deck's own skill link and put its
+    own there, with no record and no way back. Refusing instead is what keeps
+    uninstall a pure delete of created paths: nothing was ever displaced, so
+    nothing has to be restored.
+    """
     home = tmp_path / "home"
-    legacy = home / ".local/share/agent-deck/skills/orchestrate-visible-agents"
+    foreign = home / ".local/share/agent-deck/skills/orchestrate-visible-agents"
     destination = home / ".claude/skills/orchestrate-visible-agents"
-    legacy.parent.mkdir(parents=True)
+    foreign.parent.mkdir(parents=True)
     destination.parent.mkdir(parents=True)
-    destination.symlink_to(legacy)
+    destination.symlink_to(foreign)
+
+    result, _ = run_script("install-local.sh", tmp_path)
+
+    assert result.returncode != 0
+    assert "does not own" in result.stderr
+    assert destination.readlink() == foreign
+
+
+def test_install_records_every_path_it_created(tmp_path: Path) -> None:
+    """Uninstall can only be reversible if install leaves a record of what it
+    owns; an implicit list spread across three scripts is not one.
+    """
+    home = tmp_path / "home"
 
     result, _ = run_script("install-local.sh", tmp_path)
 
     assert result.returncode == 0, result.stderr
-    assert destination.readlink() == ROOT / "skills/orchestrate-visible-agents"
+    manifest_path = home / ".local/state/sightmesh/install-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert oct(manifest_path.stat().st_mode & 0o777) == "0o600"
+    assert set(manifest["created_paths"]) == {
+        str(home / f".{tool}/skills/{skill}")
+        for tool in ("claude", "codex")
+        for skill in ("orchestrate-visible-agents", "reconcile-agent-work")
+    }
+    assert manifest["repo_root"] == str(ROOT)
+
+
+def test_install_is_idempotent_over_its_own_links(tmp_path: Path) -> None:
+    """Refuse-not-steal must not refuse *this* installation's own links, or a
+    re-install of an already-installed host would fail.
+    """
+    first, _ = run_script("install-local.sh", tmp_path)
+    second, _ = run_script("install-local.sh", tmp_path)
+
+    assert first.returncode == 0, first.stderr
+    assert second.returncode == 0, second.stderr
 
 
 def test_uninstall_refuses_unrelated_skill_links_without_running_uv(tmp_path: Path) -> None:

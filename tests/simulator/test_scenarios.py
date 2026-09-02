@@ -1017,3 +1017,54 @@ def test_s28_a_reconciler_rescan_of_an_unchanged_delivered_cohort_arms_nothing(
         (),
     )
     assert live[0]["n"] == 0
+
+
+def test_s13_task_surfaces_at_a_thousand_tasks_perform_zero_fleet_scans(
+    monkeypatch, capsys, client, store: TaskStore
+) -> None:
+    """S13: `list`, `status`, `attention` and `overview` must answer from the
+    kernel store alone at fleet scale, extending S11's proof from `show` to
+    every task surface (docs/kernel-contract.md, "Observability").
+
+    The shipped `list`/`status`/`overview` did the opposite: each call fanned
+    out over `workspaces()`, `workspace_summaries()` twice, `sessions()` per
+    workspace, `providers()`, and a normalized snapshot per process. On a
+    busy host that is O(workspaces x sessions) native round-trips for a
+    question SQLite already answers, which is why the assertion here is not
+    "few calls" but a client that refuses to be constructed at all.
+    """
+    import argparse
+
+    from sightmesh import cli, observability
+
+    specs = [
+        {"key": f"terminal-{index}", "repo": "project", "base": "main", "children": 0}
+        for index in range(1000)
+    ]
+    reservations = store.reserve_all(
+        scope="operator", parent_task_id=None, specs=specs, max_attempts=3
+    )
+    for record, _inserted in reservations:
+        store.finish(record.task_id, "cancelled")
+
+    class RefusedClient:
+        def __init__(self, _url=None) -> None:
+            raise AssertionError("a task surface must not open a cdesktop client")
+
+    monkeypatch.setattr(observability, "task_store", lambda path=None: store)
+    monkeypatch.setattr(cli, "CdesktopClient", RefusedClient)
+    monkeypatch.setattr(cli.service, "status", lambda _port: {"running": True})
+    monkeypatch.setattr(cli.updates, "read_state", lambda: {"status": "idle"})
+    monkeypatch.setattr(cli.ProfileStore, "list", lambda _self: [])
+    monkeypatch.setattr(
+        cli.leases.LeaseStore, "list", lambda _self, include_stale=True: []
+    )
+
+    before = len(client.call_log)
+    assert cli.cmd_list(argparse.Namespace(url=None, json=True)) == 0
+    assert cli.cmd_status(argparse.Namespace(url=None, port=8377, json=True)) == 0
+    assert cli.cmd_attention(argparse.Namespace(url=None, json=True)) == 0
+    assert cli.cmd_overview(argparse.Namespace(url=None, json=True, since=None)) == 0
+    capsys.readouterr()
+
+    assert len(client.call_log) == before

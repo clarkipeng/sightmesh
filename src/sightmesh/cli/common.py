@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -25,6 +26,7 @@ from .. import (
     execution_routing,
     fleet,
     leases,
+    observability,
     routing,
     service,
     succession,
@@ -73,13 +75,72 @@ def _with_coordination_contract(prompt: str) -> str:
     return f"{prompt.rstrip()}\n\n{COORDINATION_CONTRACT.rstrip()}\n"
 
 
+#: Keys whose *values* are credentials. The CLI has exactly one output path,
+#: so rejecting these here makes a future leak fail loudly instead of
+#: silently serializing a live capability into a transcript
+#: (docs/kernel-contract.md, "Observability").
+SECRET_KEYS = frozenset(
+    {
+        "token",
+        "secret",
+        "password",
+        "passphrase",
+        "api_key",
+        "apikey",
+        "authorization",
+        "credential",
+        "capability",
+        "private_key",
+    }
+)
+
+
+def _reject_secret_keys(data: Any, path: str = "") -> None:
+    if isinstance(data, dict):
+        for key, value in data.items():
+            where = f"{path}.{key}" if path else str(key)
+            if str(key).casefold() in SECRET_KEYS:
+                raise ValueError(
+                    f"Refusing to emit credential-shaped field {where!r}. "
+                    "Write the value to a private file and emit its path."
+                )
+            _reject_secret_keys(value, where)
+    elif isinstance(data, (list, tuple)):
+        for index, value in enumerate(data):
+            _reject_secret_keys(value, f"{path}[{index}]")
+
+
 def _emit(data: Any, as_json: bool) -> None:
+    _reject_secret_keys(data)
     if as_json:
         print(json.dumps(data, indent=2, sort_keys=True))
     elif isinstance(data, str):
         print(data)
     else:
         print(json.dumps(data, indent=2))
+
+
+def emit_capability(directory: Path, name: str, value: str) -> Path:
+    """Deliver a capability through a private file, never through stdout.
+
+    The founder rule is absolute: never print a credential value. ``acquire``
+    is the one command that must hand a caller a live token, so it writes it
+    0600 next to the store that owns it and reports only the path.
+    """
+    root = Path(directory).expanduser()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root.chmod(0o700)
+    path = root / f"{name}.token"
+    handle, temporary = tempfile.mkstemp(prefix=f".{name}.", dir=root)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(value)
+        temporary_path.chmod(0o600)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return path
 
 
 def _repowire_status_ok(returncode: int, detail: str) -> bool:

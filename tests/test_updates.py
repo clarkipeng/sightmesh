@@ -429,7 +429,18 @@ def test_automatic_prune_reports_cleanup_error_without_failing(monkeypatch) -> N
     assert result["error"] == "read only"
 
 
-def test_activation_waits_without_touching_services(monkeypatch, tmp_path) -> None:
+def test_activation_drains_first_then_reports_a_bounded_timeout(
+    monkeypatch, tmp_path
+) -> None:
+    """A host that never goes idle must still be *asked* to drain.
+
+    The deleted idle-first gate meant a loaded host never reached
+    `set_update_drain` at all, so a staged update sat pending forever and
+    cdesktop releases piled up. Drain-first inverts that: admission is
+    refused immediately, the wait is bounded, and a host that still will not
+    quiet down is rolled back with the state it actually observed rather
+    than the state that was configured.
+    """
     isolated_state(monkeypatch, tmp_path)
     updates._write_json_atomic(
         updates.state_path(),
@@ -439,16 +450,35 @@ def test_activation_waits_without_touching_services(monkeypatch, tmp_path) -> No
             "pending": {"version": "0.2.4-sightmesh.1", "executable": "/tmp/cdesktop"},
         },
     )
+    monkeypatch.setattr(updates, "QUIET_SECONDS", 0)
+    monkeypatch.setattr(updates, "DRAIN_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(updates, "DRAIN_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(service, "_bootout", lambda _label: None)
+    monkeypatch.setattr(service, "_wait_until_unloaded", lambda _label: None)
+    monkeypatch.setattr(service, "is_healthy", lambda _port: True)
+    bootstraps: list[str] = []
+    monkeypatch.setattr(
+        service, "_bootstrap", lambda label, _path: bootstraps.append(label)
+    )
+    monkeypatch.setattr(service, "bridge_plist_path", lambda: tmp_path / "bridge.plist")
     monkeypatch.setattr(
         service,
-        "_bootout",
-        lambda _label: pytest.fail("busy activation must not stop a service"),
+        "plist_path",
+        lambda: pytest.fail("a timed-out drain must not rewrite the service plist"),
     )
 
-    result = updates.activate_if_idle(FakeClient(running=True), port=4321)
+    client = FakeClient(running=True)
+    result = updates.activate_after_drain(client, port=4321)
 
-    assert result["action"] == "waiting-for-idle"
-    assert updates.read_state()["status"] == "waiting-for-idle"
+    assert result["action"] == "drain-timed-out"
+    assert updates.read_state()["status"] == "drain-timed-out"
+    # Drain requested before the wait, then released on the way out.
+    assert client.drain_calls == [updates.DRAIN_SECONDS, 0]
+    assert result["drain"]["enforced"] is True
+    assert result["drain"]["configured_wait_seconds"] == 0.0
+    assert result["activity"]["idle"] is False
+    # The bridge is put back, so a refused activation leaves no service down.
+    assert bootstraps == [service.BRIDGE_LABEL]
 
 
 def test_activation_restarts_owned_services_and_verifies_version(
@@ -491,7 +521,7 @@ def test_activation_restarts_owned_services_and_verifies_version(
     monkeypatch.setattr(updates, "CdesktopClient", lambda _url: FakeClient())
 
     client = FakeClient()
-    result = updates.activate_if_idle(client, port=4321)
+    result = updates.activate_after_drain(client, port=4321)
 
     assert result["action"] == "activated"
     assert result["pending"] is None
@@ -547,7 +577,7 @@ def test_activation_allows_exact_legacy_bootstrap_without_drain(
         drain_supported=False,
     )
 
-    result = updates.activate_if_idle(client, port=4321)
+    result = updates.activate_after_drain(client, port=4321)
 
     assert result["action"] == "activated"
     assert result["active"]["version"] == "0.2.3-sightmesh.2"
@@ -596,7 +626,7 @@ def test_activation_failure_stops_without_rollback_or_retry(
     )
 
     with pytest.raises(RuntimeError, match="will not be retried automatically"):
-        updates.activate_if_idle(FakeClient(), port=4321)
+        updates.activate_after_drain(FakeClient(), port=4321)
 
     state = updates.read_state()
     assert state["status"] == "failed"
@@ -628,7 +658,70 @@ def test_activation_refuses_unknown_backend_without_drain(
     monkeypatch.setattr(service, "is_healthy", lambda _port: True)
 
     with pytest.raises(RuntimeError, match="HTTP 404"):
-        updates.activate_if_idle(
+        updates.activate_after_drain(
             FakeClient(version="unknown", drain_supported=False),
             port=4321,
         )
+
+
+def test_activation_converges_once_the_drain_empties_the_fleet(
+    monkeypatch, tmp_path
+) -> None:
+    """The point of draining first: work that was running when activation
+    started reaches terminal *during* the bounded wait, because no new work
+    is admitted behind it. The old idle-first gate never got this far on a
+    loaded host and left the staged update pending forever.
+    """
+    isolated_state(monkeypatch, tmp_path)
+    target = tmp_path / "cdesktop.plist"
+    bridge = tmp_path / "bridge.plist"
+    target.write_bytes(b"old-definition")
+    bridge.write_bytes(b"bridge-definition")
+    updates._write_json_atomic(
+        updates.state_path(),
+        {
+            "schema_version": 1,
+            "status": "staged",
+            "pending": {
+                "version": "0.2.4-sightmesh.1",
+                "executable": "/tmp/new-cdesktop",
+                "sha256": "abc",
+            },
+        },
+    )
+    monkeypatch.setattr(updates, "QUIET_SECONDS", 0)
+    monkeypatch.setattr(updates, "DRAIN_WAIT_SECONDS", 60.0)
+    monkeypatch.setattr(updates, "DRAIN_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(service, "plist_path", lambda: target)
+    monkeypatch.setattr(service, "bridge_plist_path", lambda: bridge)
+    monkeypatch.setattr(
+        service,
+        "definition",
+        lambda _port, executable: {"ProgramArguments": [str(executable)]},
+    )
+    monkeypatch.setattr(service, "_bootout", lambda _label: None)
+    monkeypatch.setattr(service, "_wait_until_unloaded", lambda _label: None)
+    monkeypatch.setattr(service, "wait_until_healthy", lambda _port: None)
+    monkeypatch.setattr(service, "is_healthy", lambda _port: True)
+    monkeypatch.setattr(service, "_bootstrap", lambda _label, _path: None)
+    monkeypatch.setattr(updates, "CdesktopClient", lambda _url: FakeClient())
+
+    client = FakeClient(running=True)
+    polls = {"count": 0}
+    real_activity = updates.activity
+
+    def draining_activity(observed_client):
+        polls["count"] += 1
+        if polls["count"] >= 2:
+            observed_client.running = False
+        return real_activity(observed_client)
+
+    monkeypatch.setattr(updates, "activity", draining_activity)
+
+    result = updates.activate_after_drain(client, port=4321)
+
+    assert result["action"] == "activated"
+    assert client.drain_calls == [updates.DRAIN_SECONDS]
+    assert result["drain"]["enforced"] is True
+    assert result["drain"]["waited_seconds"] >= 0
+    assert polls["count"] >= 2

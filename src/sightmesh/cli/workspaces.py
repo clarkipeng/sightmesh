@@ -188,7 +188,15 @@ def cmd_lease(args: argparse.Namespace) -> int:
             workspace_id=args.workspace_id,
             session_id=args.session_id,
         )
-        _emit(lease.to_dict(), args.json)
+        # `acquire` is the only deliberate capability exit. Inside a managed
+        # session stdout lands in a transcript, so the token goes to a 0600
+        # file and only its path is emitted.
+        path = emit_capability(
+            store.root / "capabilities",
+            leases._identity_key(lease.repo_path, lease.worktree_path),
+            lease.token,
+        )
+        _emit({**lease.to_public_dict(), "capability_path": str(path)}, args.json)
     elif args.lease_action == "list":
         _emit(
             [
@@ -198,10 +206,12 @@ def cmd_lease(args: argparse.Namespace) -> int:
             args.json,
         )
     elif args.lease_action == "release":
+        # The caller passed the token in; echoing it back only persists a
+        # live capability into the transcript for no benefit.
         _emit(
             store.release(
                 args.token, owner=args.owner, workspace_id=args.workspace_id
-            ).to_dict(),
+            ).to_public_dict(),
             args.json,
         )
     elif args.lease_action == "renew":
@@ -211,7 +221,7 @@ def cmd_lease(args: argparse.Namespace) -> int:
                 ttl_seconds=args.ttl_seconds,
                 owner=args.owner,
                 workspace_id=args.workspace_id,
-            ).to_dict(),
+            ).to_public_dict(),
             args.json,
         )
     elif args.lease_action == "recover-stale":
@@ -364,7 +374,8 @@ def add_final_parser(sub: argparse._SubParsersAction[Any]) -> None:
     lease.add_argument("--lease-dir", help="Override lease state directory")
     lease_sub = lease.add_subparsers(dest="lease_action", required=True)
     lease_acquire = lease_sub.add_parser(
-        "acquire", help="Acquire a lease and return its capability token"
+        "acquire",
+        help="Acquire a lease and write its capability token to a private file",
     )
     lease_acquire.add_argument("--owner", required=True)
     lease_acquire.add_argument("--repo", required=True)
@@ -383,14 +394,14 @@ def add_final_parser(sub: argparse._SubParsersAction[Any]) -> None:
     )
     lease_list.set_defaults(func=cmd_lease)
     lease_release = lease_sub.add_parser(
-        "release", help="Release by capability token and return that capability"
+        "release", help="Release by capability token without echoing it"
     )
     lease_release.add_argument("token")
     lease_release.add_argument("--owner")
     lease_release.add_argument("--workspace-id")
     lease_release.set_defaults(func=cmd_lease)
     lease_renew = lease_sub.add_parser(
-        "renew", help="Renew by capability token and return that capability"
+        "renew", help="Renew by capability token without echoing it"
     )
     lease_renew.add_argument("token")
     lease_renew.add_argument(

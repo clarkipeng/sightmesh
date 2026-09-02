@@ -73,4 +73,9 @@ for label in io.sightmesh.cdesktop io.sightmesh.bridge io.sightmesh.updater; do
   fi
 done
 
+# The manifest lists only paths install created, so removing it last leaves
+# no record of an installation that no longer exists.
+rm -f "$HOME/.local/state/sightmesh/install-manifest.json"
+
 echo "Removed this SightMesh installation and its owned local links."
+echo "Durable state under ~/.local/share/sightmesh and ~/.local/state/sightmesh is kept; delete it explicitly to finish."

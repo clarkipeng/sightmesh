@@ -4,12 +4,60 @@ from ..sdk import SightMesh, SightMeshError
 from .common import *
 from .fleet import _fleet_sessions, _idle_unmet_orders, _latest_process, _normalized_snapshot_with_retry, _process_event_time, _session_processes
 
+def _version_token(detail: object) -> str | None:
+    match = re.search(r"\b\d+\.\d+\.\d+[\w.+-]*", str(detail or ""))
+    return match.group(0) if match else None
+
+
+def _version_skew_check(
+    running_version: object, installed_cli_detail: object
+) -> dict[str, Any]:
+    """Compare installed CLI, running service, and staged/active versions.
+
+    Skew is invisible until something breaks, which is how three cdesktop
+    releases accumulated on one host. Reporting all three versions in one
+    failing check makes it a first-class `doctor` outcome instead.
+    """
+    try:
+        state = updates.read_state()
+    except (RuntimeError, OSError, ValueError, json.JSONDecodeError) as exc:
+        return {
+            "check": "cdesktop-version-skew",
+            "ok": False,
+            "detail": {"error": f"update state is unreadable: {exc}"},
+        }
+    active = _release_version(state.get("active"))
+    staged = _release_version(state.get("pending"))
+    running = _version_token(running_version)
+    installed_cli = _version_token(installed_cli_detail)
+    try:
+        stale = updates.prune(dry_run=True)["removed"]
+    except (OSError, RuntimeError, ValueError) as exc:
+        stale = [f"unreadable: {exc}"]
+    observed = {value for value in (active, running, installed_cli) if value}
+    ok = len(observed) <= 1 and not stale
+    return {
+        "check": "cdesktop-version-skew",
+        "ok": ok,
+        "detail": {
+            "installed_cli": installed_cli,
+            "running_service": running,
+            "active": active,
+            "staged": staged,
+            "stale_releases": stale,
+        },
+    }
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     checks: list[dict[str, Any]] = []
     failures = 0
+    running_version: object = None
+    installed_cli_detail: object = None
     try:
         client = CdesktopClient(args.url)
         info = client.info()
+        running_version = info.get("version")
         config = info["config"]
         local_ok = (
             config.get("analytics_enabled") is False
@@ -86,6 +134,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             check=False,
         )
         detail = (result.stdout or result.stderr).strip()
+        installed_cli_detail = detail
         fork_ok = result.returncode == 0 and _is_sightmesh_cdesktop_version(detail)
         checks.append(
             {
@@ -95,6 +144,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             }
         )
         failures += int(not fork_ok)
+
+    skew = _version_skew_check(running_version, installed_cli_detail)
+    checks.append(skew)
+    failures += int(not skew["ok"])
 
     if shutil.which("repowire"):
         result = subprocess.run(
@@ -147,7 +200,73 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
+    """List managed tasks from the kernel store, never the native fleet.
+
+    Native workspace inventory is `sightmesh workspaces`; keeping the two
+    surfaces apart is what stops a routine `list` from fanning out.
+    """
+    store = observability.task_store()
+    _emit(
+        [view.to_dict() for view in observability.read_tasks(store)],
+        args.json,
+    )
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    store = observability.task_store()
+    views = observability.read_tasks(store)
+    _emit(
+        {
+            "service": service.status(args.port),
+            "update": _update_summary(),
+            "tasks": [view.to_dict() for view in views],
+            "task_counts": observability.task_counts(views),
+            "leases": [lease.to_public_dict() for lease in leases.LeaseStore().list()],
+            "profiles": [profile.to_dict() for profile in ProfileStore().list()],
+        },
+        args.json,
+    )
+    return 0
+
+
+def _update_summary() -> dict[str, Any]:
+    try:
+        state = updates.read_state()
+    except (RuntimeError, OSError, ValueError, json.JSONDecodeError) as exc:
+        return {"status": "unreadable", "error": str(exc)}
+    return {
+        "status": state.get("status"),
+        "active_version": _release_version(state.get("active")),
+        "staged_version": _release_version(state.get("pending")),
+    }
+
+
+def _release_version(release: Any) -> str | None:
+    return str(release.get("version")) if isinstance(release, dict) else None
+
+
+def cmd_attention(args: argparse.Namespace) -> int:
+    """One queue of everything a human must act on, answered by the kernel."""
+    store = observability.task_store()
+    queue = fleet.attention(observability.attention_facts(store), now=datetime.now(UTC))
+    if args.json:
+        _emit(queue.to_dict(), True)
+        return 0
+    if not queue.items:
+        print("(nothing needs attention)")
+    for item in queue.items:
+        print(f"  {item.selector} - {item.reason} Next: {item.next_action}")
+    for entry in queue.degraded:
+        print(f"  degraded: {entry['source']} - {entry['reason']}")
+    return 0
+
+
+def cmd_workspaces(args: argparse.Namespace) -> int:
+    """Native workspace inventory. This surface fans out on purpose."""
     client = CdesktopClient(args.url)
+    if args.overview:
+        return _emit_native_overview(args, client)
     summaries = {
         item["workspace_id"]: item
         for archived in (False, True)
@@ -155,15 +274,16 @@ def cmd_list(args: argparse.Namespace) -> int:
     }
     rows: list[dict[str, Any]] = []
     for workspace in client.workspaces():
-        sessions = client.sessions(workspace["id"])
+        if workspace.get("archived") and not args.include_archived:
+            continue
         summary = summaries.get(workspace["id"], {})
         rows.append(
             {
                 "workspace_id": workspace["id"],
                 "name": workspace.get("name"),
                 "branch": workspace.get("branch"),
-                "archived": workspace.get("archived"),
-                "use_worktree": workspace.get("use_worktree"),
+                "archived": bool(workspace.get("archived")),
+                "use_worktree": bool(workspace.get("use_worktree")),
                 "latest_process_status": summary.get("latest_process_status"),
                 "latest_process_completed_at": summary.get(
                     "latest_process_completed_at"
@@ -178,76 +298,29 @@ def cmd_list(args: argparse.Namespace) -> int:
                         "executor": session.get("executor"),
                         "created_at": session.get("created_at"),
                     }
-                    for session in sessions
-                ],
-            }
-        )
-    _emit(rows, args.json)
-    return 0
-
-
-def cmd_status(args: argparse.Namespace) -> int:
-    client = CdesktopClient(args.url)
-    services = service.status(args.port)
-    workspaces: list[dict[str, Any]] = []
-    summaries = {
-        item["workspace_id"]: item
-        for archived in (False, True)
-        for item in client.workspace_summaries(archived)
-    }
-    for workspace in client.workspaces():
-        if workspace.get("archived") and not args.include_archived:
-            continue
-        summary = summaries.get(workspace["id"], {})
-        workspaces.append(
-            {
-                "workspace_id": workspace["id"],
-                "name": workspace.get("name"),
-                "branch": workspace.get("branch"),
-                "archived": bool(workspace.get("archived")),
-                "worktree": bool(workspace.get("use_worktree")),
-                "latest_process_status": summary.get("latest_process_status"),
-                "latest_process_completed_at": summary.get(
-                    "latest_process_completed_at"
-                ),
-                "has_pending_approval": bool(summary.get("has_pending_approval")),
-                "has_unseen_turns": bool(summary.get("has_unseen_turns")),
-                "bridge_enabled": workspace["id"] in routing.enabled_workspaces(),
-                "sessions": [
-                    {
-                        "id": session["id"],
-                        "executor": session.get("executor"),
-                        "name": session.get("name"),
-                    }
                     for session in client.sessions(workspace["id"])
                 ],
             }
         )
-    profile_rows: list[dict[str, Any]] = []
     providers = client.providers()
+    profile_rows: list[dict[str, Any]] = []
     for profile in ProfileStore().list():
         try:
             validate_provider(profile, providers)
-            valid = True
-            error = None
+            valid, error = True, None
         except ProfileError as exc:
-            valid = False
-            error = str(exc)
+            valid, error = False, str(exc)
         profile_rows.append({**profile.to_dict(), "valid": valid, "error": error})
     _emit(
         {
-            "service": services,
-            "workspaces": workspaces,
+            "workspaces": rows,
             "workspace_counts": {
-                "active": sum(not item["archived"] for item in workspaces),
+                "active": sum(not row["archived"] for row in rows),
                 "running": sum(
-                    item["latest_process_status"] == "running" for item in workspaces
+                    row["latest_process_status"] == "running" for row in rows
                 ),
-                "awaiting_approval": sum(
-                    item["has_pending_approval"] for item in workspaces
-                ),
+                "awaiting_approval": sum(row["has_pending_approval"] for row in rows),
             },
-            "leases": [lease.to_public_dict() for lease in leases.LeaseStore().list()],
             "profiles": profile_rows,
             "providers": [provider_summary(provider) for provider in providers],
         },
@@ -387,12 +460,15 @@ def _fleet_overview(
     return fleet.overview(facts, now=current_time, viewed_at=cutoff)
 
 
-def cmd_overview(args: argparse.Namespace) -> int:
+def _viewed_at(args: argparse.Namespace) -> datetime | None:
     viewed_at = datetime.fromisoformat(args.since) if args.since else None
     if viewed_at and viewed_at.tzinfo is None:
         viewed_at = viewed_at.replace(tzinfo=UTC)
-    client = CdesktopClient(args.url)
-    projection = _fleet_overview(client, viewed_at)
+    return viewed_at
+
+
+def _emit_native_overview(args: argparse.Namespace, client: CdesktopClient) -> int:
+    projection = _fleet_overview(client, _viewed_at(args))
     orders = _idle_unmet_orders(client, _fleet_sessions(client))
     if args.json:
         _emit({**projection.to_dict(), "unmet_order_expectations": orders}, True)
@@ -407,12 +483,42 @@ def cmd_overview(args: argparse.Namespace) -> int:
         if not items:
             print("  (none)")
         for item in items:
-            print(f"  {item.selector} — {item.reason} Next: {item.next_action}")
+            print(f"  {item.selector} - {item.reason} Next: {item.next_action}")
     print("Unmet order expectations")
     if not orders:
         print("  (none)")
     for order in orders:
-        print(f"  {order['agent'] or order['recipient_session_id']} — {order['body']}")
+        print(f"  {order['agent'] or order['recipient_session_id']} - {order['body']}")
+    return 0
+
+
+def cmd_overview(args: argparse.Namespace) -> int:
+    """Group managed tasks by required attention, reading only the kernel."""
+    now = datetime.now(UTC)
+    viewed_at = _viewed_at(args) or now - timedelta(hours=DEFAULT_OVERVIEW_HOURS)
+    store = observability.task_store()
+    facts = observability.attention_facts(store)
+    queue = fleet.attention(facts, now=now)
+    groups = fleet.task_groups(facts.tasks, now=now, viewed_at=viewed_at)
+    if args.json:
+        _emit({**groups.to_dict(), "attention": queue.to_dict()}, True)
+        return 0
+    print("Needs attention")
+    if not queue.items:
+        print("  (none)")
+    for item in queue.items:
+        print(f"  {item.selector} - {item.reason} Next: {item.next_action}")
+    for label, rows in (
+        ("Running", groups.running),
+        ("Done since view", groups.done_since_view),
+    ):
+        print(label)
+        if not rows:
+            print("  (none)")
+        for row in rows:
+            print(f"  task/{row.get('scope')}/{row.get('key')} - {row.get('state')}")
+    for entry in queue.degraded:
+        print(f"  degraded: {entry['source']} - {entry['reason']}")
     return 0
 
 
@@ -421,7 +527,7 @@ def add_initial_parser(sub: argparse._SubParsersAction[Any]) -> None:
     doctor = sub.add_parser("doctor", help="Verify local orchestration dependencies")
     doctor.set_defaults(func=cmd_doctor)
 
-    listing = sub.add_parser("list", help="List cdesktop workspaces and sessions")
+    listing = sub.add_parser("list", help="List managed tasks from the kernel store")
     listing.set_defaults(func=cmd_list)
 
 
@@ -429,17 +535,37 @@ def add_initial_parser(sub: argparse._SubParsersAction[Any]) -> None:
 
 def add_status_parser(sub: argparse._SubParsersAction[Any]) -> None:
     fleet_status = sub.add_parser(
-        "status", help="Show joined local fleet and reliability status"
+        "status", help="Show managed task, service, and lease state"
     )
     fleet_status.add_argument("--port", type=int, default=service.DEFAULT_PORT)
-    fleet_status.add_argument("--include-archived", action="store_true")
     fleet_status.set_defaults(func=cmd_status)
 
+    attention = sub.add_parser(
+        "attention", help="List everything that needs a human decision"
+    )
+    attention.set_defaults(func=cmd_attention)
+
     overview = sub.add_parser(
-        "overview", help="Group privacy-safe fleet activity by required attention"
+        "overview", help="Group managed tasks by required attention"
     )
     overview.add_argument(
         "--since",
         help="ISO-8601 lower bound for inactive items; defaults to the last 24 hours",
     )
     overview.set_defaults(func=cmd_overview)
+
+    workspaces = sub.add_parser(
+        "workspaces",
+        help="Native cdesktop workspace inventory (fans out to the executor)",
+    )
+    workspaces.add_argument("--include-archived", action="store_true")
+    workspaces.add_argument(
+        "--overview",
+        action="store_true",
+        help="Group native execution processes by required attention",
+    )
+    workspaces.add_argument(
+        "--since",
+        help="ISO-8601 lower bound for inactive items in --overview",
+    )
+    workspaces.set_defaults(func=cmd_workspaces)

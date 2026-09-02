@@ -1181,9 +1181,14 @@ def test_status_redacts_lease_capability(monkeypatch, tmp_path: Path, capsys) ->
     assert lease.token not in capsys.readouterr().out
 
 
-def test_overview_groups_native_processes_and_projects_private_fields(
+def test_native_workspace_overview_groups_processes_and_projects_private_fields(
     monkeypatch, capsys
 ) -> None:
+    """The native fan-out projection still works, but only behind the
+    explicitly named `workspaces --overview` surface. Task-local `overview`
+    must never reach the executor, so the fan-out lives here or nowhere.
+    """
+
     class OverviewClient:
         def __init__(self, _url=None) -> None:
             self.snapshots = []
@@ -1271,9 +1276,11 @@ def test_overview_groups_native_processes_and_projects_private_fields(
 
     client = OverviewClient()
     monkeypatch.setattr(cli, "CdesktopClient", lambda _url=None: client)
-    args = argparse.Namespace(url=None, since=None, json=True)
+    args = argparse.Namespace(
+        url=None, since=None, json=True, overview=True, include_archived=False
+    )
 
-    assert cli.cmd_overview(args) == 0
+    assert cli.cmd_workspaces(args) == 0
     output = json.loads(capsys.readouterr().out)
     assert [item["execution_id"] for item in output["needs_attention"]] == ["failed-a"]
     assert [item["execution_id"] for item in output["running"]] == ["running-a"]
@@ -1303,7 +1310,7 @@ def test_overview_groups_native_processes_and_projects_private_fields(
     assert len(selectors) == len(set(selectors))
 
     args.since = "2019-01-01T00:00:00Z"
-    assert cli.cmd_overview(args) == 0
+    assert cli.cmd_workspaces(args) == 0
     expanded = json.loads(capsys.readouterr().out)
     assert {item["execution_id"] for item in expanded["needs_attention"]} == {
         "failed-a",
@@ -1313,7 +1320,7 @@ def test_overview_groups_native_processes_and_projects_private_fields(
 
     args.since = None
     args.json = False
-    assert cli.cmd_overview(args) == 0
+    assert cli.cmd_workspaces(args) == 0
     default_output = capsys.readouterr().out
     assert "Needs attention\n" in default_output
     assert "Running\n" in default_output
