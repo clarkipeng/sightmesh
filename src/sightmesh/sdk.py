@@ -1039,15 +1039,20 @@ ADOPT_TIMEOUT_SECONDS = 30.0
 def _rejection_outcome(status: int | None) -> str:
     """Name what the provider did, as a type routing can act on.
 
-    Three names advance a route chain: capacity, auth, and a provider that is
-    down. Everything else stays a definitive rejection that blocks, because
-    retrying it on another account would only fail the same way.
+    Only the statuses cdesktop passes through from the provider are named:
+    capacity and auth. Everything else stays a definitive rejection that
+    blocks, because retrying it on another account would only fail the same
+    way.
+
+    ``provider_down`` is deliberately not produced here. The status on a
+    rejection is the one SightMesh's own localhost call to cdesktop returned,
+    so a 5xx describes the local service, not the model provider - mapping it
+    would cool an entire account pool for a cdesktop restart. The outcome and
+    everything that handles it stay in place for the day the seam reports an
+    upstream provider signal of its own; cdesktop 0.2.7 exposes none.
     """
     if status == 429:
         return "rate_limited"
     if status in (401, 403):
         return "auth"
-    if status is not None and 500 <= status < 600:
-        # A 5xx is the provider failing, not this account.
-        return "provider_down"
     return f"rejected:{status if status is not None else 'unknown'}"

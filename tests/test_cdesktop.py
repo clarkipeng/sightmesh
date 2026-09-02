@@ -79,7 +79,6 @@ def test_success_false_is_a_typed_server_rejection(monkeypatch) -> None:
         (424, cdesktop.CdesktopInterruptedError),
         (425, cdesktop.CdesktopPendingError),
         (429, cdesktop.CdesktopRejectedError),
-        (503, cdesktop.CdesktopRejectedError),
     ],
 )
 def test_stop_operation_http_outcomes_are_typed(
@@ -584,6 +583,25 @@ def test_an_untyped_status_stays_an_untyped_error(monkeypatch) -> None:
     assigned a meaning to: an unmapped code stays a plain CdesktopError, which
     blocks rather than reroutes."""
     _raise_http(monkeypatch, 418)
+
+    with pytest.raises(cdesktop.CdesktopError) as raised:
+        CdesktopClient("http://127.0.0.1:1").request("GET", "/task-launches/t/1")
+
+    assert not isinstance(raised.value, cdesktop.CdesktopRejectedError)
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_a_local_cdesktop_5xx_is_not_a_provider_outcome(monkeypatch, status) -> None:
+    """Regression guard against cooling an entire account pool for a local
+    fault.
+
+    The status on this response is what SightMesh's own localhost call to
+    cdesktop returned, not what the model provider said - cdesktop restarting,
+    running out of disk, or panicking all surface as 5xx. Typing it as a
+    rejection let `_rejection_outcome` read it as `provider_down`, which cools
+    every account behind the route. It stays an untyped error, so the task
+    stays reserved and retryable instead."""
+    _raise_http(monkeypatch, status)
 
     with pytest.raises(cdesktop.CdesktopError) as raised:
         CdesktopClient("http://127.0.0.1:1").request("GET", "/task-launches/t/1")
