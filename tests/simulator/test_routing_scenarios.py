@@ -13,6 +13,7 @@ launch was rejected before it ever held a session could not reroute at all.
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -412,3 +413,53 @@ def test_sd8_a_profile_that_forbids_failover_blocks_with_a_reason(
     task = store.get("operator", "audit")
     assert task.epoch == 1
     assert "automatic failover is off" in str(task.result)
+
+
+# ---------------------------------------------------------------- S-D9
+
+
+def test_sd9_an_upgraded_v1_install_still_starts_a_fanning_out_manager(
+    mesh: SightMesh, store: TaskStore, pool_root, routing_settings
+) -> None:
+    """S-D9: the exact shape every existing install upgrades into.
+
+    A v1 settings file is one flat route list with no class concept, so the
+    forward migration can only fill ``standard`` - it has no way to invent a
+    ``deep`` chain the operator never configured. Meanwhile ``class_for``
+    promotes any top-level supervised manager with children to ``deep``. The
+    two together meant `sightmesh start mgr --children 4` failed closed on
+    every upgraded install for work that ran the day before, so this writes a
+    genuine v1 file and proves the promotion degrades onto the chain that
+    exists instead of refusing.
+    """
+    seed_pool(claude_account("acct-a"))
+    routing_settings.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "executionRouting": {
+                    "enabled": True,
+                    "routes": [
+                        {
+                            "id": "fable",
+                            "executor": "CLAUDE_CODE",
+                            "model": "fable",
+                            "billingClass": "subscription",
+                            "accountPool": "claude",
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = execution_routing.ExecutionRoutingStore().load()
+    assert [chain.route_class for chain in settings.chains] == ["standard"]
+    assert execution_routing.validate_chain(settings, "deep").valid is False
+
+    manager = mesh.start(routed_spec(key="mgr", children=4))
+
+    assert manager.state == "active"
+    target = target_of(store, "mgr")
+    assert (target["route_class"], target["route_id"]) == ("standard", "fable")
+    assert target["auth_binding_id"] == "acct-a"

@@ -583,7 +583,10 @@ def test_cli_routing_validate_reports_routes_without_an_eligible_account(
     assert [
         (entry["routeClass"], entry["valid"], entry["reason"])
         for entry in payload["classes"]
-    ] == [("standard", False, "routes_exhausted")]
+    ] == [
+        ("standard", False, "routes_exhausted"),
+        ("deep", False, "routes_exhausted"),
+    ]
 
 
 def test_cli_routing_routes_add_list_and_explain(
@@ -892,12 +895,29 @@ def test_validate_chain_fails_closed_on_an_empty_or_dead_chain(
     assert any("cooling" in line for line in dead.trace)
 
 
-def test_validate_all_always_covers_the_default_class(pool_root: Path) -> None:
-    """Settings with no chain at all are the state validate exists to catch, so
-    the default class is checked even when nothing configures it."""
-    results = execution_routing.validate_all(ExecutionRoutingSettings())
+def test_validate_all_covers_every_class_including_unconfigured_ones(
+    pool_root: Path, monkeypatch
+) -> None:
+    """Regression guard for the check that could not see the problem it exists
+    to find: `class_for` promotes work onto `deep`, and the v1->v2 migration
+    fills only `standard`, so on every migrated install `deep` is empty. A
+    validate that iterated only the *configured* chains reported that install
+    fully valid, and the first fanning-out manager then failed to dispatch."""
+    pool_core.save_pool({"accounts": [_codex_account("codex-sub1")]})
+    monkeypatch.setattr(pool_core, "quota", _no_quota)
+    migrated = ExecutionRoutingSettings(
+        chains=_chains(_subscription_route("terra", "CODEX", "terra", "codex"))
+    )
 
-    assert [(r.route_class, r.valid) for r in results] == [("standard", False)]
+    results = execution_routing.validate_all(migrated)
+
+    assert [(r.route_class, r.valid) for r in results] == [
+        ("standard", True),
+        ("deep", False),
+    ]
+    assert [(r.route_class, r.valid) for r in execution_routing.validate_all(
+        ExecutionRoutingSettings()
+    )] == [("standard", False), ("deep", False)]
 
 
 def test_a_metered_hop_awaiting_approval_still_counts_as_a_usable_path(

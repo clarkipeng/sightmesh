@@ -557,44 +557,87 @@ def test_dispatch_fails_closed_when_the_class_chain_has_no_usable_hop(
     assert store.get("operator", "audit") is None
 
 
+def _free_route(route_id):
+    """A hop that needs no pool account, so routing is exercised for real.
+
+    Selection resolves a free route without ever loading pool state, which lets
+    these tests run the *real* `class_for` -> `validate_chain` -> `select_route`
+    path instead of monkeypatching the gate they exist to check.
+    """
+    return execution_routing.Route(
+        id=route_id, executor="CODEX", model=route_id, billing_class="free"
+    )
+
+
+def _configure_chains(monkeypatch, **chains):
+    settings = execution_routing.ExecutionRoutingSettings(
+        chains=tuple(
+            execution_routing.RouteChain(route_class, routes)
+            for route_class, routes in chains.items()
+        )
+    )
+    monkeypatch.setattr(
+        execution_routing.ExecutionRoutingStore, "load", lambda _self: settings
+    )
+    return settings
+
+
 def test_a_fanning_out_top_level_manager_takes_the_deep_class(system, monkeypatch):
     """Scope and risk pick the class once, at dispatch. A top-level supervised
     task that fans work out is the one shape where weak judgement multiplies
     across children, so it gets the deep chain; everything else stays
-    standard."""
+    standard.
+
+    Runs the real validate/select path rather than stubbing it: stubbing the
+    gate is what let the promotion ship against an install where the promoted
+    class had no chain at all."""
     mesh, _client, store, _ownership = system
-    seen = []
-    monkeypatch.setattr(
-        execution_routing.ExecutionRoutingStore,
-        "load",
-        lambda _self: execution_routing.ExecutionRoutingSettings(),
+    _configure_chains(
+        monkeypatch, standard=(_free_route("terra"),), deep=(_free_route("fable"),)
     )
-    monkeypatch.setattr(
-        execution_routing,
-        "validate_chain",
-        lambda _settings, route_class=None: execution_routing.ValidationResult(
-            route_class, True, None
-        ),
-    )
-
-    def select(_settings, *, route_class=None, **_kwargs):
-        seen.append(route_class)
-        return execution_routing.SelectionResult(
-            "resolved",
-            execution_routing.SelectedTarget(
-                route_class, "hop", "CODEX", "m", "subscription", "acct", "acct"
-            ),
-            (),
-            None,
-        )
-
-    monkeypatch.setattr(execution_routing, "select_route", select)
 
     mesh.start(spec(key="manager", executor=None, children=4))
     mesh.start(spec(key="worker", executor=None, children=0))
 
-    assert seen == ["deep", "standard"]
     assert store.get("operator", "manager").spec["target"]["route_class"] == "deep"
+    assert store.get("operator", "manager").spec["target"]["route_id"] == "fable"
+    assert store.get("operator", "worker").spec["target"]["route_class"] == "standard"
+    assert store.get("operator", "worker").spec["target"]["route_id"] == "terra"
+
+
+def test_a_promotion_onto_an_unconfigured_class_falls_back_to_the_default(
+    system, monkeypatch, caplog
+):
+    """Regression guard for the upgrade that broke every existing install: the
+    v1->v2 migration fills only `standard`, `class_for` promotes any fanning-out
+    top-level manager to `deep`, and the fail-closed gate then refused a start
+    that had worked the day before.
+
+    Promotion is this module's judgement, not the operator's instruction, so a
+    promoted class with no chain must degrade visibly onto the default rather
+    than refuse the work."""
+    mesh, _client, store, _ownership = system
+    _configure_chains(monkeypatch, standard=(_free_route("terra"),))
+
+    with caplog.at_level("WARNING", logger="sightmesh.sdk"):
+        mesh.start(spec(key="manager", executor=None, children=4))
+
+    target = store.get("operator", "manager").spec["target"]
+    assert (target["route_class"], target["route_id"]) == ("standard", "terra")
+    assert "deep" in caplog.text and "manager" in caplog.text
+
+
+def test_an_explicit_class_with_no_chain_is_still_refused(system, monkeypatch):
+    """Falling open is only ever right for a promotion. An operator who names
+    `deep` asked for that chain specifically, so silently running the work on
+    `standard` would answer a different question than the one they asked."""
+    mesh, _client, store, _ownership = system
+    _configure_chains(monkeypatch, standard=(_free_route("terra"),))
+
+    with pytest.raises(SightMeshError, match="deep"):
+        mesh.start(spec(key="deepwork", executor=None, route_class="deep"))
+
+    assert store.get("operator", "deepwork") is None
 
 
 def test_routed_start_requires_one_enabled_default_provider(system, monkeypatch):
