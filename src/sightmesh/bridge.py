@@ -238,23 +238,13 @@ class BridgeSupervisor:
             store=self.reconciler.task_store,
             ownership=self.reconciler.ownership,
         )
+        # Read-only compatibility surface for callers that tuned PR #9's
+        # observation threshold; recovery itself belongs to the reconciler.
+        self.stalls = self.reconciler.liveness
 
     async def run(self) -> None:
-        """Tick forever. A failing tick is a warning, never the end of the loop.
-
-        The supervisor is the process. An exception escaping one reconcile -
-        from a hostile executor payload, a corrupt row, anything - used to end
-        the loop silently: every bridge stopped, every wake stopped being
-        delivered, and nothing said so. The next tick is two seconds away and
-        may well succeed.
-        """
         while True:
-            try:
-                await self.reconcile()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - one tick never ends the loop
-                LOGGER.warning("Bridge reconcile tick failed: %s", exc)
+            await self.reconcile()
             await asyncio.sleep(2)
 
     async def reconcile(self) -> None:
@@ -262,13 +252,24 @@ class BridgeSupervisor:
         desired: dict[str, BridgedSession] = {}
         # Wake delivery reads task rows, not workspaces, so it runs once per
         # tick and cannot be starved behind a slow or failing workspace scan.
-        # ``reconcile_kernel`` isolates its own stages and does not raise, but
-        # this call sits outside the try below, so it is guarded here too
-        # rather than relying on a promise made in another module.
         try:
             await asyncio.to_thread(self.reconciler.reconcile_kernel)
-        except Exception as exc:  # noqa: BLE001 - the kernel pass never fails the tick
+        except Exception as exc:  # noqa: BLE001 - a kernel pass never ends a tick
             LOGGER.warning("Cannot reconcile the task kernel: %s", exc)
+        # A launch rejected before its task ever activated holds no session, so
+        # the per-session pass below can never reach it. This journal-keyed
+        # sweep is what advances it past its typed provider outcome.
+        try:
+            await asyncio.to_thread(self.managed_tasks.reconcile_provider_outcomes)
+        except (
+            CdesktopError,
+            ExecutionRoutingError,
+            PoolError,
+            SightMeshError,
+            SuccessionError,
+            TaskStoreError,
+        ) as exc:
+            LOGGER.warning("Cannot reconcile typed provider outcomes: %s", exc)
         try:
             await asyncio.to_thread(
                 leases.sync_active_workspaces,
@@ -294,7 +295,7 @@ class BridgeSupervisor:
                 for session in sessions:
                     try:
                         await asyncio.to_thread(
-                            self.managed_tasks.reconcile_quota_failure,
+                            self.managed_tasks.reconcile_provider_outcome,
                             str(session["id"]),
                         )
                     except (

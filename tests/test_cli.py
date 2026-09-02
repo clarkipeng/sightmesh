@@ -27,6 +27,8 @@ from sightmesh.leases import LeaseStore
 from sightmesh.profiles import Profile, ProfileStore
 from sightmesh.runtime_lock import RUNTIME_LOCK
 
+from fixtures.routing import _chains
+
 
 def test_read_text_requires_one_source(tmp_path) -> None:
     prompt = tmp_path / "prompt.txt"
@@ -1080,7 +1082,7 @@ def test_refused_free_route_spawn_escalates_and_releases_its_lease(
     )
     execution_routing.ExecutionRoutingStore(settings_path).save(
         execution_routing.ExecutionRoutingSettings(
-            routes=(
+            chains=_chains(
                 execution_routing.Route(
                     id="opencode-ox-free",
                     executor="OPENCODE",
