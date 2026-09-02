@@ -75,8 +75,10 @@ request. An
 unknown backend that lacks the drain endpoint fails closed.
 
 `sightmesh doctor` reports `cdesktop-version-skew`, comparing the installed CLI, the
-running service, and the active release, and failing when they disagree or stale
-releases remain past the prune budget.
+running service, and the active release as normalized version tokens. It fails when the
+running service disagrees with the active release, or when stale releases remain past
+the prune budget. A globally installed CLI that lags the active release is reported as
+`warning_only`, because it is not what the service runs.
 
 ## Plan approvals
 

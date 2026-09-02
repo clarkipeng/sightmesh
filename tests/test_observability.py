@@ -764,3 +764,40 @@ def test_approve_reports_the_answered_approval_with_the_credential_removed(
     result = json.loads(output)
     assert result["decision"]["decision"] == "approved"
     assert result["cdesktop_response"] == {"status": "approved"}
+
+
+def test_version_skew_compares_normalized_tokens(monkeypatch) -> None:
+    """The active release records cdesktop's full package label while the
+    service reports a bare version, so comparing the raw strings reported
+    two identical versions as skew and trained operators to ignore the check.
+    """
+    _skew_state(
+        monkeypatch,
+        {"active": {"version": "cdesktop/0.2.5-sightmesh.1 darwin-arm64"}},
+        [],
+    )
+
+    check = cli._version_skew_check("0.2.5-sightmesh.1", "cdesktop/0.2.5-sightmesh.1")
+
+    assert check["ok"] is True
+    assert check["detail"]["active"] == "0.2.5-sightmesh.1"
+
+
+def test_a_lagging_global_cli_is_a_warning_not_a_doctor_failure(monkeypatch) -> None:
+    """The globally installed `cdesktop` binary is not what the service runs:
+    SightMesh activates its own release under ~/.local/share. The pair that
+    must agree is running-vs-active; failing on a stale global binary makes
+    `doctor` red on every host that ever installed cdesktop by hand.
+    """
+    _skew_state(monkeypatch, {"active": {"version": "0.2.5-sightmesh.1"}}, [])
+
+    check = cli._version_skew_check("0.2.5-sightmesh.1", "cdesktop/0.2.4-sightmesh.1")
+
+    assert check["ok"] is False
+    assert check["warning_only"] is True
+    # A running service that disagrees with the activated release still fails.
+    running_skew = cli._version_skew_check(
+        "0.2.4-sightmesh.1", "cdesktop/0.2.5-sightmesh.1"
+    )
+    assert running_skew["ok"] is False
+    assert running_skew["warning_only"] is False

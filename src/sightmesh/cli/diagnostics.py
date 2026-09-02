@@ -16,7 +16,14 @@ def _version_skew_check(
 
     Skew is invisible until something breaks, which is how three cdesktop
     releases accumulated on one host. Reporting all three versions in one
-    failing check makes it a first-class `doctor` outcome instead.
+    check makes it a first-class `doctor` outcome instead.
+
+    Every version is normalized to a bare token first: the active release is
+    recorded as a package label while the service reports a plain version,
+    so comparing the raw strings called two identical versions skew. Only a
+    running service that disagrees with the activated release is a failure -
+    that is the pair that has to match. The globally installed `cdesktop`
+    binary is not what the service runs, so it is reported as a warning.
     """
     try:
         state = updates.read_state()
@@ -26,19 +33,20 @@ def _version_skew_check(
             "ok": False,
             "detail": {"error": f"update state is unreadable: {exc}"},
         }
-    active = _release_version(state.get("active"))
-    staged = _release_version(state.get("pending"))
+    active = _version_token(_release_version(state.get("active")))
+    staged = _version_token(_release_version(state.get("pending")))
     running = _version_token(running_version)
     installed_cli = _version_token(installed_cli_detail)
     try:
         stale = updates.prune(dry_run=True)["removed"]
     except (OSError, RuntimeError, ValueError) as exc:
         stale = [f"unreadable: {exc}"]
-    observed = {value for value in (active, running, installed_cli) if value}
-    ok = len(observed) <= 1 and not stale
+    runtime_skew = bool(running and active and running != active)
+    cli_skew = bool(installed_cli and active and installed_cli != active)
     return {
         "check": "cdesktop-version-skew",
-        "ok": ok,
+        "ok": not (runtime_skew or cli_skew or stale),
+        "warning_only": cli_skew and not runtime_skew and not stale,
         "detail": {
             "installed_cli": installed_cli,
             "running_service": running,
@@ -147,7 +155,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     skew = _version_skew_check(running_version, installed_cli_detail)
     checks.append(skew)
-    failures += int(not skew["ok"])
+    failures += int(not skew["ok"] and not skew["warning_only"])
 
     if shutil.which("repowire"):
         result = subprocess.run(
