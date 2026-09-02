@@ -23,7 +23,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .cdesktop import CdesktopError, CdesktopRejectedError
+from .cdesktop import CdesktopError, is_effect_not_found
 from .task_store import TaskStore, TaskStoreError
 
 LOGGER = logging.getLogger("sightmesh.effects")
@@ -291,15 +291,12 @@ class EffectJournal:
             return None
         try:
             native = lookup(task_id, epoch)
-        except CdesktopRejectedError as exc:
-            if exc.status == 404 or "404" in str(exc):
-                return None
-            raise _UnknowableEffect(str(exc)) from exc
         except CdesktopError as exc:
-            # A typed 404 is real absence; anything else (unreachable executor,
-            # 5xx, timeout) is not proof of death - reuse ``_probe_managed_launch``'s
-            # ``"404" not in str(exc)`` test.
-            if "404" in str(exc):
+            # Real absence is whatever the executor's own miss shape says
+            # (HTTP 400 "Managed task effect not found" on the pinned seam,
+            # 404 on a corrected one); anything else (unreachable executor,
+            # 5xx, timeout) is not proof of death.
+            if is_effect_not_found(exc):
                 return None
             raise _UnknowableEffect(str(exc)) from exc
         if not isinstance(native, Mapping):

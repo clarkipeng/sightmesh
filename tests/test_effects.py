@@ -242,3 +242,26 @@ def test_expiry_loses_a_reservation_no_native_session_stands_behind(tmp_path):
 def test_get_returns_none_for_an_unreserved_epoch(journal):
     """Callers branch on this to decide between adopt and launch."""
     assert journal.get("task-1", 7) is None
+
+
+def test_the_pinned_seams_400_not_found_shape_is_definitive_absence(tmp_path):
+    """Live-canary finding (2026-09-01): the pinned cdesktop seam reports a
+    missing effect as HTTP 400 "Managed task effect not found", not 404
+    (managed_tasks.rs maps the miss to ApiError::BadRequest). Treating only
+    404 as absence blocked the capability probe against the real server and
+    silently disabled reservation retirement. Both shapes are real absence;
+    a 400 with any other message stays unknowable.
+    """
+    from sightmesh.cdesktop import CdesktopRejectedError, is_effect_not_found
+
+    real_miss = CdesktopRejectedError(
+        'HTTP 400: {"success":false,"data":null,"error_data":null,'
+        '"message":"Managed task effect not found"}',
+        status=400,
+    )
+    assert is_effect_not_found(real_miss)
+    assert is_effect_not_found(CdesktopRejectedError("gone", status=404))
+    assert not is_effect_not_found(
+        CdesktopRejectedError("Caller session belongs to another workspace", status=400)
+    )
+    assert not is_effect_not_found(CdesktopRejectedError("boom", status=500))
