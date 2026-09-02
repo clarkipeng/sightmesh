@@ -21,6 +21,7 @@ from .cdesktop import (
     CdesktopInterruptedError,
     CdesktopPendingError,
     CdesktopRejectedError,
+    is_effect_not_found,
     latest_execution_process,
 )
 from .effects import EffectBusy, EffectJournal, new_owner_instance, request_hash
@@ -722,7 +723,7 @@ class SightMesh:
         try:
             effect = lookup(CONTRACT_PROBE_TASK_ID, 1)
         except CdesktopError as exc:
-            if "404" not in str(exc):
+            if not is_effect_not_found(exc):
                 raise SightMeshError(
                     f"cdesktop managed task launch probe failed: {exc}"
                 ) from exc

@@ -38,6 +38,27 @@ class CdesktopPendingError(CdesktopRejectedError):
     """A keyed operation is still owned by another cdesktop request (HTTP 425)."""
 
 
+EFFECT_NOT_FOUND_MESSAGE = "Managed task effect not found"
+
+
+def is_effect_not_found(exc: CdesktopError) -> bool:
+    """True when the executor definitively reported a missing managed effect.
+
+    The pinned cdesktop seam returns HTTP 400 with this exact message for a
+    missing ``(task, epoch)`` effect (managed_tasks.rs maps the miss to
+    ``ApiError::BadRequest``); a future seam may correct that to 404. Both are
+    real absence. Anything else - 5xx, timeout, unreachable - proves nothing.
+    """
+    if not isinstance(exc, CdesktopError):
+        return False
+    text = str(exc)
+    if getattr(exc, "status", None) == 404 or "404" in text:
+        return True
+    # The client maps the seam's 400 to a plain CdesktopError without a typed
+    # status, so the canonical miss message is the discriminator.
+    return EFFECT_NOT_FOUND_MESSAGE.lower() in text.lower()
+
+
 def execution_process_event_time(process: dict[str, Any]) -> datetime | None:
     raw = (
         process.get("completed_at")
