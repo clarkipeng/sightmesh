@@ -206,6 +206,7 @@ class TaskStore:
                         workspace_id TEXT,
                         session_id TEXT,
                         outcome TEXT,
+                        retry_at REAL,
                         owner_instance TEXT NOT NULL,
                         lease_expires_at REAL NOT NULL,
                         created_at REAL NOT NULL,
@@ -214,6 +215,7 @@ class TaskStore:
                     )
                     """
                 )
+                self._ensure_effect_retry_at(conn)
                 self._migrate_task_wakes(conn)
                 conn.execute("COMMIT")
         except sqlite3.DatabaseError as exc:
@@ -326,6 +328,23 @@ class TaskStore:
             # Only on the first upgrade, when the counter was just introduced -
             # never on a re-open, which would clobber live counters.
             TaskStore._backfill_child_event_seq(conn)
+
+    @staticmethod
+    def _ensure_effect_retry_at(conn: sqlite3.Connection) -> None:
+        """Add ``task_effects.retry_at`` forward-only, under the write lock.
+
+        Routing lane addition: a capacity outcome carries the provider's own
+        advertised reset, and the reconcile that reads the outcome runs long
+        after the rejection, so the value has to be durable next to it. The
+        column is nullable with no default, which makes ``ADD COLUMN`` a legal
+        forward migration and leaves every existing row untouched.
+        """
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(task_effects)").fetchall()
+        }
+        if "retry_at" not in columns:
+            conn.execute("ALTER TABLE task_effects ADD COLUMN retry_at REAL")
 
     @staticmethod
     def _migrate_task_wakes(conn: sqlite3.Connection) -> None:

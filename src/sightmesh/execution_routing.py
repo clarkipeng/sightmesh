@@ -1,11 +1,17 @@
-"""Execution routing policy: ordered routes over the authoritative pool.
+"""Execution routing policy: per-class route chains over the authoritative pool.
 
 A route names an executor, a model, a billing class, and either a pool of
-owned accounts (subscription) or one fixed account (metered). Selection walks
-routes in configured order and, within each route, accounts in pool order -
-`pool_core` stays the single source of account identity, credential, cooldown,
-and quota truth. Nothing here mirrors or caches pool state; every call re-reads
-it, so a newly added account or a freshly cooled one participates immediately.
+owned accounts (subscription) or one fixed account (metered). Routes are
+grouped into *classes* - the unit a manager selects - and each class holds one
+ordered fallback chain. Selection walks that chain in order and, within each
+route, accounts in pool order - `pool_core` stays the single source of account
+identity, credential, cooldown, and quota truth. Nothing here mirrors or caches
+pool state; every call re-reads it, so a newly added account or a freshly
+cooled one participates immediately.
+
+Class membership is the only closed set here. Which models a class contains is
+operator data in ``Route.model``, so adding or renaming a model is a settings
+edit, never a code change.
 
 Settings never carry tokens, headers, credential paths, or provider response
 bodies - only route shape and policy.
@@ -24,10 +30,24 @@ from typing import Any
 
 from .pool import core as pool_core
 
-SETTINGS_VERSION = 1
+SETTINGS_VERSION = 2
+#: Settings shapes this module can still read. A v1 file carries one flat
+#: ``routes`` list, which migrates forward into the ``standard`` chain.
+READABLE_SETTINGS_VERSIONS = (1, SETTINGS_VERSION)
 
 EXECUTORS = {"CLAUDE_CODE", "CODEX", "OPENCODE"}
 BILLING_CLASSES = {"subscription", "metered", "free"}
+
+#: The two route classes the contract names (docs/kernel-contract.md,
+#: "Routing"). This is the only closed set the class model introduces: the
+#: models a class chains through live in ``Route.model`` as operator data.
+ROUTE_CLASSES = ("standard", "deep")
+DEFAULT_ROUTE_CLASS = "standard"
+
+#: A top-level supervised task that fans out at least this many children is a
+#: manager: its judgement propagates to every child, which is the risk the
+#: deep chain exists to cover.
+DEEP_CLASS_MIN_CHILDREN = 1
 
 # A free route bills nothing and therefore owns no account. Selection still has
 # to hand the launcher *some* binding id, so it gets this fixed sentinel - which
@@ -36,10 +56,6 @@ BILLING_CLASSES = {"subscription", "metered", "free"}
 FREE_AUTH_BINDING = "free"
 METERED_FALLBACK_VALUES = {"auto", "ask", "never"}
 ALL_ROUTES_EXHAUSTED_VALUES = {"block"}
-
-MAX_SAME_ROUTE_RETRIES = 3
-MAX_BACKOFF_SECONDS = 3600
-MAX_BACKOFF_STEPS = 10
 
 # How a free route's terminal failure is described to a human. This is a
 # report, never routing truth: nothing here is persisted, and no selection
@@ -148,12 +164,53 @@ class Route:
 
 
 @dataclass(frozen=True)
+class RouteChain:
+    """One route class and its ordered fallback chain.
+
+    The chain is what the contract calls terra->luna->sol: each hop is one
+    ``Route``, and selection advances a hop only when every account of the
+    current one is ineligible.
+    """
+
+    route_class: str
+    routes: tuple[Route, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.route_class not in ROUTE_CLASSES:
+            raise ExecutionRoutingError(f"Unsupported route class: {self.route_class}")
+        ids = [route.id for route in self.routes]
+        if len(ids) != len(set(ids)):
+            raise ExecutionRoutingError(
+                f"Route ids must be unique within class {self.route_class}"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "routeClass": self.route_class,
+            "routes": [route.to_dict() for route in self.routes],
+        }
+
+    @staticmethod
+    def from_dict(value: Any) -> "RouteChain":
+        if not isinstance(value, dict):
+            raise ExecutionRoutingError("Invalid route chain entry")
+        try:
+            return RouteChain(
+                route_class=value["routeClass"],
+                routes=tuple(Route.from_dict(item) for item in value.get("routes", [])),
+            )
+        except KeyError as exc:
+            raise ExecutionRoutingError(
+                f"Route chain entry missing field: {exc}"
+            ) from exc
+
+
+@dataclass(frozen=True)
 class ExecutionRoutingSettings:
     enabled: bool = True
-    routes: tuple[Route, ...] = ()
+    chains: tuple[RouteChain, ...] = ()
+    default_class: str = DEFAULT_ROUTE_CLASS
     metered_fallback: str = "auto"
-    same_route_retries: int = 2
-    transient_backoff_seconds: tuple[int, ...] = (5, 20)
     approval_timeout_minutes: int = 0
     all_routes_exhausted: str = "block"
     notify_on_swap: bool = True
@@ -168,26 +225,10 @@ class ExecutionRoutingSettings:
             raise ExecutionRoutingError(
                 f"Unsupported meteredFallback: {self.metered_fallback}"
             )
-        if not 0 <= self.same_route_retries <= MAX_SAME_ROUTE_RETRIES:
+        if self.default_class not in ROUTE_CLASSES:
             raise ExecutionRoutingError(
-                f"sameRouteRetries must be between 0 and {MAX_SAME_ROUTE_RETRIES}"
+                f"Unsupported defaultClass: {self.default_class}"
             )
-        if not self.transient_backoff_seconds:
-            raise ExecutionRoutingError("transientBackoffSeconds must not be empty")
-        if len(self.transient_backoff_seconds) > MAX_BACKOFF_STEPS:
-            raise ExecutionRoutingError(
-                f"transientBackoffSeconds must have at most {MAX_BACKOFF_STEPS} entries"
-            )
-        for seconds in self.transient_backoff_seconds:
-            if (
-                isinstance(seconds, bool)
-                or not isinstance(seconds, int)
-                or not 0 < seconds <= MAX_BACKOFF_SECONDS
-            ):
-                raise ExecutionRoutingError(
-                    "transientBackoffSeconds values must be positive integers"
-                    f" up to {MAX_BACKOFF_SECONDS}"
-                )
         if self.approval_timeout_minutes < 0:
             raise ExecutionRoutingError(
                 "approvalTimeoutMinutes must be 0 or a positive integer"
@@ -196,9 +237,26 @@ class ExecutionRoutingSettings:
             raise ExecutionRoutingError(
                 f"Unsupported allRoutesExhausted: {self.all_routes_exhausted}"
             )
-        ids = [route.id for route in self.routes]
-        if len(ids) != len(set(ids)):
-            raise ExecutionRoutingError("Route ids must be unique")
+        classes = [chain.route_class for chain in self.chains]
+        if len(classes) != len(set(classes)):
+            raise ExecutionRoutingError("Each route class may hold only one chain")
+
+    def chain(self, route_class: str | None = None) -> RouteChain | None:
+        """The chain for a class, or ``None`` when the class is unconfigured."""
+        wanted = route_class or self.default_class
+        return next(
+            (chain for chain in self.chains if chain.route_class == wanted), None
+        )
+
+    def routes_for(self, route_class: str | None = None) -> tuple[Route, ...]:
+        chain = self.chain(route_class)
+        return chain.routes if chain else ()
+
+    def route(self, route_class: str | None, route_id: str) -> Route | None:
+        return next(
+            (route for route in self.routes_for(route_class) if route.id == route_id),
+            None,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return _settings_to_dict(self)
@@ -207,10 +265,9 @@ class ExecutionRoutingSettings:
 def _settings_to_dict(settings: ExecutionRoutingSettings) -> dict[str, Any]:
     return {
         "enabled": settings.enabled,
-        "routes": [route.to_dict() for route in settings.routes],
+        "chains": [chain.to_dict() for chain in settings.chains],
+        "defaultClass": settings.default_class,
         "meteredFallback": settings.metered_fallback,
-        "sameRouteRetries": settings.same_route_retries,
-        "transientBackoffSeconds": list(settings.transient_backoff_seconds),
         "approvalTimeoutMinutes": settings.approval_timeout_minutes,
         "allRoutesExhausted": settings.all_routes_exhausted,
         "notifyOnSwap": settings.notify_on_swap,
@@ -219,24 +276,29 @@ def _settings_to_dict(settings: ExecutionRoutingSettings) -> dict[str, Any]:
     }
 
 
+def _chains_from_dict(data: dict[str, Any]) -> tuple[RouteChain, ...]:
+    """Read v2 ``chains``, or migrate a v1 flat ``routes`` list forward.
+
+    v1 had no class concept, so its single ordered list is exactly the
+    ``standard`` chain. The migration is pure and total: it needs no default
+    and can never invent a hop the operator did not configure.
+    """
+    if "chains" in data:
+        return tuple(RouteChain.from_dict(item) for item in data.get("chains") or [])
+    legacy = tuple(Route.from_dict(item) for item in data.get("routes") or [])
+    return (RouteChain(DEFAULT_ROUTE_CLASS, legacy),) if legacy else ()
+
+
 def _settings_from_dict(data: Any) -> ExecutionRoutingSettings:
     if not isinstance(data, dict):
         raise ExecutionRoutingError("Invalid executionRouting settings")
     defaults = ExecutionRoutingSettings()
-    routes = tuple(Route.from_dict(item) for item in data.get("routes", []))
     try:
         return ExecutionRoutingSettings(
             enabled=data.get("enabled", defaults.enabled),
-            routes=routes,
+            chains=_chains_from_dict(data),
+            default_class=data.get("defaultClass", defaults.default_class),
             metered_fallback=data.get("meteredFallback", defaults.metered_fallback),
-            same_route_retries=data.get(
-                "sameRouteRetries", defaults.same_route_retries
-            ),
-            transient_backoff_seconds=tuple(
-                data.get(
-                    "transientBackoffSeconds", defaults.transient_backoff_seconds
-                )
-            ),
             approval_timeout_minutes=data.get(
                 "approvalTimeoutMinutes", defaults.approval_timeout_minutes
             ),
@@ -282,7 +344,10 @@ class ExecutionRoutingStore:
             raise ExecutionRoutingError(
                 f"Cannot read routing settings {self.path}: {exc}"
             ) from exc
-        if not isinstance(payload, dict) or payload.get("version") != SETTINGS_VERSION:
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") not in READABLE_SETTINGS_VERSIONS
+        ):
             raise ExecutionRoutingError(
                 f"Unsupported routing settings version: {self.path}"
             )
@@ -305,18 +370,26 @@ class ExecutionRoutingStore:
 
 
 def route_warnings(settings: ExecutionRoutingSettings) -> list[str]:
-    """Routes that cannot currently resolve to any pool account. Advisory only."""
+    """Routes that cannot currently resolve to any pool account. Advisory only.
+
+    Advisory means exactly that: a warning never blocks a dispatch. The gate
+    that does is :func:`validate_chain`, which asks the stronger question -
+    does this *class* still have one usable hop.
+    """
     pool = pool_core.load_pool()
     state = pool_core.load_state()
     warnings: list[str] = []
-    for route in settings.routes:
-        if route.billing_class == "free":
-            continue
-        if not any(
-            _account_eligibility(account, state, frozenset())[0]
-            for account in _route_candidates(route, pool)
-        ):
-            warnings.append(f"route {route.id}: no eligible account")
+    for chain in settings.chains:
+        for route in chain.routes:
+            if route.billing_class == "free":
+                continue
+            if not any(
+                _account_eligibility(account, state, frozenset())[0]
+                for account in _route_candidates(route, pool)
+            ):
+                warnings.append(
+                    f"class {chain.route_class}: route {route.id}: no eligible account"
+                )
     return warnings
 
 
@@ -342,6 +415,7 @@ def classify_free_failure(output: str) -> str:
 
 @dataclass(frozen=True)
 class SelectedTarget:
+    route_class: str
     route_id: str
     executor: str
     model: str
@@ -415,10 +489,14 @@ def _trace_account(account: dict[str, Any], settings: ExecutionRoutingSettings) 
 
 
 def _target(
-    route: Route, account: dict[str, Any] | None, settings: ExecutionRoutingSettings
+    route: Route,
+    account: dict[str, Any] | None,
+    settings: ExecutionRoutingSettings,
+    route_class: str,
 ) -> SelectedTarget:
     account_id = account["id"] if account else None
     return SelectedTarget(
+        route_class=route_class,
         route_id=route.id,
         executor=route.executor,
         model=route.model,
@@ -431,11 +509,16 @@ def _target(
 def select_route(
     settings: ExecutionRoutingSettings,
     *,
+    route_class: str | None = None,
     preferred_model: str | None = None,
     exclude_account_ids: frozenset[str] = frozenset(),
     exclude_route_ids: frozenset[str] = frozenset(),
 ) -> SelectionResult:
-    """Walk configured routes in order and return a safe selection outcome.
+    """Walk one class chain in order and return a safe selection outcome.
+
+    Selection never leaves the class it was asked for. That is what makes a
+    failover stay on the chain the manager was dispatched onto: the class is
+    frozen at dispatch, and every later hop walks the same chain.
 
     Only ever produces an opaque `auth_binding_id` (the pool account id) - never
     a resolved credential. That resolution boundary belongs to the executor
@@ -446,12 +529,17 @@ def select_route(
     name one of them without naming them all.
     """
     trace: list[str] = []
+    wanted = route_class or settings.default_class
 
     if not settings.enabled:
         trace.append("execution routing disabled")
         return SelectionResult("blocked", None, tuple(trace), "routing_disabled")
-    if not settings.routes:
-        trace.append("no routes configured")
+    if wanted not in ROUTE_CLASSES:
+        trace.append(f"unknown route class {wanted}")
+        return SelectionResult("blocked", None, tuple(trace), "unknown_route_class")
+    routes = settings.routes_for(wanted)
+    if not routes:
+        trace.append(f"class {wanted}: no routes configured")
         return SelectionResult("blocked", None, tuple(trace), "routes_exhausted")
 
     # Loaded on the first route that actually needs an account, so a free route
@@ -464,7 +552,7 @@ def select_route(
             pool_state = (pool_core.load_pool(), pool_core.load_state())
         return pool_state
 
-    for route in settings.routes:
+    for route in routes:
         if route.id in exclude_route_ids:
             trace.append(f"route {route.id}: skip, excluded by caller")
             continue
@@ -478,7 +566,10 @@ def select_route(
         if route.billing_class == "free":
             trace.append(f"selected route {route.id}: free, no account required")
             return SelectionResult(
-                "resolved", _target(route, None, settings), tuple(trace), None
+                "resolved",
+                _target(route, None, settings, wanted),
+                tuple(trace),
+                None,
             )
 
         if route.billing_class == "metered" and settings.metered_fallback == "never":
@@ -511,7 +602,7 @@ def select_route(
             continue
 
         if route.billing_class == "metered" and settings.metered_fallback == "ask":
-            target = _target(route, eligible_account, settings)
+            target = _target(route, eligible_account, settings, wanted)
             trace.append(
                 f"route {route.id}: metered route reached, meteredFallback=ask, "
                 "approval required"
@@ -520,9 +611,109 @@ def select_route(
                 "approval_needed", target, tuple(trace), "approval_needed"
             )
 
-        target = _target(route, eligible_account, settings)
+        target = _target(route, eligible_account, settings, wanted)
         trace.append(f"selected route {route.id}")
         return SelectionResult("resolved", target, tuple(trace), None)
 
-    trace.append("all configured routes exhausted")
+    trace.append(f"class {wanted}: all configured routes exhausted")
     return SelectionResult("blocked", None, tuple(trace), "routes_exhausted")
+
+
+# ---------------------------------------------------------------- class policy
+
+
+@dataclass(frozen=True)
+class ScopeRisk:
+    """The dispatch-time facts a route class is decided from.
+
+    Derived from the worker spec alone, so the decision is reproducible from
+    the persisted task and never depends on live pool or provider state.
+    """
+
+    route_class: str | None = None
+    permission: str = "SUPERVISED"
+    top_level: bool = True
+    children: int = 0
+
+
+def class_for(scope_risk: ScopeRisk, settings: ExecutionRoutingSettings) -> str:
+    """Standard for ordinary work; deep when scope and risk demand it.
+
+    Deliberately thin. An explicit operator choice always wins; otherwise the
+    deep chain is reserved for a top-level supervised manager that fans work
+    out, because that is the one shape where a weak judgement is multiplied
+    across children rather than confined to one worker.
+    """
+    if scope_risk.route_class:
+        if scope_risk.route_class not in ROUTE_CLASSES:
+            raise ExecutionRoutingError(
+                f"Unsupported route class: {scope_risk.route_class}"
+            )
+        return scope_risk.route_class
+    if (
+        scope_risk.permission == "SUPERVISED"
+        and scope_risk.top_level
+        and scope_risk.children >= DEEP_CLASS_MIN_CHILDREN
+    ):
+        return "deep"
+    return settings.default_class
+
+
+# ---------------------------------------------------------------- validation
+
+
+@dataclass(frozen=True)
+class ValidationResult:
+    route_class: str
+    valid: bool
+    reason: str | None
+    trace: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "routeClass": self.route_class,
+            "valid": self.valid,
+            "reason": self.reason,
+            "trace": list(self.trace),
+        }
+
+
+def validate_chain(
+    settings: ExecutionRoutingSettings, route_class: str | None = None
+) -> ValidationResult:
+    """Prove one class chain can currently run something, before dispatch.
+
+    This is the fail-closed gate: an unconfigured class, an empty chain, or a
+    chain whose every hop is ineligible is invalid, and a caller that honours
+    it never opens an epoch it cannot fill. A metered hop awaiting approval
+    still counts as a usable path - the work has somewhere to go, it just
+    needs a human first.
+    """
+    wanted = route_class or settings.default_class
+    if wanted not in ROUTE_CLASSES:
+        return ValidationResult(wanted, False, "unknown_route_class")
+    if not settings.enabled:
+        return ValidationResult(wanted, False, "routing_disabled")
+    if not settings.routes_for(wanted):
+        return ValidationResult(wanted, False, "routes_exhausted")
+    result = select_route(settings, route_class=wanted)
+    valid = result.status in {"resolved", "approval_needed"}
+    return ValidationResult(
+        wanted, valid, None if valid else result.reason, result.trace
+    )
+
+
+def validate_all(settings: ExecutionRoutingSettings) -> tuple[ValidationResult, ...]:
+    """Validate every class that has a chain, plus the default class always.
+
+    The default class is checked even when unconfigured: a settings file with
+    no chain for the class dispatch will actually use is the exact state
+    ``routing validate`` exists to catch.
+    """
+    classes = [chain.route_class for chain in settings.chains]
+    if settings.default_class not in classes:
+        classes.append(settings.default_class)
+    return tuple(
+        validate_chain(settings, route_class)
+        for route_class in sorted(classes, key=ROUTE_CLASSES.index)
+    )

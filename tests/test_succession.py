@@ -22,13 +22,15 @@ from sightmesh.succession import (
     OwnershipStore,
     QuarantinedSessionError,
     SuccessionError,
+    advance_route_after_outcome,
+    cool_provider_outcome,
     escalate_free_route_failure,
-    reroute_after_quota_exhaustion,
     resolve_live_successor,
     transfer_ownership,
 )
 
 from fixtures import free_route_failures
+from fixtures.routing import _chains
 
 class FakeCdesktop:
     """Stateful stand-in for cdesktop's durable command machinery.
@@ -582,7 +584,7 @@ def test_quota_exhaustion_cools_binding_and_selects_next_route(
         pool_core, "quota", lambda _account: {"known": False, "reason": "no source"}
     )
     settings = ExecutionRoutingSettings(
-        routes=(
+        chains=_chains(
             Route(
                 id="claude-max",
                 executor="CLAUDE_CODE",
@@ -604,8 +606,11 @@ def test_quota_exhaustion_cools_binding_and_selects_next_route(
     assert before.status == "resolved"
     assert before.target.auth_binding_id == "max-a"
 
-    result = reroute_after_quota_exhaustion(
-        settings, exhausted_binding_id="max-a", cooldown_seconds=3600
+    cool_provider_outcome(
+        settings, outcome="auth", binding_id="max-a", route_id="claude-max"
+    )
+    result = advance_route_after_outcome(
+        settings, outcome="auth", failed_binding_id="max-a"
     )
 
     # The cooldown is durable pool state, observed by every later selection.
@@ -689,7 +694,7 @@ def test_routed_selection_reroutes_spawn_after_quota_exhaustion(
     )
     settings = execution_routing.ExecutionRoutingStore().save(
         ExecutionRoutingSettings(
-            routes=(
+            chains=_chains(
                 Route(
                     id="claude-max",
                     executor="CLAUDE_CODE",
@@ -717,7 +722,9 @@ def test_routed_selection_reroutes_spawn_after_quota_exhaustion(
         "max-a",
     )
 
-    reroute_after_quota_exhaustion(settings, exhausted_binding_id="max-a")
+    cool_provider_outcome(
+        settings, outcome="rate_limited", binding_id="max-a", route_id="claude-max"
+    )
 
     second = cli._profile_selection(args, client=None)
     assert (second.executor, second.route_id, second.auth_binding_id) == (
@@ -799,7 +806,7 @@ def test_free_route_failure_escalates_to_a_live_parent_and_never_degrades(
     """Why: a free route owns no account, so nothing cools and nothing reroutes.
     Without an escalation the worker is simply blocked with no signal at all."""
     client = _live_parent_client()
-    settings = ExecutionRoutingSettings(routes=(FREE_ROUTE, PAID_ROUTE))
+    settings = ExecutionRoutingSettings(chains=_chains(FREE_ROUTE, PAID_ROUTE))
     assert settings.fallback_on_free_failure is False
 
     failure = escalate_free_route_failure(
@@ -835,7 +842,7 @@ def test_free_route_failure_parks_in_the_decision_inbox_without_a_parent(
     store_ = EscalationStore()
     failure = escalate_free_route_failure(
         FakeParentClient(),
-        ExecutionRoutingSettings(routes=(FREE_ROUTE,)),
+        ExecutionRoutingSettings(chains=_chains(FREE_ROUTE,)),
         route_id=FREE_ROUTE.id,
         child_session_id="child-1",
         parent_session_id=None,
@@ -856,7 +863,7 @@ def test_free_route_failure_parks_in_the_decision_inbox_without_a_parent(
 def test_repeated_free_route_failures_collapse_to_one_record(pool_root: Path) -> None:
     """Why: a retrying launcher must not turn one broken route into an inbox flood."""
     store_ = EscalationStore()
-    settings = ExecutionRoutingSettings(routes=(FREE_ROUTE,))
+    settings = ExecutionRoutingSettings(chains=_chains(FREE_ROUTE,))
     for _ in range(3):
         escalate_free_route_failure(
             FakeParentClient(),
@@ -893,7 +900,7 @@ def test_free_route_failure_degrades_to_a_paid_route_only_when_opted_in(
     )
     client = _live_parent_client()
     settings = ExecutionRoutingSettings(
-        routes=(FREE_ROUTE, PAID_ROUTE), fallback_on_free_failure=True
+        chains=_chains(FREE_ROUTE, PAID_ROUTE), fallback_on_free_failure=True
     )
 
     failure = escalate_free_route_failure(
@@ -922,7 +929,7 @@ def test_opted_in_fallback_still_reports_when_no_route_is_left(
     itself finds nothing - the operator still has to hear about it."""
     client = _live_parent_client()
     settings = ExecutionRoutingSettings(
-        routes=(FREE_ROUTE,), fallback_on_free_failure=True
+        chains=_chains(FREE_ROUTE,), fallback_on_free_failure=True
     )
 
     failure = escalate_free_route_failure(
@@ -952,7 +959,7 @@ def test_free_route_failure_never_reads_pool_state_unless_opted_in(
 
     failure = escalate_free_route_failure(
         _live_parent_client(),
-        ExecutionRoutingSettings(routes=(FREE_ROUTE, PAID_ROUTE)),
+        ExecutionRoutingSettings(chains=_chains(FREE_ROUTE, PAID_ROUTE)),
         route_id=FREE_ROUTE.id,
         child_session_id="child-1",
         parent_session_id="parent-1",
@@ -966,7 +973,7 @@ def test_free_failure_detail_is_bounded_and_redacted(pool_root: Path) -> None:
     store_ = EscalationStore()
     failure = escalate_free_route_failure(
         FakeParentClient(),
-        ExecutionRoutingSettings(routes=(FREE_ROUTE,)),
+        ExecutionRoutingSettings(chains=_chains(FREE_ROUTE,)),
         route_id=FREE_ROUTE.id,
         child_session_id="child-1",
         parent_session_id=None,
@@ -993,10 +1000,91 @@ def test_fallback_on_free_failure_defaults_off_and_round_trips(tmp_path: Path) -
     assert store_.load().fallback_on_free_failure is False
 
     saved = store_.save(
-        ExecutionRoutingSettings(routes=(FREE_ROUTE,), fallback_on_free_failure=True)
+        ExecutionRoutingSettings(chains=_chains(FREE_ROUTE,), fallback_on_free_failure=True)
     )
     assert saved.fallback_on_free_failure is True
     assert store_.load() == saved
     assert json.loads(path.read_text(encoding="utf-8"))["executionRouting"][
         "fallbackOnFreeFailure"
     ] is True
+
+
+def test_provider_down_cools_every_account_behind_the_route(
+    pool_root: Path, monkeypatch
+) -> None:
+    """A 5xx is the provider failing, not one account.
+
+    Cooling one account at a time here would send the chain through the whole
+    pool, one doomed launch per account, before it reached a provider that
+    works - and would leave a short outage looking like N separate account
+    failures in pool state.
+    """
+    pool_core.save_pool(
+        {
+            "accounts": [
+                {"id": "max-a", "provider": "claude", "kind": "oauth"},
+                {"id": "max-b", "provider": "claude", "kind": "oauth"},
+                {
+                    "id": "codex-b",
+                    "provider": "codex",
+                    "kind": "chatgpt",
+                    "codex_home": "/tmp/codex-b",
+                },
+            ]
+        }
+    )
+    settings = ExecutionRoutingSettings(
+        chains=_chains(
+            Route(
+                id="claude-max",
+                executor="CLAUDE_CODE",
+                model="opus",
+                billing_class="subscription",
+                account_pool="claude",
+            ),
+        )
+    )
+
+    cooled = cool_provider_outcome(
+        settings, outcome="provider_down", binding_id="max-a", route_id="claude-max"
+    )
+
+    assert set(cooled) == {"max-a", "max-b"}
+    state = pool_core.load_state()
+    assert pool_core.cooling_until(state, "max-a") > time.time()
+    assert pool_core.cooling_until(state, "max-b") > time.time()
+    # A different provider's account is untouched: the outage was not its.
+    assert pool_core.cooling_until(state, "codex-b") == 0
+
+
+def test_a_capacity_outcome_honours_the_advertised_reset_over_the_default(
+    pool_root: Path,
+) -> None:
+    """The provider knows when its own window reopens. Ignoring that and using
+    the blunt multi-hour default keeps an account parked long after it is
+    usable again."""
+    pool_core.save_pool({"accounts": [{"id": "max-a", "provider": "claude"}]})
+    settings = ExecutionRoutingSettings()
+    reset_at = time.time() + 120
+
+    cool_provider_outcome(
+        settings, outcome="rate_limited", binding_id="max-a", retry_at=reset_at
+    )
+
+    until = pool_core.cooling_until(pool_core.load_state(), "max-a")
+    assert until == pytest.approx(reset_at)
+    assert until < time.time() + pool_core.DEFAULT_COOLDOWN
+
+
+def test_an_outcome_that_is_not_a_provider_outcome_is_refused_outright(
+    pool_root: Path,
+) -> None:
+    """Both entry points reject anything outside the typed set rather than
+    quietly treating an unknown outcome as a reroutable one - a silent default
+    here is exactly how a code failure would start moving accounts again."""
+    settings = ExecutionRoutingSettings()
+    for outcome in ("rejected:409", "lost:reservation-expired", "completed"):
+        with pytest.raises(SuccessionError):
+            cool_provider_outcome(settings, outcome=outcome, binding_id="max-a")
+        with pytest.raises(SuccessionError):
+            advance_route_after_outcome(settings, outcome=outcome)

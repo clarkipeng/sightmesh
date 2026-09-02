@@ -30,16 +30,11 @@ PROBE_TTL = 60
 QUOTA_TTL = 120
 DEFAULT_COOLDOWN = 5 * 3600
 
-LIMIT_PATTERNS = [
-    r"usage limit reached",
-    r"reached your .{1,40} limit",
-    r"rate.?limit",
-    r"limit reached",
-    r"quota",
-    r"insufficient[_ ]quota",
-    r"resets? at",
-    r"\b429\b",
-]
+#: How long an auth or whole-provider failure cools an account. Short, because
+#: neither is capacity: a rotated credential or a provider outage clears on its
+#: own timescale, and cooling for the capacity default would strand a healthy
+#: account for hours.
+SHORT_COOLDOWN = 15 * 60
 
 PROVIDERS = ("claude", "codex")
 
@@ -226,11 +221,6 @@ def parse_iso(text: str | None) -> float | None:
         return datetime.fromisoformat(text).timestamp()
     except ValueError:
         return None
-
-
-def looks_limited(text: str) -> bool:
-    low = text.lower()
-    return any(re.search(pattern, low) for pattern in LIMIT_PATTERNS)
 
 
 # ---------------------------------------------------------------- identity
@@ -528,10 +518,13 @@ def probe(account: dict[str, Any], timeout: int = 90) -> tuple[bool, str]:
         return False, "probe timed out"
 
     output = (run.stdout or "") + (run.stderr or "")
-    if looks_limited(output):
-        return False, "usage limit"
     if run.returncode == 0:
         return True, "ok"
+    # A failing probe reports what the executor said and nothing more. Deciding
+    # *why* it failed - capacity, auth, provider - is the job of the typed
+    # provider outcome on the effect journal, which cools the binding; guessing
+    # it from output text is what made a test transcript containing "429"
+    # indistinguishable from a real rate limit.
     reason = next((ln for ln in output.strip().splitlines() if ln.strip()), "failed")
     return False, reason.strip()[:90]
 
@@ -550,8 +543,6 @@ def probe_cached(account: dict[str, Any]) -> tuple[bool, str]:
         "reason": reason,
     }
     save_state(state)
-    if not ok and reason == "usage limit":
-        set_cooldown(account["id"])
     return ok, reason
 
 

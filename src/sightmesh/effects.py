@@ -19,7 +19,7 @@ import logging
 import sqlite3
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -80,6 +80,9 @@ class Effect:
     outcome: str | None
     owner_instance: str
     lease_expires_at: float
+    #: Provider-advertised reset for a capacity outcome, when one was sent.
+    #: Absent for every other outcome, and never inferred.
+    retry_at: float | None = None
 
 
 class EffectJournal:
@@ -184,15 +187,53 @@ class EffectJournal:
             frozenset({"reserved", "launched"}),
         )
 
-    def mark_terminal(self, task_id: str, epoch: int, outcome: str) -> Effect:
-        """Record the typed outcome; the first terminal write wins."""
+    def mark_terminal(
+        self,
+        task_id: str,
+        epoch: int,
+        outcome: str,
+        retry_at: float | None = None,
+    ) -> Effect:
+        """Record the typed outcome; the first terminal write wins.
+
+        ``retry_at`` is written alongside it so a later reconcile can cool the
+        exhausted account until the provider's own reset without having to
+        re-derive it from anything.
+        """
         return self._advance(
             task_id,
             epoch,
-            "state = 'terminal', outcome = ?",
-            (str(outcome),),
+            "state = 'terminal', outcome = ?, retry_at = ?",
+            (str(outcome), None if retry_at is None else float(retry_at)),
             frozenset({"reserved", "launched"}),
         )
+
+    def with_outcomes(self, outcomes: Collection[str]) -> list[Effect]:
+        """Current-epoch effects that ended on one of these typed outcomes.
+
+        Joined against the task's own epoch so a superseded epoch's outcome can
+        never re-trigger the reconcile that already advanced past it, and
+        restricted to tasks that can still move: a completed or cancelled task
+        has nothing left to reroute.
+        """
+        if not outcomes:
+            return []
+        wanted = sorted(str(outcome) for outcome in outcomes)
+        placeholders = ", ".join("?" for _ in wanted)
+        try:
+            with self.store.connect() as conn:
+                rows = conn.execute(
+                    "SELECT e.* FROM task_effects AS e "
+                    "JOIN managed_tasks AS t "
+                    "  ON t.task_id = e.task_id AND t.epoch = e.epoch "
+                    f"WHERE e.state = 'terminal' AND e.outcome IN ({placeholders}) "
+                    "AND t.state IN ('active', 'blocked') "
+                    "ORDER BY e.updated_at",
+                    tuple(wanted),
+                ).fetchall()
+            return [_decode(row) for row in rows]
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(f"Cannot read task effects: {exc}") from exc
 
     def get(self, task_id: str, epoch: int) -> Effect | None:
         try:
@@ -398,6 +439,9 @@ def _decode(row: sqlite3.Row) -> Effect:
             outcome=row["outcome"],
             owner_instance=str(row["owner_instance"]),
             lease_expires_at=float(row["lease_expires_at"]),
+            retry_at=(
+                float(row["retry_at"]) if row["retry_at"] is not None else None
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise TaskStoreError(f"Corrupt task effect record: {exc}") from exc

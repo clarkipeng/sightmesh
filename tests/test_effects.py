@@ -265,3 +265,59 @@ def test_the_pinned_seams_400_not_found_shape_is_definitive_absence(tmp_path):
         CdesktopRejectedError("Caller session belongs to another workspace", status=400)
     )
     assert not is_effect_not_found(CdesktopRejectedError("boom", status=500))
+
+
+def test_a_capacity_outcome_persists_the_providers_reset(journal) -> None:
+    """The reconcile that reads a typed outcome runs long after the rejection,
+    so the provider's advertised reset has to be durable next to the outcome.
+    Losing it means every reroute falls back to a blunt multi-hour cooldown."""
+    journal.reserve("task-a", 1, request_hash(LAUNCH), new_owner_instance())
+
+    journal.mark_terminal("task-a", 1, "rate_limited", 1_893_456_000.0)
+
+    effect = journal.get("task-a", 1)
+    assert (effect.outcome, effect.retry_at) == ("rate_limited", 1_893_456_000.0)
+
+
+def test_an_outcome_without_a_reset_stores_none_rather_than_a_guess(journal) -> None:
+    """No advertised reset is a fact, not a zero: storing 0.0 would read as a
+    cooldown that already expired."""
+    journal.reserve("task-a", 1, request_hash(LAUNCH), new_owner_instance())
+
+    journal.mark_terminal("task-a", 1, "auth")
+
+    assert journal.get("task-a", 1).retry_at is None
+
+
+def test_only_current_epoch_outcomes_on_live_tasks_are_swept(journal) -> None:
+    """The sweep is what advances a task whose launch was rejected before it
+    ever held a session. It must see exactly the epoch the task is on: a
+    superseded epoch's outcome re-triggering the reroute that already moved
+    past it would fork the work, and a completed task has nothing to reroute.
+    """
+    store = journal.store
+    _insert_task(store, "task-live", epoch=2, state="blocked")
+    _insert_task(store, "task-stale", epoch=3, state="active")
+    _insert_task(store, "task-done", epoch=1, state="completed")
+    for task_id, epoch, outcome in (
+        ("task-live", 2, "rate_limited"),
+        ("task-stale", 2, "rate_limited"),
+        ("task-done", 1, "provider_down"),
+    ):
+        journal.reserve(task_id, epoch, request_hash(LAUNCH), new_owner_instance())
+        journal.mark_terminal(task_id, epoch, outcome)
+
+    swept = journal.with_outcomes({"rate_limited", "auth", "provider_down"})
+
+    assert [(e.task_id, e.epoch) for e in swept] == [("task-live", 2)]
+    assert journal.with_outcomes(set()) == []
+
+
+def _insert_task(store, task_id: str, *, epoch: int, state: str) -> None:
+    with store.connect() as conn:
+        conn.execute(
+            "INSERT INTO managed_tasks (task_id, scope, task_key, state, epoch, "
+            "attempts, max_attempts, child_limit, spec_json, created_at, updated_at) "
+            "VALUES (?, 'operator', ?, ?, ?, 1, 3, 0, '{}', 0, 0)",
+            (task_id, task_id, state, epoch),
+        )

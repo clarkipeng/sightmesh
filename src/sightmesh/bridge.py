@@ -253,6 +253,20 @@ class BridgeSupervisor:
         # Wake delivery reads task rows, not workspaces, so it runs once per
         # tick and cannot be starved behind a slow or failing workspace scan.
         await asyncio.to_thread(self.reconciler.reconcile_kernel)
+        # A launch rejected before its task ever activated holds no session, so
+        # the per-session pass below can never reach it. This journal-keyed
+        # sweep is what advances it past its typed provider outcome.
+        try:
+            await asyncio.to_thread(self.managed_tasks.reconcile_provider_outcomes)
+        except (
+            CdesktopError,
+            ExecutionRoutingError,
+            PoolError,
+            SightMeshError,
+            SuccessionError,
+            TaskStoreError,
+        ) as exc:
+            LOGGER.warning("Cannot reconcile typed provider outcomes: %s", exc)
         try:
             await asyncio.to_thread(
                 leases.sync_active_workspaces,
@@ -278,7 +292,7 @@ class BridgeSupervisor:
                 for session in sessions:
                     try:
                         await asyncio.to_thread(
-                            self.managed_tasks.reconcile_quota_failure,
+                            self.managed_tasks.reconcile_provider_outcome,
                             str(session["id"]),
                         )
                     except (

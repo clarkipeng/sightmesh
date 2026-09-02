@@ -198,12 +198,13 @@ def test_no_bridge_child_still_gets_stall_recovery(monkeypatch) -> None:
     supervisor = BridgeSupervisor(client, "ws://127.0.0.1:8377/ws")
     reconciled = []
 
-    def reconcile_quota_failure(session_id):
+    def reconcile_provider_outcome(session_id):
         reconciled.append(session_id)
         if len(reconciled) == 1:
             raise PoolError("pool state unavailable")
 
-    supervisor.managed_tasks.reconcile_quota_failure = reconcile_quota_failure
+    supervisor.managed_tasks.reconcile_provider_outcome = reconcile_provider_outcome
+    supervisor.managed_tasks.reconcile_provider_outcomes = lambda: []
     supervisor.stalls.threshold = timedelta(0)
     monkeypatch.setattr(bridge_module, "enabled_workspaces", lambda: set())
     monkeypatch.setattr(

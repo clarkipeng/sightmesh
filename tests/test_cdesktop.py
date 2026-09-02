@@ -73,9 +73,13 @@ def test_success_false_is_a_typed_server_rejection(monkeypatch) -> None:
 @pytest.mark.parametrize(
     ("status", "error_type"),
     [
+        (401, cdesktop.CdesktopRejectedError),
+        (403, cdesktop.CdesktopRejectedError),
         (409, cdesktop.CdesktopRejectedError),
         (424, cdesktop.CdesktopInterruptedError),
         (425, cdesktop.CdesktopPendingError),
+        (429, cdesktop.CdesktopRejectedError),
+        (503, cdesktop.CdesktopRejectedError),
     ],
 )
 def test_stop_operation_http_outcomes_are_typed(
@@ -530,3 +534,58 @@ def test_unkeyed_send_does_not_retry(monkeypatch):
     with pytest.raises(cdesktop.CdesktopDeliveryError):
         client.send("s1", "do it")
     assert len(calls) == 1
+
+
+def _raise_http(monkeypatch, status: int, headers=None) -> None:
+    error = HTTPError(
+        "http://127.0.0.1:1/api/task-launches/t/1",
+        status,
+        "rejected",
+        headers or {},
+        BytesIO(b"rejected"),
+    )
+    monkeypatch.setattr(
+        cdesktop, "urlopen", lambda *_args, **_kwargs: (_ for _ in ()).throw(error)
+    )
+
+
+def test_a_capacity_refusal_is_typed_and_carries_the_advertised_reset(
+    monkeypatch,
+) -> None:
+    """Routing acts on the status, and cools an account until the provider's
+    own reset. Both have to survive the client, or the failover path is left
+    guessing from an error string and cooling for a blunt default window.
+    """
+    _raise_http(monkeypatch, 429, {"Retry-After": "120"})
+    monkeypatch.setattr(cdesktop.time, "time", lambda: 1_000.0)
+
+    with pytest.raises(cdesktop.CdesktopRejectedError) as raised:
+        CdesktopClient("http://127.0.0.1:1").request("GET", "/task-launches/t/1")
+
+    assert raised.value.status == 429
+    assert raised.value.retry_at == 1_120.0
+
+
+def test_an_unparseable_or_absent_retry_after_falls_back_to_no_reset(
+    monkeypatch,
+) -> None:
+    """An HTTP-date `Retry-After` depends on the provider's clock agreeing with
+    ours; a wrong absolute time would cool an account for the wrong window, so
+    only the delta form is honoured and anything else defers to the default."""
+    for headers in ({}, {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}):
+        _raise_http(monkeypatch, 429, headers)
+        with pytest.raises(cdesktop.CdesktopRejectedError) as raised:
+            CdesktopClient("http://127.0.0.1:1").request("GET", "/task-launches/t/1")
+        assert raised.value.retry_at is None
+
+
+def test_an_untyped_status_stays_an_untyped_error(monkeypatch) -> None:
+    """Routing must never infer a provider outcome from a status nobody
+    assigned a meaning to: an unmapped code stays a plain CdesktopError, which
+    blocks rather than reroutes."""
+    _raise_http(monkeypatch, 418)
+
+    with pytest.raises(cdesktop.CdesktopError) as raised:
+        CdesktopClient("http://127.0.0.1:1").request("GET", "/task-launches/t/1")
+
+    assert not isinstance(raised.value, cdesktop.CdesktopRejectedError)
