@@ -32,6 +32,7 @@ from .succession import OwnershipStore, QuarantinedSessionError
 from .task_store import (
     LIVE_STATES,
     STALL_LIVENESS_STATES,
+    YIELD_STATES,
     TaskRecord,
     TaskStore,
     TaskStoreError,
@@ -55,15 +56,21 @@ LIVENESS_PREDICATES: dict[str, str] = {
     "stalled": "any_child_stalled",
     "over_budget": "any_child_over_budget",
 }
-#: Reasons that can hold at most once for a ``(child, epoch)``: a task is lost
-#: exactly once (terminal transitions are monotone) and crosses a budget
-#: exactly once (the flag is a latch). Their wake row is therefore its own
-#: idempotence latch and needs no counter.
-_ONE_SHOT_REASONS = frozenset({"lost", "over_budget"})
 #: Episodes are capped at two wakes: the episode wake, and one escalation if
 #: the manager's intervention did not restore progress. After that the kernel
 #: goes quiet and the human attention queue owns the incident.
 MAX_WAKES_PER_EPISODE = 2
+#: Wake states that prove an incident was already told to someone. ``resolved``
+#: is excluded on purpose: a wake suppressed at delivery (quarantined holder,
+#: no successor yet) was *not* told, and counting it as told dropped the only
+#: notification that incident would ever get. Same rule as the cohort re-arm.
+TOLD_WAKE_STATES = ("pending", "claimed", "delivered")
+#: Marks the second wake of an episode. It must be a distinct dedupe key: the
+#: partial unique index binds uniqueness to un-consumed wakes, so re-using the
+#: episode's key while the first wake is still pending - which is exactly the
+#: unreachable-manager case escalation exists for - made the escalation INSERT
+#: a silent no-op.
+ESCALATION_SUFFIX = ":escalation"
 
 
 @dataclass(frozen=True)
@@ -82,15 +89,30 @@ def dedupe_key(parent_task_id: str, predicate: str) -> str:
     return f"{parent_task_id}:{predicate}"
 
 
-def episode_key(child_task_id: str, epoch: int, reason: str, episode: int) -> str:
+def episode_key(
+    child_task_id: str,
+    epoch: int,
+    reason: str,
+    episode: int,
+    *,
+    escalation: bool = False,
+) -> str:
     """The stall-episode dedupe key from ``docs/liveness-spec.md``.
 
     Keyed on the *child*, not the parent, because two silent children are two
     incidents; keyed on the epoch because a replacement is a fresh subject;
     keyed on the episode because a child that stalls, recovers, and stalls
-    again is genuinely worth telling the manager about twice.
+    again is genuinely worth telling the manager about twice; and suffixed for
+    the escalation, because the escalation's whole job is to be heard while
+    the first wake is still sitting undelivered.
     """
-    return f"{child_task_id}:{epoch}:{reason}:{episode}"
+    suffix = ESCALATION_SUFFIX if escalation else ""
+    return f"{child_task_id}:{epoch}:{reason}:{episode}{suffix}"
+
+
+def is_escalation(dedupe_key: str) -> bool:
+    """True for the second wake of an episode, so delivery can label it."""
+    return dedupe_key.endswith(ESCALATION_SUFFIX)
 
 
 def finish_with_wake(
@@ -165,12 +187,21 @@ def has_live_wait_predicate(conn: sqlite3.Connection, task_id: str) -> bool:
     (liveness-spec.md, cause 1 nuance). Deriving the exemption from durable
     child rows rather than from a flag means it cannot drift: the moment the
     last child goes terminal, the manager is a leaf again and back in scope.
+
+    The exemption counts only children that are actually running
+    (``YIELD_STATES``). Counting ``blocked`` and ``reserved`` children too was
+    an invisible deadlock: a child blocks on a human, its manager therefore
+    looks like it is legitimately yielding, and the whole subtree goes quiet
+    with nothing in the system ever flagging it. A blocked child already woke
+    the manager through its own predicate; a reserved child that never
+    launched is its own attention item, not a reason to stop watching the
+    manager waiting on it.
     """
-    placeholders = ", ".join("?" for _ in LIVE_STATES)
+    placeholders = ", ".join("?" for _ in YIELD_STATES)
     total, live = conn.execute(
         f"SELECT COUNT(*), SUM(state IN ({placeholders})) "
         "FROM managed_tasks WHERE parent_task_id = ?",
-        (*sorted(LIVE_STATES), str(task_id)),
+        (*sorted(YIELD_STATES), str(task_id)),
     ).fetchone()
     return bool(total and live)
 
@@ -280,7 +311,11 @@ def record_liveness_wakes(
                 parent_task_id,
                 liveness,
                 episode_key(
-                    str(child_task_id), epoch, liveness, int(row["liveness_episode"])
+                    str(child_task_id),
+                    epoch,
+                    liveness,
+                    int(row["liveness_episode"]),
+                    escalation=escalating,
                 ),
                 moment,
                 one_shot=False,
@@ -325,9 +360,18 @@ def _arm_liveness(
     *,
     one_shot: bool = True,
 ) -> list[str]:
-    """Insert one liveness wake, or nothing if this incident was already told."""
+    """Insert one liveness wake, or nothing if this incident was already told.
+
+    The pre-check is scoped two ways. It looks only at wakes that actually
+    reached someone (``TOLD_WAKE_STATES``), so a wake suppressed at delivery
+    can arm again rather than being dropped for good; and it is an equality
+    match on the indexed ``dedupe_key``, so it is a lookup rather than a scan
+    of every wake the outbox has ever held.
+    """
+    told = ", ".join("?" for _ in TOLD_WAKE_STATES)
     if one_shot and conn.execute(
-        "SELECT 1 FROM task_wakes WHERE dedupe_key = ?", (key,)
+        f"SELECT 1 FROM task_wakes WHERE dedupe_key = ? AND state IN ({told})",
+        (key, *TOLD_WAKE_STATES),
     ).fetchone():
         return []
     wake_id = str(uuid.uuid4())
@@ -418,7 +462,7 @@ class WakeDelivery:
             return self._resolve(
                 wake, f"parent {parent.key} holds one of its own child sessions"
             )
-        payload = _payload(wake.predicate, parent, children)
+        payload = _payload(wake.predicate, parent, children, escalation=is_escalation(wake.dedupe_key))
         self.client.send(
             parent.holder_session_id,
             payload,
@@ -461,7 +505,13 @@ class WakeDelivery:
             raise TaskStoreError(f"Cannot settle task wake: {exc}") from exc
 
 
-def _payload(predicate: str, parent: TaskRecord, children: list[TaskRecord]) -> str:
+def _payload(
+    predicate: str,
+    parent: TaskRecord,
+    children: list[TaskRecord],
+    *,
+    escalation: bool = False,
+) -> str:
     """One consolidated cohort view, with each child's liveness finding inline.
 
     A liveness wake names its subject through the cohort listing rather than a
@@ -470,8 +520,13 @@ def _payload(predicate: str, parent: TaskRecord, children: list[TaskRecord]) -> 
     confidence in that evidence. Degraded evidence is labelled as such so a
     manager never mistakes "cdesktop could not tell us" for "the child is
     definitely wedged".
+
+    An escalation says so in its first line. It is the second and last time
+    the kernel will raise this incident, and a manager that reads it exactly
+    like the first wake has no way to know that.
     """
-    lines = [f"COHORT {predicate}: {parent.key}"]
+    heading = "ESCALATION" if escalation else "COHORT"
+    lines = [f"{heading} {predicate}: {parent.key}"]
     for child in children:
         line = f"- {child.key}: {child.state}"
         if child.liveness != "live":

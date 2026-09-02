@@ -42,6 +42,23 @@ LIVENESS_STATES = ("live", "parked", "idle_unreported", "limbo", "stalled")
 #: The subset that satisfies ``any_child_stalled``. ``parked`` is deliberately
 #: absent: cause 2 is excluded from stall detection by contract.
 STALL_LIVENESS_STATES = frozenset({"idle_unreported", "limbo", "stalled"})
+#: States in which a child is genuinely working on its manager's behalf, and
+#: so exempts that manager from stall detection. ``blocked`` and ``reserved``
+#: are pointedly absent: a child that is blocked, or that never launched, is
+#: not making progress, and counting it as a live wait wedged the manager
+#: behind it into permanent invisibility.
+YIELD_STATES = frozenset({"active", "replacing"})
+
+
+def liveness_stretch(liveness: str) -> str:
+    """The behavioural stretch a classification belongs to.
+
+    Three of them, and only a move between two is an episode boundary:
+    ``live`` (progress observed), ``parked`` (waiting on a human by design),
+    and ``silent`` (every stall cause). Collapsing the stall causes into one
+    stretch is what makes ``stalled`` <-> ``limbo`` flapping free.
+    """
+    return liveness if liveness in {"live", "parked"} else "silent"
 _LIVENESS_CHECK = "liveness IN (" + ", ".join(f"'{v}'" for v in LIVENESS_STATES) + ")"
 #: Forward-only liveness columns, in ``ALTER TABLE ADD COLUMN`` form. Each
 #: carries a constant default so it is a legal in-place addition; the fresh
@@ -457,6 +474,14 @@ class TaskStore:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_task_wakes_live "
             "ON task_wakes(dedupe_key) WHERE state IN ('pending', 'claimed')"
         )
+        # The liveness one-shot pre-check asks "has this exact incident already
+        # been told to anyone?", across all states. Without this index that is
+        # a full scan of every wake the outbox has ever held, run once per
+        # actionable finding per tick.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_wakes_dedupe "
+            "ON task_wakes(dedupe_key, state)"
+        )
 
     @staticmethod
     def task_id(scope: str, key: str) -> str:
@@ -707,9 +732,20 @@ class TaskStore:
                     task_id,
                     expect_states=REPLACE_PREDECESSORS,
                     expect_version=expect_version,
+                    # A replacement is a fresh subject, so every observation
+                    # about the predecessor is cleared in the same guarded
+                    # transition that bumps the epoch. Inheriting them made a
+                    # successor's own stall invisible forever (its episode was
+                    # already open and already fully woken), reported a
+                    # brand-new worker as over budget on its first tick, and
+                    # dated the replacement's silence from its predecessor's.
                     assign=(
                         "state = 'replacing', epoch = epoch + 1, "
-                        "attempts = attempts + 1, spec_json = ?"
+                        "attempts = attempts + 1, spec_json = ?, "
+                        "liveness = 'live', liveness_episode = 0, "
+                        "liveness_since = NULL, liveness_wakes = 0, "
+                        "liveness_evidence = NULL, over_budget = 0, "
+                        "checkpoint_at = NULL"
                     ),
                     values=(json.dumps(spec, sort_keys=True, separators=(",", ":")),),
                     attempted="replacing",
@@ -750,15 +786,23 @@ class TaskStore:
     ) -> TaskRecord:
         """Open, continue, or close a stall episode with one guarded transition.
 
-        An episode *opens* the first tick a classification holds and *closes*
-        when the classification returns to ``live``; the counter only ever
-        moves forward, so a child that stalls, recovers, and stalls again gets
-        a genuinely new dedupe key rather than colliding with the episode its
-        manager already handled. Continuing an episode refreshes the evidence
-        but never the episode number, the phase clock, or the wake count -
-        that is what makes "the same silent child cannot wake its manager twice
-        in one episode" true by construction rather than by a caller
-        remembering to check.
+        **An episode boundary is a change of behaviour, never a change of
+        opinion.** The spec is explicit: an episode opens when the condition
+        first holds and closes when progress evidence resumes (liveness-spec.md
+        line 46). So the boundary is computed over the *stretch* a task is in -
+        working, parked, or silent - and not over the classification string.
+        Re-labelling one unbroken silent stretch from ``stalled`` to ``limbo``
+        and back, which one flaky snapshot read is enough to cause, updates the
+        reason in place: same episode, same phase clock, same wake count.
+
+        Treating any relabelling as a boundary minted a fresh episode on every
+        tick, and because each new episode resets ``liveness_wakes`` to zero
+        the escalation that fires at two wakes could never arrive: a wedged
+        child produced one wake per tick, forever, and no human was ever told.
+
+        ``parked`` is its own stretch rather than part of the silent one. It
+        arms no stall predicate, and its phase clock is what the approval
+        timeout is measured from, so it must start when the parking did.
 
         Two things this write deliberately does *not* do. It does not touch
         ``version``: an observation about a task is not a change to the task,
@@ -785,8 +829,12 @@ class TaskStore:
             ).fetchone()
             if row is None:
                 raise TaskStoreError("Managed task not found")
-            if str(row["liveness"]) == liveness:
-                assign, values = "liveness_evidence = ?", (evidence,)
+            current = str(row["liveness"])
+            if liveness_stretch(current) == liveness_stretch(liveness):
+                # Same stretch: the reason may be refined, but nothing about
+                # the incident restarted.
+                assign = "liveness = ?, liveness_evidence = ?"
+                values = (liveness, evidence)
             else:
                 closing = liveness == "live"
                 assign = (
@@ -832,13 +880,21 @@ class TaskStore:
         about it exactly once without any episode bookkeeping. The flag never
         changes task state - an over-budget task stays active, as the contract
         requires - and, like every liveness write, it leaves ``version`` alone.
+
+        Epoch scoping comes from two places, and it needs both:
+        ``prepare_replacement`` clears the latch so a successor starts unflagged,
+        and ``LIVE_STATES`` guards this write so a late tick cannot flag a task
+        that has already finished. Without the guard a completed task could
+        acquire a budget finding after its own terminal.
         """
+        states = sorted(LIVE_STATES)
+        placeholders = ", ".join("?" for _ in states)
 
         def apply(active: sqlite3.Connection) -> bool:
             cursor = active.execute(
                 "UPDATE managed_tasks SET over_budget = 1 "
-                "WHERE task_id = ? AND over_budget = 0",
-                (str(task_id),),
+                f"WHERE task_id = ? AND over_budget = 0 AND state IN ({placeholders})",
+                (str(task_id), *states),
             )
             return bool(cursor.rowcount)
 

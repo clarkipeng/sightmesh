@@ -1306,9 +1306,17 @@ def test_s17_a_persistently_silent_child_wakes_twice_then_goes_quiet(
     reconciler.reconcile_kernel()
     escalated = _liveness_wakes(store, "any_child_stalled")
     assert len(escalated) == 2
+    # Both wakes belong to episode 1, but the escalation carries its own key.
+    # Re-using the episode key made the escalation an INSERT the partial
+    # unique index rejected whenever the first wake was still un-consumed -
+    # which is precisely the unreachable-manager case escalation exists for.
     assert {row["dedupe_key"] for row in escalated} == {
-        f"{stalled.task_id}:{stalled.epoch}:stalled:1"
+        f"{stalled.task_id}:{stalled.epoch}:stalled:1",
+        f"{stalled.task_id}:{stalled.epoch}:stalled:1:escalation",
     }
+    assert [
+        row for row in client.sent if row[0] == parent.session_id and "ESCALATION" in row[1]
+    ], "the second wake must be readable as the last one"
     attention = [
         item
         for item in EscalationStore(store.path).pending()
