@@ -1054,7 +1054,32 @@ def _liveness_reconciler(client, store, ownership, clock):
         ownership=ownership,
         signal_store=EscalationStore(store.path),
         clock=clock,
+        environment={},
     )
+
+
+def _bridge_tick(reconciler, store, client):
+    """Run one *whole* bridge tick: the kernel pass and the session pass.
+
+    Both, deliberately. The no-kill negatives used to assert around
+    ``reconcile_kernel`` alone, and every liveness-driven kill this lane
+    removed lived in the other pass - ``reconcile_session``. So the scenarios
+    could not structurally have caught the thing they exist to catch: the
+    kernel woke a manager about limbo in one pass and killed the process in
+    the next, inside the same two-second tick, then read its own kill back as
+    ``lost``. Asserting ``client.stopped == []`` only means something if the
+    pass that called ``stop_execution`` actually ran.
+    """
+    reconciler.reconcile_kernel()
+    sessions = [
+        {"id": str(row["holder_session_id"])}
+        for row in query(
+            store,
+            "SELECT holder_session_id FROM managed_tasks "
+            "WHERE holder_session_id IS NOT NULL",
+        )
+    ]
+    reconciler.reconcile_sessions(sessions)
 
 
 def _liveness_cohort(client, store, ownership, **child_spec):
@@ -1102,7 +1127,7 @@ def test_s13_a_turn_that_ends_without_a_lifecycle_call_wakes_once(
     launches_before = len(client.calls("managed_launch"))
     reconciler = _liveness_reconciler(client, store, ownership, clock)
 
-    reconciler.reconcile_kernel()
+    _bridge_tick(reconciler, store, client)
 
     child_row = store.get_by_session(child.session_id)
     assert child_row.liveness == "idle_unreported"
@@ -1123,11 +1148,25 @@ def test_s13_a_turn_that_ends_without_a_lifecycle_call_wakes_once(
     assert client.execution_processes(child.session_id)[0]["id"] == process
 
     # Episode dedupe: the same silent child cannot wake its manager twice for
-    # one episode, however many ticks the reconciler runs.
+    # one episode, however many ticks the reconciler runs. The clock advances,
+    # because a frozen clock makes this assertion vacuous - the escalation
+    # gate is "one further progress_timeout since the manager was told", so a
+    # loop that never moves time can never reach it and would pass against a
+    # detector with no dedupe at all. Three minutes is well inside the window.
     for _ in range(3):
-        reconciler.reconcile_kernel()
+        clock.advance(60)
+        _bridge_tick(reconciler, store, client)
     assert len(_liveness_wakes(store, "any_child_stalled")) == 1
     assert len([row for row in client.sent if row[0] == parent.session_id]) == 1
+
+    # ...and once the window does lapse, exactly one escalation follows, with
+    # its own key. Together these two loops pin both sides of the gate.
+    clock.advance(1_500)
+    _bridge_tick(reconciler, store, client)
+    escalated = _liveness_wakes(store, "any_child_stalled")
+    assert len(escalated) == 2
+    assert any(str(row["dedupe_key"]).endswith(":escalation") for row in escalated)
+    assert client.stopped == []
 
 
 def test_s14_a_parked_approval_times_out_into_blocked_never_a_kill(
@@ -1152,14 +1191,14 @@ def test_s14_a_parked_approval_times_out_into_blocked_never_a_kill(
     )
     reconciler = _liveness_reconciler(client, store, ownership, clock)
 
-    reconciler.reconcile_kernel()
+    _bridge_tick(reconciler, store, client)
     child_row = store.get_by_session(child.session_id)
     assert child_row.liveness == "parked"
     assert child_row.state == "active", "parking is not yet a decision"
     assert _liveness_wakes(store) == [], "cause 2 is excluded from stall detection"
 
     clock.advance(301)
-    reconciler.reconcile_kernel()
+    _bridge_tick(reconciler, store, client)
 
     timed_out = store.get_by_session(child.session_id)
     assert timed_out.state == "blocked"
@@ -1199,7 +1238,7 @@ def test_s15_a_killed_process_is_lost_and_wakes_before_its_siblings(
     client.kill_process(process, exit_reason="restart")
     reconciler = _liveness_reconciler(client, store, ownership, clock)
 
-    reconciler.reconcile_kernel()
+    _bridge_tick(reconciler, store, client)
 
     lost = store.get_by_session(victim.session_id)
     assert lost.state == "lost"
@@ -1220,7 +1259,7 @@ def test_s15_a_killed_process_is_lost_and_wakes_before_its_siblings(
     effects_before = client.distinct_effects()
 
     for _ in range(3):
-        reconciler.reconcile_kernel()
+        _bridge_tick(reconciler, store, client)
     assert len(_liveness_wakes(store, "any_child_lost")) == 1
     assert client.distinct_effects() == effects_before
 
@@ -1236,13 +1275,54 @@ def test_s16_a_long_command_with_live_output_is_never_flagged(
     client, store, ownership
 ):
     """S16 (cause 3, stated positively): a command runs for twice the
-    progress_timeout while emitting output the whole time.
+    progress_timeout while it is demonstrably still working.
 
     Historical incident: idle-time heuristics killed long-but-healthy work -
     a build, a test suite, a large migration - because nothing had touched the
-    transcript in a while. Must hold: output bytes are progress, so the task is
-    never flagged, no episode opens, and no wake arms, no matter how many ticks
-    pass.
+    transcript in a while. Must hold: the task is never flagged, no episode
+    opens, and no wake arms, no matter how many ticks pass.
+
+    This is run against the *production* evidence shape. No real cdesktop
+    process row carries ``output_bytes``; the earlier version of this scenario
+    asked the fake to invent one, so it proved the detector was safe on a
+    signal that does not exist out there and left the path that actually runs
+    - the running process's advancing ``updated_at``, with a frozen transcript
+    - completely untested. The output-byte case is still covered below, for
+    the executors that do report it.
+    """
+    clock = _Clock()
+    parent, child, _mesh = _liveness_cohort(client, store, ownership, progress_timeout=1500.0)
+    process = client.run_process(child.session_id, last_activity=clock.now)
+    assert "output_bytes" not in client.execution_processes(child.session_id)[0]
+    reconciler = _liveness_reconciler(client, store, ownership, clock)
+    _bridge_tick(reconciler, store, client)
+
+    for _ in range(12):  # 12 * 300s = 3600s, well past 2x progress_timeout
+        clock.advance(300)
+        # The one thing a real long-running command does: its process row keeps
+        # moving. The transcript never changes.
+        client.set_last_activity(process, clock.now)
+        _bridge_tick(reconciler, store, client)
+
+    working = store.get_by_session(child.session_id)
+    assert working.state == "active"
+    assert working.liveness == "live"
+    assert working.liveness_episode == 0, "no episode ever opened"
+    assert _liveness_wakes(store) == []
+    assert [row for row in client.sent if row[0] == parent.session_id] == []
+    assert client.stopped == []
+
+
+def test_s16b_output_bytes_are_progress_when_an_executor_reports_them(
+    client, store, ownership
+):
+    """S16, the typed half: an executor that *does* report output bytes makes
+    growth alone sufficient, even with every timestamp frozen.
+
+    Kept separate from S16 so the two cannot be confused again. This one only
+    holds once a baseline exists: the first observation has nothing to compare
+    against, and reporting a stall from a missing baseline is what flagged a
+    healthy 5KB-per-tick emitter on the first tick after every restart.
     """
     clock = _Clock()
     parent, child, _mesh = _liveness_cohort(client, store, ownership, progress_timeout=1500.0)
@@ -1251,19 +1331,17 @@ def test_s16_a_long_command_with_live_output_is_never_flagged(
         child.session_id, last_activity=clock.now, output_bytes=4_096
     )
     reconciler = _liveness_reconciler(client, store, ownership, clock)
-    reconciler.reconcile_kernel()
+    _bridge_tick(reconciler, store, client)
 
-    for _ in range(12):  # 12 * 300s = 3600s, well past 2x progress_timeout
+    for _ in range(12):
         clock.advance(300)
         client.feed_output(process, 8_192)
-        reconciler.reconcile_kernel()
+        _bridge_tick(reconciler, store, client)
 
     working = store.get_by_session(child.session_id)
-    assert working.state == "active"
     assert working.liveness == "live"
-    assert working.liveness_episode == 0, "no episode ever opened"
+    assert working.liveness_episode == 0
     assert _liveness_wakes(store) == []
-    assert [row for row in client.sent if row[0] == parent.session_id] == []
     assert client.stopped == []
 
 
@@ -1287,7 +1365,7 @@ def test_s17_a_persistently_silent_child_wakes_twice_then_goes_quiet(
     client.run_process(child.session_id, last_activity=clock.now - 2_000)
     reconciler = _liveness_reconciler(client, store, ownership, clock)
 
-    reconciler.reconcile_kernel()
+    _bridge_tick(reconciler, store, client)
     assert len(_liveness_wakes(store, "any_child_stalled")) == 1
     stalled = store.get_by_session(child.session_id)
     assert stalled.liveness == "stalled"
@@ -1298,12 +1376,12 @@ def test_s17_a_persistently_silent_child_wakes_twice_then_goes_quiet(
     manager_mesh.send("leaf", "are you still working?")
     for _ in range(3):
         clock.advance(60)
-        reconciler.reconcile_kernel()
+        _bridge_tick(reconciler, store, client)
     assert len(_liveness_wakes(store, "any_child_stalled")) == 1, "still one episode"
 
     # One further progress_timeout with no restored progress: escalate once.
     clock.advance(1_500)
-    reconciler.reconcile_kernel()
+    _bridge_tick(reconciler, store, client)
     escalated = _liveness_wakes(store, "any_child_stalled")
     assert len(escalated) == 2
     # Both wakes belong to episode 1, but the escalation carries its own key.
@@ -1327,7 +1405,7 @@ def test_s17_a_persistently_silent_child_wakes_twice_then_goes_quiet(
     # Then quiet, forever. The human owns the incident now.
     for _ in range(5):
         clock.advance(1_500)
-        reconciler.reconcile_kernel()
+        _bridge_tick(reconciler, store, client)
     assert len(_liveness_wakes(store, "any_child_stalled")) == 2
     assert len([row for row in client.sent if row[0] == parent.session_id]) == 2
     assert (

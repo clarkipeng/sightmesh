@@ -646,3 +646,44 @@ def test_a_probe_that_finds_the_sentinel_reserved_fails_the_contract(system):
 
     with pytest.raises(SightMeshError, match="reserved sentinel effect"):
         mesh.start(spec())
+
+
+def test_start_stays_idempotent_when_the_detection_floor_changes(system):
+    """Why: the resolved detection policy used to be folded into the public
+    spec, and the public spec is the identity fingerprint `start()` compares.
+    So an operator raising SIGHTMESH_PROGRESS_TIMEOUT_SECONDS - or simply
+    upgrading to a build with different defaults - turned every subsequent
+    `start()` for an existing worker into "already exists with a different
+    specification". The policy describes how this run was resolved, not what
+    was asked for, so it is stored beside the spec and never in it."""
+    _mesh, client, store, ownership = system
+    first = SightMesh(
+        client=client, store=store, ownership=ownership, environment={}
+    ).start(spec())
+
+    upgraded = SightMesh(
+        client=client,
+        store=store,
+        ownership=ownership,
+        environment={"SIGHTMESH_PROGRESS_TIMEOUT_SECONDS": "60"},
+    )
+    replayed = upgraded.start(spec())
+
+    assert replayed == first
+    assert len(client.launches) == 1
+    stored = store.get("operator", "audit")
+    assert "progress_timeout" not in stored.spec, "the policy is not part of identity"
+    assert stored.spec["detection"]["progress_timeout"] == 1500.0
+
+
+def test_a_worker_cannot_buy_itself_a_longer_approval_timeout(system):
+    """Why: `approval_timeout` had no default floor, so the "stricter of the
+    two" rule had nothing to be stricter than and a worker's request passed
+    through verbatim. A ten-day approval timeout is an approval nobody is ever
+    told about."""
+    _mesh, client, store, ownership = system
+    SightMesh(
+        client=client, store=store, ownership=ownership, environment={}
+    ).start(spec(approval_timeout=864_000.0))
+
+    assert store.get("operator", "audit").spec["detection"]["approval_timeout"] == 1800.0
