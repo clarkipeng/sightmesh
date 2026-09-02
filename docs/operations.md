@@ -49,12 +49,15 @@ backend, and records pending state atomically under `~/.local/state/sightmesh/up
 does not overwrite the globally installed cdesktop package or restart a worker.
 
 Run `sightmesh update activate` when you want to apply the staged release. Activation
-drains first: it stops bridge intake, asks cdesktop to refuse new launches, then waits a
-bounded window for in-flight turns to reach terminal. A loaded host converges because no
-new work is admitted behind the drain. If the window expires the drain is released, the
-bridge is restored, and the result reports `drain-timed-out` with the activity actually
-observed. Dev servers do not block activation because they are disposable children of
-the backend.
+drains first: it asks cdesktop to refuse new launches, then waits a bounded window for
+in-flight turns to reach terminal. cdesktop caps one drain request at 30 seconds, so the
+wait renews the refusal on a shorter cadence and stops as soon as a renewal fails,
+reporting `rearms` and `lapsed` alongside the time it actually waited. A loaded host
+converges because no new work is admitted behind the drain. If the window expires the
+drain is released and the result reports `drain-timed-out` with the activity actually
+observed. The bridge stays up for the whole wait and is stopped only for the swap
+itself, so a refused activation costs no bridge downtime at all. Dev servers do not
+block activation because they are disposable children of the backend.
 
 Activation checks the new backend health endpoint and exact reported version before
 restarting the bridge. Failure is recorded, clears pending activation, and is never
@@ -64,8 +67,9 @@ restart. CLI and skill updates are one-shot and can take effect while cdesktop w
 continue.
 
 The one supported bootstrap exception is `0.2.3-sightmesh.1`, which predates the drain
-endpoint. Its transition to `.2` still stops bridge intake and waits the bounded window
-before restart, and reports `enforced: false` for the drain it could not request. An
+endpoint. Its transition to `.2` still waits the bounded window before restart, keeps
+the bridge up throughout, and reports `enforced: false` for the drain it could not
+request. An
 unknown backend that lacks the drain endpoint fails closed.
 
 `sightmesh doctor` reports `cdesktop-version-skew`, comparing the installed CLI, the
