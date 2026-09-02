@@ -780,3 +780,25 @@ def test_a_replacement_in_flight_is_never_classified_from_its_predecessor(store)
     mid_handoff = store.get_by_id(child.task_id)
     assert mid_handoff.state == "replacing"
     assert wake_rows(store, "any_child_lost") == []
+
+
+def test_output_baselines_do_not_outlive_the_tasks_they_describe(store):
+    """Why: the baseline map is process-lifetime state in a daemon that runs
+    for weeks. A terminal task's entry is dead weight, and a replaced task's
+    entry belongs to a predecessor whose byte count has nothing to do with the
+    successor's - a stale entry there would read as growth on the successor's
+    first tick and close an episode it never had."""
+    manager = task(store, "manager", session="s-manager", children=4)
+    child = task(store, "child", parent=manager.task_id, session="s-child")
+    client = FakeClient()
+    client.run("s-child", last_activity=NOW)
+    client.processes["s-child"][0]["output_bytes"] = 1_024
+    pass_ = reconciler(client, store, lambda: NOW)
+
+    pass_.detect_liveness()
+    assert child.task_id in pass_._output_bytes  # noqa: SLF001 - state under test
+
+    store.finish(child.task_id, "completed", "done")
+    pass_.detect_liveness()
+
+    assert child.task_id not in pass_._output_bytes  # noqa: SLF001 - state under test
