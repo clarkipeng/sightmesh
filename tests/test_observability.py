@@ -854,3 +854,20 @@ def test_the_expiry_sweep_removes_capability_files_too(tmp_path: Path) -> None:
         assert [recovered.token for recovered in store.recover_stale()] == [lease.token]
 
     assert not capability.exists()
+
+
+def test_an_unreadable_update_state_still_fails_doctor(monkeypatch) -> None:
+    """Every skew result carries the same keys, including the one `doctor`
+    reads to decide whether a check counts against it. A result missing
+    `warning_only` would crash the command that reports it.
+    """
+
+    def unreadable() -> dict:
+        raise RuntimeError("update state is corrupt")
+
+    monkeypatch.setattr(cli.updates, "read_state", unreadable)
+
+    check = cli._version_skew_check("0.2.5-sightmesh.1", "cdesktop/0.2.5-sightmesh.1")
+
+    assert check["ok"] is False
+    assert check["warning_only"] is False

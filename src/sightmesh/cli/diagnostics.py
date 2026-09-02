@@ -31,6 +31,7 @@ def _version_skew_check(
         return {
             "check": "cdesktop-version-skew",
             "ok": False,
+            "warning_only": False,
             "detail": {"error": f"update state is unreadable: {exc}"},
         }
     active = _version_token(_release_version(state.get("active")))
