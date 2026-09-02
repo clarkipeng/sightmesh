@@ -441,3 +441,86 @@ def test_the_wake_predicate_check_widens_for_the_liveness_predicates(tmp_path):
                 "dedupe_key, state, created_at, updated_at) "
                 "VALUES ('w3', 'p', 'any_child_confused', 'k3', 'pending', 1, 1)"
             )
+
+
+def _one_task(tmp_path, key="child", **spec):
+    store = TaskStore(tmp_path / "state.sqlite3")
+    ((record, _inserted),) = store.reserve_all(
+        scope="operator",
+        parent_task_id=None,
+        specs=[{"key": key, "children": 0, **spec}],
+        max_attempts=3,
+    )
+    return store, store.activate(
+        record.task_id, workspace_id="ws", session_id=f"s-{key}"
+    )
+
+
+def test_a_reason_flip_inside_one_silence_is_not_a_new_episode(tmp_path):
+    """Why (the unbounded-wake bug): any classification change used to count as
+    an episode boundary, and an episode boundary resets `liveness_wakes` to
+    zero. One flaky snapshot read is enough to flip a silent task between
+    `stalled` and `limbo`, so a wedged child minted a fresh episode on every
+    tick, emitted a wake on every tick, and never reached the two-wake
+    escalation that hands the incident to a human. An episode ends when
+    progress resumes; nothing else."""
+    store, task = _one_task(tmp_path)
+    store.record_liveness(task.task_id, "stalled", evidence="{}", now=100.0)
+    opened = store.get_by_id(task.task_id)
+    with store.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE managed_tasks SET liveness_wakes = 1 WHERE task_id = ?",
+            (task.task_id,),
+        )
+        conn.execute("COMMIT")
+
+    for reason in ("limbo", "stalled", "idle_unreported", "limbo"):
+        store.record_liveness(task.task_id, reason, evidence="{}", now=200.0)
+
+    flipped = store.get_by_id(task.task_id)
+    assert flipped.liveness == "limbo", "the reason itself is allowed to change"
+    assert flipped.liveness_episode == opened.liveness_episode
+    assert flipped.liveness_since == opened.liveness_since, "the phase clock is untouched"
+    assert flipped.liveness_wakes == 1, "the escalation counter must survive a relabel"
+
+
+def test_progress_closes_the_episode_and_the_next_silence_opens_a_new_one(tmp_path):
+    """The other half of the same rule: the boundary that does exist has to
+    keep existing, or a child that stalls, recovers, and stalls again would
+    collapse into one incident and its manager would never hear about the
+    second."""
+    store, task = _one_task(tmp_path)
+    store.record_liveness(task.task_id, "stalled", evidence="{}", now=100.0)
+    store.record_liveness(task.task_id, "live", now=200.0)
+    recovered = store.get_by_id(task.task_id)
+    assert (recovered.liveness, recovered.liveness_since) == ("live", None)
+    assert recovered.liveness_wakes == 0
+
+    store.record_liveness(task.task_id, "stalled", evidence="{}", now=300.0)
+    assert store.get_by_id(task.task_id).liveness_episode == 2
+
+
+def test_parking_starts_its_own_phase_clock(tmp_path):
+    """Why: the approval timeout is measured from `liveness_since`. If parking
+    shared the preceding silence's clock, a task that went quiet and *then*
+    parked on an approval would be timed out into blocked(approval) the
+    instant it parked - reporting a decision nobody had waited for."""
+    store, task = _one_task(tmp_path)
+    store.record_liveness(task.task_id, "stalled", evidence="{}", now=100.0)
+    store.record_liveness(task.task_id, "parked", evidence="{}", now=900.0)
+    assert store.get_by_id(task.task_id).liveness_since == 900.0
+
+
+def test_a_terminal_task_can_neither_be_reclassified_nor_flagged(tmp_path):
+    """Why: a detector tick and a task's own terminal write race by nature. A
+    late tick that lands after the terminal must not annotate a finished task
+    with a stall finding or a budget flag - both surface to a human as an
+    incident about a worker that is not there any more."""
+    store, task = _one_task(tmp_path)
+    store.finish(task.task_id, "completed", "done")
+
+    store.record_liveness(task.task_id, "stalled", evidence="{}", now=100.0)
+    assert store.get_by_id(task.task_id).liveness == "live"
+    assert store.record_over_budget(task.task_id) is False
+    assert store.get_by_id(task.task_id).over_budget is False

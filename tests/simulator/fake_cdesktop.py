@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from sightmesh.cdesktop import CdesktopError, CdesktopRejectedError
+from sightmesh.runtime_lock import RUNTIME_LOCK
 
 
 class SimulatedCrash(RuntimeError):
@@ -134,7 +135,15 @@ class FakeCdesktop:
     # ------------------------------------------------------------------
     def info(self) -> dict[str, Any]:
         self._log("info")
-        return {"service_capabilities": {"managed_task_launch": 1}}
+        return {
+            # A version the durable reconciler accepts, so a scenario can run
+            # the *whole* bridge tick - kernel pass and session pass - rather
+            # than only the half the detector lives in. The no-kill negatives
+            # are worthless if the pass that used to do the killing is gated
+            # off behind a missing version string.
+            "version": f"cdesktop/{RUNTIME_LOCK.cdesktop.compatibility.durable_recovery}",
+            "service_capabilities": {"managed_task_launch": 1},
+        }
 
     def repos(self) -> list[dict[str, Any]]:
         self._log("repos")
