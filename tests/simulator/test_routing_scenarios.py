@@ -650,6 +650,37 @@ def test_sd12_a_replacement_epoch_that_already_ended_blocks_and_then_advances(
     assert store.get("operator", "audit").epoch == 2
 
 
+def test_sd12_a_manual_replacement_is_left_to_the_human_who_started_it(
+    mesh: SightMesh, store: TaskStore, pool_root, routing_settings
+) -> None:
+    """S-D12 (contrast): the sweep finishes only the replacements it opened.
+
+    A manual ``replace(worker, prompt)`` carries a prompt that lives nowhere
+    but the caller's hands. Resuming one here would quietly re-run the original
+    work under a new epoch - a wrong answer that looks like a right one - and
+    its failure is already visible to the human who ran the command.
+    """
+    seed_pool(claude_account("acct-a"), claude_account("acct-b"))
+    configure_chains(standard=(subscription("terra", "terra", "claude"),))
+
+    started = mesh.start(routed_spec())
+    mesh.client.fail_launch(CdesktopError("PUT /task-launches failed: HTTP 503: down"))
+    with pytest.raises(CdesktopError):
+        mesh.replace("audit", "do only the second half")
+    stranded = store.get("operator", "audit")
+    assert stranded.state == "replacing" and "recovery" not in stranded.spec["target"]
+
+    assert mesh.reconcile_provider_outcomes() == []
+    assert mesh.reconcile_provider_outcome(started.session_id) is None
+    assert store.get("operator", "audit").epoch == stranded.epoch
+
+    # The human re-runs their own command, prompt and all, and it resumes the
+    # epoch already open rather than burning another.
+    resumed = mesh.replace("audit", "do only the second half")
+    assert resumed.state == "active"
+    assert store.get("operator", "audit").epoch == stranded.epoch
+
+
 # ---------------------------------------------------------------- S-D13
 
 
