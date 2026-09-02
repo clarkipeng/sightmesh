@@ -346,9 +346,8 @@ class DurableExecutionReconciler:
         """
         store = self.task_store
         counts = {"findings": 0, "wakes_inserted": 0}
-        selected, scanned_all = self._detection_slice(store)
-        if scanned_all:
-            self._evict_baselines({task.task_id for task in selected})
+        selected, watched = self._detection_slice(store)
+        self._evict_baselines(watched)
         deadline = time.monotonic() + self.pass_budget_seconds
         for task in selected:
             # Per-task isolation. Evidence comes from an untrusted executor
@@ -440,12 +439,16 @@ class DurableExecutionReconciler:
             trusted=trusted,
         )
 
-    def _detection_slice(self, store: TaskStore) -> tuple[list[TaskRecord], bool]:
+    def _detection_slice(
+        self, store: TaskStore
+    ) -> tuple[list[TaskRecord], set[str]]:
         """The tasks this pass will classify, resuming from the cursor.
 
-        Returns the slice and whether it covered the whole fleet, which is the
-        only moment a baseline eviction can safely tell a task apart from one
-        that simply was not reached this tick.
+        Returns the capped slice plus the *full* watched set. Baseline
+        eviction needs the latter: a fleet bigger than one pass never has a
+        "complete" tick, so evicting against the slice alone would either
+        leak every terminal task's baseline forever or throw away the
+        baselines of tasks that were simply not reached this tick.
         """
         states = ", ".join("?" for _ in DETECTABLE_STATES)
         try:
@@ -457,10 +460,14 @@ class DurableExecutionReconciler:
                 ).fetchall()
         except TaskStoreError as exc:
             LOGGER.warning("Cannot scan tasks for liveness: %s", exc)
-            return ([], False)
+            return ([], set(self._output_bytes))
         ordered = [str(row["task_id"]) for row in rows]
         start = next(
-            (index for index, task_id in enumerate(ordered) if task_id > self._liveness_cursor),
+            (
+                index
+                for index, task_id in enumerate(ordered)
+                if task_id > self._liveness_cursor
+            ),
             0,
         )
         rotated = ordered[start:] + ordered[:start]
@@ -468,7 +475,7 @@ class DurableExecutionReconciler:
         chosen = rotated if complete else rotated[: self.tasks_per_pass]
         self._liveness_cursor = chosen[-1] if chosen and not complete else ""
         tasks = [store.get_by_id(task_id) for task_id in chosen]
-        return ([task for task in tasks if task is not None], complete)
+        return ([task for task in tasks if task is not None], set(ordered))
 
     def _evict_baselines(self, live_task_ids: set[str]) -> None:
         """Forget output baselines for tasks that are no longer being watched.
