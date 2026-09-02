@@ -49,7 +49,8 @@ class _FaultPlan:
     kill_steps: set[str] = field(default_factory=set)
     duplicate_steps: set[str] = field(default_factory=set)
     latency_steps: dict[str, float] = field(default_factory=dict)
-    rate_limit_steps: set[str] = field(default_factory=set)
+    #: step -> (status, retry_after seconds or None), consumed once.
+    rejection_steps: dict[str, tuple[int, float | None]] = field(default_factory=dict)
 
 
 class FakeCdesktop:
@@ -97,10 +98,21 @@ class FakeCdesktop:
         with self._faults_lock:
             self._faults.latency_steps[step] = seconds
 
-    def rate_limit_after(self, step: str) -> None:
+    def rate_limit_after(self, step: str, retry_after: float | None = None) -> None:
         """Raise a typed HTTP 429 the next time ``step`` executes."""
+        self.reject_after(step, 429, retry_after)
+
+    def reject_after(
+        self, step: str, status: int, retry_after: float | None = None
+    ) -> None:
+        """Raise a typed rejection with this status the next time ``step`` runs.
+
+        The status is the whole point: routing reads the typed discriminator,
+        so a scenario injecting a 401 or a 503 must produce exactly what the
+        real client produces for one, down to the optional ``Retry-After``.
+        """
         with self._faults_lock:
-            self._faults.rate_limit_steps.add(step)
+            self._faults.rejection_steps[step] = (int(status), retry_after)
 
     def _consume_duplicate(self, step: str) -> bool:
         with self._faults_lock:
@@ -112,17 +124,18 @@ class FakeCdesktop:
     def _hook(self, step: str) -> None:
         with self._faults_lock:
             delay = self._faults.latency_steps.get(step)
-            rate_limited = step in self._faults.rate_limit_steps
-            if rate_limited:
-                self._faults.rate_limit_steps.discard(step)
+            rejection = self._faults.rejection_steps.pop(step, None)
             killed = step in self._faults.kill_steps
             if killed:
                 self._faults.kill_steps.discard(step)
         if delay:
             time.sleep(delay)
-        if rate_limited:
+        if rejection is not None:
+            status, retry_after = rejection
             raise CdesktopRejectedError(
-                f"managed launch step {step!r}: HTTP 429: rate limited", status=429
+                f"managed launch step {step!r}: HTTP {status}",
+                status=status,
+                retry_at=None if retry_after is None else time.time() + retry_after,
             )
         if killed:
             raise SimulatedCrash(f"simulated crash at step {step!r}")

@@ -569,15 +569,25 @@ def test_account_without_a_credential_yields_no_launch_env(pool_root: Path) -> N
     assert core.env_for({"id": "missing", "provider": "claude", "kind": "oauth"}) == {}
 
 
-def test_limit_detection_matches_real_provider_refusals() -> None:
-    # These strings are what selection reads to decide an account is exhausted.
-    # Missing one means a limited account keeps being chosen and every launch on
-    # it fails.
-    assert core.looks_limited("Claude usage limit reached. Resets at 3pm")
-    assert core.looks_limited("You've reached your Fable 5 limit.")
-    assert core.looks_limited("HTTP 429 Too Many Requests")
-    assert core.looks_limited("insufficient_quota")
-    assert not core.looks_limited("compilation finished with 2 warnings")
+def test_a_failed_probe_never_cools_an_account_on_its_own(pool_root: Path, monkeypatch) -> None:
+    """A probe reports what the executor said; it does not classify why.
+
+    The pattern list that used to read "429" or "quota" out of probe output
+    also matched a worker's own test transcript, which cooled a healthy
+    account. Cooling is now driven only by a typed provider outcome, so a
+    failing probe must leave pool state alone.
+    """
+    account = {"id": "max-a", "provider": "claude", "kind": "oauth"}
+    core.save_pool({"accounts": [account]})
+    core.write_token("max-a", "sk-ant-oat01-" + "a" * 120)
+    monkeypatch.setattr(
+        core, "probe", lambda _account, timeout=90: (False, "HTTP 429 Too Many Requests")
+    )
+
+    ok, reason = core.probe_cached(account)
+
+    assert (ok, reason) == (False, "HTTP 429 Too Many Requests")
+    assert core.cooling_until(core.load_state(), "max-a") == 0
 
 
 # ---------------------------------------------------------------- local UI

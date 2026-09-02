@@ -6,7 +6,8 @@ Execution routing is a local, subscription-first selection policy. It chooses a 
 
 Settings live at `~/.config/sightmesh/execution_routing.json` with owner-only permissions. They contain policy and non-secret identifiers only:
 
-- routes are ordered. The selector evaluates them from first to last;
+- routes are grouped into **classes**, and each class holds one ordered chain. `standard` is ordinary work; `deep` is for a top-level supervised manager that fans work out. `defaultClass` names the class used when a task does not choose one;
+- within a class, routes are ordered. The selector evaluates them from first to last and never leaves the class it was asked for;
 - a `subscription` route names an `accountPool` (`claude` or `codex`) and considers its non-API accounts in their existing pool order;
 - a `metered` route names one fixed `account` alias;
 - a `free` route names neither, because it bills nothing and owns no account;
@@ -35,7 +36,11 @@ sightmesh routing routes add \
   --account codex-api-primary
 ```
 
-Keep subscription routes before metered routes when subscription capacity should be preferred. `sightmesh routing routes order` must receive every configured route ID exactly once; that makes priority explicit and stable.
+Every `routing routes` command acts on one class - `--class` selects it, and omitting it means the default class. `sightmesh routing routes order` must receive every route ID in that class exactly once; that makes priority explicit and stable. Keep subscription routes before metered routes when subscription capacity should be preferred.
+
+Route IDs are unique within a class, not across classes: two chains may both end on a hop named `sol`.
+
+A settings file written before classes existed loads unchanged - its single ordered list becomes the `standard` chain, and the next save rewrites the file in the current shape.
 
 ## Metered policy and current boundary
 
@@ -43,14 +48,31 @@ Keep subscription routes before metered routes when subscription capacity should
 
 These are durable selector guarantees: the settings are persisted and each selection produces a resolved, approval-needed, or blocked result. SightMesh spawn and teammate launches route through the selector and carry the selected binding.
 
-Managed SDK tasks also persist that opaque binding. When the bridge observes a terminal assistant response that reports subscription quota exhaustion, it cools that binding and transfers the task to one successor on the next eligible configured route. The task epoch, active lease, and attempt budget make repeated observations idempotent and bounded. Explicit-profile tasks and ordinary non-quota failures never change routes automatically. A route that requires metered approval or a fully exhausted chain leaves the task blocked for a human decision.
+## What advances a chain
+
+Exactly three typed provider outcomes move a task along its chain, and they are read from the effect journal, never from anything a worker printed:
+
+| outcome | cooldown |
+|---|---|
+| `rate_limited` | the provider's advertised `retry_at`, else the capacity default |
+| `auth` | the short window - a rotated credential is not exhausted capacity |
+| `provider_down` | the short window, applied to every account in that route's pool |
+
+Anything else - a definitive rejection, a lost launch, and every repository, test, or code failure - carries no provider outcome at all, so it cannot reroute. A worker whose failing test output happens to mention a rate limit is not a rate limit.
+
+The condemned accounts are cooled once, at the moment the outcome is recorded, into pool `state.json` - the single source of account truth, so the cooldown survives a restart and every later selection observes it. The reroute itself is then a pure read: it excludes the failed binding and re-walks the same class chain, which lands on the next eligible *account of the same route* before it ever reaches the next route. Retrying one model on a second account before switching models therefore needs no retry counter.
+
+The new target opens a new epoch that fences the old one. The task epoch, active lease, and attempt budget make repeated observations idempotent and bounded. An explicit profile or `--executor` override still records its class, so it stays recoverable; a profile with `automatic_failover` off blocks with a reason instead of failing over. A route that requires metered approval or a fully exhausted chain leaves the task blocked for a human decision.
 
 Use the non-launching commands to review the policy:
+
+`routing validate` proves a usable path per class before dispatch, and dispatch gates on it: a class whose chain is empty or whose every hop is ineligible is refused before any epoch, effect row, or native call exists. A metered hop awaiting approval still counts as usable - the work has somewhere to go, it just needs a human first.
 
 ```sh
 sightmesh routing show
 sightmesh routing validate
-sightmesh routing explain --workspace workspace-demo
+sightmesh routing validate --class deep
+sightmesh routing explain --class deep --workspace workspace-demo
 sightmesh routing set-metered ask
 sightmesh routing set-free-fallback off
 ```
@@ -91,6 +113,6 @@ With `exposeAccountAlias=true`, the selected target includes that safe alias for
 
 ## Upgrade and compatibility
 
-This settings file is versioned independently and starts with routing enabled, no routes, and `meteredFallback: auto`. No route means selection is safely blocked. Add routes deliberately, validate them, and inspect the non-launching explanation before connecting later execution integration.
+This settings file is versioned independently and starts with routing enabled, no chains, and `meteredFallback: auto`. No chain for a class means dispatch of that class is refused by `validate`, not silently degraded. Add routes deliberately, validate them, and inspect the non-launching explanation before connecting later execution integration.
 
 Existing cdesktop workspaces, profiles, and active sessions continue to be managed in cdesktop. Do not use this policy to imply that an existing session will be interrupted, recovered, or approved automatically. cdesktop is the primary UI for those activities. `sightmesh pool serve` is retained only as a loopback recovery/compatibility view of pool state; it is not a route launcher, route-approval UI, or substitute for cdesktop.

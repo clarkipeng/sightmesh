@@ -27,11 +27,24 @@ class CdesktopError(RuntimeError):
 
 
 class CdesktopRejectedError(CdesktopError):
-    """A cdesktop server response definitively rejected the requested action."""
+    """A cdesktop server response definitively rejected the requested action.
 
-    def __init__(self, message: str, *, status: int | None = None) -> None:
+    ``status`` is the typed discriminator every routing decision reads; the
+    optional ``retry_at`` is the provider's own advertised reset, so a rate
+    limit cools its account until the provider says it is over rather than for
+    a blunt default window.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        retry_at: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
+        self.retry_at = retry_at
 
 
 class CdesktopTransportError(CdesktopError):
@@ -50,6 +63,36 @@ class CdesktopInterruptedError(CdesktopRejectedError):
 
 class CdesktopPendingError(CdesktopRejectedError):
     """A keyed operation is still owned by another cdesktop request (HTTP 425)."""
+
+
+#: HTTP statuses that carry a typed meaning routing acts on. Everything else
+#: stays an untyped ``CdesktopError``: routing must never infer a provider
+#: outcome from a status it was not told the meaning of.
+_REJECTION_STATUSES = (401, 403, 409, 429, 500, 502, 503, 504)
+
+
+def _rejection_type(status: int) -> type[CdesktopRejectedError] | None:
+    if status == 424:
+        return CdesktopInterruptedError
+    if status == 425:
+        return CdesktopPendingError
+    return CdesktopRejectedError if status in _REJECTION_STATUSES else None
+
+
+def _retry_at(headers: Any) -> float | None:
+    """Absolute time the provider says to retry, from ``Retry-After`` seconds.
+
+    Only the delta-seconds form is honoured. An HTTP-date form depends on the
+    provider's clock agreeing with ours, and a wrong absolute time would cool
+    an account for the wrong window; falling back to the default cooldown is
+    the safe reading.
+    """
+    raw = headers.get("Retry-After") if headers is not None else None
+    try:
+        seconds = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return time.time() + seconds if seconds >= 0 else None
 
 
 EFFECT_NOT_FOUND_MESSAGE = "Managed task effect not found"
@@ -162,15 +205,15 @@ class CdesktopClient:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            error_type = {
-                409: CdesktopRejectedError,
-                424: CdesktopInterruptedError,
-                425: CdesktopPendingError,
-            }.get(exc.code)
+            error_type = _rejection_type(exc.code)
             message = f"{method} {path} failed: HTTP {exc.code}: {detail}"
             if error_type is None:
                 raise CdesktopError(message) from exc
-            raise error_type(message, status=exc.code) from exc
+            raise error_type(
+                message,
+                status=exc.code,
+                retry_at=_retry_at(exc.headers),
+            ) from exc
         except URLError as exc:
             raise CdesktopTransportError(
                 f"Cannot reach cdesktop at {self.base_url}: {exc}"

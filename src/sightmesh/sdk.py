@@ -22,21 +22,23 @@ from .cdesktop import (
     CdesktopPendingError,
     CdesktopRejectedError,
     is_effect_not_found,
-    latest_execution_process,
 )
-from .effects import EffectBusy, EffectJournal, new_owner_instance, request_hash
-from .escalation import (
-    CDESKTOP_SESSION_ENV,
-    EscalationStore,
-    LauncherIdentity,
-    redact_credentials,
+from .effects import (
+    Effect,
+    EffectBusy,
+    EffectJournal,
+    new_owner_instance,
+    request_hash,
 )
+from .escalation import CDESKTOP_SESSION_ENV, EscalationStore, LauncherIdentity
 from .liveness import Budget, resolve_policy, trusted_policy
 from .pool import core as pool_core
 from .profiles import ProfileStore, validate_provider
 from .succession import (
+    REROUTE_OUTCOMES,
     OwnershipStore,
-    reroute_after_quota_exhaustion,
+    advance_route_after_outcome,
+    cool_provider_outcome,
     transfer_ownership,
 )
 from .task_store import StaleTransition, TaskRecord, TaskStore, TaskStoreError
@@ -81,6 +83,8 @@ class WorkerSpec:
     reasoning: str | None = None
     permission: str = "BYPASS_PERMISSIONS"
     children: int = 0
+    #: Explicit route class override. ``None`` lets scope and risk decide.
+    route_class: str | None = None
     #: Liveness detection settings (docs/liveness-spec.md, "WorkerSpec
     #: additions"). ``None`` means "inherit the trusted floor". These are
     #: requests, not grants: ``liveness.resolve_policy`` takes the stricter of
@@ -191,7 +195,10 @@ class SightMesh:
             raise SightMeshError(
                 f"Task {parent.key!r} cannot start children while {parent.state}"
             )
-        prepared = [self._prepare_spec(scope, spec) for spec in requested]
+        prepared = [
+            self._prepare_spec(scope, spec, top_level=parent is None)
+            for spec in requested
+        ]
         self._require_contract()
         reservations = self.store.reserve_all(
             scope=scope,
@@ -270,7 +277,6 @@ class SightMesh:
     def checkpoint(self, text: str, worker: str | None = None) -> Worker:
         if not text.strip():
             raise SightMeshError("Checkpoint must not be empty")
-        text = redact_credentials(text)
         task = self._current() if worker is None else self._find(worker)
         path = self._checkpoint_path(task, hashlib.sha256(text.encode()).hexdigest())
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -340,32 +346,86 @@ class SightMesh:
         self.wakes.pump()
         return updated
 
-    def reconcile_quota_failure(self, session_id: str) -> Worker | None:
-        """Move one managed task past an observed subscription quota refusal."""
+    def reconcile_provider_outcome(self, session_id: str) -> Worker | None:
+        """Advance the task holding this session past a typed provider outcome."""
         task = self.store.get_by_session(session_id)
-        if task is None:
-            return None
+        return self._advance_past_outcome(task) if task is not None else None
+
+    def reconcile_provider_outcomes(self) -> list[Worker]:
+        """Advance every task whose current epoch ended on a typed outcome.
+
+        A launch rejected before the task ever activated holds no session, so
+        no session-keyed sweep can ever reach it. This one is keyed on the
+        journal instead, which is where the outcome actually lives.
+        """
+        advanced: list[Worker] = []
+        for effect in self.journal.with_outcomes(REROUTE_OUTCOMES):
+            task = self.store.get_by_id(effect.task_id)
+            if task is None:
+                continue
+            # Each task settles on its own: one whose replacement launch is
+            # itself rejected must not stop the sweep from reaching the rest.
+            try:
+                worker = self._advance_past_outcome(task, effect)
+            except (CdesktopError, SightMeshError, TaskStoreError) as exc:
+                LOGGER.info("Cannot advance task %s this tick: %s", task.key, exc)
+                continue
+            if worker is not None:
+                advanced.append(worker)
+        return advanced
+
+    def _advance_past_outcome(
+        self, task: TaskRecord, effect: Effect | None = None
+    ) -> Worker | None:
+        """Move one task past a typed capacity, auth, or provider outcome.
+
+        The typed outcome on the effect journal is the only trigger. A task
+        that failed to build, failed its tests, or blocked itself carries no
+        provider outcome at all, so it can never enter this path - however
+        much its transcript may look like a rate limit.
+        """
         target = task.spec.get("target", {})
-        if task.state == "replacing" and target.get("recovery") == "quota":
+        if task.state == "replacing" and target.get("recovery") in REROUTE_OUTCOMES:
+            # A crashed replacement: resume the epoch already prepared rather
+            # than burn another one.
             self._require_contract()
             return Worker.from_record(
-                self._replace_prepared(task, str(task.spec["prompt"]))
+                self._launch_prepared(task, str(task.spec["prompt"]))
             )
-        if task.state != "active":
+        if task.state not in {"active", "blocked"}:
             return None
-        failure = self._quota_failure(session_id)
-        route_id = target.get("route_id")
-        binding_id = target.get("auth_binding_id")
-        if failure is None or not route_id or not binding_id:
+        if effect is None:
+            effect = self.journal.get(task.task_id, task.epoch)
+        if (
+            effect is None
+            or effect.state != "terminal"
+            or effect.outcome not in REROUTE_OUTCOMES
+        ):
             return None
 
-        selection = reroute_after_quota_exhaustion(
+        route_id = target.get("route_id")
+        route_class = target.get("route_class") or execution_routing.DEFAULT_ROUTE_CLASS
+        if target.get("failover") == "pinned":
+            # The operator pinned this task to one target and switched
+            # automatic failover off. It blocks with the reason rather than
+            # silently going nowhere, so `replace()` remains a human's call.
+            return self._block_unroutable(
+                task,
+                f"{effect.outcome} on {route_id}; automatic failover is off",
+            )
+
+        selection = advance_route_after_outcome(
             execution_routing.ExecutionRoutingStore().load(),
-            exhausted_binding_id=str(binding_id),
+            outcome=str(effect.outcome),
+            route_class=route_class,
+            failed_binding_id=target.get("auth_binding_id"),
         )
         if selection.status != "resolved" or selection.target is None:
-            reason = f"Quota exhausted for route {route_id}; {selection.reason}"
-            return Worker.from_record(self._finish(task, "blocked", reason))
+            return self._block_unroutable(
+                task,
+                f"{effect.outcome} on route {route_id} "
+                f"({route_class}); {selection.reason}",
+            )
 
         selected = selection.target
         next_target = {
@@ -374,17 +434,85 @@ class SightMesh:
             "reasoning": task.spec.get("reasoning"),
             "provider_id": self._default_provider_id(),
             "auth_binding_id": selected.auth_binding_id,
+            "route_class": selected.route_class,
             "route_id": selected.route_id,
             "billing_class": selected.billing_class,
-            "recovery": "quota",
+            "failover": "auto",
+            "recovery": effect.outcome,
         }
         self._require_contract()
         prepared = self.store.prepare_replacement(
             task.task_id, target=next_target, expect_version=task.version
         )
         return Worker.from_record(
-            self._replace_prepared(prepared, str(task.spec["prompt"]))
+            self._launch_prepared(prepared, str(task.spec["prompt"]))
         )
+
+    def _block_unroutable(self, task: TaskRecord, reason: str) -> Worker | None:
+        """Block a task that cannot advance, and report only a real change.
+
+        A task blocked at launch already carries its typed outcome as its
+        result, and a terminal effect stays in the sweep's view forever - so
+        re-blocking it every tick would report the same non-event over and
+        over. The reason is recorded when the task still had somewhere to move
+        from; after that, silence is accurate.
+        """
+        if task.state == "blocked":
+            return None
+        return Worker.from_record(self._finish(task, "blocked", reason))
+
+    def _record_provider_outcome(
+        self, task: TaskRecord, outcome: str, retry_at: float | None
+    ) -> str:
+        """Mark this epoch terminal and cool what the outcome condemns, once.
+
+        The cooldown belongs with the write that records the outcome, not with
+        the reroute that later reads it: the first terminal write wins, so an
+        account is cooled exactly once however many times reconcile re-reads
+        the same outcome.
+        """
+        self.journal.mark_terminal(task.task_id, task.epoch, outcome, retry_at)
+        if outcome in REROUTE_OUTCOMES:
+            target = task.spec.get("target", {})
+            binding_id = target.get("auth_binding_id")
+            # A free route owns no account, so its shared sentinel names no
+            # binding to cool. Writing one would put a phantom account into
+            # pool state - the single source of account truth.
+            if binding_id and binding_id != execution_routing.FREE_AUTH_BINDING:
+                cool_provider_outcome(
+                    execution_routing.ExecutionRoutingStore().load(),
+                    outcome=outcome,
+                    binding_id=str(binding_id),
+                    route_class=target.get("route_class"),
+                    route_id=target.get("route_id"),
+                    retry_at=retry_at,
+                )
+        return outcome
+
+    def _launch_prepared(
+        self, prepared: TaskRecord, replacement_prompt: str
+    ) -> TaskRecord:
+        """Fill the epoch ``prepare_replacement`` opened.
+
+        A task that already holds a session hands ownership to its successor.
+        One whose launch was rejected before it ever activated has no session
+        to transfer and no workspace to reuse, so its new epoch opens a
+        workspace exactly as the first attempt would have.
+        """
+        if prepared.workspace_id and prepared.holder_session_id:
+            return self._replace_prepared(prepared, replacement_prompt)
+        workspace_id, session_id = self._journaled_launch(
+            prepared,
+            {
+                "kind": "workspace",
+                "request": self._workspace_request(prepared, replacement_prompt),
+            },
+        )
+        active = self.store.activate(
+            prepared.task_id, workspace_id=workspace_id, session_id=session_id
+        )
+        self._record_launcher(active)
+        return active
 
     def _replace_prepared(
         self, prepared: TaskRecord, replacement_prompt: str
@@ -427,36 +555,14 @@ class SightMesh:
         self._record_launcher(active)
         return active
 
-    def _quota_failure(self, session_id: str) -> str | None:
-        latest = latest_execution_process(
-            [
-                process
-                for process in self.client.execution_processes(session_id)
-                if process.get("run_reason") == "codingagent"
-            ]
-        )
-        if latest is None or latest.get("status") != "failed":
-            return None
-        snapshot = self.client.normalized_snapshot(str(latest["id"]))
-        messages: list[str] = []
-        for wrapped in snapshot.get("entries", []):
-            content = wrapped.get("content") if isinstance(wrapped, dict) else None
-            entry = content.get("entry_type") if isinstance(content, dict) else None
-            if isinstance(entry, dict) and entry.get("type") == "assistant_message":
-                messages.append(str(content.get("content") or ""))
-        output = "\n".join(messages)
-        return output if pool_core.looks_limited(output) else None
-
-    def _start_reserved(self, task: TaskRecord) -> TaskRecord:
-        if task.state != "reserved":
-            return task
+    def _workspace_request(self, task: TaskRecord, prompt: str) -> dict[str, Any]:
         target = task.spec["target"]
-        request = self.client.workspace_launch_request(
+        return self.client.workspace_launch_request(
             name=task.key,
             repo_path=Path(task.spec["repo_path"]),
             target_branch=task.spec["base"],
             executor=target["executor"],
-            prompt=task.spec["prompt"],
+            prompt=prompt,
             use_worktree=True,
             permission_policy=task.spec["permission"],
             model=target.get("model"),
@@ -465,6 +571,10 @@ class SightMesh:
             setup_script=task.spec.get("setup_script"),
             auth_binding_id=target.get("auth_binding_id"),
         )
+    def _start_reserved(self, task: TaskRecord) -> TaskRecord:
+        if task.state != "reserved":
+            return task
+        request = self._workspace_request(task, str(task.spec["prompt"]))
         self._wait_for_launch_capacity(task)
         workspace_id, session_id = self._journaled_launch(
             task, {"kind": "workspace", "request": request}
@@ -536,8 +646,9 @@ class SightMesh:
             # task so it is not left `reserved` and relaunchable - a retry is an
             # explicit new epoch via replace().
             if not isinstance(exc, (CdesktopInterruptedError, CdesktopPendingError)):
-                outcome = _rejection_outcome(exc.status)
-                self.journal.mark_terminal(task.task_id, task.epoch, outcome)
+                outcome = self._record_provider_outcome(
+                    task, _rejection_outcome(exc.status), exc.retry_at
+                )
                 self._finish(task, "blocked", f"launch rejected: {outcome}")
             raise
         workspace_id, session_id = self._effect_ids(task, native)
@@ -561,7 +672,9 @@ class SightMesh:
             )
         return str(workspace_id), str(session_id)
 
-    def _prepare_spec(self, scope: str, requested: WorkerSpec) -> dict[str, Any]:
+    def _prepare_spec(
+        self, scope: str, requested: WorkerSpec, *, top_level: bool = True
+    ) -> dict[str, Any]:
         self._validate_spec(requested)
         repo = self._resolve_repo(requested.repo)
         repo_path = Path(str(repo["path"])).expanduser().resolve()
@@ -579,6 +692,7 @@ class SightMesh:
             "reasoning": requested.reasoning,
             "permission": requested.permission,
             "children": requested.children,
+            "route_class": requested.route_class,
         }
         existing = self.store.get(scope, requested.key)
         if existing is not None:
@@ -587,7 +701,13 @@ class SightMesh:
                 for key, value in existing.spec.items()
                 if key not in _SPEC_FINGERPRINT_EXCLUSIONS
             }
-            if old_public != public:
+            # Compare only the fields the stored spec actually carries. A field
+            # this version added is one the running task's version could not
+            # have recorded, and its absence describes no disagreement about
+            # the work - so an upgrade mid-flight must not read as one.
+            if old_public != {
+                key: value for key, value in public.items() if key in old_public
+            }:
                 raise SightMeshError(
                     f"Task {requested.key!r} already exists with a different specification"
                 )
@@ -595,7 +715,7 @@ class SightMesh:
         return {
             **public,
             "setup_script": self._setup_script(repo_path, requested.base),
-            "target": self._select_target(requested),
+            "target": self._select_target(requested, top_level=top_level),
             # Resolved once, at reserve time, so the detector reads a settled
             # policy off the durable row instead of re-deriving it - and so a
             # worker cannot loosen its detection later by re-specifying.
@@ -614,7 +734,27 @@ class SightMesh:
             ).to_dict(),
         }
 
-    def _select_target(self, spec: WorkerSpec) -> dict[str, Any]:
+    def _select_target(
+        self, spec: WorkerSpec, *, top_level: bool = True
+    ) -> dict[str, Any]:
+        """Choose the route class, prove it is usable, then bind the first hop.
+
+        The class is decided once, here, and frozen into the target: every
+        later failover walks the same chain rather than re-deciding what kind
+        of work this is. An explicit profile or executor still names the first
+        hop, but it records that class too, so it stays recoverable instead of
+        being a dead end the reconciler cannot advance.
+        """
+        settings = execution_routing.ExecutionRoutingStore().load()
+        route_class = execution_routing.class_for(
+            execution_routing.ScopeRisk(
+                route_class=spec.route_class,
+                permission=spec.permission,
+                top_level=top_level,
+                children=spec.children,
+            ),
+            settings,
+        )
         if spec.profile:
             profile = ProfileStore().get(spec.profile)
             validate_provider(profile, self.client.providers())
@@ -626,6 +766,9 @@ class SightMesh:
                 "reasoning": spec.reasoning or profile.reasoning,
                 "provider_id": profile.provider_id,
                 "auth_binding_id": None,
+                "route_class": route_class,
+                "route_id": f"profile:{profile.name}",
+                "failover": "auto" if profile.automatic_failover else "pinned",
             }
         if spec.executor:
             return {
@@ -634,9 +777,21 @@ class SightMesh:
                 "reasoning": spec.reasoning,
                 "provider_id": None,
                 "auth_binding_id": None,
+                "route_class": route_class,
+                "route_id": f"executor:{spec.executor}",
+                "failover": "auto",
             }
-        settings = execution_routing.ExecutionRoutingStore().load()
-        selection = execution_routing.select_route(settings, preferred_model=spec.model)
+        validation = execution_routing.validate_chain(settings, route_class)
+        if not validation.valid:
+            # The explicit fail-closed gate: no epoch, no effect row, and no
+            # native call happen for a class that has nowhere to run.
+            raise SightMeshError(
+                f"Route class {route_class!r} cannot start {spec.key!r}: "
+                f"{validation.reason}"
+            )
+        selection = execution_routing.select_route(
+            settings, route_class=route_class, preferred_model=spec.model
+        )
         if selection.status != "resolved" or selection.target is None:
             raise SightMeshError(
                 f"Execution routing could not start {spec.key!r}: {selection.reason}"
@@ -648,7 +803,10 @@ class SightMesh:
             "reasoning": spec.reasoning,
             "provider_id": self._default_provider_id(),
             "auth_binding_id": target.auth_binding_id,
+            "route_class": target.route_class,
             "route_id": target.route_id,
+            "billing_class": target.billing_class,
+            "failover": "auto",
         }
 
     def _default_provider_id(self) -> str:
@@ -779,9 +937,13 @@ class SightMesh:
     def _probe_managed_launch(self) -> str:
         lookup = getattr(self.client, "managed_effect", None)
         if lookup is None:
-            # Seam v2 adds an executed probe for every capability; until then
-            # this runtime can only be taken at its word, and says so.
-            return "advertised-only"
+            # An advertised capability with no executable lookup is exactly the
+            # state that lets a launch fail late. There is no "take it at its
+            # word" answer: either the probe runs or the launch does not.
+            raise SightMeshError(
+                "cdesktop advertises the managed task launch contract but "
+                "exposes no effect lookup to probe it"
+            )
         try:
             effect = lookup(CONTRACT_PROBE_TASK_ID, 1)
         except CdesktopError as exc:
@@ -815,6 +977,14 @@ class SightMesh:
         if spec.permission not in PERMISSION_POLICIES:
             raise SightMeshError(
                 f"Unknown permission policy {spec.permission!r}; expected one of {sorted(PERMISSION_POLICIES)}"
+            )
+        if (
+            spec.route_class is not None
+            and spec.route_class not in execution_routing.ROUTE_CLASSES
+        ):
+            raise SightMeshError(
+                "route_class must be one of "
+                f"{', '.join(execution_routing.ROUTE_CLASSES)}"
             )
 
     @staticmethod
@@ -852,8 +1022,17 @@ ADOPT_TIMEOUT_SECONDS = 30.0
 
 
 def _rejection_outcome(status: int | None) -> str:
+    """Name what the provider did, as a type routing can act on.
+
+    Three names advance a route chain: capacity, auth, and a provider that is
+    down. Everything else stays a definitive rejection that blocks, because
+    retrying it on another account would only fail the same way.
+    """
     if status == 429:
         return "rate_limited"
     if status in (401, 403):
         return "auth"
+    if status is not None and 500 <= status < 600:
+        # A 5xx is the provider failing, not this account.
+        return "provider_down"
     return f"rejected:{status if status is not None else 'unknown'}"

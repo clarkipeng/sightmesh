@@ -44,9 +44,17 @@ def cmd_routing(args: argparse.Namespace) -> int:
 
     if action == "validate":
         settings = store.load()
-        warnings = execution_routing.route_warnings(settings)
+        results = (
+            (execution_routing.validate_chain(settings, args.route_class),)
+            if args.route_class
+            else execution_routing.validate_all(settings)
+        )
         _emit(
-            {"valid": not warnings, "warnings": warnings},
+            {
+                "valid": all(result.valid for result in results),
+                "classes": [result.to_dict() for result in results],
+                "warnings": execution_routing.route_warnings(settings),
+            },
             args.json,
         )
         return 0
@@ -70,8 +78,18 @@ def cmd_routing(args: argparse.Namespace) -> int:
 
     if action == "explain":
         settings = store.load()
-        result = execution_routing.select_route(settings, preferred_model=args.model)
-        payload = {**result.to_dict(), "workspace_id": args.workspace}
+        route_class = args.route_class or settings.default_class
+        result = execution_routing.select_route(
+            settings, route_class=route_class, preferred_model=args.model
+        )
+        payload = {
+            **result.to_dict(),
+            "routeClass": route_class,
+            "chain": [
+                route.to_dict() for route in settings.routes_for(route_class)
+            ],
+            "workspace_id": args.workspace,
+        }
         _emit(payload, args.json)
         return 0
 
@@ -82,16 +100,18 @@ def _cmd_routing_routes(
     args: argparse.Namespace, store: execution_routing.ExecutionRoutingStore
 ) -> int:
     settings = store.load()
+    route_class = args.route_class or settings.default_class
+    routes = list(settings.routes_for(route_class))
     action = args.routes_action
 
     if action == "list":
-        _emit([route.to_dict() for route in settings.routes], args.json)
+        _emit([route.to_dict() for route in routes], args.json)
         return 0
 
     if action == "add":
-        if any(existing.id == args.id for existing in settings.routes):
+        if any(existing.id == args.id for existing in routes):
             raise execution_routing.ExecutionRoutingError(
-                f"Route already exists: {args.id}"
+                f"Route already exists in class {route_class}: {args.id}"
             )
         route = execution_routing.Route(
             id=args.id,
@@ -101,41 +121,75 @@ def _cmd_routing_routes(
             account_pool=args.account_pool,
             account=args.account,
         )
-        routes = [*settings.routes, route]
+        routes.append(route)
         if args.before:
             routes = [r for r in routes if r.id != route.id]
             index = next((i for i, r in enumerate(routes) if r.id == args.before), None)
             if index is None:
                 raise execution_routing.ExecutionRoutingError(
-                    f"Unknown route: {args.before}"
+                    f"Unknown route in class {route_class}: {args.before}"
                 )
             routes = [*routes[:index], route, *routes[index:]]
-        updated = store.save(dataclasses.replace(settings, routes=tuple(routes)))
-        _emit([r.to_dict() for r in updated.routes], args.json)
-        return 0
+        return _save_chain(store, settings, route_class, routes, args, ids_only=False)
 
     if action == "remove":
-        if not any(r.id == args.id for r in settings.routes):
-            raise execution_routing.ExecutionRoutingError(f"Unknown route: {args.id}")
-        routes = tuple(r for r in settings.routes if r.id != args.id)
-        updated = store.save(dataclasses.replace(settings, routes=routes))
-        _emit([r.to_dict() for r in updated.routes], args.json)
-        return 0
+        if not any(r.id == args.id for r in routes):
+            raise execution_routing.ExecutionRoutingError(
+                f"Unknown route in class {route_class}: {args.id}"
+            )
+        routes = [r for r in routes if r.id != args.id]
+        return _save_chain(store, settings, route_class, routes, args, ids_only=False)
 
     if action == "order":
-        current_ids = [r.id for r in settings.routes]
+        current_ids = [r.id for r in routes]
         if sorted(args.ids) != sorted(current_ids):
             raise execution_routing.ExecutionRoutingError(
-                f"must list every route exactly once (have: {' '.join(current_ids)})"
+                f"must list every route in class {route_class} exactly once "
+                f"(have: {' '.join(current_ids)})"
             )
-        by_id = {r.id: r for r in settings.routes}
-        routes = tuple(by_id[i] for i in args.ids)
-        updated = store.save(dataclasses.replace(settings, routes=routes))
-        _emit([r.id for r in updated.routes], args.json)
-        return 0
+        by_id = {r.id: r for r in routes}
+        routes = [by_id[i] for i in args.ids]
+        return _save_chain(store, settings, route_class, routes, args, ids_only=True)
 
-    raise ValueError(f"Unknown routes action: {action}")
+    raise ValueError(f"Unknown routes action: {args.routes_action}")
 
+
+def _save_chain(
+    store: execution_routing.ExecutionRoutingStore,
+    settings: execution_routing.ExecutionRoutingSettings,
+    route_class: str,
+    routes: list[execution_routing.Route],
+    args: argparse.Namespace,
+    *,
+    ids_only: bool,
+) -> int:
+    """Replace one class chain, leaving every other class exactly as it was."""
+    chain = execution_routing.RouteChain(route_class, tuple(routes))
+    others = tuple(c for c in settings.chains if c.route_class != route_class)
+    updated = store.save(
+        dataclasses.replace(settings, chains=(*others, chain))
+    )
+    saved = updated.routes_for(route_class)
+    _emit(
+        [r.id for r in saved] if ids_only else [r.to_dict() for r in saved],
+        args.json,
+    )
+    return 0
+
+
+
+def _add_class_argument(parser: argparse.ArgumentParser) -> None:
+    """``--class`` names which chain a command reads or edits.
+
+    Omitted, it means the configured default class, so every existing
+    invocation keeps addressing the chain it always addressed.
+    """
+    parser.add_argument(
+        "--class",
+        dest="route_class",
+        choices=execution_routing.ROUTE_CLASSES,
+        help="Route class to act on (default: the configured default class)",
+    )
 
 
 def add_parser(sub: argparse._SubParsersAction[Any]) -> None:
@@ -167,7 +221,10 @@ def add_parser(sub: argparse._SubParsersAction[Any]) -> None:
     profile_set.add_argument(
         "--automatic-failover",
         action="store_true",
-        help="Allow checkpointed failover to this configured profile",
+        help=(
+            "Let a task launched on this profile fail over automatically onto "
+            "its route class chain on a typed provider outcome"
+        ),
     )
     profile_set.set_defaults(func=cmd_profile)
     profile_remove = profile_sub.add_parser("remove", help="Remove a named profile")
@@ -183,8 +240,10 @@ def add_parser(sub: argparse._SubParsersAction[Any]) -> None:
     routing_show.set_defaults(func=cmd_routing)
 
     routing_validate = routing_sub.add_parser(
-        "validate", help="Validate settings and report routes with no eligible account"
+        "validate",
+        help="Prove every route class still has a usable path before dispatch",
     )
+    _add_class_argument(routing_validate)
     routing_validate.set_defaults(func=cmd_routing)
 
     routing_set_metered = routing_sub.add_parser(
@@ -203,14 +262,17 @@ def add_parser(sub: argparse._SubParsersAction[Any]) -> None:
     routing_set_free_fallback.add_argument("value", choices=["on", "off"])
     routing_set_free_fallback.set_defaults(func=cmd_routing)
 
-    routing_routes = routing_sub.add_parser("routes", help="Manage configured routes")
+    routing_routes = routing_sub.add_parser(
+        "routes", help="Manage one route class's ordered chain"
+    )
     routing_routes_sub = routing_routes.add_subparsers(
         dest="routes_action", required=True
     )
 
     routing_routes_list = routing_routes_sub.add_parser(
-        "list", help="List configured routes in order"
+        "list", help="List a class chain's routes in order"
     )
+    _add_class_argument(routing_routes_list)
     routing_routes_list.set_defaults(func=cmd_routing)
 
     routing_routes_add = routing_routes_sub.add_parser("add", help="Add a route")
@@ -229,16 +291,19 @@ def add_parser(sub: argparse._SubParsersAction[Any]) -> None:
         "--account", help="Fixed pool account id for a metered route"
     )
     routing_routes_add.add_argument("--before", help="Insert before this route id")
+    _add_class_argument(routing_routes_add)
     routing_routes_add.set_defaults(func=cmd_routing)
 
     routing_routes_remove = routing_routes_sub.add_parser("remove", help="Remove a route")
     routing_routes_remove.add_argument("id")
+    _add_class_argument(routing_routes_remove)
     routing_routes_remove.set_defaults(func=cmd_routing)
 
     routing_routes_order = routing_routes_sub.add_parser(
-        "order", help="Reorder every configured route"
+        "order", help="Reorder every route in one class chain"
     )
     routing_routes_order.add_argument("ids", nargs="+")
+    _add_class_argument(routing_routes_order)
     routing_routes_order.set_defaults(func=cmd_routing)
 
     routing_explain = routing_sub.add_parser(
@@ -246,4 +311,5 @@ def add_parser(sub: argparse._SubParsersAction[Any]) -> None:
     )
     routing_explain.add_argument("--workspace", help="Workspace id, echoed for traceability")
     routing_explain.add_argument("--model", help="Preferred model override")
+    _add_class_argument(routing_explain)
     routing_explain.set_defaults(func=cmd_routing)
