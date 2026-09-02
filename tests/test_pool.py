@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -384,6 +385,31 @@ def test_exhausted_account_is_cooled_until_its_reported_reset(
     assert chosen is None
     cooldown = core.load_state()["cooldowns"]["first"]
     assert cooldown == pytest.approx(core.parse_iso(reset))
+
+
+def test_a_cooldown_extends_but_never_shortens(pool_root: Path) -> None:
+    """Regression guard for a live five-hour rate limit being erased.
+
+    Every cooling caller is reporting one refusal it observed, and no refusal
+    is evidence that an earlier, longer one has ended: a 401 or a one-minute
+    `Retry-After` arriving during a rate limit says nothing about that limit.
+    Writes were unconditional, so whichever observation landed last won and the
+    pool put work straight back onto an exhausted account. Monotonic cooling
+    also makes ordering between concurrent observers stop mattering, which is
+    what lets the reroute path cool before it marks an outcome terminal.
+    """
+    long_deadline = core.set_cooldown("acct", core.DEFAULT_COOLDOWN)
+
+    assert core.set_cooldown("acct", core.SHORT_COOLDOWN) == long_deadline
+    assert core.cool_until_timestamp("acct", time.time() + 60) == long_deadline
+    assert core.load_state()["cooldowns"]["acct"] == long_deadline
+
+    later = core.cool_until_timestamp("acct", long_deadline + 3600)
+    assert later == long_deadline + 3600
+
+    # Only an operator has the outside knowledge to end a window early.
+    core.clear_cooldown("acct")
+    assert core.cooling_until(core.load_state(), "acct") == 0
 
 
 def test_selection_skips_an_account_with_no_stored_credential(

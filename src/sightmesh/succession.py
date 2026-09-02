@@ -419,12 +419,14 @@ def cool_provider_outcome(
 ) -> tuple[str, ...]:
     """Cool exactly the accounts one typed outcome condemns. Returns their ids.
 
-    Called once, next to the write that records the outcome, so however many
-    times a reconcile later re-reads that outcome the cooldown is not extended
-    again. The cooldown itself lives in pool state, the single source of
-    account truth, so every later selection - including one after a restart -
-    observes it. Only opaque binding ids are touched; credentials are never
-    read here.
+    Safe to call any number of times for one outcome: pool cooling is
+    monotonic, so a repeat is a no-op rather than an extension. That is what
+    lets the caller cool *before* it records the outcome, closing the window
+    where a crash in between left an exhausted account uncooled forever.
+
+    The cooldown itself lives in pool state, the single source of account
+    truth, so every later selection - including one after a restart - observes
+    it. Only opaque binding ids are touched; credentials are never read here.
 
     A capacity or auth outcome is about one account, so one account cools. A
     ``provider_down`` is about the provider behind the route, so every account

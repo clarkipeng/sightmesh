@@ -171,20 +171,29 @@ def cooling_until(state: dict[str, Any], account_id: str) -> float:
 
 
 def set_cooldown(account_id: str, seconds: int = DEFAULT_COOLDOWN) -> float:
-    state = load_state()
-    until = time.time() + seconds
-    state.setdefault("cooldowns", {})[account_id] = until
-    state.setdefault("probes", {}).pop(account_id, None)
-    save_state(state)
-    return until
+    return cool_until_timestamp(account_id, time.time() + seconds)
 
 
 def cool_until_timestamp(account_id: str, when: float) -> float:
+    """Cool an account until at least ``when``. A cooldown never shortens.
+
+    Every caller is reporting one refusal it observed, and no refusal is
+    evidence that an earlier, longer one has ended: a 401 or a short
+    ``Retry-After`` arriving during a five-hour rate limit says nothing about
+    that limit. Taking the later of the two deadlines makes cooling monotonic,
+    so ordering between concurrent observations stops mattering and re-cooling
+    the same outcome is idempotent by construction.
+
+    Only :func:`clear_cooldown` shortens a cooldown, because only an operator
+    has the outside knowledge to say a window is really over.
+    """
     state = load_state()
-    state.setdefault("cooldowns", {})[account_id] = when
+    cooldowns = state.setdefault("cooldowns", {})
+    until = max(float(when), float(cooldowns.get(account_id) or 0))
+    cooldowns[account_id] = until
     state.setdefault("probes", {}).pop(account_id, None)
     save_state(state)
-    return when
+    return until
 
 
 def clear_cooldown(account_id: str) -> None:
