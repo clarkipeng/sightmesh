@@ -238,14 +238,13 @@ class BridgeSupervisor:
             store=self.reconciler.task_store,
             ownership=self.reconciler.ownership,
         )
+        # Read-only compatibility surface for callers that tuned PR #9's
+        # observation threshold; recovery itself belongs to the reconciler.
+        self.stalls = self.reconciler.liveness
+
     async def run(self) -> None:
         while True:
-            try:
-                await self.reconcile()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - one tick never ends the loop
-                LOGGER.warning("Bridge reconcile tick failed: %s", exc)
+            await self.reconcile()
             await asyncio.sleep(2)
 
     async def reconcile(self) -> None:

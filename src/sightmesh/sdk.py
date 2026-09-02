@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
+import time
 import os
 import re
 import subprocess
 import tempfile
-import time
 import tomllib
 import uuid
 from collections.abc import Iterable, Mapping
@@ -17,16 +16,12 @@ from typing import Any, Generic, TypeVar
 
 from . import execution_routing, wakes
 from .cdesktop import (
-    PROCESS_FAILURE_STATUSES,
     CdesktopClient,
     CdesktopError,
     CdesktopInterruptedError,
     CdesktopPendingError,
     CdesktopRejectedError,
     is_effect_not_found,
-    latest_execution_process,
-    process_failure_reason,
-    process_provider_outcome,
 )
 from .effects import (
     Effect,
@@ -36,28 +31,17 @@ from .effects import (
     request_hash,
 )
 from .escalation import CDESKTOP_SESSION_ENV, EscalationStore, LauncherIdentity
-from .execution_routing import ExecutionRoutingError
 from .liveness import Budget, resolve_policy, trusted_policy
-from .pool.core import PoolError
+from .pool import core as pool_core
 from .profiles import ProfileStore, validate_provider
 from .succession import (
-    COMMAND_TERMINAL_STATES,
     REROUTE_OUTCOMES,
-    SWEEPABLE_OUTCOMES,
     OwnershipStore,
-    SuccessionError,
     advance_route_after_outcome,
     cool_provider_outcome,
-    routing_outcome,
     transfer_ownership,
 )
-from .task_store import (
-    StaleTransition,
-    TaskFence,
-    TaskRecord,
-    TaskStore,
-    TaskStoreError,
-)
+from .task_store import StaleTransition, TaskRecord, TaskStore, TaskStoreError
 
 LOGGER = logging.getLogger("sightmesh.sdk")
 
@@ -84,9 +68,7 @@ class BatchError(SightMeshError):
         super().__init__(message)
 
 
-PERMISSION_POLICIES = frozenset(
-    {"BYPASS_PERMISSIONS", "ACCEPT_EDITS", "PLAN", "SUPERVISED"}
-)
+PERMISSION_POLICIES = frozenset({"BYPASS_PERMISSIONS", "ACCEPT_EDITS", "PLAN", "SUPERVISED"})
 
 
 @dataclass(frozen=True)
@@ -314,77 +296,46 @@ class SightMesh:
 
     def complete(self, summary: str | None = None, worker: str | None = None) -> Worker:
         task = self._current() if worker is None else self._find(worker)
-        return Worker.from_record(self._finish_locked(task, "completed", summary))
+        return Worker.from_record(self._finish(task, "completed", summary))
 
     def blocked(self, reason: str, worker: str | None = None) -> Worker:
         if not reason.strip():
             raise SightMeshError("Blocked reason must not be empty")
         task = self._current() if worker is None else self._find(worker)
-        return Worker.from_record(self._finish_locked(task, "blocked", reason))
+        return Worker.from_record(self._finish(task, "blocked", reason))
 
     def cancel(self, worker: str) -> Worker:
         task = self._find(worker)
-        return Worker.from_record(
-            self._finish_locked(task, "cancelled", None, stop_workspace=True)
-        )
+        if task.workspace_id:
+            self.client.stop_workspace(task.workspace_id)
+        return Worker.from_record(self._finish(task, "cancelled", None))
 
     def replace(self, worker: str, prompt: str | None = None) -> Worker:
         task = self._find(worker)
+        if not task.workspace_id or not task.holder_session_id:
+            raise SightMeshError(f"Task {worker!r} has no session to replace")
+        replacement_prompt = prompt or self._read_checkpoint(task)
+        if not replacement_prompt or not replacement_prompt.strip():
+            raise SightMeshError("Replacement requires a prompt or saved checkpoint")
         self._require_contract()
-        with self.store.task_lock(task.task_id) as fence:
-            # The snapshot used to find the task may have waited behind an
-            # automatic recovery. Reloading under the same lock makes this
-            # replacement and that recovery one indivisible choice.
-            task = self._find(worker)
-            if not task.workspace_id or not task.holder_session_id:
-                raise SightMeshError(f"Task {worker!r} has no session to replace")
-            replacement_prompt = prompt or self._read_checkpoint(task)
-            if not replacement_prompt or not replacement_prompt.strip():
-                raise SightMeshError(
-                    "Replacement requires a prompt or saved checkpoint"
-                )
-            target = {**task.spec["target"]}
-            automatic_recovery = routing_outcome(target.get("recovery"))
-            target.pop("recovery", None)
-            prepared = (
-                self.store.transition(
-                    task.task_id,
-                    expect_states=frozenset({"replacing"}),
-                    expect_version=task.version,
-                    assign=(
-                        "epoch = epoch + 1, attempts = attempts + 1, spec_json = ?"
-                        if automatic_recovery is not None
-                        else "spec_json = ?"
-                    ),
-                    values=(
-                        json.dumps(
-                            {**task.spec, "target": target},
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                    ),
-                    attempted="manual replacement resume",
-                    fence=fence,
-                )
-                if task.state == "replacing"
-                else self.store.prepare_replacement(
-                    task.task_id,
-                    target=target,
-                    expect_version=task.version,
-                    fence=fence,
-                )
+        target = {**task.spec["target"]}
+        target.pop("recovery", None)
+        # A task already in ``replacing`` is a crashed replacement, not a new
+        # one: resume the epoch that was prepared instead of burning another.
+        prepared = (
+            task
+            if task.state == "replacing"
+            else self.store.prepare_replacement(
+                task.task_id, target=target, expect_version=task.version
             )
-            return Worker.from_record(
-                self._replace_prepared(prepared, replacement_prompt, fence)
-            )
+        )
+        return Worker.from_record(self._replace_prepared(prepared, replacement_prompt))
 
-    def _finish(
-        self, task: TaskRecord, state: str, result: str | None, fence: TaskFence
-    ) -> TaskRecord:
-        """Make the durable terminal decision and enqueue its parent wake."""
+    def _finish(self, task: TaskRecord, state: str, result: str | None) -> TaskRecord:
+        """Terminate one task, record its parent's wake, then try to deliver."""
         try:
             updated, _created = wakes.finish_with_wake(
-                self.store, task.task_id, state, result, fence=fence
+                self.store, task.task_id, state, result
             )
         except StaleTransition as exc:
             if exc.current.state == state:
@@ -392,238 +343,65 @@ class SightMesh:
                 # the caller repeating itself, not a conflict.
                 return exc.current
             raise
-        return updated
-
-    def _finish_locked(
-        self,
-        task: TaskRecord,
-        state: str,
-        result: str | None,
-        *,
-        stop_workspace: bool = False,
-    ) -> TaskRecord:
-        """Finish one task without racing the epoch it may be launching.
-
-        The lock protects only the durable decision. The cdesktop stop and wake
-        delivery are intentionally outside it: a slow HTTP request cannot hold
-        a task's lifecycle gate. Re-entry fences delivery against a newer row.
-        """
-        with self.store.task_lock(task.task_id) as fence:
-            current = self.store.get_by_id(task.task_id)
-            if current is None:
-                raise SightMeshError(f"Task {task.key!r} no longer exists")
-            updated = self._finish(current, state, result, fence)
-            workspace_id = current.workspace_id if stop_workspace else None
-
-        if workspace_id:
-            self.client.stop_workspace(workspace_id)
-
-        with self.store.task_lock(task.task_id):
-            current = self.store.get_by_id(task.task_id)
-            if current is None or current.version != updated.version:
-                return current or updated
         self.wakes.pump()
         return updated
 
     def reconcile_provider_outcome(self, session_id: str) -> Worker | None:
-        """Settle the task holding this session against what its worker did.
-
-        Two things can have happened since the last tick. The session's own
-        process may have stopped - the only place a *mid-run* provider refusal
-        is ever visible, since a task that launched fine and was cut off hours
-        later has no launch rejection to read - or a typed outcome may already
-        be on the journal, waiting to be advanced past.
-        """
+        """Advance the task holding this session past a typed provider outcome."""
         task = self.store.get_by_session(session_id)
-        if task is None:
-            return None
-        blocked = self._observe_session_failure(task, session_id)
-        if blocked is not None:
-            return blocked
-        return self._advance_past_outcome(self.store.get_by_id(task.task_id) or task)
+        return self._advance_past_outcome(task) if task is not None else None
 
     def reconcile_provider_outcomes(self) -> list[Worker]:
-        """Advance every task the journal shows is stuck, session or no session.
+        """Advance every task whose current epoch ended on a typed outcome.
 
         A launch rejected before the task ever activated holds no session, so
-        no session-keyed sweep can ever reach it, and a task mid-replacement
-        holds no *live* session either. This one is keyed on durable state
-        instead - the journal for typed outcomes, the task's own state for a
-        replacement that never got filled - which is where both actually live.
+        no session-keyed sweep can ever reach it. This one is keyed on the
+        journal instead, which is where the outcome actually lives.
         """
         advanced: list[Worker] = []
-        # A crash after an epoch becomes terminal but before it blocks leaves
-        # one task in both sources. Task identity, rather than that transient
-        # state, is the invariant: settle each task at most once per sweep.
-        pending_by_id: dict[str, TaskRecord] = {
-            task.task_id: task
-            for task in (
-                self.store.get_by_id(effect.task_id)
-                for effect in self.journal.with_outcomes(SWEEPABLE_OUTCOMES)
-            )
-            if task is not None
-        }
-        for task in self.store.list_state("replacing"):
-            pending_by_id.setdefault(task.task_id, task)
-        pending = list(pending_by_id.values())
-        for task in pending:
+        for effect in self.journal.with_outcomes(REROUTE_OUTCOMES):
+            task = self.store.get_by_id(effect.task_id)
+            if task is None:
+                continue
             # Each task settles on its own: one whose replacement launch is
             # itself rejected must not stop the sweep from reaching the rest.
-            # The isolation covers every error the advance can raise, since
-            # SuccessionError, ExecutionRoutingError, and PoolError are plain
-            # RuntimeErrors that would otherwise escape and skip the remainder.
             try:
-                worker = self._advance_past_outcome(task)
-            except (
-                CdesktopError,
-                ExecutionRoutingError,
-                PoolError,
-                SightMeshError,
-                SuccessionError,
-                TaskStoreError,
-            ) as exc:
+                worker = self._advance_past_outcome(task, effect)
+            except (CdesktopError, SightMeshError, TaskStoreError) as exc:
                 LOGGER.info("Cannot advance task %s this tick: %s", task.key, exc)
                 continue
             if worker is not None:
                 advanced.append(worker)
         return advanced
 
-    def _observe_session_failure(
-        self, task: TaskRecord, session_id: str
+    def _advance_past_outcome(
+        self, task: TaskRecord, effect: Effect | None = None
     ) -> Worker | None:
-        """Record what a stopped worker process reports, so a live run can move.
-
-        Without this, only a *launch* rejection could ever reroute: a task that
-        started fine and hit a rate limit an hour in has no rejection anywhere,
-        its effect stays ``launched`` forever, and the task hangs silently.
-
-        Only typed fields are read - the process status and cdesktop's own
-        outcome classification - never the transcript. A capacity or auth
-        signal becomes a typed outcome on the journal, which the ordinary
-        advance path then acts on. A process that failed with no such signal
-        failed at its work, so the task blocks with the process's typed reason
-        and wakes its manager, rather than hanging or being rerouted on a
-        guess.
-        """
-        with self.store.task_lock(task.task_id) as fence:
-            current = self.store.get_by_id(task.task_id)
-            if current is None:
-                return None
-            return self._observe_session_failure_locked(current, session_id, fence)
-
-    def _observe_session_failure_locked(
-        self, task: TaskRecord, session_id: str, fence: TaskFence
-    ) -> Worker | None:
-        if task.state != "active":
-            return None
-        effect = self.journal.get(task.task_id, task.epoch)
-        if effect is None or effect.state != "launched":
-            # Nothing launched under this epoch, or its outcome is already
-            # recorded; either way the process tells us nothing new.
-            return None
-        version = task.version
-        with fence.external_io():
-            processes = self.client.execution_processes(session_id)
-            queue_owned = self._queue_still_owns(session_id)
-        current = self.store.get_by_id(task.task_id)
-        if (
-            current is None
-            or (current.epoch, current.version) != (task.epoch, version)
-        ):
-            return None
-        task = current
-        process = latest_execution_process(
-            [
-                item
-                for item in processes
-                if item.get("run_reason") == "codingagent"
-            ]
-        )
-        if (
-            process is None
-            or str(process.get("status") or "") not in PROCESS_FAILURE_STATUSES
-        ):
-            return None
-        outcome, retry_at = process_provider_outcome(process)
-        if outcome is not None:
-            # A provider refusal is not something a retry fixes, so it is
-            # recorded whatever else the session has queued: the reroute
-            # fences this epoch and quarantines the session, which cancels
-            # that queue on the way out.
-            self._record_provider_outcome(task, outcome, retry_at)
-            return None
-        if queue_owned:
-            # cdesktop's own durable recovery requeues a claimed command whose
-            # execution died, so this failure is one it is about to retry.
-            # Blocking here would strand a task that is still being worked -
-            # and `blocked` is not a legal predecessor of `active`, so nothing
-            # could put it back.
-            return None
-        return self._block_unroutable(task, process_failure_reason(process), fence)
-
-    def _queue_still_owns(self, session_id: str) -> bool:
-        """Whether the native command queue has unfinished work for a session."""
-        return any(
-            str(row.get("state") or row.get("status") or "pending")
-            not in COMMAND_TERMINAL_STATES
-            for row in self.client.session_commands(session_id)
-        )
-
-    def _advance_past_outcome(self, task: TaskRecord) -> Worker | None:
         """Move one task past a typed capacity, auth, or provider outcome.
 
         The typed outcome on the effect journal is the only trigger. A task
         that failed to build, failed its tests, or blocked itself carries no
         provider outcome at all, so it can never enter this path - however
         much its transcript may look like a rate limit.
-
-        The effect is read here, from the task row this call was handed, rather
-        than accepted from the caller. A caller that found the effect first
-        holds a task row that may since have advanced an epoch, and acting on a
-        superseded epoch's outcome reroutes a run that already moved on; taking
-        no effect as an argument makes that pairing impossible to get wrong.
         """
-        with self.store.task_lock(task.task_id) as fence:
-            current = self.store.get_by_id(task.task_id)
-            if current is None:
-                return None
-            return self._advance_past_outcome_locked(current, fence)
-
-    def _advance_past_outcome_locked(
-        self, task: TaskRecord, fence: TaskFence
-    ) -> Worker | None:
-        """Advance a fresh task snapshot while its launch intent is locked."""
         target = task.spec.get("target", {})
-        effect = self.journal.get(task.task_id, task.epoch)
-        if task.state == "replacing":
-            # Only a replacement this path opened is one it can finish. A
-            # manual ``replace()`` carries a prompt that lives nowhere but its
-            # caller's hands, so resuming it here would quietly re-run the
-            # original work instead - and its failure is already visible to the
-            # human who invoked it. ``replace()`` clears the marker, so the two
-            # can never be confused.
-            recovery = routing_outcome(target.get("recovery"))
-            if recovery is None:
-                return None
-            return self._resume_replacement(task, effect, fence)
+        if task.state == "replacing" and target.get("recovery") in REROUTE_OUTCOMES:
+            # A crashed replacement: resume the epoch already prepared rather
+            # than burn another one.
+            self._require_contract()
+            return Worker.from_record(
+                self._launch_prepared(task, str(task.spec["prompt"]))
+            )
         if task.state not in {"active", "blocked"}:
             return None
-        outcome = (
-            routing_outcome(effect.outcome)
-            if effect is not None and effect.state == "terminal"
-            else None
-        )
-        if outcome is None:
+        if effect is None:
+            effect = self.journal.get(task.task_id, task.epoch)
+        if (
+            effect is None
+            or effect.state != "terminal"
+            or effect.outcome not in REROUTE_OUTCOMES
+        ):
             return None
-        if task.attempts >= task.max_attempts:
-            # The circuit breaker has tripped. Saying so once is the whole
-            # difference between a stopped task and a hung one.
-            return self._block_unroutable(
-                task,
-                f"{outcome} on route {target.get('route_id')}; "
-                f"{task.max_attempts}-attempt circuit breaker tripped",
-                fence,
-            )
 
         route_id = target.get("route_id")
         route_class = target.get("route_class") or execution_routing.DEFAULT_ROUTE_CLASS
@@ -633,90 +411,44 @@ class SightMesh:
             # silently going nowhere, so `replace()` remains a human's call.
             return self._block_unroutable(
                 task,
-                f"{outcome} on {route_id}; automatic failover is off",
-                fence,
+                f"{effect.outcome} on {route_id}; automatic failover is off",
             )
 
         selection = advance_route_after_outcome(
             execution_routing.ExecutionRoutingStore().load(),
-            outcome=outcome,
+            outcome=str(effect.outcome),
             route_class=route_class,
             failed_binding_id=target.get("auth_binding_id"),
         )
         if selection.status != "resolved" or selection.target is None:
             return self._block_unroutable(
                 task,
-                f"{outcome} on route {route_id} ({route_class}); {selection.reason}",
-                fence,
+                f"{effect.outcome} on route {route_id} "
+                f"({route_class}); {selection.reason}",
             )
 
         selected = selection.target
-        version = task.version
-        with fence.external_io():
-            provider_id = self._default_provider_id()
-            self._require_contract()
-        current = self.store.get_by_id(task.task_id)
-        if (
-            current is None
-            or (current.epoch, current.version) != (task.epoch, version)
-        ):
-            return None
-        task = current
         next_target = {
             "executor": selected.executor,
             "model": selected.model,
             "reasoning": task.spec.get("reasoning"),
-            "provider_id": provider_id,
+            "provider_id": self._default_provider_id(),
             "auth_binding_id": selected.auth_binding_id,
             "route_class": selected.route_class,
             "route_id": selected.route_id,
             "billing_class": selected.billing_class,
             "failover": "auto",
-            "recovery": outcome,
+            "recovery": effect.outcome,
         }
+        self._require_contract()
         prepared = self.store.prepare_replacement(
-            task.task_id, target=next_target, expect_version=task.version, fence=fence
+            task.task_id, target=next_target, expect_version=task.version
         )
         return Worker.from_record(
-            self._launch_prepared(prepared, str(task.spec["prompt"]), fence)
+            self._launch_prepared(prepared, str(task.spec["prompt"]))
         )
 
-    def _resume_replacement(
-        self, task: TaskRecord, effect: Effect | None, fence: TaskFence
-    ) -> Worker | None:
-        """Settle a task whose replacement epoch was opened but never filled.
-
-        ``prepare_replacement`` and the launch that fills it are two steps, so
-        anything between them - a crash, an unreachable executor, a rejected
-        replacement launch - leaves the task in ``replacing``. Neither
-        reconciler used to look at that state, so such a task was invisible to
-        both and simply stopped.
-
-        The already-open epoch's effect says which of the two things to do, and
-        nothing here needs to know how the task got here: an epoch that is
-        merely unfilled gets filled, and one that already ended blocks with its
-        outcome. Blocking is the whole settlement even for a typed outcome,
-        because a *blocked* task with a terminal outcome is exactly what the
-        ordinary advance path handles - so the chain moves on the next tick
-        through one code path rather than two.
-        """
-        if effect is not None and effect.state == "terminal":
-            return self._block_unroutable(
-                task, f"replacement epoch ended: {effect.outcome}", fence
-            )
-        with fence.external_io():
-            self._require_contract()
-        current = self.store.get_by_id(task.task_id)
-        if current is None or (current.epoch, current.version) != (task.epoch, task.version):
-            return None
-        task = current
-        return Worker.from_record(
-            self._launch_prepared(task, str(task.spec["prompt"]), fence)
-        )
-
-    def _block_unroutable(
-        self, task: TaskRecord, reason: str, fence: TaskFence
-    ) -> Worker | None:
+    def _block_unroutable(self, task: TaskRecord, reason: str) -> Worker | None:
         """Block a task that cannot advance, and report only a real change.
 
         A task blocked at launch already carries its typed outcome as its
@@ -727,20 +459,19 @@ class SightMesh:
         """
         if task.state == "blocked":
             return None
-        return Worker.from_record(self._finish(task, "blocked", reason, fence))
+        return Worker.from_record(self._finish(task, "blocked", reason))
 
     def _record_provider_outcome(
         self, task: TaskRecord, outcome: str, retry_at: float | None
     ) -> str:
-        """Cool what the outcome condemns, then mark this epoch terminal.
+        """Mark this epoch terminal and cool what the outcome condemns, once.
 
-        Cooling goes first because pool cooling is monotonic and therefore
-        idempotent: cooling an account that a later crash makes us cool again
-        costs nothing, while marking terminal first and crashing before the
-        cool leaves an exhausted account eligible forever - the reconcile that
-        reads the outcome sees a terminal effect and moves on without ever
-        looking at whether the binding was cooled.
+        The cooldown belongs with the write that records the outcome, not with
+        the reroute that later reads it: the first terminal write wins, so an
+        account is cooled exactly once however many times reconcile re-reads
+        the same outcome.
         """
+        self.journal.mark_terminal(task.task_id, task.epoch, outcome, retry_at)
         if outcome in REROUTE_OUTCOMES:
             target = task.spec.get("target", {})
             binding_id = target.get("auth_binding_id")
@@ -756,11 +487,10 @@ class SightMesh:
                     route_id=target.get("route_id"),
                     retry_at=retry_at,
                 )
-        self.journal.mark_terminal(task.task_id, task.epoch, outcome, retry_at)
         return outcome
 
     def _launch_prepared(
-        self, prepared: TaskRecord, replacement_prompt: str, fence: TaskFence
+        self, prepared: TaskRecord, replacement_prompt: str
     ) -> TaskRecord:
         """Fill the epoch ``prepare_replacement`` opened.
 
@@ -770,26 +500,22 @@ class SightMesh:
         workspace exactly as the first attempt would have.
         """
         if prepared.workspace_id and prepared.holder_session_id:
-            return self._replace_prepared(prepared, replacement_prompt, fence)
+            return self._replace_prepared(prepared, replacement_prompt)
         workspace_id, session_id = self._journaled_launch(
             prepared,
             {
                 "kind": "workspace",
                 "request": self._workspace_request(prepared, replacement_prompt),
             },
-            fence,
         )
         active = self.store.activate(
-            prepared.task_id,
-            workspace_id=workspace_id,
-            session_id=session_id,
-            fence=fence,
+            prepared.task_id, workspace_id=workspace_id, session_id=session_id
         )
         self._record_launcher(active)
         return active
 
     def _replace_prepared(
-        self, prepared: TaskRecord, replacement_prompt: str, fence: TaskFence
+        self, prepared: TaskRecord, replacement_prompt: str
     ) -> TaskRecord:
         target = prepared.spec["target"]
         request = self.client.session_launch_request(
@@ -811,29 +537,20 @@ class SightMesh:
         }
 
         def spawn() -> str:
-            return self._journaled_launch(prepared, launch, fence)[1]
+            return self._journaled_launch(prepared, launch)[1]
 
-        with fence.external_io():
-            transfer = transfer_ownership(
-                self.client,
-                self.ownership,
-                source_session_id=prepared.holder_session_id,
-                spawn=spawn,
-                reason="managed task replacement",
-                logical_key=f"task:{prepared.task_id}:epoch:{prepared.epoch}",
-            )
-        current = self.store.get_by_id(prepared.task_id)
-        if (
-            current is None
-            or (current.epoch, current.version) != (prepared.epoch, prepared.version)
-        ):
-            self.journal.mark_terminal(prepared.task_id, prepared.epoch, "superseded")
-            raise SightMeshError(f"Replacement for {prepared.key!r} was superseded")
+        transfer = transfer_ownership(
+            self.client,
+            self.ownership,
+            source_session_id=prepared.holder_session_id,
+            spawn=spawn,
+            reason="managed task replacement",
+            logical_key=f"task:{prepared.task_id}:epoch:{prepared.epoch}",
+        )
         active = self.store.activate(
             prepared.task_id,
             workspace_id=prepared.workspace_id,
             session_id=transfer.successor_session_id,
-            fence=fence,
         )
         self._record_launcher(active)
         return active
@@ -854,25 +571,16 @@ class SightMesh:
             setup_script=task.spec.get("setup_script"),
             auth_binding_id=target.get("auth_binding_id"),
         )
-
     def _start_reserved(self, task: TaskRecord) -> TaskRecord:
-        """Launch a reservation while sharing terminal writers' task fence."""
-        with self.store.task_lock(task.task_id) as fence:
-            current = self.store.get_by_id(task.task_id)
-            if current is None:
-                raise SightMeshError(f"Task {task.key!r} no longer exists")
-            return self._start_reserved_locked(current, fence)
-
-    def _start_reserved_locked(self, task: TaskRecord, fence: TaskFence) -> TaskRecord:
         if task.state != "reserved":
             return task
         request = self._workspace_request(task, str(task.spec["prompt"]))
         self._wait_for_launch_capacity(task)
         workspace_id, session_id = self._journaled_launch(
-            task, {"kind": "workspace", "request": request}, fence
+            task, {"kind": "workspace", "request": request}
         )
         active = self.store.activate(
-            task.task_id, workspace_id=workspace_id, session_id=session_id, fence=fence
+            task.task_id, workspace_id=workspace_id, session_id=session_id
         )
         self._record_launcher(active)
         return active
@@ -885,9 +593,7 @@ class SightMesh:
         instead of stampeding the host.
         """
         cap = int(os.environ.get("SIGHTMESH_MAX_ACTIVE_WORKERS", "4"))
-        deadline = time.monotonic() + float(
-            os.environ.get("SIGHTMESH_LAUNCH_WAIT_SECONDS", "90")
-        )
+        deadline = time.monotonic() + float(os.environ.get("SIGHTMESH_LAUNCH_WAIT_SECONDS", "90"))
         delay = 0.5
         while True:
             running = self.store.count_running()
@@ -902,7 +608,7 @@ class SightMesh:
             delay = min(delay * 2, 5.0)
 
     def _journaled_launch(
-        self, task: TaskRecord, launch: Mapping[str, Any], fence: TaskFence
+        self, task: TaskRecord, launch: Mapping[str, Any]
     ) -> tuple[str, str]:
         """Reserve, launch once, and record the native identifiers.
 
@@ -920,28 +626,18 @@ class SightMesh:
         while True:
             try:
                 effect, _took_over = self.journal.reserve(
-                    task.task_id,
-                    task.epoch,
-                    request_hash(launch),
-                    self.owner_instance,
+                    task.task_id, task.epoch, request_hash(launch), self.owner_instance
                 )
                 break
             except EffectBusy:
                 if time.monotonic() >= deadline:
                     raise
-                # The owner that made the native call must reacquire the fence
-                # to publish it.  Waiting here while holding it deadlocks a
-                # duplicate starter behind that owner.
-                with fence.external_io():
-                    time.sleep(delay)
+                time.sleep(delay)
                 delay = min(delay * 2, 0.5)
         if effect.state == "launched" and effect.workspace_id and effect.session_id:
             return effect.workspace_id, effect.session_id
         try:
-            with fence.external_io():
-                native = self.client.managed_launch(
-                    task.task_id, task.epoch, dict(launch)
-                )
+            native = self.client.managed_launch(task.task_id, task.epoch, dict(launch))
         except CdesktopRejectedError as exc:
             # 424/425 mean the outcome is unknowable or still owned; the
             # reservation must stay adoptable for a retry. Anything else is a
@@ -949,33 +645,24 @@ class SightMesh:
             # effect so callers never have to grep error text, and block the
             # task so it is not left `reserved` and relaunchable - a retry is an
             # explicit new epoch via replace().
-            current = self.store.get_by_id(task.task_id)
-            if current is None or (current.epoch, current.version) != (task.epoch, task.version):
-                self.journal.mark_terminal(task.task_id, task.epoch, "superseded")
-            elif not isinstance(exc, (CdesktopInterruptedError, CdesktopPendingError)):
+            if not isinstance(exc, (CdesktopInterruptedError, CdesktopPendingError)):
                 outcome = self._record_provider_outcome(
                     task, _rejection_outcome(exc.status), exc.retry_at
                 )
-                self._finish(task, "blocked", f"launch rejected: {outcome}", fence)
+                self._finish(task, "blocked", f"launch rejected: {outcome}")
             raise
-        workspace_id, session_id = self._effect_ids(task, native, fence)
-        current = self.store.get_by_id(task.task_id)
-        if current is None or (current.epoch, current.version) != (task.epoch, task.version):
-            self.journal.mark_terminal(task.task_id, task.epoch, "superseded")
-            with fence.external_io():
-                self.client.stop_workspace(workspace_id)
-            raise SightMeshError(f"Native launch for {task.key!r} was superseded")
+        workspace_id, session_id = self._effect_ids(task, native)
         self.journal.mark_launched(task.task_id, task.epoch, workspace_id, session_id)
         return workspace_id, session_id
 
     def _effect_ids(
-        self, task: TaskRecord, effect: Mapping[str, Any], fence: TaskFence
+        self, task: TaskRecord, effect: Mapping[str, Any]
     ) -> tuple[str, str]:
         state = str(effect.get("state") or "")
         if state == "lost":
             reason = str(effect.get("reason") or "lost")
             self.journal.mark_terminal(task.task_id, task.epoch, f"lost:{reason}")
-            self._finish(task, "lost", reason, fence)
+            self._finish(task, "lost", reason)
             raise SightMeshError(f"Native launch for {task.key!r} was lost")
         workspace_id = effect.get("workspace_id")
         session_id = effect.get("session_id")
@@ -1059,33 +746,15 @@ class SightMesh:
         being a dead end the reconciler cannot advance.
         """
         settings = execution_routing.ExecutionRoutingStore().load()
-        decision = execution_routing.resolve_class(
-            settings,
+        route_class = execution_routing.class_for(
             execution_routing.ScopeRisk(
                 route_class=spec.route_class,
+                permission=spec.permission,
                 top_level=top_level,
                 children=spec.children,
             ),
+            settings,
         )
-        route_class = decision.route_class
-        if decision.demoted_from:
-            # Scope and risk wanted a stronger chain than this install has
-            # configured. Refusing the work would make an upgrade that adds a
-            # class break every dispatch that class now claims, so the work
-            # runs on the default chain and says so.
-            LOGGER.warning(
-                "Route class %r has no usable chain for %r; falling back to %r",
-                decision.demoted_from,
-                spec.key,
-                route_class,
-            )
-        if not decision.validation.valid:
-            # This gate applies to overrides too. An override names the first
-            # hop, not a waiver of the explicitly requested route class.
-            raise SightMeshError(
-                f"Route class {route_class!r} cannot start {spec.key!r}: "
-                f"{decision.validation.reason}"
-            )
         if spec.profile:
             profile = ProfileStore().get(spec.profile)
             validate_provider(profile, self.client.providers())
@@ -1112,6 +781,14 @@ class SightMesh:
                 "route_id": f"executor:{spec.executor}",
                 "failover": "auto",
             }
+        validation = execution_routing.validate_chain(settings, route_class)
+        if not validation.valid:
+            # The explicit fail-closed gate: no epoch, no effect row, and no
+            # native call happen for a class that has nowhere to run.
+            raise SightMeshError(
+                f"Route class {route_class!r} cannot start {spec.key!r}: "
+                f"{validation.reason}"
+            )
         selection = execution_routing.select_route(
             settings, route_class=route_class, preferred_model=spec.model
         )
@@ -1341,28 +1018,21 @@ class SightMesh:
                 ".conductor/settings.toml scripts.setup must be a string"
             )
         return setup.strip() if setup and setup.strip() else None
-
-
 ADOPT_TIMEOUT_SECONDS = 30.0
 
 
 def _rejection_outcome(status: int | None) -> str:
     """Name what the provider did, as a type routing can act on.
 
-    Only the statuses cdesktop passes through from the provider are named:
-    capacity and auth. Everything else stays a definitive rejection that
-    blocks, because retrying it on another account would only fail the same
-    way.
-
-    ``provider_down`` is deliberately not produced here. The status on a
-    rejection is the one SightMesh's own localhost call to cdesktop returned,
-    so a 5xx describes the local service, not the model provider - mapping it
-    would cool an entire account pool for a cdesktop restart. The outcome and
-    everything that handles it stay in place for the day the seam reports an
-    upstream provider signal of its own; cdesktop 0.2.7 exposes none.
+    Three names advance a route chain: capacity, auth, and a provider that is
+    down. Everything else stays a definitive rejection that blocks, because
+    retrying it on another account would only fail the same way.
     """
     if status == 429:
         return "rate_limited"
     if status in (401, 403):
         return "auth"
+    if status is not None and 500 <= status < 600:
+        # A 5xx is the provider failing, not this account.
+        return "provider_down"
     return f"rejected:{status if status is not None else 'unknown'}"

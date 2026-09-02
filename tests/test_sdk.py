@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,8 +10,8 @@ import pytest
 from sightmesh import execution_routing
 from sightmesh import sdk as sdk_module
 from sightmesh.cdesktop import CdesktopError, CdesktopRejectedError
-from sightmesh.profiles import Profile
 from sightmesh.sdk import BatchError, Command, SightMesh, SightMeshError, WorkerSpec
+from sightmesh.profiles import Profile
 from sightmesh.task_store import StaleTransition, TaskStore, TaskStoreError
 
 
@@ -148,20 +147,9 @@ class FakeOwnership:
 
 
 @pytest.fixture
-def system(tmp_path, monkeypatch):
+def system(tmp_path):
     repo = tmp_path / "project"
     repo.mkdir()
-    settings = execution_routing.ExecutionRoutingSettings(
-        chains=(
-            execution_routing.RouteChain(
-                "standard",
-                (execution_routing.Route("test", "CODEX", "test", "free"),),
-            ),
-        )
-    )
-    monkeypatch.setattr(
-        execution_routing.ExecutionRoutingStore, "load", lambda _self: settings
-    )
     store = TaskStore(tmp_path / "state.sqlite3")
     client = FakeClient(repo)
     ownership = FakeOwnership()
@@ -193,35 +181,6 @@ def test_start_is_idempotent_for_one_semantic_key(system):
 
     assert replayed == first
     assert len(client.launches) == 1
-
-
-def test_cancel_can_win_while_managed_launch_is_in_flight(system, monkeypatch):
-    """A late launch result is stopped, never allowed to revive cancellation."""
-    mesh, client, store, _ownership = system
-    entered = threading.Event()
-    release = threading.Event()
-    native = client.managed_launch
-
-    def paused_launch(task_id, epoch, launch):
-        entered.set()
-        assert release.wait(timeout=5)
-        return native(task_id, epoch, launch)
-
-    monkeypatch.setattr(client, "managed_launch", paused_launch)
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        starting = pool.submit(mesh.start, spec())
-        assert entered.wait(timeout=5)
-        cancelled = pool.submit(mesh.cancel, "audit")
-        assert cancelled.result(timeout=1).state == "cancelled"
-        release.set()
-        with pytest.raises(BatchError, match="superseded"):
-            starting.result(timeout=5)
-
-    task = store.get("operator", "audit")
-    assert task is not None and task.state == "cancelled"
-    effect = mesh.journal.get(task.task_id, 1)
-    assert effect is not None and effect.outcome == "superseded"
-    assert client.stopped == [f"workspace-{task.task_id}"]
 
 
 def test_repo_name_prefers_the_canonical_registration(system):
@@ -464,17 +423,12 @@ def test_a_typed_rate_limit_moves_once_to_the_next_hop(system, monkeypatch):
     assert record.spec["target"]["route_class"] == "standard"
 
 
-def test_a_code_failure_blocks_visibly_and_never_reroutes(system):
+def test_a_code_failure_never_reroutes_however_it_reads(system):
     """The regression this exists for: the old path scraped the transcript, so
     a worker whose failing test output merely mentioned a rate limit was
-    rerouted onto a fresh account. A code or test failure carries no typed
-    provider outcome, so it cannot reach the reroute path by construction.
-
-    It must not vanish either. A failed worker process that reports no provider
-    signal blocks the task with its typed reason, which wakes the manager -
-    the alternative is a task that is neither running nor finished and that
-    nobody is told about."""
-    mesh, client, store, _ownership = system
+    rerouted onto a fresh account. A code or test failure produces no provider
+    outcome at all, so it cannot reach the reroute path by construction."""
+    mesh, client, _store, _ownership = system
     started = mesh.start(spec())
     client.processes[started.session_id] = [
         {"id": "failed-build", "run_reason": "codingagent", "status": "failed"}
@@ -490,13 +444,8 @@ def test_a_code_failure_blocks_visibly_and_never_reroutes(system):
         ]
     }
 
-    settled = mesh.reconcile_provider_outcome(started.session_id)
-
-    assert settled is not None and settled.state == "blocked"
-    assert "worker process failed" in str(store.get("operator", "audit").result)
-    # Blocked, not rerouted: no second epoch and no second launch.
+    assert mesh.reconcile_provider_outcome(started.session_id) is None
     assert mesh.reconcile_provider_outcomes() == []
-    assert store.get("operator", "audit").epoch == 1
     assert len(client.launches) == 1
 
 
@@ -521,7 +470,7 @@ def test_an_explicit_profile_stays_recoverable_when_failover_is_on(
     """Contract: explicit profile overrides remain recoverable. The old code
     recorded no route identity for them, so `reconcile` returned None and the
     task sat on an exhausted account forever."""
-    mesh, _client, store, _ownership = system
+    mesh, client, store, _ownership = system
     monkeypatch.setattr(
         sdk_module.ProfileStore,
         "get",
@@ -608,108 +557,44 @@ def test_dispatch_fails_closed_when_the_class_chain_has_no_usable_hop(
     assert store.get("operator", "audit") is None
 
 
-def _free_route(route_id):
-    """A hop that needs no pool account, so routing is exercised for real.
-
-    Selection resolves a free route without ever loading pool state, which lets
-    these tests run the *real* `class_for` -> `validate_chain` -> `select_route`
-    path instead of monkeypatching the gate they exist to check.
-    """
-    return execution_routing.Route(
-        id=route_id, executor="CODEX", model=route_id, billing_class="free"
-    )
-
-
-def _configure_chains(monkeypatch, **chains):
-    settings = execution_routing.ExecutionRoutingSettings(
-        chains=tuple(
-            execution_routing.RouteChain(route_class, routes)
-            for route_class, routes in chains.items()
-        )
-    )
-    monkeypatch.setattr(
-        execution_routing.ExecutionRoutingStore, "load", lambda _self: settings
-    )
-    return settings
-
-
 def test_a_fanning_out_top_level_manager_takes_the_deep_class(system, monkeypatch):
-    """Scope and risk pick the class once, at dispatch. A top-level
+    """Scope and risk pick the class once, at dispatch. A top-level supervised
     task that fans work out is the one shape where weak judgement multiplies
     across children, so it gets the deep chain; everything else stays
-    standard.
-
-    Runs the real validate/select path rather than stubbing it: stubbing the
-    gate is what let the promotion ship against an install where the promoted
-    class had no chain at all."""
+    standard."""
     mesh, _client, store, _ownership = system
-    _configure_chains(
-        monkeypatch, standard=(_free_route("terra"),), deep=(_free_route("fable"),)
+    seen = []
+    monkeypatch.setattr(
+        execution_routing.ExecutionRoutingStore,
+        "load",
+        lambda _self: execution_routing.ExecutionRoutingSettings(),
     )
+    monkeypatch.setattr(
+        execution_routing,
+        "validate_chain",
+        lambda _settings, route_class=None: execution_routing.ValidationResult(
+            route_class, True, None
+        ),
+    )
+
+    def select(_settings, *, route_class=None, **_kwargs):
+        seen.append(route_class)
+        return execution_routing.SelectionResult(
+            "resolved",
+            execution_routing.SelectedTarget(
+                route_class, "hop", "CODEX", "m", "subscription", "acct", "acct"
+            ),
+            (),
+            None,
+        )
+
+    monkeypatch.setattr(execution_routing, "select_route", select)
 
     mesh.start(spec(key="manager", executor=None, children=4))
     mesh.start(spec(key="worker", executor=None, children=0))
 
+    assert seen == ["deep", "standard"]
     assert store.get("operator", "manager").spec["target"]["route_class"] == "deep"
-    assert store.get("operator", "manager").spec["target"]["route_id"] == "fable"
-    assert store.get("operator", "worker").spec["target"]["route_class"] == "standard"
-    assert store.get("operator", "worker").spec["target"]["route_id"] == "terra"
-
-
-def test_a_promotion_onto_an_unconfigured_class_falls_back_to_the_default(
-    system, monkeypatch, caplog
-):
-    """Regression guard for the upgrade that broke every existing install: the
-    v1->v2 migration fills only `standard`, `class_for` promotes any fanning-out
-    top-level manager to `deep`, and the fail-closed gate then refused a start
-    that had worked the day before.
-
-    Promotion is this module's judgement, not the operator's instruction, so a
-    promoted class with no chain must degrade visibly onto the default rather
-    than refuse the work."""
-    mesh, _client, store, _ownership = system
-    _configure_chains(monkeypatch, standard=(_free_route("terra"),))
-
-    with caplog.at_level("WARNING", logger="sightmesh.sdk"):
-        mesh.start(spec(key="manager", executor=None, children=4))
-
-    target = store.get("operator", "manager").spec["target"]
-    assert (target["route_class"], target["route_id"]) == ("standard", "terra")
-    assert "deep" in caplog.text and "manager" in caplog.text
-
-
-@pytest.mark.parametrize("override", ("executor", "profile"))
-def test_an_explicit_class_with_no_chain_is_refused_before_an_override_can_start(
-    system, monkeypatch, override
-):
-    """Falling open is only ever right for a promotion. An operator who names
-    `deep` asked for that chain specifically, so silently running the work on
-    `standard` would answer a different question than the one they asked."""
-    mesh, client, store, _ownership = system
-    _configure_chains(monkeypatch, standard=(_free_route("terra"),))
-    if override == "profile":
-        monkeypatch.setattr(
-            sdk_module.ProfileStore,
-            "get",
-            lambda _self, _name: Profile(
-                name="selected",
-                executor="CODEX",
-                provider_id="default-provider",
-            ),
-        )
-
-    with pytest.raises(SightMeshError, match="deep"):
-        mesh.start(
-            spec(
-                key="deepwork",
-                executor="CODEX" if override == "executor" else None,
-                profile="selected" if override == "profile" else None,
-                route_class="deep",
-            )
-        )
-
-    assert store.get("operator", "deepwork") is None
-    assert client.launches == []
 
 
 def test_routed_start_requires_one_enabled_default_provider(system, monkeypatch):

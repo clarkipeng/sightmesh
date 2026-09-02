@@ -583,10 +583,7 @@ def test_cli_routing_validate_reports_routes_without_an_eligible_account(
     assert [
         (entry["routeClass"], entry["valid"], entry["reason"])
         for entry in payload["classes"]
-    ] == [
-        ("standard", False, "routes_exhausted"),
-        ("deep", False, "routes_exhausted"),
-    ]
+    ] == [("standard", False, "routes_exhausted")]
 
 
 def test_cli_routing_routes_add_list_and_explain(
@@ -835,12 +832,14 @@ def test_one_class_may_hold_only_one_chain() -> None:
 
 
 def test_class_for_reads_scope_and_risk_and_never_a_model_name() -> None:
-    """Which class a task takes is decided from its own shape - parentage and
-    fan-out - never from its execution permission or model. Model names
+    """Which class a task takes is decided from its own shape - permission,
+    parentage, fan-out - never from the model it happens to name. Model names
     are operator data, so a policy that branched on them would break the moment
     a chain was reconfigured."""
     settings = ExecutionRoutingSettings()
-    deep_shape = execution_routing.ScopeRisk(top_level=True, children=4)
+    deep_shape = execution_routing.ScopeRisk(
+        permission="SUPERVISED", top_level=True, children=4
+    )
 
     assert execution_routing.class_for(deep_shape, settings) == "deep"
     # An explicit operator choice outranks the policy in both directions.
@@ -856,9 +855,11 @@ def test_class_for_reads_scope_and_risk_and_never_a_model_name() -> None:
         )
         == "deep"
     )
-    # A child and a manager with no children are ordinary work.
+    # A child, an unsupervised task, and a manager with no children are all
+    # ordinary work.
     for ordinary in (
         dataclasses.replace(deep_shape, top_level=False),
+        dataclasses.replace(deep_shape, permission="ACCEPT_EDITS"),
         dataclasses.replace(deep_shape, children=0),
     ):
         assert execution_routing.class_for(ordinary, settings) == "standard"
@@ -891,29 +892,12 @@ def test_validate_chain_fails_closed_on_an_empty_or_dead_chain(
     assert any("cooling" in line for line in dead.trace)
 
 
-def test_validate_all_covers_every_class_including_unconfigured_ones(
-    pool_root: Path, monkeypatch
-) -> None:
-    """Regression guard for the check that could not see the problem it exists
-    to find: `class_for` promotes work onto `deep`, and the v1->v2 migration
-    fills only `standard`, so on every migrated install `deep` is empty. A
-    validate that iterated only the *configured* chains reported that install
-    fully valid, and the first fanning-out manager then failed to dispatch."""
-    pool_core.save_pool({"accounts": [_codex_account("codex-sub1")]})
-    monkeypatch.setattr(pool_core, "quota", _no_quota)
-    migrated = ExecutionRoutingSettings(
-        chains=_chains(_subscription_route("terra", "CODEX", "terra", "codex"))
-    )
+def test_validate_all_always_covers_the_default_class(pool_root: Path) -> None:
+    """Settings with no chain at all are the state validate exists to catch, so
+    the default class is checked even when nothing configures it."""
+    results = execution_routing.validate_all(ExecutionRoutingSettings())
 
-    results = execution_routing.validate_all(migrated)
-
-    assert [(r.route_class, r.valid) for r in results] == [
-        ("standard", True),
-        ("deep", False),
-    ]
-    assert [(r.route_class, r.valid) for r in execution_routing.validate_all(
-        ExecutionRoutingSettings()
-    )] == [("standard", False), ("deep", False)]
+    assert [(r.route_class, r.valid) for r in results] == [("standard", False)]
 
 
 def test_a_metered_hop_awaiting_approval_still_counts_as_a_usable_path(

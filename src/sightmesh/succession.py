@@ -407,26 +407,6 @@ def transfer_ownership(
 #: by construction rather than by pattern-matching what a worker printed.
 REROUTE_OUTCOMES = frozenset({"rate_limited", "auth", "provider_down"})
 
-#: Spellings written before the outcomes were typed. A task that was already
-#: mid-failover when the upgrade landed carries ``quota`` in its target and its
-#: journal, and refusing to read it would strand exactly the work an upgrade is
-#: most likely to interrupt.
-LEGACY_OUTCOMES = {"quota": "rate_limited"}
-
-#: Everything a reconcile sweep should look for, current and legacy alike.
-SWEEPABLE_OUTCOMES = REROUTE_OUTCOMES | frozenset(LEGACY_OUTCOMES)
-
-
-def routing_outcome(value: object) -> str | None:
-    """The reroute outcome a stored value names, or ``None`` if it names none.
-
-    One place decides what counts, so every caller reads legacy and current
-    spellings identically and no branch can be forgotten.
-    """
-    outcome = str(value or "")
-    outcome = LEGACY_OUTCOMES.get(outcome, outcome)
-    return outcome if outcome in REROUTE_OUTCOMES else None
-
 
 def cool_provider_outcome(
     settings: execution_routing.ExecutionRoutingSettings,
@@ -439,14 +419,12 @@ def cool_provider_outcome(
 ) -> tuple[str, ...]:
     """Cool exactly the accounts one typed outcome condemns. Returns their ids.
 
-    Safe to call any number of times for one outcome: pool cooling is
-    monotonic, so re-cooling the same window changes nothing. That is what
-    lets the caller cool *before* it records the outcome, closing the window
-    where a crash in between left an exhausted account uncooled forever.
-
-    The cooldown itself lives in pool state, the single source of account
-    truth, so every later selection - including one after a restart - observes
-    it. Only opaque binding ids are touched; credentials are never read here.
+    Called once, next to the write that records the outcome, so however many
+    times a reconcile later re-reads that outcome the cooldown is not extended
+    again. The cooldown itself lives in pool state, the single source of
+    account truth, so every later selection - including one after a restart -
+    observes it. Only opaque binding ids are touched; credentials are never
+    read here.
 
     A capacity or auth outcome is about one account, so one account cools. A
     ``provider_down`` is about the provider behind the route, so every account

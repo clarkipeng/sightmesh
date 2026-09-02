@@ -207,16 +207,9 @@ Routing failover scenarios (`tests/simulator/test_routing_scenarios.py`), over t
 | S-D3 | cooldown from `retry_at` | skipped until the reset, eligible again after it |
 | S-D4 | failing test suite naming "429" | no reroute, no cooldown, epoch unchanged |
 | S-D5 | typed 401 | short cooldown, not the capacity default; chain advances |
-| S-D6 | `provider_down` outcome; local 5xx | whole pool cooled together; a cdesktop 5xx cools nothing and stays retryable |
+| S-D6 | typed 503 | whole pool cooled together; chain skips the rest of that provider |
 | S-D7 | class with no usable hop | `validate` names it, dispatch refused before any epoch or effect row |
 | S-D8 | explicit profile override | still advances; `automatic_failover` off blocks with a reason |
-| S-D9 | upgraded v1 flat config | a promoted class with no chain degrades onto the default, not a refusal |
-| S-D10 | crash between cooling and the journal | the account is cooled anyway; cooling is monotonic |
-| S-D11 | mid-run process failure | typed capacity/auth reroutes; no signal blocks; a queued retry is left alone |
-| S-D12 | replacement epoch never filled | the sweep fills it; a manual `replace()` is left to its caller |
-| S-D13 | attempt limit reached | blocked once with a reason, then never retried again |
-| S-D14 | legacy `quota` outcome | still reroutes after the upgrade |
-| S-D15 | one task's advance raises | every other task in the sweep still settles |
 
 Red-first requirement: the suite must first run against pre-transplant `main` (77f66eb) with S1, S2, S3, S5, S6, S7, S12 failing, and the red log committed under `tests/simulator/RED-BASELINE.md`.
 

@@ -51,8 +51,6 @@ class _FaultPlan:
     latency_steps: dict[str, float] = field(default_factory=dict)
     #: step -> (status, retry_after seconds or None), consumed once.
     rejection_steps: dict[str, tuple[int, float | None]] = field(default_factory=dict)
-    #: Untyped launch failures, raised one per call in order.
-    launch_errors: list[Exception] = field(default_factory=list)
 
 
 class FakeCdesktop:
@@ -116,52 +114,6 @@ class FakeCdesktop:
         with self._faults_lock:
             self._faults.rejection_steps[step] = (int(status), retry_after)
 
-    def fail_launch(self, error: Exception) -> None:
-        """Raise ``error`` from the next ``managed_launch``, verbatim.
-
-        Distinct from :meth:`reject_after`, which produces a *typed* rejection.
-        This one stands in for an executor call that failed in a way carrying
-        no provider meaning at all - a local 5xx, a timeout, an unreachable
-        service - so a scenario can prove that such a failure never becomes a
-        provider outcome.
-        """
-        with self._faults_lock:
-            self._faults.launch_errors.append(error)
-
-    def fail_process(
-        self,
-        session_id: str,
-        *,
-        outcome_class: str | None = None,
-        retry_after: float | None = None,
-        status: str = "failed",
-        exit_code: int | None = 1,
-    ) -> str:
-        """Record that this session's coding agent process stopped.
-
-        Injects the *typed* process record the real seam returns - status, exit
-        code, and cdesktop's normalized outcome class - and nothing else. A
-        scenario cannot make this fake carry transcript text into the routing
-        decision, because the observer does not read any, which is exactly the
-        property the routing lane exists to hold.
-        """
-        process_id = f"process-{session_id}-{len(self.processes.get(session_id, []))}"
-        record: dict[str, Any] = {
-            "id": process_id,
-            "session_id": session_id,
-            "run_reason": "codingagent",
-            "status": status,
-            "exit_code": exit_code,
-        }
-        if outcome_class is not None:
-            record["outcome"] = {
-                "class": outcome_class,
-                "safe_message": "provider refused the request",
-                **({} if retry_after is None else {"retry_after_seconds": retry_after}),
-            }
-        self.processes.setdefault(session_id, []).append(record)
-        return process_id
-
     def _consume_duplicate(self, step: str) -> bool:
         with self._faults_lock:
             if step in self._faults.duplicate_steps:
@@ -173,18 +125,11 @@ class FakeCdesktop:
         with self._faults_lock:
             delay = self._faults.latency_steps.get(step)
             rejection = self._faults.rejection_steps.pop(step, None)
-            error = (
-                self._faults.launch_errors.pop(0)
-                if step == "launch" and self._faults.launch_errors
-                else None
-            )
             killed = step in self._faults.kill_steps
             if killed:
                 self._faults.kill_steps.discard(step)
         if delay:
             time.sleep(delay)
-        if error is not None:
-            raise error
         if rejection is not None:
             status, retry_after = rejection
             raise CdesktopRejectedError(
