@@ -1,3 +1,4 @@
+import time
 from io import BytesIO
 from pathlib import Path
 from urllib.error import HTTPError
@@ -607,3 +608,41 @@ def test_a_local_cdesktop_5xx_is_not_a_provider_outcome(monkeypatch, status) -> 
         CdesktopClient("http://127.0.0.1:1").request("GET", "/task-launches/t/1")
 
     assert not isinstance(raised.value, cdesktop.CdesktopRejectedError)
+
+
+def test_a_process_failure_reason_carries_no_provider_text() -> None:
+    """The reason becomes a blocked task's persisted result, so it is built
+    from typed fields only. A reason assembled from provider text is both a
+    leak risk and an invitation to parse it back out into a routing decision -
+    which is the failure the whole typed-outcome design replaced."""
+    leak = "Error from api.example.com: token sk-ant-oat01-abc is over its limit"
+    reason = cdesktop.process_failure_reason(
+        {
+            "status": "failed",
+            "exit_code": 1,
+            "outcome": {"class": "task_failed", "safe_message": leak},
+        }
+    )
+
+    assert reason == "worker process failed (task_failed, exit 1)"
+    assert "sk-ant" not in reason and leak not in reason
+
+
+def test_only_a_typed_outcome_class_becomes_a_routing_outcome() -> None:
+    """Capacity and auth advance a chain; every other class describes the work
+    failing, not the binding. A process reporting no class at all - which is
+    every process the pinned seam returns today - must yield nothing, or the
+    observer would be guessing again."""
+    assert cdesktop.process_provider_outcome({"status": "failed"}) == (None, None)
+    assert cdesktop.process_provider_outcome(
+        {"outcome": {"class": "task_failed"}}
+    ) == (None, None)
+    assert cdesktop.process_provider_outcome(
+        {"outcome": {"class": "auth_expired"}}
+    ) == ("auth", None)
+
+    outcome, retry_at = cdesktop.process_provider_outcome(
+        {"outcome": {"class": "quota_exhausted", "retry_after_seconds": 90}}
+    )
+    assert outcome == "rate_limited"
+    assert retry_at is not None and retry_at > time.time()

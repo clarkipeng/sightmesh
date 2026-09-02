@@ -210,7 +210,14 @@ def process_failure_reason(process: Mapping[str, Any]) -> str:
         else str(outcome or "")
     )
     exit_code = process.get("exit_code")
-    parts = [part for part in (detail, f"exit {exit_code}" if exit_code else "") if part]
+    parts = [
+        # A class name is a short enum value. Bounding it anyway means a seam
+        # that one day puts something longer there cannot turn a task's reason
+        # into a dump of whatever the provider said.
+        part
+        for part in (detail[:64], f"exit {exit_code}" if exit_code else "")
+        if part
+    ]
     return f"worker process {status}" + (f" ({', '.join(parts)})" if parts else "")
 
 
