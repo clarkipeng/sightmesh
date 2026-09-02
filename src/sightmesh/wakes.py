@@ -122,37 +122,59 @@ def finish_with_wake(
     result: str | None = None,
     *,
     expect_version: int | None = None,
+    conn: sqlite3.Connection | None = None,
 ) -> tuple[TaskRecord, list[str]]:
-    """Finish a task and record any parent wake it satisfies, atomically."""
+    """Finish a task and record any parent wake it satisfies, atomically.
+
+    A caller that is already inside a transaction passes its connection, so
+    the terminal, the parent's wake, and whatever the caller wrote alongside
+    them stay one commit rather than three that a crash can land between.
+    """
+    if conn is not None:
+        return _finish_with_wake(store, conn, task_id, state, result, expect_version)
     try:
-        with store.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            record = store.finish(
-                task_id, state, result, expect_version=expect_version, conn=conn
+        with store.connect() as owned:
+            owned.execute("BEGIN IMMEDIATE")
+            result_pair = _finish_with_wake(
+                store, owned, task_id, state, result, expect_version
             )
-            created: list[str] = []
-            if record.parent_task_id:
-                # One child terminal/blocked transition is one cohort event:
-                # bump the parent's monotonic counter in the same transaction
-                # so a wake's watermark can prove, later, whether the manager
-                # has already been woken for it.
-                conn.execute(
-                    "UPDATE managed_tasks SET child_event_seq = child_event_seq + 1 "
-                    "WHERE task_id = ?",
-                    (str(record.parent_task_id),),
-                )
-                created = record_wakes(conn, record.parent_task_id)
-                # A lost child is terminal but must not wait for its siblings
-                # (liveness-spec.md, cause 4). Arming here, in the same
-                # transaction as the terminal write, is what makes "immediate"
-                # true even if the process that observed the loss dies next.
-                created += record_liveness_wakes(conn, record.task_id)
-            conn.execute("COMMIT")
-            return record, created
+            owned.execute("COMMIT")
+            return result_pair
     except TaskStoreError:
         raise
     except sqlite3.DatabaseError as exc:
         raise TaskStoreError(f"Cannot finish managed task: {exc}") from exc
+
+
+def _finish_with_wake(
+    store: TaskStore,
+    conn: sqlite3.Connection,
+    task_id: str,
+    state: str,
+    result: str | None,
+    expect_version: int | None,
+) -> tuple[TaskRecord, list[str]]:
+    record = store.finish(
+        task_id, state, result, expect_version=expect_version, conn=conn
+    )
+    created: list[str] = []
+    if record.parent_task_id:
+        # One child terminal/blocked transition is one cohort event: bump the
+        # parent's monotonic counter in the same transaction so a wake's
+        # watermark can prove, later, whether the manager has already been
+        # woken for it.
+        conn.execute(
+            "UPDATE managed_tasks SET child_event_seq = child_event_seq + 1 "
+            "WHERE task_id = ?",
+            (str(record.parent_task_id),),
+        )
+        created = record_wakes(conn, record.parent_task_id)
+        # A lost child is terminal but must not wait for its siblings
+        # (liveness-spec.md, cause 4). Arming here, in the same transaction as
+        # the terminal write, is what makes "immediate" true even if the
+        # process that observed the loss dies next.
+        created += record_liveness_wakes(conn, record.task_id)
+    return record, created
 
 
 def satisfied_predicates(conn: sqlite3.Connection, parent_task_id: str) -> list[str]:
