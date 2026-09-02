@@ -440,7 +440,7 @@ def cool_provider_outcome(
     """Cool exactly the accounts one typed outcome condemns. Returns their ids.
 
     Safe to call any number of times for one outcome: pool cooling is
-    monotonic, so a repeat is a no-op rather than an extension. That is what
+    monotonic, so re-cooling the same window changes nothing. That is what
     lets the caller cool *before* it records the outcome, closing the window
     where a crash in between left an exhausted account uncooled forever.
 
