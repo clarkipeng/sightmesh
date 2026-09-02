@@ -707,9 +707,9 @@ def validate_all(settings: ExecutionRoutingSettings) -> tuple[ValidationResult, 
     """Validate every route class, configured or not.
 
     Iterating the closed set rather than the configured chains is the whole
-    point: a class dispatch can promote work onto but nobody has configured is
-    invisible to a check that only looks at what exists, and that invisible
-    empty chain is exactly what ``routing validate`` exists to catch.
+    point. A check that only looks at what exists cannot see a class that
+    dispatch can promote work onto but nobody has configured - and an upgrade
+    that adds a class leaves every install in exactly that state.
     """
     return tuple(validate_chain(settings, route_class) for route_class in ROUTE_CLASSES)
 
