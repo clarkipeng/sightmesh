@@ -27,6 +27,7 @@ import pytest
 from sightmesh.cdesktop import CdesktopRejectedError
 from sightmesh.durable import DurableExecutionReconciler
 from sightmesh.effects import EffectJournal, request_hash
+from sightmesh.escalation import EscalationStore
 from sightmesh.sdk import BatchError, SightMesh
 from sightmesh.task_store import (
     _MANAGED_TASKS_COLUMNS,
@@ -1017,3 +1018,313 @@ def test_s28_a_reconciler_rescan_of_an_unchanged_delivered_cohort_arms_nothing(
         (),
     )
     assert live[0]["n"] == 0
+
+
+# ======================================================================
+# Kernel v1.1 liveness scenarios S13-S17 (docs/liveness-spec.md).
+#
+# Every one of these replays a stall cause from the per-cause table and pins
+# the same two negatives alongside the positive: the kernel did not kill
+# anything, and the kernel did not respawn anything. Those are the failure
+# modes the incident record is made of - 30-minute approval SIGKILLs, restart
+# deaths misread as worker deaths - so a scenario that only checked "a wake
+# arrived" would pass against the exact regression this lane exists to prevent.
+# ======================================================================
+
+
+class _Clock:
+    """A hand-wound clock, so a scenario can place a task N seconds into
+    silence without a sleep and without a flaky wall-clock race."""
+
+    def __init__(self, now: float = 1_700_000_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> float:
+        self.now += seconds
+        return self.now
+
+
+def _liveness_reconciler(client, store, ownership, clock):
+    return DurableExecutionReconciler(
+        client,
+        task_store=store,
+        ownership=ownership,
+        signal_store=EscalationStore(store.path),
+        clock=clock,
+    )
+
+
+def _liveness_cohort(client, store, ownership, **child_spec):
+    """One manager plus one leaf child, both launched through the real SDK."""
+    parent_mesh = make_mesh(client, store, ownership)
+    parent = parent_mesh.start(worker_spec("manager", children=4))
+    child_mesh = make_mesh(client, store, ownership, session_id=parent.session_id)
+    child = child_mesh.start(worker_spec("leaf", **child_spec))
+    return parent, child, child_mesh
+
+
+def _liveness_wakes(store, predicate=None):
+    if predicate is None:
+        return query(
+            store,
+            "SELECT * FROM task_wakes WHERE predicate LIKE 'any_child_%' "
+            "AND predicate != 'any_child_blocked' ORDER BY created_at",
+        )
+    return query(
+        store,
+        "SELECT * FROM task_wakes WHERE predicate = ? ORDER BY created_at",
+        (predicate,),
+    )
+
+
+def test_s13_a_turn_that_ends_without_a_lifecycle_call_wakes_once(
+    client, store, ownership
+):
+    """S13 (cause 1): a leaf worker ends its turn and never calls
+    complete/blocked/checkpoint, so nothing in the system knows the task is
+    over and the manager waits forever on a cohort that will never close.
+
+    Historical incident: this is the most common stall in the pre-v1.1 record -
+    the model simply stops, the process stays alive and idle, and the only
+    thing that ever noticed was a human. Must hold: exactly one
+    `any_child_stalled` wake once the two-minute grace lapses, delivered with
+    `intent="continue"`, and - because every automatic reaper in the incident
+    record caused damage - no stop and no relaunch.
+    """
+    clock = _Clock()
+    parent, child, _mesh = _liveness_cohort(client, store, ownership)
+    process = client.run_process(
+        child.session_id, last_activity=clock.now - 600, turn_ended=True
+    )
+    launches_before = len(client.calls("managed_launch"))
+    reconciler = _liveness_reconciler(client, store, ownership, clock)
+
+    reconciler.reconcile_kernel()
+
+    child_row = store.get_by_session(child.session_id)
+    assert child_row.liveness == "idle_unreported"
+    assert child_row.state == "active", "a stall is an observation, never a terminal"
+    armed = _liveness_wakes(store, "any_child_stalled")
+    assert len(armed) == 1
+    assert armed[0]["dedupe_key"] == f"{child_row.task_id}:{child_row.epoch}:idle_unreported:1"
+    to_manager = [row for row in client.sent if row[0] == parent.session_id]
+    assert len(to_manager) == 1
+    assert to_manager[0][4] == "continue"
+    assert "any_child_stalled" in to_manager[0][1]
+
+    # The two negatives. `stopped` stays empty and no second launch happened:
+    # the kernel told the manager and did nothing else.
+    assert client.stopped == []
+    assert client.calls("stop_execution") == []
+    assert len(client.calls("managed_launch")) == launches_before
+    assert client.execution_processes(child.session_id)[0]["id"] == process
+
+    # Episode dedupe: the same silent child cannot wake its manager twice for
+    # one episode, however many ticks the reconciler runs.
+    for _ in range(3):
+        reconciler.reconcile_kernel()
+    assert len(_liveness_wakes(store, "any_child_stalled")) == 1
+    assert len([row for row in client.sent if row[0] == parent.session_id]) == 1
+
+
+def test_s14_a_parked_approval_times_out_into_blocked_never_a_kill(
+    client, store, ownership
+):
+    """S14 (cause 2): a child parked on an approval sits past its
+    approval_timeout.
+
+    Historical incident: a 30-minute wall-clock reaper SIGKILLed processes
+    whose only fault was waiting for a human to answer, destroying real work
+    and recording infrastructure impatience as a task failure. Must hold: the
+    task becomes `blocked(approval)`, the process is still alive and untouched,
+    a human attention item exists, and the parked child is excluded from stall
+    detection the entire time.
+    """
+    clock = _Clock()
+    parent, child, _mesh = _liveness_cohort(
+        client, store, ownership, approval_timeout=300.0
+    )
+    client.run_process(
+        child.session_id, last_activity=clock.now - 10_000, parked=True
+    )
+    reconciler = _liveness_reconciler(client, store, ownership, clock)
+
+    reconciler.reconcile_kernel()
+    child_row = store.get_by_session(child.session_id)
+    assert child_row.liveness == "parked"
+    assert child_row.state == "active", "parking is not yet a decision"
+    assert _liveness_wakes(store) == [], "cause 2 is excluded from stall detection"
+
+    clock.advance(301)
+    reconciler.reconcile_kernel()
+
+    timed_out = store.get_by_session(child.session_id)
+    assert timed_out.state == "blocked"
+    assert timed_out.result == "approval"
+    # The whole point: the process survives its own timeout.
+    assert client.execution_processes(child.session_id)[0]["status"] == "running"
+    assert client.stopped == []
+    assert client.calls("stop_execution") == []
+    assert _liveness_wakes(store) == [], "a timed-out approval is blocked, not stalled"
+
+    attention = EscalationStore(store.path).pending()
+    assert [item for item in attention if "blocked(approval)" in item.message]
+    # The manager is told through the existing blocked predicate, not a new pipe.
+    assert len(_liveness_wakes(store, "any_child_blocked")) == 1
+
+
+def test_s15_a_killed_process_is_lost_and_wakes_before_its_siblings(
+    client, store, ownership
+):
+    """S15 (cause 4): a child's process is killed mid-turn by a service
+    restart, with a typed restart marker behind it.
+
+    Historical incident: restart deaths were misread as worker deaths and
+    infrastructure failure was recorded as result failure. Must hold: a typed
+    `lost:restart` terminal, an immediate `any_child_lost` wake that does not
+    wait for the sibling cohort to finish, and a retry that adopts a fresh
+    epoch instead of forking a duplicate session.
+    """
+    clock = _Clock()
+    parent_mesh = make_mesh(client, store, ownership)
+    parent = parent_mesh.start(worker_spec("manager", children=4))
+    child_mesh = make_mesh(client, store, ownership, session_id=parent.session_id)
+    victim = child_mesh.start(worker_spec("victim"))
+    sibling = child_mesh.start(worker_spec("sibling"))
+    process = client.run_process(victim.session_id, last_activity=clock.now)
+    client.run_process(sibling.session_id, last_activity=clock.now)
+    client.kill_process(process, exit_reason="restart")
+    reconciler = _liveness_reconciler(client, store, ownership, clock)
+
+    reconciler.reconcile_kernel()
+
+    lost = store.get_by_session(victim.session_id)
+    assert lost.state == "lost"
+    assert lost.result == "lost:restart"
+    armed = _liveness_wakes(store, "any_child_lost")
+    assert len(armed) == 1
+    assert armed[0]["dedupe_key"] == f"{lost.task_id}:{lost.epoch}:lost:1"
+    # "Do not wait for siblings": the cohort is still open, so the consolidated
+    # terminal wake must not have fired, yet the manager has already been told.
+    assert store.get_by_session(sibling.session_id).state == "active"
+    assert _liveness_wakes(store, "all_children_terminal") == []
+    assert [row for row in client.sent if row[0] == parent.session_id]
+    assert EscalationStore(store.path).pending()
+
+    # No kill and no respawn: the process was already dead, and replacing it is
+    # the manager's call, not the kernel's.
+    assert client.stopped == []
+    effects_before = client.distinct_effects()
+
+    for _ in range(3):
+        reconciler.reconcile_kernel()
+    assert len(_liveness_wakes(store, "any_child_lost")) == 1
+    assert client.distinct_effects() == effects_before
+
+    # The retry the manager does authorize adopts a new epoch and produces
+    # exactly one more native session - never a duplicate of the lost one.
+    replaced = child_mesh.replace("victim", prompt="resume from the restart")
+    assert replaced.state == "active"
+    assert len(client.distinct_effects()) == len(effects_before) + 1
+    assert len(_liveness_wakes(store, "any_child_lost")) == 1
+
+
+def test_s16_a_long_command_with_live_output_is_never_flagged(
+    client, store, ownership
+):
+    """S16 (cause 3, stated positively): a command runs for twice the
+    progress_timeout while emitting output the whole time.
+
+    Historical incident: idle-time heuristics killed long-but-healthy work -
+    a build, a test suite, a large migration - because nothing had touched the
+    transcript in a while. Must hold: output bytes are progress, so the task is
+    never flagged, no episode opens, and no wake arms, no matter how many ticks
+    pass.
+    """
+    clock = _Clock()
+    parent, child, _mesh = _liveness_cohort(client, store, ownership, progress_timeout=1500.0)
+    # Timestamps freeze at t0 and never move again: bytes are the only evidence.
+    process = client.run_process(
+        child.session_id, last_activity=clock.now, output_bytes=4_096
+    )
+    reconciler = _liveness_reconciler(client, store, ownership, clock)
+    reconciler.reconcile_kernel()
+
+    for _ in range(12):  # 12 * 300s = 3600s, well past 2x progress_timeout
+        clock.advance(300)
+        client.feed_output(process, 8_192)
+        reconciler.reconcile_kernel()
+
+    working = store.get_by_session(child.session_id)
+    assert working.state == "active"
+    assert working.liveness == "live"
+    assert working.liveness_episode == 0, "no episode ever opened"
+    assert _liveness_wakes(store) == []
+    assert [row for row in client.sent if row[0] == parent.session_id] == []
+    assert client.stopped == []
+
+
+def test_s17_a_persistently_silent_child_wakes_twice_then_goes_quiet(
+    client, store, ownership
+):
+    """S17 (episode dedupe): a child stalls, the manager nudges it, and the
+    child stays silent anyway.
+
+    Historical incident: per-child notification storms - the same unresponsive
+    worker re-notifying its manager on every reconciler tick, burning the
+    manager's context and drowning the signal that mattered. Must hold: exactly
+    two wakes for the episode (the episode wake plus one escalation after a
+    further progress_timeout), then silence, with the incident handed to the
+    human attention queue rather than repeated at the manager.
+    """
+    clock = _Clock()
+    parent, child, manager_mesh = _liveness_cohort(
+        client, store, ownership, progress_timeout=1500.0
+    )
+    client.run_process(child.session_id, last_activity=clock.now - 2_000)
+    reconciler = _liveness_reconciler(client, store, ownership, clock)
+
+    reconciler.reconcile_kernel()
+    assert len(_liveness_wakes(store, "any_child_stalled")) == 1
+    stalled = store.get_by_session(child.session_id)
+    assert stalled.liveness == "stalled"
+    assert stalled.liveness_wakes == 1
+
+    # The manager nudges. A nudge is not evidence: the child produces nothing
+    # new, so the episode stays open and the clock keeps running.
+    manager_mesh.send("leaf", "are you still working?")
+    for _ in range(3):
+        clock.advance(60)
+        reconciler.reconcile_kernel()
+    assert len(_liveness_wakes(store, "any_child_stalled")) == 1, "still one episode"
+
+    # One further progress_timeout with no restored progress: escalate once.
+    clock.advance(1_500)
+    reconciler.reconcile_kernel()
+    escalated = _liveness_wakes(store, "any_child_stalled")
+    assert len(escalated) == 2
+    assert {row["dedupe_key"] for row in escalated} == {
+        f"{stalled.task_id}:{stalled.epoch}:stalled:1"
+    }
+    attention = [
+        item
+        for item in EscalationStore(store.path).pending()
+        if "after two manager wakes" in item.message
+    ]
+    assert len(attention) == 1
+
+    # Then quiet, forever. The human owns the incident now.
+    for _ in range(5):
+        clock.advance(1_500)
+        reconciler.reconcile_kernel()
+    assert len(_liveness_wakes(store, "any_child_stalled")) == 2
+    assert len([row for row in client.sent if row[0] == parent.session_id]) == 2
+    assert (
+        len([item for item in EscalationStore(store.path).pending()
+             if "after two manager wakes" in item.message]) == 1
+    )
+    assert store.get_by_session(child.session_id).state == "active"
+    assert client.stopped == []

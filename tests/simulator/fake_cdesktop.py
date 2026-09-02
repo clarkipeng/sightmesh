@@ -63,6 +63,7 @@ class FakeCdesktop:
         self.processes: dict[str, list[dict[str, Any]]] = {}
         self.snapshots: dict[str, dict[str, Any]] = {}
         self.commands: dict[str, list[dict[str, Any]]] = {}
+        self.queued_mail: dict[str, int] = {}
 
         self._effects: dict[tuple[str, int], dict[str, Any]] = {}
         self._effect_errors: list[Exception] = []
@@ -295,6 +296,86 @@ class FakeCdesktop:
     def normalized_snapshot(self, process_id: str) -> dict[str, Any]:
         self._log("normalized_snapshot", process_id)
         return self.snapshots[process_id]
+
+    def queue_status(self, session_id: str) -> dict[str, Any]:
+        self._log("queue_status", session_id)
+        return {"pending": self.queued_mail.get(session_id, 0)}
+
+    # ------------------------------------------------------------------
+    # Progress-evidence controls (spec: docs/liveness-spec.md, "Progress
+    # evidence"). Each one stands for a signal a real executor emits, so a
+    # liveness scenario configures the *world* and lets the real detector
+    # draw its own conclusion.
+    # ------------------------------------------------------------------
+    def run_process(
+        self,
+        session_id: str,
+        *,
+        process_id: str | None = None,
+        last_activity: float,
+        run_reason: str = "codingagent",
+        output_bytes: int = 0,
+        stream_alive: bool = True,
+        **snapshot: Any,
+    ) -> str:
+        """Give a session one running execution with a chosen last-activity time.
+
+        ``last_activity`` is an epoch timestamp, not an age, so a scenario can
+        place a task exactly N seconds into silence without sleeping.
+        """
+        pid = process_id or f"proc-{session_id}-{len(self.processes.get(session_id, []))}"
+        self.processes.setdefault(session_id, []).append(
+            {
+                "id": pid,
+                "status": "running",
+                "run_reason": run_reason,
+                "updated_at": last_activity,
+                "output_bytes": output_bytes,
+            }
+        )
+        self.snapshots[pid] = {"entries": [], "stream_alive": stream_alive, **snapshot}
+        return pid
+
+    def set_last_activity(self, process_id: str, when: float) -> None:
+        """Move one execution's last-activity timestamp; the detector reads it."""
+        for rows in self.processes.values():
+            for row in rows:
+                if str(row["id"]) == process_id:
+                    row["updated_at"] = when
+
+    def feed_output(self, process_id: str, extra_bytes: int) -> None:
+        """Grow a running command's output. Bytes are progress, however slow."""
+        for rows in self.processes.values():
+            for row in rows:
+                if str(row["id"]) == process_id:
+                    row["output_bytes"] = int(row.get("output_bytes") or 0) + extra_bytes
+
+    def mark_snapshot(self, process_id: str, **markers: Any) -> None:
+        """Set typed executor markers (``turn_ended``, ``parked``, ...).
+
+        These are the Phase 4 seam's signals. A scenario that sets them is
+        asserting the *post*-degraded-mode behavior; one that leaves them off
+        exercises what the current 0.2.x client can actually see.
+        """
+        self.snapshots.setdefault(process_id, {"entries": [], "stream_alive": True})
+        self.snapshots[process_id].update(markers)
+
+    def kill_process(self, process_id: str, *, exit_reason: str = "restart") -> None:
+        """Kill an execution with a typed attribution, as a restart marker would.
+
+        Typed on purpose: without an ``exit_reason`` the detector must refuse
+        to attribute the loss at all, and a scenario that wants a `lost`
+        outcome has to say which kind of loss actually happened.
+        """
+        for rows in self.processes.values():
+            for row in rows:
+                if str(row["id"]) == process_id:
+                    row["status"] = "killed"
+                    row["exit_reason"] = exit_reason
+
+    def queue_mail(self, session_id: str, pending: int) -> None:
+        """Set a session's queued-mail depth; queued work is not silence."""
+        self.queued_mail[session_id] = pending
 
     def dispatch_queued(self, session_id: str) -> Any:
         self._log("dispatch_queued", session_id)

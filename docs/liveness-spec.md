@@ -74,6 +74,15 @@ Executor prerequisites (Phase 4 seam, tracked in the seam contract):
 
 Until Phase 4 lands, the detector runs in degraded mode on what 0.2.7 exposes (transcript timestamps, process liveness, command states) and marks its own confidence in the wake payload rather than guessing.
 
+### Degraded mode today
+
+Detectable now: `stalled` (no process, snapshot, or checkpoint timestamp advanced for `progress_timeout`), `limbo` (snapshot reports a dead stream over a running process), `over_budget` on turns and tokens, and `lost` when a process row carries an explicit `exit_reason` or a `killed` status.
+
+Not detectable without the Phase 4 seam: `idle_unreported` and `parked`, which need the typed `turn_ended` and `parked(approval)` markers; `lost:restart` versus `lost:oom` versus `lost:killed`, which needs restart markers; cost budgets, which the client does not report.
+
+A process that has merely vanished from a list read is `unknown`, never `lost` - a partial read looks identical, and no attribution is better than a wrong one.
+Every finding carries `confidence` (`typed` or `degraded`) and its evidence sources into the wake payload.
+
 ## Simulator scenarios (v1.1 additions)
 
 | id | scenario | must hold |

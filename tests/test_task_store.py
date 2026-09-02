@@ -333,3 +333,111 @@ def test_a_missing_task_is_not_reported_as_a_stale_transition(tmp_path):
 
     with pytest.raises(TaskStoreError, match="not found"):
         store.finish("00000000-0000-0000-0000-000000000000", "completed")
+
+
+def test_a_round1_upgrade_gains_the_liveness_columns_at_their_safe_defaults(tmp_path):
+    """A live 0.11.x/0.12.x database must gain the v1.1 liveness columns without
+    a rebuild and without inventing findings.
+
+    The defaults matter as much as the columns: a task the detector has never
+    looked at must read as `live`, episode 0, never woken. Backfilling anything
+    else would make the first tick after an upgrade wake every manager in the
+    fleet about tasks that were never in trouble.
+    """
+    path = tmp_path / "round1-liveness.sqlite3"
+    _round1_kernel_store(
+        path, rows=[("p", "operator", "mgr", None, "active", "session-p")]
+    )
+
+    store = TaskStore(path)
+
+    task = store.get_by_id("p")
+    assert (task.liveness, task.liveness_episode, task.liveness_wakes) == ("live", 0, 0)
+    assert (task.liveness_since, task.liveness_evidence, task.checkpoint_at) == (
+        None,
+        None,
+        None,
+    )
+    assert task.over_budget is False
+    # Re-opening must be a no-op, not a second ALTER that errors the process out.
+    assert TaskStore(path).get_by_id("p").liveness == "live"
+
+
+def test_the_upgraded_liveness_column_still_rejects_an_unknown_classification(tmp_path):
+    """ADD COLUMN carries the CHECK, so an upgraded database enforces the same
+    typed vocabulary a freshly created one does.
+
+    Without the constraint on the alter path the two schemas would diverge, and
+    a typo in a future detector branch would silently persist a classification
+    no predicate can ever match - a task stuck in a state nothing reads.
+    """
+    path = tmp_path / "round1-check.sqlite3"
+    _round1_kernel_store(
+        path, rows=[("p", "operator", "mgr", None, "active", "session-p")]
+    )
+    store = TaskStore(path)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        with store._database._connect() as conn:
+            conn.execute("UPDATE managed_tasks SET liveness = 'wedged'")
+
+
+def test_the_wake_predicate_check_widens_for_the_liveness_predicates(tmp_path):
+    """SQLite cannot alter a CHECK in place, so the widened `predicate` set is a
+    table rebuild - and a rebuild that dropped rows would lose undelivered
+    wakes on upgrade, which is precisely the crash gap the outbox exists to
+    close.
+    """
+    path = tmp_path / "wakes-widen.sqlite3"
+    database = EscalationStore(path)
+    with database._connect() as conn:
+        # A kernel-v1 `task_wakes`: watermark column present, narrow CHECK.
+        conn.execute(
+            """
+            CREATE TABLE task_wakes (
+                wake_id TEXT PRIMARY KEY,
+                parent_task_id TEXT NOT NULL,
+                predicate TEXT NOT NULL CHECK (predicate IN
+                    ('all_children_terminal', 'any_child_blocked')),
+                dedupe_key TEXT NOT NULL,
+                event_seq INTEGER,
+                state TEXT NOT NULL CHECK (state IN
+                    ('pending', 'claimed', 'delivered', 'resolved')),
+                claim_expires_at REAL,
+                payload TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO task_wakes (wake_id, parent_task_id, predicate, dedupe_key, "
+            "state, created_at, updated_at) "
+            "VALUES ('w1', 'p', 'any_child_blocked', 'p:any_child_blocked', "
+            "'pending', 1, 1)"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO task_wakes (wake_id, parent_task_id, predicate, "
+                "dedupe_key, state, created_at, updated_at) "
+                "VALUES ('w0', 'p', 'any_child_stalled', 'k0', 'pending', 1, 1)"
+            )
+
+    store = TaskStore(path)  # opening rebuilds the table with the wider CHECK
+
+    with store._database._connect() as conn:
+        # The undelivered pre-upgrade wake survived the rebuild.
+        assert conn.execute("SELECT COUNT(*) FROM task_wakes").fetchone()[0] == 1
+        conn.execute(
+            "INSERT INTO task_wakes (wake_id, parent_task_id, predicate, dedupe_key, "
+            "state, created_at, updated_at) "
+            "VALUES ('w2', 'p', 'any_child_stalled', 'p:1:stalled:1', 'pending', 1, 1)"
+        )
+        # ...and a nonsense predicate is still refused, so the widening did not
+        # degenerate into dropping the constraint.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO task_wakes (wake_id, parent_task_id, predicate, "
+                "dedupe_key, state, created_at, updated_at) "
+                "VALUES ('w3', 'p', 'any_child_confused', 'k3', 'pending', 1, 1)"
+            )
