@@ -631,7 +631,6 @@ class ScopeRisk:
     """
 
     route_class: str | None = None
-    permission: str = "SUPERVISED"
     top_level: bool = True
     children: int = 0
 
@@ -640,8 +639,8 @@ def class_for(scope_risk: ScopeRisk, settings: ExecutionRoutingSettings) -> str:
     """Standard for ordinary work; deep when scope and risk demand it.
 
     Deliberately thin. An explicit operator choice always wins; otherwise the
-    deep chain is reserved for a top-level supervised manager that fans work
-    out, because that is the one shape where a weak judgement is multiplied
+    deep chain is reserved for a top-level manager that fans work out, because
+    that is the one shape where a weak judgement is multiplied
     across children rather than confined to one worker.
     """
     if scope_risk.route_class:
@@ -650,11 +649,7 @@ def class_for(scope_risk: ScopeRisk, settings: ExecutionRoutingSettings) -> str:
                 f"Unsupported route class: {scope_risk.route_class}"
             )
         return scope_risk.route_class
-    if (
-        scope_risk.permission == "SUPERVISED"
-        and scope_risk.top_level
-        and scope_risk.children >= DEEP_CLASS_MIN_CHILDREN
-    ):
+    if scope_risk.top_level and scope_risk.children >= DEEP_CLASS_MIN_CHILDREN:
         return "deep"
     return settings.default_class
 
