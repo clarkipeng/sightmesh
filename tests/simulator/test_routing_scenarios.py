@@ -948,3 +948,51 @@ def test_sd9_an_upgraded_v1_install_still_starts_a_fanning_out_manager(
     target = target_of(store, "mgr")
     assert (target["route_class"], target["route_id"]) == ("standard", "fable")
     assert target["auth_binding_id"] == "acct-a"
+
+
+# ---------------------------------------------------------------- S-D16
+
+
+def test_sd16_a_human_override_fences_a_stale_recovery_sweep(
+    mesh: SightMesh, store: TaskStore, routing_settings, monkeypatch
+) -> None:
+    """A sweep snapshot cannot launch after a human takes over its recovery."""
+    configure_chains(
+        standard=(execution_routing.Route("test", "CODEX", "test", "free"),)
+    )
+    mesh.start(worker_spec())
+    task = store.get("operator", "audit")
+    assert task is not None
+    # The sweep has already read this automatic replacement when the human
+    # clears its marker and starts a replacement of their own.
+    stale = store.prepare_replacement(
+        task.task_id,
+        target={**task.spec["target"], "recovery": "rate_limited"},
+        expect_version=task.version,
+    )
+
+    reserve_calls = []
+    reserve = mesh.journal.reserve
+
+    def record_reserve(*args, **kwargs):
+        reserve_calls.append((args, kwargs))
+        return reserve(*args, **kwargs)
+
+    monkeypatch.setattr(mesh.journal, "reserve", record_reserve)
+    mesh.replace("audit", "Human override prompt")
+
+    assert store.get("operator", "audit").epoch == stale.epoch + 1
+    # Make the stale path reach its reservation seam rather than adopting the
+    # successor already recorded by the human path.
+    mesh.ownership.records.clear()
+    assert mesh._advance_past_outcome(stale) is None
+    assert len(reserve_calls) == 2  # human epoch, then the stale sweep attempt
+    replacement_launches = [
+        call for call in mesh.client.call_log if call[0] == "managed_launch"
+    ][1:]
+    assert len(replacement_launches) == 1
+    assert replacement_launches[0][1][1] == stale.epoch + 1
+    assert (
+        replacement_launches[0][1][2]["request"]["session"]["prompt"]
+        == "Human override prompt"
+    )
