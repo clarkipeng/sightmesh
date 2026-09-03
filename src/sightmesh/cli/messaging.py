@@ -19,7 +19,10 @@ def cmd_message(args: argparse.Namespace) -> int:
     succession.OwnershipStore().assert_deliverable(str(target["session_id"]))
     sender = args.sender_session or os.environ.get("CDESKTOP_SESSION_ID")
     order_id = f"order:{uuid.uuid4()}"
-    if not getattr(args, "no_expect_ack", False):
+    # Enqueue is instant and unconditional; an acknowledgment expectation is
+    # opt-in. A parked recipient can never ack, so a blocking default turned
+    # ordinary timeouts into 24h of silent non-delivery (#91).
+    if getattr(args, "expect_ack", False):
         escalation.EscalationStore().expect_order(
             order_id=order_id,
             sender_session_id=sender,
@@ -325,7 +328,8 @@ def add_primary_parser(sub: argparse._SubParsersAction[Any]) -> None:
     message_group.add_argument("--message-file")
     message.add_argument("--sender-session")
     message.add_argument(
-        "--no-expect-ack", action="store_true", help="Do not require an outbound acknowledgment"
+        "--expect-ack", action="store_true",
+        help="Also record an acknowledgment expectation (off by default: enqueue is instant, never blocks)",
     )
     message.set_defaults(func=cmd_message)
 

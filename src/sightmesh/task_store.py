@@ -472,6 +472,19 @@ class TaskStore:
     def get(self, scope: str, key: str) -> TaskRecord | None:
         return self._one("scope = ? AND task_key = ?", (scope, key))
 
+    def count_running(self) -> int:
+        """Managed tasks currently holding an executor session (active or in a
+        handoff). This is the kernel-side admission count: direct launches
+        must not stampede past what queued coordination can live with (#88)."""
+        try:
+            with self._database._connect() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM managed_tasks WHERE state IN ('active', 'replacing')"
+                ).fetchone()
+            return int(row[0]) if row else 0
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(f"Cannot count running tasks: {exc}") from exc
+
     def get_by_id(self, task_id: str) -> TaskRecord | None:
         return self._one("task_id = ?", (str(task_id),))
 
