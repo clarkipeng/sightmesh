@@ -30,6 +30,14 @@ Delete is deliberately separate from archive. It requires an archived workspace 
 
 Do not place secrets in prompts, transcripts, `.context`, handoffs, command arguments, or the orchestration repository. Local-only storage and restrictive permissions reduce exposure but do not turn those surfaces into a secrets manager.
 
+## Pool credentials (the one explicit exception)
+
+The account pool is the credential owner for the accounts it launches under, the same way each provider CLI owns its on-disk login.
+It may persist one setup token per account at `credentials/<id>.token`, owner-only (0600), inside the pool's private state directory, and nowhere else.
+Tokens are read only while building a worker's launch environment; they never appear in prompts, transcripts, logs, command arguments, or status output (shapes only, never values).
+Rotate on a schedule and immediately when any token could have been exposed; anything that ever appeared in a transcript counts as exposed.
+This is the whole exception. Everything else in this document still applies.
+
 Approval decisions are stored in `~/.local/state/sightmesh/approvals.sqlite3`. The database and its WAL files are owner-only. Rejection text is not copied into this store; SightMesh records only its SHA-256 digest so an audit can correlate a decision without creating another transcript.
 
 Parent return addresses and queued commands live in cdesktop's application database. During the v0.9 update, legacy SightMesh delivery and relationship databases are imported, copied to `~/.local/state/sightmesh/legacy`, and removed from the active state directory.
