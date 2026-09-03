@@ -147,9 +147,20 @@ class FakeOwnership:
 
 
 @pytest.fixture
-def system(tmp_path):
+def system(tmp_path, monkeypatch):
     repo = tmp_path / "project"
     repo.mkdir()
+    settings = execution_routing.ExecutionRoutingSettings(
+        chains=(
+            execution_routing.RouteChain(
+                "standard",
+                (execution_routing.Route("test", "CODEX", "test", "free"),),
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        execution_routing.ExecutionRoutingStore, "load", lambda _self: settings
+    )
     store = TaskStore(tmp_path / "state.sqlite3")
     client = FakeClient(repo)
     ownership = FakeOwnership()

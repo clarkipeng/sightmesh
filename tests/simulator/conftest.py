@@ -109,7 +109,12 @@ def ownership() -> FakeOwnership:
 
 
 @pytest.fixture
-def mesh(client: FakeCdesktop, store: TaskStore, ownership: FakeOwnership) -> SightMesh:
+def mesh(
+    client: FakeCdesktop,
+    store: TaskStore,
+    ownership: FakeOwnership,
+    routing_settings: Path,
+) -> SightMesh:
     return SightMesh(client=client, store=store, ownership=ownership, environment={})
 
 
@@ -185,10 +190,23 @@ def pool_root(monkeypatch, tmp_path: Path) -> Path:
     return root
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def routing_settings(monkeypatch, tmp_path: Path) -> Path:
     path = tmp_path / "execution_routing.json"
     monkeypatch.setattr(execution_routing, "default_settings_path", lambda: path)
+    # Explicit executors still select a route class and must pass its
+    # fail-closed validation. Generic scenarios get an isolated standard route;
+    # routing scenarios overwrite it with their own chain.
+    execution_routing.ExecutionRoutingStore().save(
+        execution_routing.ExecutionRoutingSettings(
+            chains=(
+                execution_routing.RouteChain(
+                    "standard",
+                    (execution_routing.Route("test", "CODEX", "test", "free"),),
+                ),
+            )
+        )
+    )
     return path
 
 
