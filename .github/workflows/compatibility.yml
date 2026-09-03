@@ -25,11 +25,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Install package
+        run: python -m pip install -e .
       - name: Inspect public main package contract
         run: |
-          repository=$(PYTHONPATH=src python -c 'from sightmesh.runtime_lock import RUNTIME_LOCK; print(RUNTIME_LOCK.cdesktop.repository)')
+          repository=$(python -c 'from sightmesh.runtime_lock import RUNTIME_LOCK; print(RUNTIME_LOCK.cdesktop.repository)')
           git clone --depth 1 "https://github.com/${repository}.git" ../cdesktop-main
-          PYTHONPATH=src python - <<'PY'
+          python - <<'PY'
           import json
           from pathlib import Path
           from sightmesh.runtime_lock import RUNTIME_LOCK
