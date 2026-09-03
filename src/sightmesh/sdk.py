@@ -65,7 +65,7 @@ class WorkerSpec:
     executor: str | None = None
     model: str | None = None
     reasoning: str | None = None
-    permission: str = "SUPERVISED"
+    permission: str = "ACCEPT_EDITS"
     children: int = 0
 
 
