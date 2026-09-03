@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -100,7 +101,7 @@ def _retry_at(headers: Any) -> float | None:
         seconds = float(str(raw).strip())
     except (TypeError, ValueError):
         return None
-    return time.time() + seconds if seconds >= 0 else None
+    return time.time() + seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
 EFFECT_NOT_FOUND_MESSAGE = "Managed task effect not found"
@@ -190,9 +191,10 @@ def _outcome_reset(outcome: Mapping[str, Any]) -> float | None:
         except ValueError:
             return None
     try:
-        return time.time() + float(outcome["retry_after_seconds"])
+        seconds = float(outcome["retry_after_seconds"])
     except (KeyError, TypeError, ValueError):
         return None
+    return time.time() + seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
 def process_failure_reason(process: Mapping[str, Any]) -> str:

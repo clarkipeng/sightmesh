@@ -620,7 +620,7 @@ def test_sd12_a_task_stranded_mid_replacement_is_resumed_by_the_sweep(
 
 
 def test_sd12_a_replacement_epoch_that_already_ended_blocks_and_then_advances(
-    mesh: SightMesh, store: TaskStore, pool_root, routing_settings
+    mesh: SightMesh, store: TaskStore, pool_root, routing_settings, monkeypatch
 ) -> None:
     """S-D12 (contrast): a ``replacing`` task whose new epoch already ended
     settles by blocking, and the ordinary advance path takes it from there.
@@ -641,7 +641,17 @@ def test_sd12_a_replacement_epoch_that_already_ended_blocks_and_then_advances(
     assert stranded.state == "replacing"
     mesh.journal.mark_terminal(stranded.task_id, stranded.epoch, "rejected:400")
 
+    calls: list[str] = []
+    real_advance = mesh._advance_past_outcome
+
+    def advance(task):
+        calls.append(task.task_id)
+        return real_advance(task)
+
+    monkeypatch.setattr(mesh, "_advance_past_outcome", advance)
+
     assert [worker.state for worker in mesh.reconcile_provider_outcomes()] == ["blocked"]
+    assert calls == [stranded.task_id]
     blocked = store.get("operator", "audit")
     assert blocked.epoch == 2 and "rejected:400" in str(blocked.result)
 
@@ -679,6 +689,40 @@ def test_sd12_a_manual_replacement_is_left_to_the_human_who_started_it(
     resumed = mesh.replace("audit", "do only the second half")
     assert resumed.state == "active"
     assert store.get("operator", "audit").epoch == stranded.epoch
+
+
+def test_sd12_a_manual_resume_clears_a_failed_failovers_recovery_marker(
+    mesh: SightMesh, store: TaskStore, pool_root, routing_settings, monkeypatch
+) -> None:
+    """A human resume takes ownership of a failed automatic replacement.
+
+    Clearing the marker durably makes the sweep unable to launch the original
+    prompt alongside the human's override during that resume.
+    """
+    seed_pool(claude_account("acct-a"), claude_account("acct-b"))
+    configure_chains(standard=(subscription("terra", "terra", "claude"),))
+
+    started = mesh.start(routed_spec())
+    original = store.get("operator", "audit")
+    mesh.journal.mark_terminal(original.task_id, original.epoch, "rate_limited")
+    mesh.client.fail_launch(CdesktopError("PUT /task-launches failed: HTTP 503: down"))
+    assert mesh.reconcile_provider_outcomes() == []
+    stranded = store.get("operator", "audit")
+    assert (
+        stranded.state == "replacing"
+        and stranded.holder_session_id == started.session_id
+        and stranded.spec["target"]["recovery"] == "rate_limited"
+    )
+
+    monkeypatch.setattr(
+        mesh,
+        "_replace_prepared",
+        lambda *_args: (_ for _ in ()).throw(CdesktopError("launch interrupted")),
+    )
+    with pytest.raises(CdesktopError, match="launch interrupted"):
+        mesh.replace("audit", "human override")
+
+    assert "recovery" not in store.get("operator", "audit").spec["target"]
 
 
 # ---------------------------------------------------------------- S-D13
