@@ -13,6 +13,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Install package
+        run: python -m pip install -e .
       - name: Verify locked artifact and executable
         run: ./scripts/check-cdesktop-runtime.sh
 
