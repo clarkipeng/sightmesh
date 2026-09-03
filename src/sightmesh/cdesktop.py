@@ -18,6 +18,10 @@ from websockets.sync.client import connect as websocket_connect
 from .service import DEFAULT_PORT, is_healthy, service_url
 
 
+SEND_TRANSPORT_RETRIES = 3
+SEND_RETRY_BACKOFF_SECONDS = 1.0
+
+
 class CdesktopError(RuntimeError):
     pass
 
@@ -28,6 +32,16 @@ class CdesktopRejectedError(CdesktopError):
     def __init__(self, message: str, *, status: int | None = None) -> None:
         super().__init__(message)
         self.status = status
+
+
+class CdesktopTransportError(CdesktopError):
+    """The request never got a response (unreachable, timeout). The server may
+    or may not have applied it - the only honest state is 'unknown'."""
+
+
+class CdesktopDeliveryError(CdesktopError):
+    """A follow-up could not be confirmed queued after retries and lookup.
+    Loud by design: silent loss of a directive cost a coordinator 24 hours."""
 
 
 class CdesktopInterruptedError(CdesktopRejectedError):
@@ -158,7 +172,7 @@ class CdesktopClient:
                 raise CdesktopError(message) from exc
             raise error_type(message, status=exc.code) from exc
         except URLError as exc:
-            raise CdesktopError(
+            raise CdesktopTransportError(
                 f"Cannot reach cdesktop at {self.base_url}: {exc}"
             ) from exc
 
@@ -665,11 +679,40 @@ class CdesktopClient:
         if dedupe_key:
             payload["dedupe_key"] = dedupe_key
         payload["intent"] = intent
-        return self.request(
-            "POST",
-            f"/sessions/{session_id}/follow-up",
-            payload,
-            headers=headers,
+        # A transport failure leaves the outcome unknown, not failed. Because
+        # every keyed send is idempotent on dedupe_key, retrying the identical
+        # POST is provably safe; afterwards we VERIFY the row instead of
+        # guessing, and report a typed delivery state. Never silent.
+        attempts = SEND_TRANSPORT_RETRIES if dedupe_key else 1
+        last_error: CdesktopTransportError | None = None
+        for attempt in range(attempts):
+            try:
+                result = self.request(
+                    "POST", f"/sessions/{session_id}/follow-up", payload, headers=headers
+                )
+                if isinstance(result, dict):
+                    result.setdefault("delivery", "queued")
+                return result
+            except CdesktopTransportError as exc:
+                last_error = exc
+                if attempt + 1 < attempts:
+                    time.sleep(SEND_RETRY_BACKOFF_SECONDS * (attempt + 1))
+        if dedupe_key and self._command_is_queued(session_id, dedupe_key):
+            return {"delivery": "already_queued", "dedupe_key": dedupe_key}
+        raise CdesktopDeliveryError(
+            f"Follow-up to session {session_id} could NOT be confirmed queued after "
+            f"{attempts} attempt(s) ({last_error}). Retry with the same dedupe_key "
+            f"{dedupe_key!r}; it is safe to repeat."
+        ) from last_error
+
+    def _command_is_queued(self, session_id: str, dedupe_key: str) -> bool:
+        """Verification read: is a command with this dedupe_key present?"""
+        try:
+            rows = self.session_commands(session_id)
+        except CdesktopError:
+            return False
+        return any(
+            isinstance(row, dict) and row.get("dedupe_key") == dedupe_key for row in rows
         )
 
     def wait_for_workspace_idle(
