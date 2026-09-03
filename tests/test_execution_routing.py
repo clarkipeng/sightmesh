@@ -835,14 +835,12 @@ def test_one_class_may_hold_only_one_chain() -> None:
 
 
 def test_class_for_reads_scope_and_risk_and_never_a_model_name() -> None:
-    """Which class a task takes is decided from its own shape - permission,
-    parentage, fan-out - never from the model it happens to name. Model names
+    """Which class a task takes is decided from its own shape - parentage and
+    fan-out - never from its execution permission or model. Model names
     are operator data, so a policy that branched on them would break the moment
     a chain was reconfigured."""
     settings = ExecutionRoutingSettings()
-    deep_shape = execution_routing.ScopeRisk(
-        permission="SUPERVISED", top_level=True, children=4
-    )
+    deep_shape = execution_routing.ScopeRisk(top_level=True, children=4)
 
     assert execution_routing.class_for(deep_shape, settings) == "deep"
     # An explicit operator choice outranks the policy in both directions.
@@ -858,11 +856,9 @@ def test_class_for_reads_scope_and_risk_and_never_a_model_name() -> None:
         )
         == "deep"
     )
-    # A child, an unsupervised task, and a manager with no children are all
-    # ordinary work.
+    # A child and a manager with no children are ordinary work.
     for ordinary in (
         dataclasses.replace(deep_shape, top_level=False),
-        dataclasses.replace(deep_shape, permission="ACCEPT_EDITS"),
         dataclasses.replace(deep_shape, children=0),
     ):
         assert execution_routing.class_for(ordinary, settings) == "standard"
