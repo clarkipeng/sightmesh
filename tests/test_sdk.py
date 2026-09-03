@@ -604,7 +604,7 @@ def _configure_chains(monkeypatch, **chains):
 
 
 def test_a_fanning_out_top_level_manager_takes_the_deep_class(system, monkeypatch):
-    """Scope and risk pick the class once, at dispatch. A top-level supervised
+    """Scope and risk pick the class once, at dispatch. A top-level
     task that fans work out is the one shape where weak judgement multiplies
     across children, so it gets the deep chain; everything else stays
     standard.

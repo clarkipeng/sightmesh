@@ -906,7 +906,6 @@ class SightMesh:
             settings,
             execution_routing.ScopeRisk(
                 route_class=spec.route_class,
-                permission=spec.permission,
                 top_level=top_level,
                 children=spec.children,
             ),
