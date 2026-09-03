@@ -646,3 +646,33 @@ def test_a_probe_that_finds_the_sentinel_reserved_fails_the_contract(system):
 
     with pytest.raises(SightMeshError, match="reserved sentinel effect"):
         mesh.start(spec())
+
+
+def test_start_waits_for_capacity_then_refuses_with_a_typed_error(monkeypatch, tmp_path):
+    """#88: direct launches bypass the executor's queued-dispatch cap, so an
+    unbounded fan-out starves every queued wake/resume. The kernel now admits
+    launches against its own managed-concurrency cap and refuses loudly (not
+    silently stampeding) when it stays full."""
+    from sightmesh import sdk as sdk_mod
+    from sightmesh.task_store import TaskRecord
+
+    class Store:
+        def count_running(self):
+            return 4
+
+    mesh = sdk_mod.SightMesh.__new__(sdk_mod.SightMesh)
+    mesh.store = Store()
+    monkeypatch.setenv("SIGHTMESH_MAX_ACTIVE_WORKERS", "4")
+    monkeypatch.setenv("SIGHTMESH_LAUNCH_WAIT_SECONDS", "0")
+    monkeypatch.setattr(sdk_mod.time, "sleep", lambda *_: None)
+    task = TaskRecord(
+        task_id="t", scope="operator", key="w", parent_task_id=None, state="reserved",
+        epoch=1, attempts=1, max_attempts=3, child_limit=0, spec={}, workspace_id=None,
+        holder_session_id=None, checkpoint=None, result=None, created_at=0.0, updated_at=0.0,
+        **{f: 0 for f in TaskRecord.__dataclass_fields__ if f not in {
+            "task_id","scope","key","parent_task_id","state","epoch","attempts","max_attempts",
+            "child_limit","spec","workspace_id","holder_session_id","checkpoint","result",
+            "created_at","updated_at"}},
+    )
+    with pytest.raises(sdk_mod.SightMeshError, match="capacity"):
+        mesh._wait_for_launch_capacity(task)

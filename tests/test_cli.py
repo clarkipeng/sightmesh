@@ -802,8 +802,15 @@ def test_message_creates_a_durable_expectation_and_queues_continue(
         json=True,
     )
 
+    # #91: enqueue is instant and unconditional; an ack expectation is opt-in.
+    # The old blocking default turned timeouts into 24h of silent non-delivery.
     assert cli.cmd_message(args) == 0
     assert '"intent": "continue"' in capsys.readouterr().out
+    assert escalation.EscalationStore(tmp_path / "orders.sqlite3").orders() == []
+
+    args.expect_ack = True
+    assert cli.cmd_message(args) == 0
+    capsys.readouterr()
     orders = escalation.EscalationStore(tmp_path / "orders.sqlite3").orders()
     assert len(orders) == 1
     assert orders[0].sender_session_id == "manager"

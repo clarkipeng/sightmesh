@@ -13,7 +13,12 @@ import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
+import os
 import pytest
+
+# The simulator deliberately runs unbounded cohorts (100 children); kernel-side
+# launch admission (#88) is a production default, not a simulated constraint.
+os.environ.setdefault("SIGHTMESH_MAX_ACTIVE_WORKERS", "100000")
 
 from sightmesh.sdk import SightMesh, WorkerSpec
 from sightmesh.succession import QuarantinedSessionError, TerminalOwnership

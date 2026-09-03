@@ -442,6 +442,7 @@ class SightMesh:
             setup_script=task.spec.get("setup_script"),
             auth_binding_id=target.get("auth_binding_id"),
         )
+        self._wait_for_launch_capacity(task)
         workspace_id, session_id = self._journaled_launch(
             task, {"kind": "workspace", "request": request}
         )
@@ -450,6 +451,28 @@ class SightMesh:
         )
         self._record_launcher(active)
         return active
+
+    def _wait_for_launch_capacity(self, task: TaskRecord) -> None:
+        """Kernel-side admission (#88): direct launches bypass cdesktop's queued
+        dispatch cap, so an unbounded fan-out starves every queued wake and
+        resume. Wait (bounded) for managed concurrency to drop under the cap,
+        then launch; past the deadline refuse with a typed, retryable error
+        instead of stampeding the host.
+        """
+        cap = int(os.environ.get("SIGHTMESH_MAX_ACTIVE_WORKERS", "4"))
+        deadline = time.monotonic() + float(os.environ.get("SIGHTMESH_LAUNCH_WAIT_SECONDS", "90"))
+        delay = 0.5
+        while True:
+            running = self.store.count_running()
+            if running < cap:
+                return
+            if time.monotonic() >= deadline:
+                raise SightMeshError(
+                    f"capacity: {running} managed workers running >= cap {cap}; "
+                    f"{task.key!r} stays reserved - retry start (it adopts the reservation)"
+                )
+            time.sleep(delay)
+            delay = min(delay * 2, 5.0)
 
     def _journaled_launch(
         self, task: TaskRecord, launch: Mapping[str, Any]
