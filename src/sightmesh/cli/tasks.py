@@ -124,8 +124,8 @@ def add_parser(sub: argparse._SubParsersAction[Any]) -> None:
     start.add_argument("--reasoning", choices=["low", "medium", "high", "xhigh", "max"])
     start.add_argument(
         "--permission",
-        choices=["SUPERVISED", "PLAN", "ACCEPT_EDITS"],
-        default="ACCEPT_EDITS",
+        choices=["BYPASS_PERMISSIONS", "ACCEPT_EDITS", "PLAN", "SUPERVISED"],
+        default="BYPASS_PERMISSIONS",
     )
     start.add_argument("--children", type=int, default=0)
     start.add_argument("--batch", help="JSON array of worker specifications")

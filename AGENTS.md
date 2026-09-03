@@ -12,7 +12,7 @@ Keep skills and agent guidance short and semantic. Use a small example when help
 
 ## Working defaults
 
-- Workers start with ACCEPT_EDITS. Supervision is only for destructive actions (merge, deploy, delete, restart, migrate); never give a worker a permission that forbids its own deliverable (plan-only workers cannot write reports or run `sightmesh complete`).
+- Workers run unattended (BYPASS_PERMISSIONS) in their own worktree; nothing waits on a human approval. Reserve supervised policies for destructive actions (merge, deploy, delete, restart, migrate); never give a worker a permission that forbids its own deliverable (plan-only workers cannot write reports or run `sightmesh complete`).
 - Don't ask for permission; proceed. Ask only when the decision is the founder's (prod, spend, scope), and ask a real directional question.
 - Follow-ups are dense: what changed, what's decided, what needs a decision.
 - Small, specified fixes are done directly by the coordinator; dispatch workers only for long or heavy jobs. Keep at most ~3 concurrent workers while launch admission is unbounded (#88).

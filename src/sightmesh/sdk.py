@@ -55,6 +55,9 @@ class BatchError(SightMeshError):
         super().__init__(message)
 
 
+PERMISSION_POLICIES = frozenset({"BYPASS_PERMISSIONS", "ACCEPT_EDITS", "PLAN", "SUPERVISED"})
+
+
 @dataclass(frozen=True)
 class WorkerSpec:
     key: str
@@ -65,7 +68,7 @@ class WorkerSpec:
     executor: str | None = None
     model: str | None = None
     reasoning: str | None = None
-    permission: str = "ACCEPT_EDITS"
+    permission: str = "BYPASS_PERMISSIONS"
     children: int = 0
 
 
@@ -773,8 +776,10 @@ class SightMesh:
             raise SightMeshError(f"Base branch for {spec.key!r} must not be empty")
         if not 0 <= spec.children <= 1000:
             raise SightMeshError("children must be between 0 and 1000")
-        if spec.permission not in {"SUPERVISED", "PLAN", "ACCEPT_EDITS"}:
-            raise SightMeshError("Managed tasks require a supervised permission policy")
+        if spec.permission not in PERMISSION_POLICIES:
+            raise SightMeshError(
+                f"Unknown permission policy {spec.permission!r}; expected one of {sorted(PERMISSION_POLICIES)}"
+            )
 
     @staticmethod
     def _reject_ephemeral(repo_path: Path) -> None:
