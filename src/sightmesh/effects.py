@@ -58,10 +58,6 @@ class EffectTerminal(TaskStoreError):
     """
 
 
-class EffectStale(TaskStoreError):
-    """The task no longer describes the automatic recovery being launched."""
-
-
 def request_hash(launch: Mapping[str, Any]) -> str:
     """Digest a launch spec so drift can never be replayed as a duplicate."""
     canonical = json.dumps(launch, sort_keys=True, separators=(",", ":"), default=str)
@@ -102,9 +98,6 @@ class EffectJournal:
         request_hash: str,
         owner: str,
         ttl: float = RESERVATION_TTL_SECONDS,
-        *,
-        task_version: int | None = None,
-        recovery: str | None = None,
     ) -> tuple[Effect, bool]:
         """Claim the right to launch this epoch; report whether we took over.
 
@@ -124,9 +117,6 @@ class EffectJournal:
         try:
             with self.store.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                self._require_current_recovery(
-                    conn, task_id, epoch, task_version, recovery
-                )
                 row = self._row(conn, task_id, epoch)
                 if row is None:
                     conn.execute(
@@ -184,55 +174,6 @@ class EffectJournal:
             raise
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(f"Cannot reserve task effect: {exc}") from exc
-
-    def require_current_recovery(
-        self, task_id: str, epoch: int, task_version: int, recovery: str
-    ) -> None:
-        """Prove an automatic recovery still owns this task before its PUT.
-
-        Reservation is the durable side-effect boundary, but a human may
-        supersede the recovery after a sweep read it. Rechecking at the native
-        boundary keeps a stale sweep from sending its old prompt after that
-        override.
-        """
-        try:
-            with self.store.connect() as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                self._require_current_recovery(
-                    conn, task_id, epoch, task_version, recovery
-                )
-                conn.execute("COMMIT")
-        except TaskStoreError:
-            raise
-        except sqlite3.DatabaseError as exc:
-            raise TaskStoreError(f"Cannot validate task recovery: {exc}") from exc
-
-    @staticmethod
-    def _require_current_recovery(
-        conn: sqlite3.Connection,
-        task_id: str,
-        epoch: int,
-        task_version: int | None,
-        recovery: str | None,
-    ) -> None:
-        if task_version is None or recovery is None:
-            return
-        row = conn.execute(
-            "SELECT state, epoch, version, spec_json FROM managed_tasks WHERE task_id = ?",
-            (str(task_id),),
-        ).fetchone()
-        if row is None:
-            raise EffectStale(f"Task {task_id} no longer exists")
-        target = json.loads(str(row["spec_json"])).get("target", {})
-        if (
-            str(row["state"]) != "replacing"
-            or int(row["epoch"]) != int(epoch)
-            or int(row["version"]) != int(task_version)
-            or target.get("recovery") != recovery
-        ):
-            raise EffectStale(
-                f"Task {task_id} recovery is no longer current for epoch {epoch}"
-            )
 
     def mark_launched(
         self, task_id: str, epoch: int, workspace_id: str, session_id: str
