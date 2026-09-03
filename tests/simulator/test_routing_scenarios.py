@@ -14,7 +14,9 @@ launch was rejected before it ever held a session could not reroute at all.
 from __future__ import annotations
 
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -953,46 +955,87 @@ def test_sd9_an_upgraded_v1_install_still_starts_a_fanning_out_manager(
 # ---------------------------------------------------------------- S-D16
 
 
-def test_sd16_a_human_override_fences_a_stale_recovery_sweep(
-    mesh: SightMesh, store: TaskStore, routing_settings, monkeypatch
-) -> None:
-    """A sweep snapshot cannot launch after a human takes over its recovery."""
+def _automatic_replacement(mesh: SightMesh, store: TaskStore, key: str = "audit"):
     configure_chains(
         standard=(execution_routing.Route("test", "CODEX", "test", "free"),)
     )
-    mesh.start(worker_spec())
-    task = store.get("operator", "audit")
+    mesh.start(worker_spec(key=key))
+    task = store.get("operator", key)
     assert task is not None
-    # The sweep has already read this automatic replacement when the human
-    # clears its marker and starts a replacement of their own.
-    stale = store.prepare_replacement(
+    return store.prepare_replacement(
         task.task_id,
         target={**task.spec["target"], "recovery": "rate_limited"},
         expect_version=task.version,
     )
 
-    reserve_calls = []
-    reserve = mesh.journal.reserve
 
-    def record_reserve(*args, **kwargs):
-        reserve_calls.append((args, kwargs))
-        return reserve(*args, **kwargs)
-
-    monkeypatch.setattr(mesh.journal, "reserve", record_reserve)
+def test_sd16_a_human_override_before_recovery_authorization_launches_only_human_prompt(
+    mesh: SightMesh, store: TaskStore, routing_settings
+) -> None:
+    """A stale sweep reloads its task while holding the intent lock."""
+    stale = _automatic_replacement(mesh, store)
     mesh.replace("audit", "Human override prompt")
 
-    assert store.get("operator", "audit").epoch == stale.epoch + 1
-    # Make the stale path reach its reservation seam rather than adopting the
-    # successor already recorded by the human path.
-    mesh.ownership.records.clear()
     assert mesh._advance_past_outcome(stale) is None
-    assert len(reserve_calls) == 2  # human epoch, then the stale sweep attempt
-    replacement_launches = [
-        call for call in mesh.client.call_log if call[0] == "managed_launch"
-    ][1:]
-    assert len(replacement_launches) == 1
-    assert replacement_launches[0][1][1] == stale.epoch + 1
-    assert (
-        replacement_launches[0][1][2]["request"]["session"]["prompt"]
-        == "Human override prompt"
-    )
+    launches = [call for call in mesh.client.call_log if call[0] == "managed_launch"]
+    assert len(launches) == 2
+    assert launches[-1][1][1] == stale.epoch + 1
+    assert launches[-1][1][2]["request"]["session"]["prompt"] == "Human override prompt"
+
+
+def test_sd16_a_human_override_waits_for_recovery_authorized_at_native_boundary(
+    mesh: SightMesh, store: TaskStore, routing_settings, monkeypatch
+) -> None:
+    """No manual transition can land between recovery reservation and PUT."""
+    stale = _automatic_replacement(mesh, store)
+    entered = threading.Event()
+    release = threading.Event()
+    native = mesh.client.managed_launch
+
+    def pause_recovery(task_id, epoch, launch):
+        if task_id == stale.task_id and epoch == stale.epoch:
+            entered.set()
+            assert release.wait(timeout=5)
+        return native(task_id, epoch, launch)
+
+    monkeypatch.setattr(mesh.client, "managed_launch", pause_recovery)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        automatic = pool.submit(mesh._advance_past_outcome, stale)
+        assert entered.wait(timeout=5)
+        manual = pool.submit(mesh.replace, "audit", "Human override prompt")
+        assert not manual.done()
+        release.set()
+        assert automatic.result(timeout=5) is not None
+        assert manual.result(timeout=5).state == "active"
+
+    launches = [call for call in mesh.client.call_log if call[0] == "managed_launch"]
+    assert [call[1][1] for call in launches] == [1, stale.epoch, stale.epoch + 1]
+    assert launches[-1][1][2]["request"]["session"]["prompt"] == "Human override prompt"
+
+
+def test_sd16_one_tasks_native_launch_does_not_serialize_another_task(
+    mesh: SightMesh, store: TaskStore, routing_settings, monkeypatch
+) -> None:
+    """Intent serialization is task-scoped, not a fleet-wide launch mutex."""
+    stale_a = _automatic_replacement(mesh, store, "a")
+    stale_b = _automatic_replacement(mesh, store, "b")
+    entered = threading.Event()
+    release = threading.Event()
+    native = mesh.client.managed_launch
+
+    def pause_a(task_id, epoch, launch):
+        if task_id == stale_a.task_id and epoch == stale_a.epoch:
+            entered.set()
+            assert release.wait(timeout=5)
+        return native(task_id, epoch, launch)
+
+    monkeypatch.setattr(mesh.client, "managed_launch", pause_a)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        automatic = pool.submit(mesh._advance_past_outcome, stale_a)
+        assert entered.wait(timeout=5)
+        manual_b = pool.submit(mesh.replace, "b", "B human override")
+        assert manual_b.result(timeout=2).state == "active"
+        release.set()
+        assert automatic.result(timeout=5) is not None
+
+    assert store.get("operator", "b").epoch == stale_b.epoch + 1
