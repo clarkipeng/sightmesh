@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import sqlite3
 import time
@@ -220,6 +222,26 @@ class TaskStore:
                 conn.execute("COMMIT")
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(f"Cannot initialize managed tasks: {exc}") from exc
+
+    @contextmanager
+    def task_lock(self, task_id: str) -> Iterator[None]:
+        """Serialize one task's intent through its native launch.
+
+        This is deliberately a per-task advisory file lock rather than a
+        SQLite transaction: it spans the executor request without holding the
+        database writer lock, survives separate SightMesh processes, and the
+        kernel releases it if its owner crashes.
+        """
+        digest = hashlib.sha256(str(task_id).encode("utf-8")).hexdigest()
+        directory = self.path.parent / f".{self.path.name}.task-locks"
+        directory.mkdir(parents=True, exist_ok=True)
+        lock_path = directory / digest
+        with lock_path.open("a+") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
     @staticmethod
     def _migrate_managed_tasks(conn: sqlite3.Connection) -> None:
