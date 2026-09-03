@@ -31,6 +31,16 @@ jobs:
             dist/*.whl
             dist/*.tar.gz
             dist/SHA256SUMS
+      - name: Publish to PyPI (when a token is configured)
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -z "$PYPI_API_TOKEN" ]; then
+            echo "PYPI_API_TOKEN not set; skipping PyPI publish (GitHub Release remains canonical)"
+            exit 0
+          fi
+          python -m pip install --upgrade twine
+          TWINE_USERNAME=__token__ TWINE_PASSWORD="$PYPI_API_TOKEN" twine upload --non-interactive dist/*.whl dist/*.tar.gz
       - name: Upload release artifacts
         env:
           GH_TOKEN: ${{ github.token }}
