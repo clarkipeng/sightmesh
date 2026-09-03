@@ -84,15 +84,6 @@ Built from 12k of my own messages (June to September 2026); every rule traces to
 - Route by cognitive risk: Fable plans and reviews kernel-class changes; sol orchestrates; terra implements and audits; luna does bounded mechanical work. GPT (codex) and Claude accounts both exist; fail over on quota or auth errors only, never on test failures.
 - Fewer roundtrips, fewer tokens. A 15-minute direct fix beats a 45-minute worker round trip.
 
-## Superseded
-
-Later corrections win. These stay here so they don't come back.
-
-- "Always ask me before stripping legacy out" (July). Now: proceed with ordinary cleanup; ask only for irreversible or directional decisions.
-- Blanket YAGNI read as "no early shared path". Now: build the shared path when duplication already exists or the next use is known and concrete.
-- A long universal rulebook and abstract UI slogans. Now: short, decision-changing, human-readable rules; repo details stay local.
-- A blocked tool or unavailable environment reported as a failed experiment. Now: missing measurement and product failure are distinct and both get reported plainly.
-
 ## SightMesh layer
 
 - The task is the durable thing, never the session. One task, one identity, one owner; a retry repeats the request, never the effect.
