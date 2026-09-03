@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import time
 import os
@@ -318,7 +319,20 @@ class SightMesh:
         # A task already in ``replacing`` is a crashed replacement, not a new
         # one: resume the epoch that was prepared instead of burning another.
         prepared = (
-            task
+            self.store.transition(
+                task.task_id,
+                expect_states=frozenset({"replacing"}),
+                expect_version=task.version,
+                assign="spec_json = ?",
+                values=(
+                    json.dumps(
+                        {**task.spec, "target": target},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ),
+                attempted="manual replacement resume",
+            )
             if task.state == "replacing"
             else self.store.prepare_replacement(
                 task.task_id, target=target, expect_version=task.version
@@ -368,17 +382,20 @@ class SightMesh:
         replacement that never got filled - which is where both actually live.
         """
         advanced: list[Worker] = []
-        # The two queries cannot overlap: an outcome is only swept while its
-        # task is active or blocked, so a `replacing` task is reachable through
-        # the second and only the second.
-        pending: list[TaskRecord] = [
-            task
+        # A crash after an epoch becomes terminal but before it blocks leaves
+        # one task in both sources. Task identity, rather than that transient
+        # state, is the invariant: settle each task at most once per sweep.
+        pending_by_id: dict[str, TaskRecord] = {
+            task.task_id: task
             for task in (
                 self.store.get_by_id(effect.task_id)
                 for effect in self.journal.with_outcomes(SWEEPABLE_OUTCOMES)
             )
             if task is not None
-        ] + self.store.list_state("replacing")
+        }
+        for task in self.store.list_state("replacing"):
+            pending_by_id.setdefault(task.task_id, task)
+        pending = list(pending_by_id.values())
         for task in pending:
             # Each task settles on its own: one whose replacement launch is
             # itself rejected must not stop the sweep from reaching the rest.
@@ -882,6 +899,13 @@ class SightMesh:
                 spec.key,
                 route_class,
             )
+        if not decision.validation.valid:
+            # This gate applies to overrides too. An override names the first
+            # hop, not a waiver of the explicitly requested route class.
+            raise SightMeshError(
+                f"Route class {route_class!r} cannot start {spec.key!r}: "
+                f"{decision.validation.reason}"
+            )
         if spec.profile:
             profile = ProfileStore().get(spec.profile)
             validate_provider(profile, self.client.providers())
@@ -908,15 +932,6 @@ class SightMesh:
                 "route_id": f"executor:{spec.executor}",
                 "failover": "auto",
             }
-        if not decision.validation.valid:
-            # The explicit fail-closed gate: no epoch, no effect row, and no
-            # native call happen for a class that has nowhere to run. Reached
-            # only when no class is usable, since a promoted class that is
-            # empty was already demoted onto the default chain above.
-            raise SightMeshError(
-                f"Route class {route_class!r} cannot start {spec.key!r}: "
-                f"{decision.validation.reason}"
-            )
         selection = execution_routing.select_route(
             settings, route_class=route_class, preferred_model=spec.model
         )
