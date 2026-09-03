@@ -412,6 +412,18 @@ def test_a_cooldown_extends_but_never_shortens(pool_root: Path) -> None:
     assert core.cooling_until(core.load_state(), "acct") == 0
 
 
+@pytest.mark.parametrize("deadline", (float("inf"), float("nan")))
+def test_a_non_finite_cooldown_deadline_uses_the_bounded_default(
+    pool_root: Path, monkeypatch, deadline: float
+) -> None:
+    monkeypatch.setattr(core.time, "time", lambda: 1_000.0)
+
+    until = core.cool_until_timestamp("acct", deadline)
+
+    assert until == 1_000.0 + core.DEFAULT_COOLDOWN
+    assert core.load_state()["cooldowns"]["acct"] == until
+
+
 def test_selection_skips_an_account_with_no_stored_credential(
     pool_root: Path, monkeypatch
 ) -> None:
