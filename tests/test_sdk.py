@@ -637,17 +637,38 @@ def test_a_promotion_onto_an_unconfigured_class_falls_back_to_the_default(
     assert "deep" in caplog.text and "manager" in caplog.text
 
 
-def test_an_explicit_class_with_no_chain_is_still_refused(system, monkeypatch):
+@pytest.mark.parametrize("override", ("executor", "profile"))
+def test_an_explicit_class_with_no_chain_is_refused_before_an_override_can_start(
+    system, monkeypatch, override
+):
     """Falling open is only ever right for a promotion. An operator who names
     `deep` asked for that chain specifically, so silently running the work on
     `standard` would answer a different question than the one they asked."""
-    mesh, _client, store, _ownership = system
+    mesh, client, store, _ownership = system
     _configure_chains(monkeypatch, standard=(_free_route("terra"),))
+    if override == "profile":
+        monkeypatch.setattr(
+            sdk_module.ProfileStore,
+            "get",
+            lambda _self, _name: Profile(
+                name="selected",
+                executor="CODEX",
+                provider_id="default-provider",
+            ),
+        )
 
     with pytest.raises(SightMeshError, match="deep"):
-        mesh.start(spec(key="deepwork", executor=None, route_class="deep"))
+        mesh.start(
+            spec(
+                key="deepwork",
+                executor="CODEX" if override == "executor" else None,
+                profile="selected" if override == "profile" else None,
+                route_class="deep",
+            )
+        )
 
     assert store.get("operator", "deepwork") is None
+    assert client.launches == []
 
 
 def test_routed_start_requires_one_enabled_default_provider(system, monkeypatch):
