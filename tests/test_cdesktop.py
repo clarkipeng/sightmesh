@@ -572,7 +572,12 @@ def test_an_unparseable_or_absent_retry_after_falls_back_to_no_reset(
     """An HTTP-date `Retry-After` depends on the provider's clock agreeing with
     ours; a wrong absolute time would cool an account for the wrong window, so
     only the delta form is honoured and anything else defers to the default."""
-    for headers in ({}, {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}):
+    for headers in (
+        {},
+        {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"},
+        {"Retry-After": "Infinity"},
+        {"Retry-After": "NaN"},
+    ):
         _raise_http(monkeypatch, 429, headers)
         with pytest.raises(cdesktop.CdesktopRejectedError) as raised:
             CdesktopClient("http://127.0.0.1:1").request("GET", "/task-launches/t/1")
@@ -646,3 +651,13 @@ def test_only_a_typed_outcome_class_becomes_a_routing_outcome() -> None:
     )
     assert outcome == "rate_limited"
     assert retry_at is not None and retry_at > time.time()
+
+
+@pytest.mark.parametrize("retry_after", ("Infinity", "NaN"))
+def test_a_non_finite_process_retry_after_falls_back_to_default(retry_after) -> None:
+    outcome, reset = cdesktop.process_provider_outcome(
+        {"outcome": {"class": "quota_exhausted", "retry_after_seconds": retry_after}}
+    )
+
+    assert outcome == "rate_limited"
+    assert reset is None
