@@ -688,8 +688,9 @@ def test_tasks_launch_unattended_by_default(system):
     mesh.start(spec())
 
     (_key, launch), = client.launches
-    assert launch["workspace"]["permission_policy"] == "BYPASS_PERMISSIONS"
-    assert launch["workspace"]["use_worktree"] is True
+    workspace = launch["request"]["workspace"]
+    assert workspace["permission_policy"] == "BYPASS_PERMISSIONS"
+    assert workspace["use_worktree"] is True
 
 
 def test_unknown_permission_policy_is_rejected(system):
