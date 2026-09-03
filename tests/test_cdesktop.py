@@ -477,3 +477,56 @@ def test_missing_container_ref_is_reconciled_not_dirty() -> None:
 
     assert client.dirty_repositories("workspace") == []
     assert client.missing_repositories("workspace") == []
+
+
+# --- follow-up delivery: transport failure is 'unknown', never silent loss ---
+# Why: a coordinator lost 24h when `sightmesh message` timed out under host load
+# and the directive never landed (issue #90). Every keyed send is idempotent on
+# dedupe_key, so retrying is safe; what must never happen is a quiet failure.
+
+
+def _flaky_client(monkeypatch, failures: int, queued_after: bool):
+    client = cdesktop.CdesktopClient("http://127.0.0.1:1")
+    calls: list[dict] = []
+
+    def fake_request(method, path, payload=None, query=None, headers=None):
+        if path.endswith("/follow-up"):
+            calls.append(payload)
+            if len(calls) <= failures:
+                raise cdesktop.CdesktopTransportError("timeout")
+            return {"id": "cmd-1", "dedupe_key": payload["dedupe_key"]}
+        if path.endswith("/commands"):
+            return [{"dedupe_key": "order:x"}] if queued_after else []
+        raise AssertionError(path)
+
+    monkeypatch.setattr(client, "request", fake_request)
+    monkeypatch.setattr(cdesktop.time, "sleep", lambda *_: None)
+    return client, calls
+
+
+def test_send_retries_the_identical_keyed_post_after_transport_failure(monkeypatch):
+    client, calls = _flaky_client(monkeypatch, failures=2, queued_after=False)
+    result = client.send("s1", "do it", dedupe_key="order:x")
+    assert result["delivery"] == "queued"
+    assert len(calls) == 3
+    assert {c["dedupe_key"] for c in calls} == {"order:x"}  # same key every retry
+
+
+def test_send_reports_already_queued_when_the_row_landed_despite_timeouts(monkeypatch):
+    client, _ = _flaky_client(monkeypatch, failures=99, queued_after=True)
+    result = client.send("s1", "do it", dedupe_key="order:x")
+    assert result["delivery"] == "already_queued"
+
+
+def test_send_is_loud_when_delivery_cannot_be_confirmed(monkeypatch):
+    client, _ = _flaky_client(monkeypatch, failures=99, queued_after=False)
+    with pytest.raises(cdesktop.CdesktopDeliveryError, match="could NOT be confirmed"):
+        client.send("s1", "do it", dedupe_key="order:x")
+
+
+def test_unkeyed_send_does_not_retry(monkeypatch):
+    """Without a dedupe_key a retry could duplicate the message; fail once, loudly."""
+    client, calls = _flaky_client(monkeypatch, failures=99, queued_after=False)
+    with pytest.raises(cdesktop.CdesktopDeliveryError):
+        client.send("s1", "do it")
+    assert len(calls) == 1
