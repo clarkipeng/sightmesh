@@ -676,3 +676,25 @@ def test_start_waits_for_capacity_then_refuses_with_a_typed_error(monkeypatch, t
     )
     with pytest.raises(sdk_mod.SightMeshError, match="capacity"):
         mesh._wait_for_launch_capacity(task)
+
+
+def test_tasks_launch_unattended_by_default(system):
+    # Workers used to start with ACCEPT_EDITS, so every shell call parked on a
+    # human approval and the whole mesh stalled the moment nobody was watching.
+    # Kernel tasks always run in their own worktree, so unattended is the safe
+    # default and the only one that never waits on a person.
+    mesh, client, _store, _ownership = system
+
+    mesh.start(spec())
+
+    (_key, launch), = client.launches
+    workspace = launch["request"]["workspace"]
+    assert workspace["permission_policy"] == "BYPASS_PERMISSIONS"
+    assert workspace["use_worktree"] is True
+
+
+def test_unknown_permission_policy_is_rejected(system):
+    mesh, _client, _store, _ownership = system
+
+    with pytest.raises(SightMeshError, match="Unknown permission policy"):
+        mesh.start(spec(permission="YOLO"))
