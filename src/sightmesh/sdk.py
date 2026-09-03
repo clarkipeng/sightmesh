@@ -3,11 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import time
 import os
 import re
 import subprocess
 import tempfile
+import time
 import tomllib
 import uuid
 from collections.abc import Iterable, Mapping
@@ -32,7 +32,6 @@ from .effects import (
     Effect,
     EffectBusy,
     EffectJournal,
-    EffectStale,
     new_owner_instance,
     request_hash,
 )
@@ -317,45 +316,37 @@ class SightMesh:
 
     def replace(self, worker: str, prompt: str | None = None) -> Worker:
         task = self._find(worker)
-        if not task.workspace_id or not task.holder_session_id:
-            raise SightMeshError(f"Task {worker!r} has no session to replace")
-        replacement_prompt = prompt or self._read_checkpoint(task)
-        if not replacement_prompt or not replacement_prompt.strip():
-            raise SightMeshError("Replacement requires a prompt or saved checkpoint")
-        self._require_contract()
-        target = {**task.spec["target"]}
-        automatic_recovery = routing_outcome(target.get("recovery"))
-        target.pop("recovery", None)
-        # A task already in ``replacing`` is a crashed replacement, not a new
-        # one: resume the epoch that was prepared instead of burning another.
-        prepared = (
-            self.store.transition(
-                task.task_id,
-                expect_states=frozenset({"replacing"}),
-                expect_version=task.version,
-                # A human override of an automatic replacement opens a new
-                # epoch. That fences any sweep which retained the old
-                # recovery-bearing row before the override.
-                assign=(
-                    "epoch = epoch + 1, attempts = attempts + 1, spec_json = ?"
-                    if automatic_recovery is not None
-                    else "spec_json = ?"
-                ),
-                values=(
-                    json.dumps(
-                        {**task.spec, "target": target},
-                        sort_keys=True,
-                        separators=(",", ":"),
+        with self.store.task_lock(task.task_id):
+            # The snapshot used to find the task may have waited behind an
+            # automatic recovery. Reloading under the same lock makes this
+            # replacement and that recovery one indivisible choice.
+            task = self._find(worker)
+            if not task.workspace_id or not task.holder_session_id:
+                raise SightMeshError(f"Task {worker!r} has no session to replace")
+            replacement_prompt = prompt or self._read_checkpoint(task)
+            if not replacement_prompt or not replacement_prompt.strip():
+                raise SightMeshError("Replacement requires a prompt or saved checkpoint")
+            self._require_contract()
+            target = {**task.spec["target"]}
+            automatic_recovery = routing_outcome(target.get("recovery"))
+            target.pop("recovery", None)
+            prepared = (
+                self.store.transition(
+                    task.task_id,
+                    expect_states=frozenset({"replacing"}),
+                    expect_version=task.version,
+                    assign=(
+                        "epoch = epoch + 1, attempts = attempts + 1, spec_json = ?"
+                        if automatic_recovery is not None
+                        else "spec_json = ?"
                     ),
-                ),
-                attempted="manual replacement resume",
+                    values=(json.dumps({**task.spec, "target": target}, sort_keys=True, separators=(",", ":")),),
+                    attempted="manual replacement resume",
+                )
+                if task.state == "replacing"
+                else self.store.prepare_replacement(task.task_id, target=target, expect_version=task.version)
             )
-            if task.state == "replacing"
-            else self.store.prepare_replacement(
-                task.task_id, target=target, expect_version=task.version
-            )
-        )
-        return Worker.from_record(self._replace_prepared(prepared, replacement_prompt))
+            return Worker.from_record(self._replace_prepared(prepared, replacement_prompt))
 
     def _finish(self, task: TaskRecord, state: str, result: str | None) -> TaskRecord:
         """Terminate one task, record its parent's wake, then try to deliver."""
@@ -510,6 +501,14 @@ class SightMesh:
         superseded epoch's outcome reroutes a run that already moved on; taking
         no effect as an argument makes that pairing impossible to get wrong.
         """
+        with self.store.task_lock(task.task_id):
+            current = self.store.get_by_id(task.task_id)
+            if current is None:
+                return None
+            return self._advance_past_outcome_locked(current)
+
+    def _advance_past_outcome_locked(self, task: TaskRecord) -> Worker | None:
+        """Advance a fresh task snapshot while its launch intent is locked."""
         target = task.spec.get("target", {})
         effect = self.journal.get(task.task_id, task.epoch)
         if task.state == "replacing":
@@ -608,12 +607,7 @@ class SightMesh:
                 task, f"replacement epoch ended: {effect.outcome}"
             )
         self._require_contract()
-        try:
-            return Worker.from_record(
-                self._launch_prepared(task, str(task.spec["prompt"]))
-            )
-        except EffectStale:
-            return None
+        return Worker.from_record(self._launch_prepared(task, str(task.spec["prompt"])))
 
     def _block_unroutable(self, task: TaskRecord, reason: str) -> Worker | None:
         """Block a task that cannot advance, and report only a real change.
@@ -790,7 +784,6 @@ class SightMesh:
         # worker instead of erroring (contract: "duplicate insert returns the
         # existing effect"). The wait is bounded well under the reservation
         # lease so a crashed winner is recovered by retry, not by takeover here.
-        recovery = routing_outcome(task.spec.get("target", {}).get("recovery"))
         deadline = time.monotonic() + ADOPT_TIMEOUT_SECONDS
         delay = 0.05
         while True:
@@ -800,8 +793,6 @@ class SightMesh:
                     task.epoch,
                     request_hash(launch),
                     self.owner_instance,
-                    task_version=task.version if recovery is not None else None,
-                    recovery=recovery,
                 )
                 break
             except EffectBusy:
@@ -811,10 +802,6 @@ class SightMesh:
                 delay = min(delay * 2, 0.5)
         if effect.state == "launched" and effect.workspace_id and effect.session_id:
             return effect.workspace_id, effect.session_id
-        if recovery is not None:
-            self.journal.require_current_recovery(
-                task.task_id, task.epoch, task.version, recovery
-            )
         try:
             native = self.client.managed_launch(task.task_id, task.epoch, dict(launch))
         except CdesktopRejectedError as exc:
