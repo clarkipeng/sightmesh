@@ -11,6 +11,7 @@ import pytest
 from sightmesh import execution_routing
 from sightmesh import sdk as sdk_module
 from sightmesh.cdesktop import CdesktopError, CdesktopRejectedError
+from sightmesh.durable import DurableExecutionReconciler
 from sightmesh.profiles import Profile
 from sightmesh.sdk import BatchError, Command, SightMesh, SightMeshError, WorkerSpec
 from sightmesh.fence import assert_external_io_allowed
@@ -29,6 +30,9 @@ class FakeClient:
         self.processes = {}
         self.snapshots = {}
         self.reject_launch = None
+        self.commands = []
+        self.cancel_calls = []
+        self.execution_stops = []
 
     def info(self):
         assert_external_io_allowed()  # the real client does HTTP here
@@ -106,9 +110,21 @@ class FakeClient:
         self.sent.append(row)
         return {"queued": True}
 
-    def session_commands(self, _session_id):
+    def session_commands(self, session_id):
         assert_external_io_allowed()  # the real client does HTTP here
-        return []
+        return [dict(row) for row in self.commands if row["session_id"] == session_id]
+
+    def cancel_command(self, session_id, command_id):
+        assert_external_io_allowed()  # the real client does HTTP here
+        self.cancel_calls.append((session_id, command_id))
+        row = next(row for row in self.commands if row["id"] == command_id)
+        row["state"] = "cancelled"
+        return dict(row)
+
+    def stop_execution(self, execution_process_id, *, dedupe_key=None):
+        assert_external_io_allowed()  # the real client does HTTP here
+        self.execution_stops.append((execution_process_id, dedupe_key))
+        return {"id": execution_process_id, "status": "killed"}
 
     def execution_processes(self, session_id):
         assert_external_io_allowed()  # the real client does HTTP here
@@ -986,6 +1002,65 @@ def test_admission_sweep_loses_dead_tasks_across_scopes(system):
     assert second["terminal_workspaces_stopped"] == 1
     assert other_scope.journal.get(task.task_id, task.epoch).workspace_id is None
     assert client.stopped == [worker.workspace_id]
+
+
+def test_terminalization_cancels_queued_command_before_releasing_capacity(system):
+    """#105: a terminal task cannot leave a pending native command dispatchable."""
+    mesh, client, store, _ownership = system
+    worker = mesh.start(spec())
+    client.commands = [{
+        "id": "queued-1", "session_id": worker.session_id, "state": "pending",
+        "execution_process_id": None,
+    }]
+
+    mesh.cancel("audit")
+
+    assert client.commands[0]["state"] == "cancelled"
+    assert client.cancel_calls == [(worker.session_id, "queued-1")]
+    assert store.count_running() == 0
+
+
+def test_terminalization_stops_a_running_execution_and_waits_for_its_ack(system):
+    """A claimed command owns a process as well as a queue row (#105)."""
+    mesh, client, store, _ownership = system
+    worker = mesh.start(spec())
+    client.commands = [{
+        "id": "claimed-1", "session_id": worker.session_id, "state": "claimed",
+        "execution_process_id": "process-1",
+    }]
+
+    mesh.cancel("audit")
+
+    assert client.execution_stops == [
+        ("process-1", f"terminal:{store.get('operator', 'audit').task_id}:process-1")
+    ]
+    assert store.count_running() == 0
+
+
+def test_missing_cancel_route_keeps_terminal_capacity_and_retries_after_restart(system):
+    """Pinned 0.2.8's missing cancel route is not a cancellation acknowledgement."""
+    mesh, client, store, ownership = system
+    worker = mesh.start(spec())
+    client.commands = [{
+        "id": "queued-1", "session_id": worker.session_id, "state": "pending",
+        "execution_process_id": None,
+    }]
+
+    def missing_route(session_id, command_id):
+        assert_external_io_allowed()
+        client.cancel_calls.append((session_id, command_id))
+        raise CdesktopError("POST cancel failed: HTTP 404")
+
+    client.cancel_command = missing_route
+    mesh.cancel("audit")
+    assert store.count_running() == 1
+    assert store.pending_cleanup_intents()[0]["state"] == "pending"
+
+    # A fresh reconciler sees the stored intent, not a former process's memory.
+    client.cancel_command = FakeClient.cancel_command.__get__(client, FakeClient)
+    DurableExecutionReconciler(client, task_store=store, ownership=ownership).reconcile_cleanup_intents()
+    assert client.commands[0]["state"] == "cancelled"
+    assert store.count_running() == 0
 
 
 def test_expired_reservation_can_be_reissued_with_a_new_spec(system):

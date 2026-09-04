@@ -518,6 +518,20 @@ class CdesktopClient:
             raise CdesktopError("cdesktop command response is not a list")
         return [dict(item) for item in result if isinstance(item, dict)]
 
+    def cancel_command(self, session_id: str, command_id: str) -> dict[str, Any]:
+        """Atomically terminalize one queued command in cdesktop.
+
+        A 404 is deliberately left for the caller to treat as unacknowledged:
+        pinned 0.2.8 has no route, and guessing that a missing response means a
+        cancelled command would reopen the resurrection window.
+        """
+        result = self.request(
+            "POST", f"/sessions/{session_id}/commands/{command_id}/cancel"
+        )
+        if not isinstance(result, dict):
+            raise CdesktopError("cdesktop command cancel response is invalid")
+        return dict(result)
+
     def requeue_execution_commands(
         self, session_id: str, execution_process_id: str
     ) -> Any:

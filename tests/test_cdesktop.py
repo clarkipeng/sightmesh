@@ -8,7 +8,7 @@ import pytest
 
 from sightmesh import cdesktop
 from sightmesh.cdesktop import CdesktopClient, _apply_approval_patches
-from sightmesh.fence import FenceHeldError
+from sightmesh.fence import FenceHeldError, assert_external_io_allowed
 from sightmesh.task_store import TaskStore
 
 
@@ -90,6 +90,7 @@ class FakeClient(CdesktopClient):
         return [{"id": "existing", "path": "/tmp/repo"}]
 
     def request(self, method, path, payload=None, query=None, headers=None):
+        assert_external_io_allowed()  # the real client opens HTTP here
         self.calls.append((method, path, payload, query, headers))
         return {"id": "created"}
 
@@ -450,6 +451,15 @@ def test_stop_execution_passes_process_scoped_dedupe_key() -> None:
             None,
             None,
         )
+    ]
+
+
+def test_cancel_command_targets_the_session_scoped_native_row() -> None:
+    client = FakeClient()
+
+    assert client.cancel_command("session-a", "command-a")["id"] == "created"
+    assert client.calls == [
+        ("POST", "/sessions/session-a/commands/command-a/cancel", None, None, None)
     ]
 
 

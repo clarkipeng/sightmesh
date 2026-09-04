@@ -35,7 +35,7 @@ from .effects import (
     new_owner_instance,
     request_hash,
 )
-from .durable import DurableExecutionReconciler
+from .durable import DurableExecutionReconciler, NativeCommandQueue
 from .escalation import CDESKTOP_SESSION_ENV, EscalationStore, LauncherIdentity
 from .execution_routing import ExecutionRoutingError
 from .liveness import Budget, resolve_policy, trusted_policy
@@ -421,10 +421,26 @@ class SightMesh:
         delivery are intentionally outside it: a slow HTTP request cannot hold
         a task's lifecycle gate. Re-entry fences delivery against a newer row.
         """
+        commands = []
+        if state in {"completed", "cancelled", "lost"} and task.holder_session_id:
+            with self.store.task_lock(task.task_id) as snapshot_fence:
+                with snapshot_fence.external_io():
+                    commands = NativeCommandQueue(self.client).commands(task.holder_session_id)
         with self.store.task_lock(task.task_id) as fence:
             current = self.store.get_by_id(task.task_id)
             if current is None:
                 raise SightMeshError(f"Task {task.key!r} no longer exists")
+            # The native queue is part of the terminal decision.  Persist its
+            # cancellation/stop intents before changing the task row, so a
+            # terminal task cannot release admission while cdesktop can still
+            # dispatch one of its commands.
+            if (
+                state in {"completed", "cancelled", "lost"}
+                and current.holder_session_id == task.holder_session_id
+            ):
+                self.store.record_cleanup_intents(
+                    current.task_id, current.epoch, current.holder_session_id, commands
+                )
             updated = self._finish(current, state, result, fence)
             workspace_id = current.workspace_id if stop_workspace else None
             effect = self.journal.get(current.task_id, current.epoch)
@@ -456,6 +472,9 @@ class SightMesh:
             if current is None or current.version != updated.version:
                 return current or updated
         self.wakes.pump()
+        DurableExecutionReconciler(
+            self.client, task_store=self.store, ownership=self.ownership
+        ).reconcile_cleanup_intents()
         return updated
 
     def sweep_admission(self) -> dict[str, int]:
