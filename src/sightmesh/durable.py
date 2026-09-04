@@ -175,7 +175,7 @@ def _idle_seconds(processes: Iterable[dict[str, Any]], now: float) -> float | No
                 break
             if isinstance(value, str):
                 try:
-                    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    parsed = datetime.fromisoformat(value)
                 except ValueError:
                     continue
                 timestamps.append(
@@ -439,9 +439,7 @@ class DurableExecutionReconciler:
             trusted=trusted,
         )
 
-    def _detection_slice(
-        self, store: TaskStore
-    ) -> tuple[list[TaskRecord], set[str]]:
+    def _detection_slice(self, store: TaskStore) -> tuple[list[TaskRecord], set[str]]:
         """The tasks this pass will classify, resuming from the cursor.
 
         Returns the capped slice plus the *full* watched set. Baseline
@@ -638,7 +636,13 @@ class DurableExecutionReconciler:
         if since is None or finding.now - since < policy.effective_approval_timeout:
             return
         try:
-            wakes.finish_with_wake(store, task.task_id, "blocked", "approval")
+            with store.task_lock(task.task_id) as fence:
+                current = store.get_by_id(task.task_id)
+                if current is None:
+                    return
+                wakes.finish_with_wake(
+                    store, current.task_id, "blocked", "approval", fence=fence
+                )
         except TaskStoreError as exc:
             LOGGER.warning("Cannot block %s on its approval timeout: %s", task.key, exc)
             return
@@ -676,17 +680,28 @@ class DurableExecutionReconciler:
         states = sorted(LIVE_STATES)
         placeholders = ", ".join("?" for _ in states)
         try:
-            with store.connect() as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                conn.execute(
-                    "UPDATE managed_tasks SET liveness_evidence = ? "
-                    f"WHERE task_id = ? AND state IN ({placeholders})",
-                    (payload, task.task_id, *states),
-                )
-                _record, armed = wakes.finish_with_wake(
-                    store, task.task_id, "lost", reason, conn=conn
-                )
-                conn.execute("COMMIT")
+            with store.task_lock(task.task_id) as fence:
+                # The detector's snapshot may have waited behind a replacement.
+                # Reload under the lifecycle gate so a predecessor verdict cannot
+                # terminalize the successor it no longer describes.
+                current = store.get_by_id(task.task_id)
+                if (
+                    current is None
+                    or current.state != "active"
+                    or current.epoch != task.epoch
+                ):
+                    return 0
+                with store.connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute(
+                        "UPDATE managed_tasks SET liveness_evidence = ? "
+                        f"WHERE task_id = ? AND state IN ({placeholders})",
+                        (payload, current.task_id, *states),
+                    )
+                    _record, armed = wakes.finish_with_wake(
+                        store, current.task_id, "lost", reason, fence=fence, conn=conn
+                    )
+                    conn.execute("COMMIT")
         except TaskStoreError as exc:
             LOGGER.warning("Cannot record loss for %s: %s", task.key, exc)
             return 0

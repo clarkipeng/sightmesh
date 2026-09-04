@@ -33,6 +33,7 @@ from .task_store import (
     LIVE_STATES,
     STALL_LIVENESS_STATES,
     YIELD_STATES,
+    TaskFence,
     TaskRecord,
     TaskStore,
     TaskStoreError,
@@ -122,6 +123,7 @@ def finish_with_wake(
     result: str | None = None,
     *,
     expect_version: int | None = None,
+    fence: TaskFence | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> tuple[TaskRecord, list[str]]:
     """Finish a task and record any parent wake it satisfies, atomically.
@@ -130,13 +132,26 @@ def finish_with_wake(
     the terminal, the parent's wake, and whatever the caller wrote alongside
     them stay one commit rather than three that a crash can land between.
     """
+    if fence is None:
+        with store.task_lock(task_id) as held:
+            return finish_with_wake(
+                store,
+                task_id,
+                state,
+                result,
+                expect_version=expect_version,
+                fence=held,
+                conn=conn,
+            )
     if conn is not None:
-        return _finish_with_wake(store, conn, task_id, state, result, expect_version)
+        return _finish_with_wake(
+            store, conn, task_id, state, result, expect_version, fence
+        )
     try:
         with store.connect() as owned:
             owned.execute("BEGIN IMMEDIATE")
             result_pair = _finish_with_wake(
-                store, owned, task_id, state, result, expect_version
+                store, owned, task_id, state, result, expect_version, fence
             )
             owned.execute("COMMIT")
             return result_pair
@@ -153,9 +168,10 @@ def _finish_with_wake(
     state: str,
     result: str | None,
     expect_version: int | None,
+    fence: TaskFence | None,
 ) -> tuple[TaskRecord, list[str]]:
     record = store.finish(
-        task_id, state, result, expect_version=expect_version, conn=conn
+        task_id, state, result, expect_version=expect_version, fence=fence, conn=conn
     )
     created: list[str] = []
     if record.parent_task_id:
@@ -324,8 +340,10 @@ def record_liveness_wakes(
     if liveness in STALL_LIVENESS_STATES:
         emitted = int(row["liveness_wakes"])
         since = row["liveness_since"]
-        escalating = emitted == 1 and since is not None and (
-            moment - float(since) >= progress_timeout
+        escalating = (
+            emitted == 1
+            and since is not None
+            and (moment - float(since) >= progress_timeout)
         )
         if emitted == 0 or escalating:
             armed = _arm_liveness(
@@ -391,10 +409,13 @@ def _arm_liveness(
     of every wake the outbox has ever held.
     """
     told = ", ".join("?" for _ in TOLD_WAKE_STATES)
-    if one_shot and conn.execute(
-        f"SELECT 1 FROM task_wakes WHERE dedupe_key = ? AND state IN ({told})",
-        (key, *TOLD_WAKE_STATES),
-    ).fetchone():
+    if (
+        one_shot
+        and conn.execute(
+            f"SELECT 1 FROM task_wakes WHERE dedupe_key = ? AND state IN ({told})",
+            (key, *TOLD_WAKE_STATES),
+        ).fetchone()
+    ):
         return []
     wake_id = str(uuid.uuid4())
     cursor = conn.execute(

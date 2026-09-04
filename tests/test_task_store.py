@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -287,6 +289,45 @@ def test_a_stale_version_loses_the_transition(tmp_path):
     assert caught.value.current.version > record.version
 
 
+def test_state_transition_requires_a_fence_capability(tmp_path):
+    """A new terminal writer cannot accidentally bypass the lifecycle fence."""
+    store = TaskStore(tmp_path / "state.sqlite3")
+    record = _active(store, "audit")
+
+    with pytest.raises(TaskStoreError, match="require the task fence"):
+        store.transition(
+            record.task_id,
+            expect_states=frozenset({"active"}),
+            expect_version=record.version,
+            assign="state = 'completed'",
+            values=(),
+            attempted="completed",
+        )
+
+
+def test_every_transition_caller_passes_the_fence_capability():
+    """Keep every lifecycle writer structurally closed over the fence token."""
+    source_root = Path(__file__).parents[1] / "src"
+    offenders: list[str] = []
+    # These are the modules that own or invoke TaskStore's lifecycle API.
+    # ``approvals_commands`` has a different ``finish`` API, so method-name
+    # matching across every source file would be a false structural claim.
+    lifecycle_modules = ("task_store.py", "wakes.py", "sdk.py", "durable.py", "effects.py")
+    for name in lifecycle_modules:
+        path = source_root / "sightmesh" / name
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(
+                node.func, ast.Attribute
+            ):
+                continue
+            if node.func.attr not in {"transition", "finish", "activate", "prepare_replacement"}:
+                continue
+            if not any(keyword.arg == "fence" for keyword in node.keywords):
+                offenders.append(f"{path.relative_to(source_root)}:{node.lineno}")
+    assert offenders == []
+
+
 def test_checkpoints_cannot_be_written_to_a_terminal_task(tmp_path):
     """A checkpoint is recovery state for a task that can still be resumed;
     writing one to a finished task would advertise a resume path that does
@@ -377,9 +418,8 @@ def test_the_upgraded_liveness_column_still_rejects_an_unknown_classification(tm
     )
     store = TaskStore(path)
 
-    with pytest.raises(sqlite3.IntegrityError):
-        with store._database._connect() as conn:
-            conn.execute("UPDATE managed_tasks SET liveness = 'wedged'")
+    with pytest.raises(sqlite3.IntegrityError), store._database._connect() as conn:
+        conn.execute("UPDATE managed_tasks SET liveness = 'wedged'")
 
 
 def test_the_wake_predicate_check_widens_for_the_liveness_predicates(tmp_path):
@@ -481,7 +521,9 @@ def test_a_reason_flip_inside_one_silence_is_not_a_new_episode(tmp_path):
     flipped = store.get_by_id(task.task_id)
     assert flipped.liveness == "limbo", "the reason itself is allowed to change"
     assert flipped.liveness_episode == opened.liveness_episode
-    assert flipped.liveness_since == opened.liveness_since, "the phase clock is untouched"
+    assert flipped.liveness_since == opened.liveness_since, (
+        "the phase clock is untouched"
+    )
     assert flipped.liveness_wakes == 1, "the escalation counter must survive a relabel"
 
 

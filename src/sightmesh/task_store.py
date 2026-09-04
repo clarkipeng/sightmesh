@@ -61,6 +61,8 @@ def liveness_stretch(liveness: str) -> str:
     stretch is what makes ``stalled`` <-> ``limbo`` flapping free.
     """
     return liveness if liveness in {"live", "parked"} else "silent"
+
+
 _LIVENESS_CHECK = "liveness IN (" + ", ".join(f"'{v}'" for v in LIVENESS_STATES) + ")"
 #: Forward-only liveness columns, in ``ALTER TABLE ADD COLUMN`` form. Each
 #: carries a constant default so it is a legal in-place addition; the fresh
@@ -202,6 +204,14 @@ class StaleTransition(TaskStoreError):
 
 
 @dataclass(frozen=True)
+class TaskFence:
+    """Unforgeable-in-practice capability yielded only by ``task_lock``."""
+
+    _store: TaskStore
+    task_id: str
+
+
+@dataclass(frozen=True)
 class TaskRecord:
     task_id: str
     scope: str
@@ -284,7 +294,7 @@ class TaskStore:
             raise TaskStoreError(f"Cannot initialize managed tasks: {exc}") from exc
 
     @contextmanager
-    def task_lock(self, task_id: str) -> Iterator[None]:
+    def task_lock(self, task_id: str) -> Iterator[TaskFence]:
         """Serialize one task's intent through its native launch.
 
         This is deliberately a per-task advisory file lock rather than a
@@ -299,7 +309,7 @@ class TaskStore:
         with lock_path.open("a+") as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
             try:
-                yield
+                yield TaskFence(self, str(task_id))
             finally:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
@@ -694,6 +704,7 @@ class TaskStore:
         assign: str,
         values: tuple[object, ...],
         attempted: str,
+        fence: TaskFence | None = None,
         conn: sqlite3.Connection | None = None,
     ) -> TaskRecord:
         """Apply one state change only if the observed task still holds.
@@ -701,6 +712,7 @@ class TaskStore:
         Every mutation bumps ``version``, so a caller that read the row can
         prove nothing moved underneath it by passing ``expect_version``.
         """
+        self._require_fence(task_id, fence)
         if conn is not None:
             return self._transition(
                 conn, task_id, expect_states, expect_version, assign, values, attempted
@@ -755,12 +767,30 @@ class TaskStore:
             raise StaleTransition(self._decode(row), attempted)
         return self._decode(row)
 
+    def _require_fence(self, task_id: str, fence: TaskFence | None) -> None:
+        if fence is None or fence._store is not self or fence.task_id != str(task_id):
+            raise TaskStoreError("Lifecycle state writes require the task fence")
+
     def activate(
-        self, task_id: str, *, workspace_id: str, session_id: str
+        self,
+        task_id: str,
+        *,
+        workspace_id: str,
+        session_id: str,
+        fence: TaskFence | None = None,
     ) -> TaskRecord:
         # BEGIN IMMEDIATE so the guarded UPDATE and its readback share one
         # transaction; otherwise a competing terminal writer can slip between
         # them and the returned record describes a row this call never wrote.
+        if fence is None:
+            with self.task_lock(task_id) as held:
+                return self.activate(
+                    task_id,
+                    workspace_id=workspace_id,
+                    session_id=session_id,
+                    fence=held,
+                )
+        self._require_fence(task_id, fence)
         return self._transaction(
             expect_states=ACTIVATE_PREDECESSORS,
             task_id=task_id,
@@ -776,7 +806,17 @@ class TaskStore:
         *,
         target: dict[str, Any] | None = None,
         expect_version: int | None = None,
+        fence: TaskFence | None = None,
     ) -> TaskRecord:
+        if fence is None:
+            with self.task_lock(task_id) as held:
+                return self.prepare_replacement(
+                    task_id,
+                    target=target,
+                    expect_version=expect_version,
+                    fence=held,
+                )
+        self._require_fence(task_id, fence)
         try:
             with self._database._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -813,6 +853,7 @@ class TaskStore:
                     ),
                     values=(json.dumps(spec, sort_keys=True, separators=(",", ":")),),
                     attempted="replacing",
+                    fence=fence,
                     conn=conn,
                 )
                 conn.execute("COMMIT")
@@ -1010,11 +1051,22 @@ class TaskStore:
         result: str | None = None,
         *,
         expect_version: int | None = None,
+        fence: TaskFence | None = None,
         conn: sqlite3.Connection | None = None,
     ) -> TaskRecord:
         predecessors = FINISH_PREDECESSORS.get(state)
         if predecessors is None:
             raise ValueError(f"Unsupported task finish state: {state}")
+        if fence is None:
+            with self.task_lock(task_id) as held:
+                return self.finish(
+                    task_id,
+                    state,
+                    result,
+                    expect_version=expect_version,
+                    fence=held,
+                    conn=conn,
+                )
         return self.transition(
             task_id,
             expect_states=predecessors,
@@ -1022,6 +1074,7 @@ class TaskStore:
             assign="state = ?, result = ?",
             values=(state, result),
             attempted=state,
+            fence=fence,
             conn=conn,
         )
 

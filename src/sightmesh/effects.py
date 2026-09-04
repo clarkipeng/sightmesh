@@ -276,7 +276,39 @@ class EffectJournal:
         lost: list[Effect] = []
         for task_id, epoch in candidates:
             try:
-                native = self._native_effect(client, task_id, epoch)
+                with self.store.task_lock(task_id) as fence:
+                    current = self.store.get_by_id(task_id)
+                    if current is None:
+                        retired = self._retire_reservation(task_id, epoch, moment)
+                        if retired is not None:
+                            lost.append(retired)
+                        continue
+                    if current.epoch != epoch:
+                        continue
+                    native = self._native_effect(client, task_id, epoch)
+                    if native is not None:
+                        workspace_id = native.get("workspace_id")
+                        session_id = native.get("session_id")
+                        if (
+                            native.get("state") == "active"
+                            and workspace_id
+                            and session_id
+                        ):
+                            # Native is live behind the lease: adopt it rather than
+                            # orphan the running session.
+                            self.mark_launched(
+                                task_id, epoch, str(workspace_id), str(session_id)
+                            )
+                            self.store.activate(
+                                task_id,
+                                workspace_id=str(workspace_id),
+                                session_id=str(session_id),
+                                fence=fence,
+                            )
+                            continue
+                    retired = self._retire_reservation(task_id, epoch, moment)
+                    if retired is not None:
+                        lost.append(retired)
             except _UnknowableEffect as exc:
                 # The executor could not answer. Leave the reservation intact
                 # for the next tick rather than orphan a possibly-live session.
@@ -286,29 +318,6 @@ class EffectJournal:
                     epoch,
                     exc,
                 )
-                continue
-            # Each candidate settles in its own try/except: one row that moved
-            # out from under the sweep (a racing terminal or a task that left
-            # ACTIVATE_PREDECESSORS mid-adopt) must never skip the rest.
-            try:
-                if native is not None:
-                    workspace_id = native.get("workspace_id")
-                    session_id = native.get("session_id")
-                    if native.get("state") == "active" and workspace_id and session_id:
-                        # Native is live behind the lease: adopt it rather than
-                        # orphan the running session.
-                        self.mark_launched(
-                            task_id, epoch, str(workspace_id), str(session_id)
-                        )
-                        self.store.activate(
-                            task_id,
-                            workspace_id=str(workspace_id),
-                            session_id=str(session_id),
-                        )
-                        continue
-                retired = self._retire_reservation(task_id, epoch, moment)
-                if retired is not None:
-                    lost.append(retired)
             except TaskStoreError as exc:
                 LOGGER.info(
                     "Skipping expired reservation %s/%s this tick: %s",
@@ -363,7 +372,9 @@ class EffectJournal:
                     "AND state = 'reserved' AND lease_expires_at < ?",
                     ("lost:reservation-expired", moment, task_id, epoch, moment),
                 )
-                effect = self._require(conn, task_id, epoch) if cursor.rowcount else None
+                effect = (
+                    self._require(conn, task_id, epoch) if cursor.rowcount else None
+                )
                 conn.execute("COMMIT")
                 return effect
         except TaskStoreError:
@@ -443,9 +454,7 @@ def _decode(row: sqlite3.Row) -> Effect:
             outcome=row["outcome"],
             owner_instance=str(row["owner_instance"]),
             lease_expires_at=float(row["lease_expires_at"]),
-            retry_at=(
-                float(row["retry_at"]) if row["retry_at"] is not None else None
-            ),
+            retry_at=(float(row["retry_at"]) if row["retry_at"] is not None else None),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise TaskStoreError(f"Corrupt task effect record: {exc}") from exc
