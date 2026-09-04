@@ -200,6 +200,48 @@ def test_durable_escalation_records_never_retain_credential_values(
     assert "[REDACTED]" in stored
 
 
+def test_durable_records_redact_nested_json_credentials_at_every_message_boundary(tmp_path):
+    """A JSON callback cannot bypass the one durable-message redaction boundary."""
+    secret = "nested-json-authorization-value"
+    payload = (
+        '{"event":"status","children":[{"request":'
+        '{"Authorization":"Bearer nested-json-authorization-value"}}]}'
+    )
+    path = tmp_path / "escalations.sqlite3"
+    store = EscalationStore(path)
+    parked = store.park(
+        child_session_id="child-a",
+        child_workspace_id=None,
+        recorded_parent_session_id=None,
+        reason="no_parent",
+        message=payload,
+        dedupe_key="nested-parked",
+    )
+    acknowledged = store.acknowledge(
+        child_session_id="child-a",
+        parent_session_id="parent-a",
+        kind="routine",
+        intent="continue",
+        message=payload,
+        dedupe_key="nested-acknowledged",
+    )
+    order = store.expect_order(
+        order_id="nested-order",
+        sender_session_id="parent-a",
+        recipient_session_id="child-a",
+        body=payload,
+    )
+
+    assert all(secret not in value for value in (parked.message, acknowledged.message, order.body))
+    with sqlite3.connect(path) as connection:
+        stored = [
+            connection.execute("SELECT message FROM escalations").fetchone()[0],
+            connection.execute("SELECT message FROM acknowledgments").fetchone()[0],
+            connection.execute("SELECT body FROM order_expectations").fetchone()[0],
+        ]
+    assert all(secret not in value and "[REDACTED]" in value for value in stored)
+
+
 def test_blocked_and_decision_escalations_replace_the_active_turn(tmp_path):
     client = FakeClient(
         sessions={"parent-a": {"id": "parent-a", "workspace_id": "parent-workspace"}},

@@ -25,7 +25,12 @@ from .cdesktop import (
     latest_execution_process,
 )
 from .effects import EffectBusy, EffectJournal, new_owner_instance, request_hash
-from .escalation import CDESKTOP_SESSION_ENV, EscalationStore, LauncherIdentity
+from .escalation import (
+    CDESKTOP_SESSION_ENV,
+    EscalationStore,
+    LauncherIdentity,
+    redact_credentials,
+)
 from .liveness import Budget, resolve_policy, trusted_policy
 from .pool import core as pool_core
 from .profiles import ProfileStore, validate_provider
@@ -265,6 +270,7 @@ class SightMesh:
     def checkpoint(self, text: str, worker: str | None = None) -> Worker:
         if not text.strip():
             raise SightMeshError("Checkpoint must not be empty")
+        text = redact_credentials(text)
         task = self._current() if worker is None else self._find(worker)
         path = self._checkpoint_path(task, hashlib.sha256(text.encode()).hexdigest())
         path.parent.mkdir(parents=True, exist_ok=True)

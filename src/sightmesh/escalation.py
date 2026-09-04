@@ -195,14 +195,62 @@ class OrderExpectation:
     satisfied_at: float | None
 
 
-def redact_credentials(message: str) -> str:
-    """Keep operational records useful without retaining obvious credentials."""
+_CREDENTIAL_KEY_PARTS = (
+    "authorization",
+    "bearer",
+    "cookie",
+    "token",
+    "apikey",
+    "secret",
+    "password",
+    "credential",
+)
+
+
+def _is_credential_key(key: object) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return any(part in normalized for part in _CREDENTIAL_KEY_PARTS)
+
+
+def _redact_structured_credentials(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        return {
+            key: "[REDACTED]" if _is_credential_key(key) else _redact_structured_credentials(value)
+            for key, value in payload.items()
+        }
+    if isinstance(payload, list):
+        return [_redact_structured_credentials(value) for value in payload]
+    return payload
+
+
+def redact_credentials(payload: Any) -> Any:
+    """Redact credential-bearing fields before a payload becomes durable.
+
+    JSON is decoded and walked so formatting cannot hide a nested credential;
+    free-form prose keeps the header and inline-value redaction used by logs.
+    """
+    if isinstance(payload, (dict, list)):
+        return _redact_structured_credentials(payload)
+    if not isinstance(payload, str):
+        return payload
+    try:
+        structured = json.loads(payload)
+    except json.JSONDecodeError:
+        structured = None
+    else:
+        if isinstance(structured, (dict, list)):
+            return json.dumps(
+                _redact_structured_credentials(structured),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
     # Header values can contain a scheme and spaces (``Bearer secret``), so
     # redact an entire credential header before handling inline key/value forms.
     without_headers = re.sub(
         r"(?im)\b(authorization|cookie)\b\s*:\s*[^\r\n]*",
         r"\1: [REDACTED]",
-        message,
+        payload,
     )
     return re.sub(
         r"(?im)\b(token|secret|password|credential|api[_-]?key)\b\s*([:=])\s*"

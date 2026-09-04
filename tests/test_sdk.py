@@ -286,6 +286,23 @@ def test_checkpoint_content_stays_in_the_task_worktree(system):
     )
 
 
+def test_checkpoint_does_not_persist_a_nested_json_credential(system):
+    """Checkpoint files share the durable credential-redaction boundary."""
+    mesh, client, _store, _ownership = system
+    started = mesh.start(spec())
+    secret = "checkpoint-json-authorization-value"
+    checkpointed = mesh.checkpoint(
+        '{"progress":[{"authorization":"Bearer checkpoint-json-authorization-value"}]}',
+        worker="audit",
+    )
+
+    root = client.workspace(started.workspace_id)["container_ref"]
+    path = Path(root) / "project" / checkpointed.checkpoint
+    stored = path.read_text()
+    assert secret not in stored
+    assert "[REDACTED]" in stored
+
+
 def test_duplicate_failover_wakeups_reserve_one_successor_epoch(system):
     """Two managers observing the same failure must not burn two epochs.
 
