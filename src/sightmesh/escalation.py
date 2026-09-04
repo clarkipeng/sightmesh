@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -199,12 +200,34 @@ _CREDENTIAL_KEY_PARTS = (
     "authorization",
     "bearer",
     "cookie",
+    "auth",
     "token",
+    "key",
     "apikey",
     "secret",
     "password",
     "credential",
 )
+
+_CREDENTIAL_VALUE_PATTERNS = (
+    (re.compile(r"(?i)\b(bearer|basic)\s+(?:[A-Za-z0-9._~+/=-]+)"), r"\1 [REDACTED]"),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9_])(?:sk-ant-|sk-|ghp_|gho_|github_pat_|xox[abp]-|AKIA|pypi-|npm-)[A-Za-z0-9_-]+"
+        ),
+        "[REDACTED]",
+    ),
+    (
+        re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])"),
+        "[REDACTED]",
+    ),
+)
+_URL_USERINFO_RE = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/\s@]+@")
+_SAFE_ROUTING_VALUE_RE = re.compile(
+    r"^(?:[0-9a-f]{7,64}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[A-Za-z][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+)$",
+    re.IGNORECASE,
+)
+_SAFE_ROUTING_KEY_PARTS = ("dedupe", "session", "sha", "commit", "path", "uuid")
 
 
 def _is_credential_key(key: object) -> bool:
@@ -212,14 +235,46 @@ def _is_credential_key(key: object) -> bool:
     return any(part in normalized for part in _CREDENTIAL_KEY_PARTS)
 
 
-def _redact_structured_credentials(payload: Any) -> Any:
+def _is_routing_key(key: object) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return any(part in normalized for part in _SAFE_ROUTING_KEY_PARTS)
+
+
+def _has_high_entropy(value: str) -> bool:
+    """Identify opaque secrets without treating ordinary routing ids as secrets."""
+    if len(value) <= 24 or _SAFE_ROUTING_VALUE_RE.fullmatch(value):
+        return False
+    frequencies = {character: value.count(character) for character in set(value)}
+    entropy = -sum(
+        (count / len(value)) * math.log2(count / len(value))
+        for count in frequencies.values()
+    )
+    return entropy >= 4.0
+
+
+def _redact_string(value: str, key: object | None = None) -> str:
+    """Redact credential shapes whether or not callers gave them a revealing key."""
+    if key is not None and _is_credential_key(key):
+        if not _is_routing_key(key) and _has_high_entropy(value):
+            return "[REDACTED]"
+    redacted = _URL_USERINFO_RE.sub(r"\1***@", value)
+    for pattern, replacement in _CREDENTIAL_VALUE_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def _redact_structured_credentials(payload: Any, key: object | None = None) -> Any:
     if isinstance(payload, dict):
         return {
-            key: "[REDACTED]" if _is_credential_key(key) else _redact_structured_credentials(value)
-            for key, value in payload.items()
+            child_key: "[REDACTED]"
+            if _is_credential_key(child_key) and not _is_routing_key(child_key)
+            else _redact_structured_credentials(value, child_key)
+            for child_key, value in payload.items()
         }
     if isinstance(payload, list):
-        return [_redact_structured_credentials(value) for value in payload]
+        return [_redact_structured_credentials(value, key) for value in payload]
+    if isinstance(payload, str):
+        return _redact_string(payload, key)
     return payload
 
 
@@ -250,7 +305,7 @@ def redact_credentials(payload: Any) -> Any:
     without_headers = re.sub(
         r"(?im)\b(authorization|cookie)\b\s*:\s*[^\r\n]*",
         r"\1: [REDACTED]",
-        payload,
+        _redact_string(payload),
     )
     return re.sub(
         r"(?im)\b(token|secret|password|credential|api[_-]?key)\b\s*([:=])\s*"
