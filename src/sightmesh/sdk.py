@@ -300,19 +300,19 @@ class SightMesh:
 
     def complete(self, summary: str | None = None, worker: str | None = None) -> Worker:
         task = self._current() if worker is None else self._find(worker)
-        return Worker.from_record(self._finish(task, "completed", summary))
+        return Worker.from_record(self._finish_locked(task, "completed", summary))
 
     def blocked(self, reason: str, worker: str | None = None) -> Worker:
         if not reason.strip():
             raise SightMeshError("Blocked reason must not be empty")
         task = self._current() if worker is None else self._find(worker)
-        return Worker.from_record(self._finish(task, "blocked", reason))
+        return Worker.from_record(self._finish_locked(task, "blocked", reason))
 
     def cancel(self, worker: str) -> Worker:
         task = self._find(worker)
-        if task.workspace_id:
-            self.client.stop_workspace(task.workspace_id)
-        return Worker.from_record(self._finish(task, "cancelled", None))
+        return Worker.from_record(
+            self._finish_locked(task, "cancelled", None, stop_workspace=True)
+        )
 
     def replace(self, worker: str, prompt: str | None = None) -> Worker:
         task = self._find(worker)
@@ -362,6 +362,29 @@ class SightMesh:
             raise
         self.wakes.pump()
         return updated
+
+    def _finish_locked(
+        self,
+        task: TaskRecord,
+        state: str,
+        result: str | None,
+        *,
+        stop_workspace: bool = False,
+    ) -> TaskRecord:
+        """Finish one task without racing the epoch it may be launching.
+
+        A task lock covers an intent until its native launch activates. Terminal
+        writers take that same lock and discard their pre-wait snapshot, so
+        cancellation stops whichever workspace owns the task after recovery,
+        never the predecessor it happened to observe first.
+        """
+        with self.store.task_lock(task.task_id):
+            current = self.store.get_by_id(task.task_id)
+            if current is None:
+                raise SightMeshError(f"Task {task.key!r} no longer exists")
+            if stop_workspace and current.workspace_id:
+                self.client.stop_workspace(current.workspace_id)
+            return self._finish(current, state, result)
 
     def reconcile_provider_outcome(self, session_id: str) -> Worker | None:
         """Settle the task holding this session against what its worker did.
