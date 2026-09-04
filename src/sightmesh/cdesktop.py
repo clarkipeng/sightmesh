@@ -246,6 +246,18 @@ def latest_execution_process(
     )
 
 
+
+def _running_route_missing(exc: CdesktopError) -> bool:
+    """Whether the executor predates ``GET /execution-processes/running``.
+
+    cdesktop 0.2.9 serves the route. Older services route the path through
+    ``/execution-processes/{id}`` and reject the literal ``running`` with
+    HTTP 400 "Cannot parse `id`" - not 404 - so both shapes mean "fall back to
+    the per-session walk". Any other error is real and propagates.
+    """
+    text = str(exc)
+    return "HTTP 404" in text or ("HTTP 400" in text and "Cannot parse `id`" in text)
+
 class CdesktopClient:
     def __init__(self, base_url: str | None = None) -> None:
         configured = base_url or os.environ.get("SIGHTMESH_CDESKTOP_URL")
@@ -461,7 +473,7 @@ class CdesktopClient:
         try:
             result = self.request("GET", "/execution-processes/running")
         except CdesktopError as exc:
-            if "HTTP 404" not in str(exc):
+            if not _running_route_missing(exc):
                 raise
         else:
             if not isinstance(result, list):

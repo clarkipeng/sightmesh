@@ -793,3 +793,38 @@ def test_a_non_finite_process_retry_after_falls_back_to_default(retry_after) -> 
 
     assert outcome == "rate_limited"
     assert reset is None
+
+
+def test_running_probe_falls_back_when_an_old_service_rejects_the_literal_running(monkeypatch):
+    # 0.13.2's activation timed out against cdesktop 0.2.8: the old router treats
+    # "running" as an execution id and answers HTTP 400 "Cannot parse `id`", not
+    # the 404 the fallback expected, so the probe failed for the whole drain
+    # window and 0.2.9 could not be activated. Both shapes must mean "fall back".
+    from sightmesh.cdesktop import CdesktopClient, CdesktopError
+
+    client = CdesktopClient(base_url="http://127.0.0.1:1")
+    calls = []
+
+    def fake_request(method, path, payload=None, query=None, headers=None):
+        calls.append(path)
+        if path == "/execution-processes/running":
+            raise CdesktopError(
+                "GET /execution-processes/running failed: HTTP 400: Invalid URL: "
+                "Cannot parse `id` with value `running`: UUID parsing failed"
+            )
+        if path == "/workspaces":
+            return [{"id": "ws-1", "name": "w", "archived": False}]
+        if path == "/workspaces/ws-1/sessions":
+            return [{"id": "s-1", "name": "worker"}]
+        if path == "/sessions/s-1/execution-processes":
+            return [{"id": "e-1", "status": "running"}, {"id": "e-2", "status": "completed"}]
+        raise AssertionError(path)
+
+    monkeypatch.setattr(client, "request", fake_request)
+    monkeypatch.setattr(client, "workspaces", lambda: fake_request("GET", "/workspaces"))
+    monkeypatch.setattr(client, "sessions", lambda ws: fake_request("GET", f"/workspaces/{ws}/sessions"))
+    monkeypatch.setattr(client, "execution_processes", lambda sid: fake_request("GET", f"/sessions/{sid}/execution-processes"))
+    running = client.running_execution_processes()
+    assert [r["id"] for r in running] == ["e-1"]
+    assert running[0]["workspace_name"] == "w" and running[0]["session_name"] == "worker"
+    assert calls[0] == "/execution-processes/running"
