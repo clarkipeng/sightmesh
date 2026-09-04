@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ..cdesktop import CdesktopClient
+from ..external_runs import ExternalRunReconciler, ExternalRunStore
 from ..sdk import Command, SightMesh, WorkerSpec
 from .common import _emit
 
@@ -112,6 +114,50 @@ def cmd_blocked(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_run_subscribe(args: argparse.Namespace) -> int:
+    result = ExternalRunStore().subscribe(
+        run_id=args.run_id,
+        output_root=args.output_root,
+        return_session_id=args.return_session,
+        return_workspace_id=args.return_workspace,
+    )
+    _emit(result.to_dict(), args.json)
+    return 0
+
+
+def cmd_run_bind(args: argparse.Namespace) -> int:
+    result = ExternalRunStore().bind(
+        args.subscription,
+        writer_capability=args.writer_capability,
+        pid=args.pid,
+        process_fingerprint=args.process_fingerprint,
+    )
+    _emit(result.to_dict(), args.json)
+    return 0
+
+
+def cmd_run_show(args: argparse.Namespace) -> int:
+    store = ExternalRunStore()
+    value: object = (
+        store.find(args.subscription).to_dict()
+        if args.subscription
+        else [run.to_dict() for run in store.pending()]
+    )
+    _emit(value, args.json)
+    return 0
+
+
+def cmd_run_reconcile(args: argparse.Namespace) -> int:
+    reconciler = ExternalRunReconciler(CdesktopClient(args.url))
+    count = (
+        reconciler.reconcile_one(args.subscription)
+        if args.subscription
+        else reconciler.reconcile()
+    )
+    _emit({"reconciled": count}, args.json)
+    return 0
+
+
 def add_parser(sub: argparse._SubParsersAction[Any]) -> None:
     start = sub.add_parser("start", help="Idempotently start a managed worker")
     start.add_argument("key", nargs="?")
@@ -169,3 +215,32 @@ def add_parser(sub: argparse._SubParsersAction[Any]) -> None:
     blocked.add_argument("reason")
     blocked.add_argument("--worker")
     blocked.set_defaults(func=cmd_blocked)
+
+    run = sub.add_parser(
+        "run", help="Manage durable wake subscriptions for external runs"
+    )
+    actions = run.add_subparsers(dest="run_action", required=True)
+    subscribe = actions.add_parser(
+        "subscribe", help="Lease an output root before provider activity"
+    )
+    subscribe.add_argument("--run-id", required=True)
+    subscribe.add_argument("--output-root", required=True)
+    subscribe.add_argument("--return-session", required=True)
+    subscribe.add_argument("--return-workspace")
+    subscribe.set_defaults(func=cmd_run_subscribe)
+    bind = actions.add_parser("bind", help="Bind a runner-owned process fingerprint")
+    bind.add_argument("subscription")
+    bind.add_argument("--writer-capability", required=True)
+    bind.add_argument("--pid", required=True, type=int)
+    bind.add_argument("--process-fingerprint", required=True)
+    bind.set_defaults(func=cmd_run_bind)
+    show_run = actions.add_parser(
+        "show", help="Show durable external-run subscriptions"
+    )
+    show_run.add_argument("subscription", nargs="?")
+    show_run.set_defaults(func=cmd_run_show)
+    reconcile = actions.add_parser(
+        "reconcile", help="Run one external-run reconciliation pass"
+    )
+    reconcile.add_argument("subscription", nargs="?")
+    reconcile.set_defaults(func=cmd_run_reconcile)

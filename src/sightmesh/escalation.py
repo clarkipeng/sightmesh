@@ -474,6 +474,51 @@ class EscalationStore:
                     "CREATE INDEX IF NOT EXISTS idx_escalations_status "
                     "ON escalations(status, created_at DESC)"
                 )
+                # External runners own their process and receipt.  These rows only
+                # retain the return address and exclusive output-root claim while
+                # SightMesh is away; no process token belongs in this store.
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS external_run_leases (
+                        output_root TEXT PRIMARY KEY,
+                        subscription_id TEXT NOT NULL UNIQUE,
+                        state TEXT NOT NULL CHECK (state IN ('active', 'released')),
+                        version INTEGER NOT NULL DEFAULT 0,
+                        created_at REAL NOT NULL,
+                        released_at REAL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS external_run_subscriptions (
+                        subscription_id TEXT PRIMARY KEY,
+                        run_id TEXT NOT NULL UNIQUE,
+                        output_root TEXT NOT NULL UNIQUE,
+                        return_session_id TEXT NOT NULL,
+                        return_workspace_id TEXT,
+                        writer_capability_digest TEXT NOT NULL,
+                        dedupe_key TEXT NOT NULL UNIQUE,
+                        state TEXT NOT NULL CHECK (state IN
+                            ('subscribed', 'running', 'terminal', 'lost', 'notified')),
+                        version INTEGER NOT NULL DEFAULT 0,
+                        pid INTEGER,
+                        process_fingerprint TEXT,
+                        receipt_path TEXT NOT NULL,
+                        receipt_digest TEXT,
+                        outcome TEXT,
+                        diagnostic TEXT,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        terminal_at REAL,
+                        notified_at REAL
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_external_run_subscriptions_pending "
+                    "ON external_run_subscriptions(state, updated_at)"
+                )
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS signal_policies (
@@ -590,7 +635,8 @@ class EscalationStore:
             with self._connect() as conn:
                 return bool(
                     conn.execute(
-                        "DELETE FROM signal_policies WHERE session_id = ?", (session_id,)
+                        "DELETE FROM signal_policies WHERE session_id = ?",
+                        (session_id,),
                     ).rowcount
                 )
         except sqlite3.DatabaseError as exc:
@@ -606,7 +652,9 @@ class EscalationStore:
                     (dedupe_key, dedupe_key),
                 ).fetchone()
         except sqlite3.DatabaseError as exc:
-            raise EscalationStoreError(f"Cannot read delivery dedupe state: {exc}") from exc
+            raise EscalationStoreError(
+                f"Cannot read delivery dedupe state: {exc}"
+            ) from exc
         return row is not None
 
     def has_terminal_dedupe_key(self, dedupe_key: str) -> bool:
@@ -667,7 +715,9 @@ class EscalationStore:
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(f"Cannot park escalation: {exc}") from exc
         if row is None:
-            raise EscalationStoreError(f"Escalation is missing after park: {dedupe_key}")
+            raise EscalationStoreError(
+                f"Escalation is missing after park: {dedupe_key}"
+            )
         return _from_row(row)
 
     def resolve(self, escalation_id: str) -> ParkedEscalation:
@@ -808,18 +858,31 @@ class EscalationStore:
                         body_digest, created_at, satisfied_at
                     ) VALUES (?, ?, ?, ?, ?, ?, NULL)
                     """,
-                    (key, sender_session_id, recipient_session_id, safe_body, digest, now),
+                    (
+                        key,
+                        sender_session_id,
+                        recipient_session_id,
+                        safe_body,
+                        digest,
+                        now,
+                    ),
                 )
                 row = conn.execute(
                     "SELECT * FROM order_expectations WHERE order_id = ?", (key,)
                 ).fetchone()
         except sqlite3.DatabaseError as exc:
-            raise EscalationStoreError(f"Cannot record order expectation: {exc}") from exc
+            raise EscalationStoreError(
+                f"Cannot record order expectation: {exc}"
+            ) from exc
         if row is None:
-            raise EscalationStoreError(f"Order expectation is missing after record: {key}")
+            raise EscalationStoreError(
+                f"Order expectation is missing after record: {key}"
+            )
         return _order_from_row(row)
 
-    def satisfy_orders(self, recipient_session_id: str, *, order_id: str | None = None) -> int:
+    def satisfy_orders(
+        self, recipient_session_id: str, *, order_id: str | None = None
+    ) -> int:
         """Any later outbound report closes the recipient's outstanding orders."""
         now = time.time()
         where = "recipient_session_id = ? AND satisfied_at IS NULL"
@@ -830,10 +893,13 @@ class EscalationStore:
         try:
             with self._connect() as conn:
                 return conn.execute(
-                    f"UPDATE order_expectations SET satisfied_at = ? WHERE {where}", values
+                    f"UPDATE order_expectations SET satisfied_at = ? WHERE {where}",
+                    values,
                 ).rowcount
         except sqlite3.DatabaseError as exc:
-            raise EscalationStoreError(f"Cannot satisfy order expectation: {exc}") from exc
+            raise EscalationStoreError(
+                f"Cannot satisfy order expectation: {exc}"
+            ) from exc
 
     def _order_filter(
         self,
