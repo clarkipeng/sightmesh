@@ -398,33 +398,111 @@ def transfer_ownership(
     )
 
 
-# ---------------------------------------------------------------- quota reroute
+# ---------------------------------------------------------------- outcome reroute
+
+#: The typed provider outcomes that may advance a route chain. Everything else
+#: - a definitive rejection, a lost launch, and every repository, test, or code
+#: failure - is a task-level result with no provider outcome at all, so it can
+#: never reach this path. That is what makes "code failures never reroute" true
+#: by construction rather than by pattern-matching what a worker printed.
+REROUTE_OUTCOMES = frozenset({"rate_limited", "auth", "provider_down"})
+
+#: Spellings written before the outcomes were typed. A task that was already
+#: mid-failover when the upgrade landed carries ``quota`` in its target and its
+#: journal, and refusing to read it would strand exactly the work an upgrade is
+#: most likely to interrupt.
+LEGACY_OUTCOMES = {"quota": "rate_limited"}
+
+#: Everything a reconcile sweep should look for, current and legacy alike.
+SWEEPABLE_OUTCOMES = REROUTE_OUTCOMES | frozenset(LEGACY_OUTCOMES)
 
 
-def reroute_after_quota_exhaustion(
+def routing_outcome(value: object) -> str | None:
+    """The reroute outcome a stored value names, or ``None`` if it names none.
+
+    One place decides what counts, so every caller reads legacy and current
+    spellings identically and no branch can be forgotten.
+    """
+    outcome = str(value or "")
+    outcome = LEGACY_OUTCOMES.get(outcome, outcome)
+    return outcome if outcome in REROUTE_OUTCOMES else None
+
+
+def cool_provider_outcome(
     settings: execution_routing.ExecutionRoutingSettings,
     *,
-    exhausted_binding_id: str,
-    preferred_model: str | None = None,
-    cooldown_seconds: int | None = None,
+    outcome: str,
+    binding_id: str,
+    route_class: str | None = None,
+    route_id: str | None = None,
     retry_at: float | None = None,
-) -> execution_routing.SelectionResult:
-    """Durably cool the exhausted binding, then pick the next route without it.
+) -> tuple[str, ...]:
+    """Cool exactly the accounts one typed outcome condemns. Returns their ids.
 
-    The cooldown lives in pool state, the single source of account truth, so
-    every later selection - including one after a restart - observes it. Only
-    the opaque binding id is touched; credentials are never read here.
+    Safe to call any number of times for one outcome: pool cooling is
+    monotonic, so re-cooling the same window changes nothing. That is what
+    lets the caller cool *before* it records the outcome, closing the window
+    where a crash in between left an exhausted account uncooled forever.
+
+    The cooldown itself lives in pool state, the single source of account
+    truth, so every later selection - including one after a restart - observes
+    it. Only opaque binding ids are touched; credentials are never read here.
+
+    A capacity or auth outcome is about one account, so one account cools. A
+    ``provider_down`` is about the provider behind the route, so every account
+    in that route's pool cools for the short window - otherwise the chain would
+    walk the same dead provider account by account.
     """
-    if retry_at is not None:
-        pool_core.cool_until_timestamp(exhausted_binding_id, max(retry_at, time.time()))
-    elif cooldown_seconds is not None:
-        pool_core.set_cooldown(exhausted_binding_id, cooldown_seconds)
+    if outcome not in REROUTE_OUTCOMES:
+        raise SuccessionError(f"Outcome {outcome!r} does not cool an account")
+    route = settings.route(route_class, route_id) if route_id else None
+    if outcome == "provider_down" and route is not None and route.account_pool:
+        pool = pool_core.load_pool()
+        cooled = tuple(
+            str(account["id"])
+            for account in pool_core.accounts_for(pool, route.account_pool)
+            if account.get("id")
+        )
+        for account_id in cooled:
+            pool_core.set_cooldown(account_id, pool_core.SHORT_COOLDOWN)
+        return cooled
+    if outcome == "rate_limited":
+        if retry_at is not None:
+            pool_core.cool_until_timestamp(binding_id, max(retry_at, time.time()))
+        else:
+            pool_core.set_cooldown(binding_id)
     else:
-        pool_core.set_cooldown(exhausted_binding_id)
+        pool_core.set_cooldown(binding_id, pool_core.SHORT_COOLDOWN)
+    return (binding_id,)
+
+
+def advance_route_after_outcome(
+    settings: execution_routing.ExecutionRoutingSettings,
+    *,
+    outcome: str,
+    route_class: str | None = None,
+    failed_binding_id: str | None = None,
+) -> execution_routing.SelectionResult:
+    """Pick the next hop of a class chain after a typed provider outcome.
+
+    A pure read: the condemned accounts were already cooled by
+    :func:`cool_provider_outcome` when the outcome was recorded, so running
+    this twice cannot extend a cooldown or move an account twice.
+
+    Selection stays inside ``route_class`` and passes no model preference, so
+    the walk lands on the next eligible *account of the same route* before it
+    ever reaches the next route. Retrying the same model on a second account
+    before switching models therefore needs no retry counter: it falls out of
+    pool order.
+    """
+    if outcome not in REROUTE_OUTCOMES:
+        raise SuccessionError(f"Outcome {outcome!r} does not advance a route chain")
     return execution_routing.select_route(
         settings,
-        preferred_model=preferred_model,
-        exclude_account_ids=frozenset({exhausted_binding_id}),
+        route_class=route_class,
+        exclude_account_ids=(
+            frozenset({failed_binding_id}) if failed_binding_id else frozenset()
+        ),
     )
 
 
@@ -466,13 +544,14 @@ def escalate_free_route_failure(
     child_session_id: str,
     child_workspace_id: str | None = None,
     parent_session_id: str | None = None,
+    route_class: str | None = None,
     output: str = "",
     store: EscalationStore | None = None,
 ) -> FreeRouteFailure:
     """Make a free route's terminal failure visible, and never quietly billed.
 
     A free route owns no account by construction, so there is no binding to
-    cool and nothing for `reroute_after_quota_exhaustion` to act on - a
+    cool and nothing for `advance_route_after_outcome` to act on - a
     terminal failure would otherwise leave the worker blocked with no signal
     at all. This gives it exactly one visible outcome: an escalation carrying
     the route id and outcome class, delivered to a live parent or parked in
@@ -490,7 +569,9 @@ def escalate_free_route_failure(
     selection: execution_routing.SelectionResult | None = None
     if settings.fallback_on_free_failure:
         selection = execution_routing.select_route(
-            settings, exclude_route_ids=frozenset({route_id})
+            settings,
+            route_class=route_class,
+            exclude_route_ids=frozenset({route_id}),
         )
 
     if selection is None:

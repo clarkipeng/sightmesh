@@ -14,6 +14,7 @@ from sightmesh.effects import (
     new_owner_instance,
     request_hash,
 )
+from sightmesh.fence import assert_external_io_allowed
 from sightmesh.task_store import TaskStore, TaskStoreError
 
 
@@ -239,6 +240,58 @@ def test_expiry_loses_a_reservation_no_native_session_stands_behind(tmp_path):
     assert journal.get("gone", 1).outcome == "lost:reservation-expired"
 
 
+def test_expiry_stops_a_native_workspace_superseded_during_its_probe(tmp_path):
+    """A probe that loses its epoch records and stops the workspace outside the fence."""
+    store = TaskStore(tmp_path / "state.sqlite3")
+    ((task, _inserted),) = store.reserve_all(
+        scope="operator",
+        parent_task_id=None,
+        specs=[{"key": "expired", "children": 0}],
+        max_attempts=3,
+    )
+    journal = EffectJournal(store)
+    journal.reserve(task.task_id, task.epoch, request_hash(LAUNCH), "owner-a", ttl=-1.0)
+
+    class SupersedingClient:
+        stopped: list[str] = []
+
+        def managed_effect(self, task_id, epoch):
+            store.finish(task_id, "cancelled")
+            return {"state": "active", "workspace_id": "ws-race", "session_id": "s-race"}
+
+        def stop_workspace(self, workspace_id):
+            assert_external_io_allowed()
+            self.stopped.append(workspace_id)
+
+    client = SupersedingClient()
+    assert journal.expire_reservations(client) == []
+    assert client.stopped == ["ws-race"]
+    effect = journal.get(task.task_id, task.epoch)
+    assert effect is not None and effect.outcome == "superseded"
+    assert effect.workspace_id is None
+
+
+def test_superseded_stop_is_retried_from_its_recorded_intent(journal):
+    """A failed stop leaves its workspace id durable for the next reconcile pass."""
+    journal.reserve("task-1", 1, request_hash(LAUNCH), "owner-a")
+    journal.mark_superseded("task-1", 1, "ws-retry")
+
+    class FlakyClient:
+        def __init__(self):
+            self.calls = 0
+
+        def stop_workspace(self, _workspace_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise CdesktopError("temporary stop failure")
+
+    client = FlakyClient()
+    assert journal.reconcile_superseded(client) == 0
+    assert journal.get("task-1", 1).workspace_id == "ws-retry"
+    assert journal.reconcile_superseded(client) == 1
+    assert journal.get("task-1", 1).workspace_id is None
+
+
 def test_get_returns_none_for_an_unreserved_epoch(journal):
     """Callers branch on this to decide between adopt and launch."""
     assert journal.get("task-1", 7) is None
@@ -265,3 +318,59 @@ def test_the_pinned_seams_400_not_found_shape_is_definitive_absence(tmp_path):
         CdesktopRejectedError("Caller session belongs to another workspace", status=400)
     )
     assert not is_effect_not_found(CdesktopRejectedError("boom", status=500))
+
+
+def test_a_capacity_outcome_persists_the_providers_reset(journal) -> None:
+    """The reconcile that reads a typed outcome runs long after the rejection,
+    so the provider's advertised reset has to be durable next to the outcome.
+    Losing it means every reroute falls back to a blunt multi-hour cooldown."""
+    journal.reserve("task-a", 1, request_hash(LAUNCH), new_owner_instance())
+
+    journal.mark_terminal("task-a", 1, "rate_limited", 1_893_456_000.0)
+
+    effect = journal.get("task-a", 1)
+    assert (effect.outcome, effect.retry_at) == ("rate_limited", 1_893_456_000.0)
+
+
+def test_an_outcome_without_a_reset_stores_none_rather_than_a_guess(journal) -> None:
+    """No advertised reset is a fact, not a zero: storing 0.0 would read as a
+    cooldown that already expired."""
+    journal.reserve("task-a", 1, request_hash(LAUNCH), new_owner_instance())
+
+    journal.mark_terminal("task-a", 1, "auth")
+
+    assert journal.get("task-a", 1).retry_at is None
+
+
+def test_only_current_epoch_outcomes_on_live_tasks_are_swept(journal) -> None:
+    """The sweep is what advances a task whose launch was rejected before it
+    ever held a session. It must see exactly the epoch the task is on: a
+    superseded epoch's outcome re-triggering the reroute that already moved
+    past it would fork the work, and a completed task has nothing to reroute.
+    """
+    store = journal.store
+    _insert_task(store, "task-live", epoch=2, state="blocked")
+    _insert_task(store, "task-stale", epoch=3, state="active")
+    _insert_task(store, "task-done", epoch=1, state="completed")
+    for task_id, epoch, outcome in (
+        ("task-live", 2, "rate_limited"),
+        ("task-stale", 2, "rate_limited"),
+        ("task-done", 1, "provider_down"),
+    ):
+        journal.reserve(task_id, epoch, request_hash(LAUNCH), new_owner_instance())
+        journal.mark_terminal(task_id, epoch, outcome)
+
+    swept = journal.with_outcomes({"rate_limited", "auth", "provider_down"})
+
+    assert [(e.task_id, e.epoch) for e in swept] == [("task-live", 2)]
+    assert journal.with_outcomes(set()) == []
+
+
+def _insert_task(store, task_id: str, *, epoch: int, state: str) -> None:
+    with store.connect() as conn:
+        conn.execute(
+            "INSERT INTO managed_tasks (task_id, scope, task_key, state, epoch, "
+            "attempts, max_attempts, child_limit, spec_json, created_at, updated_at) "
+            "VALUES (?, 'operator', ?, ?, ?, 1, 3, 0, '{}', 0, 0)",
+            (task_id, task_id, state, epoch),
+        )

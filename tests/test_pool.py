@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -386,6 +387,43 @@ def test_exhausted_account_is_cooled_until_its_reported_reset(
     assert cooldown == pytest.approx(core.parse_iso(reset))
 
 
+def test_a_cooldown_extends_but_never_shortens(pool_root: Path) -> None:
+    """Regression guard for a live five-hour rate limit being erased.
+
+    Every cooling caller is reporting one refusal it observed, and no refusal
+    is evidence that an earlier, longer one has ended: a 401 or a one-minute
+    `Retry-After` arriving during a rate limit says nothing about that limit.
+    Writes were unconditional, so whichever observation landed last won and the
+    pool put work straight back onto an exhausted account. Monotonic cooling
+    also makes ordering between concurrent observers stop mattering, which is
+    what lets the reroute path cool before it marks an outcome terminal.
+    """
+    long_deadline = core.set_cooldown("acct", core.DEFAULT_COOLDOWN)
+
+    assert core.set_cooldown("acct", core.SHORT_COOLDOWN) == long_deadline
+    assert core.cool_until_timestamp("acct", time.time() + 60) == long_deadline
+    assert core.load_state()["cooldowns"]["acct"] == long_deadline
+
+    later = core.cool_until_timestamp("acct", long_deadline + 3600)
+    assert later == long_deadline + 3600
+
+    # Only an operator has the outside knowledge to end a window early.
+    core.clear_cooldown("acct")
+    assert core.cooling_until(core.load_state(), "acct") == 0
+
+
+@pytest.mark.parametrize("deadline", (float("inf"), float("nan")))
+def test_a_non_finite_cooldown_deadline_uses_the_bounded_default(
+    pool_root: Path, monkeypatch, deadline: float
+) -> None:
+    monkeypatch.setattr(core.time, "time", lambda: 1_000.0)
+
+    until = core.cool_until_timestamp("acct", deadline)
+
+    assert until == 1_000.0 + core.DEFAULT_COOLDOWN
+    assert core.load_state()["cooldowns"]["acct"] == until
+
+
 def test_selection_skips_an_account_with_no_stored_credential(
     pool_root: Path, monkeypatch
 ) -> None:
@@ -569,15 +607,25 @@ def test_account_without_a_credential_yields_no_launch_env(pool_root: Path) -> N
     assert core.env_for({"id": "missing", "provider": "claude", "kind": "oauth"}) == {}
 
 
-def test_limit_detection_matches_real_provider_refusals() -> None:
-    # These strings are what selection reads to decide an account is exhausted.
-    # Missing one means a limited account keeps being chosen and every launch on
-    # it fails.
-    assert core.looks_limited("Claude usage limit reached. Resets at 3pm")
-    assert core.looks_limited("You've reached your Fable 5 limit.")
-    assert core.looks_limited("HTTP 429 Too Many Requests")
-    assert core.looks_limited("insufficient_quota")
-    assert not core.looks_limited("compilation finished with 2 warnings")
+def test_a_failed_probe_never_cools_an_account_on_its_own(pool_root: Path, monkeypatch) -> None:
+    """A probe reports what the executor said; it does not classify why.
+
+    The pattern list that used to read "429" or "quota" out of probe output
+    also matched a worker's own test transcript, which cooled a healthy
+    account. Cooling is now driven only by a typed provider outcome, so a
+    failing probe must leave pool state alone.
+    """
+    account = {"id": "max-a", "provider": "claude", "kind": "oauth"}
+    core.save_pool({"accounts": [account]})
+    core.write_token("max-a", "sk-ant-oat01-" + "a" * 120)
+    monkeypatch.setattr(
+        core, "probe", lambda _account, timeout=90: (False, "HTTP 429 Too Many Requests")
+    )
+
+    ok, reason = core.probe_cached(account)
+
+    assert (ok, reason) == (False, "HTTP 429 Too Many Requests")
+    assert core.cooling_until(core.load_state(), "max-a") == 0
 
 
 # ---------------------------------------------------------------- local UI

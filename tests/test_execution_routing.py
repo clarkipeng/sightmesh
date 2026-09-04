@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -11,9 +12,12 @@ from sightmesh.execution_routing import (
     ExecutionRoutingSettings,
     ExecutionRoutingStore,
     Route,
+    RouteChain,
     select_route,
 )
 from sightmesh.pool import core as pool_core
+
+from fixtures.routing import _chains
 
 
 @pytest.fixture
@@ -88,7 +92,7 @@ def test_first_healthy_subscription_route_wins(pool_root: Path, monkeypatch) -> 
     monkeypatch.setattr(pool_core, "quota", _no_quota)
 
     settings = ExecutionRoutingSettings(
-        routes=(
+        chains=_chains(
             _subscription_route("codex-luna-subscriptions", "CODEX", "gpt-5.6-luna", "codex"),
             _subscription_route("claude-opus-subscriptions", "CLAUDE_CODE", "opus", "claude"),
         )
@@ -126,7 +130,7 @@ def test_cooling_missing_disabled_and_zero_quota_accounts_are_skipped_in_stable_
     monkeypatch.setattr(pool_core, "quota", quota)
 
     settings = ExecutionRoutingSettings(
-        routes=(_subscription_route("codex-subs", "CODEX", "luna", "codex"),)
+        chains=_chains(_subscription_route("codex-subs", "CODEX", "luna", "codex"),)
     )
 
     result = select_route(settings)
@@ -150,7 +154,7 @@ def test_hidden_account_aliases_are_absent_from_selection_traces(
 
     result = select_route(
         ExecutionRoutingSettings(
-            routes=(_subscription_route("codex-subs", "CODEX", "luna", "codex"),),
+            chains=_chains(_subscription_route("codex-subs", "CODEX", "luna", "codex"),),
             expose_account_alias=False,
         )
     )
@@ -169,7 +173,7 @@ def test_new_auth_entry_is_discovered_without_any_code_change(
     pool_core.save_pool({"accounts": [_codex_account("existing")]})
     monkeypatch.setattr(pool_core, "quota", _no_quota)
     settings = ExecutionRoutingSettings(
-        routes=(_subscription_route("codex-subs", "CODEX", "luna", "codex"),)
+        chains=_chains(_subscription_route("codex-subs", "CODEX", "luna", "codex"),)
     )
 
     first = select_route(settings)
@@ -198,7 +202,7 @@ def test_preferred_model_unavailable_advances_to_the_next_route(
     monkeypatch.setattr(pool_core, "quota", _no_quota)
 
     settings = ExecutionRoutingSettings(
-        routes=(
+        chains=_chains(
             _subscription_route("codex-luna-subscriptions", "CODEX", "gpt-5.6-luna", "codex"),
             _subscription_route("claude-opus-subscriptions", "CLAUDE_CODE", "opus", "claude"),
         )
@@ -228,7 +232,7 @@ def test_cross_provider_fallback_preserves_the_logical_command_shape(
     monkeypatch.setattr(pool_core, "quota", _no_quota)
 
     settings = ExecutionRoutingSettings(
-        routes=(
+        chains=_chains(
             _subscription_route("codex-luna-subscriptions", "CODEX", "gpt-5.6-luna", "codex"),
             _subscription_route("claude-opus-subscriptions", "CLAUDE_CODE", "opus", "claude"),
         )
@@ -239,6 +243,7 @@ def test_cross_provider_fallback_preserves_the_logical_command_shape(
     assert result.status == "resolved"
     assert result.target.route_id == "claude-opus-subscriptions"
     assert set(result.target.to_dict()) == {
+        "route_class",
         "route_id",
         "executor",
         "model",
@@ -253,7 +258,7 @@ def test_cross_provider_fallback_preserves_the_logical_command_shape(
 
 def _exhausted_subscription_and_metered_settings(metered_fallback: str) -> ExecutionRoutingSettings:
     return ExecutionRoutingSettings(
-        routes=(
+        chains=_chains(
             _subscription_route("codex-luna-subscriptions", "CODEX", "gpt-5.6-luna", "codex"),
             _metered_route("codex-metered-api", "CODEX", "gpt-5.6-luna", "codex-api"),
         ),
@@ -442,26 +447,27 @@ def test_metered_route_requires_account_not_account_pool() -> None:
 def test_duplicate_route_ids_are_rejected() -> None:
     with pytest.raises(ExecutionRoutingError, match="unique"):
         ExecutionRoutingSettings(
-            routes=(
+            chains=_chains(
                 _metered_route("dup", "CODEX", "luna", "codex-api"),
                 _metered_route("dup", "CODEX", "luna", "codex-api-2"),
             )
         )
 
 
-def test_same_route_retries_and_backoff_bounds_are_enforced() -> None:
-    with pytest.raises(ExecutionRoutingError, match="sameRouteRetries"):
-        ExecutionRoutingSettings(same_route_retries=4)
-    with pytest.raises(ExecutionRoutingError, match="transientBackoffSeconds"):
-        ExecutionRoutingSettings(transient_backoff_seconds=())
-    with pytest.raises(ExecutionRoutingError, match="transientBackoffSeconds"):
-        ExecutionRoutingSettings(transient_backoff_seconds=(0,))
+def test_an_unknown_route_class_is_rejected_at_construction() -> None:
+    """Class membership is the one closed set the routing model owns, so a
+    typo in a chain or a default must fail loudly at load rather than silently
+    select nothing at dispatch time."""
+    with pytest.raises(ExecutionRoutingError, match="route class"):
+        RouteChain("shallow", ())
+    with pytest.raises(ExecutionRoutingError, match="defaultClass"):
+        ExecutionRoutingSettings(default_class="shallow")
 
 
 def test_disabled_routing_blocks_without_inspecting_routes(pool_root: Path) -> None:
     settings = ExecutionRoutingSettings(
         enabled=False,
-        routes=(_subscription_route("codex-subs", "CODEX", "luna", "codex"),),
+        chains=_chains(_subscription_route("codex-subs", "CODEX", "luna", "codex"),),
     )
 
     result = select_route(settings)
@@ -473,7 +479,7 @@ def test_disabled_routing_blocks_without_inspecting_routes(pool_root: Path) -> N
 def test_settings_round_trip_never_persists_a_secret_like_value(tmp_path: Path) -> None:
     path = tmp_path / "execution_routing.json"
     settings = ExecutionRoutingSettings(
-        routes=(
+        chains=_chains(
             _subscription_route("codex-luna-subscriptions", "CODEX", "gpt-5.6-luna", "codex"),
             _metered_route("codex-metered-api", "CODEX", "gpt-5.6-luna", "codex-api"),
         ),
@@ -562,17 +568,25 @@ def test_cli_routing_validate_reports_routes_without_an_eligible_account(
     )
     ExecutionRoutingStore(routing_settings_path).save(
         ExecutionRoutingSettings(
-            routes=(_subscription_route("codex-subs", "CODEX", "luna", "codex"),)
+            chains=_chains(_subscription_route("codex-subs", "CODEX", "luna", "codex"),)
         )
     )
 
     args = cli.parser().parse_args(["--json", "routing", "validate"])
 
     assert args.func(args) == 0
-    assert json.loads(capsys.readouterr().out) == {
-        "valid": False,
-        "warnings": ["route codex-subs: no eligible account"],
-    }
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["valid"] is False
+    assert payload["warnings"] == [
+        "class standard: route codex-subs: no eligible account"
+    ]
+    assert [
+        (entry["routeClass"], entry["valid"], entry["reason"])
+        for entry in payload["classes"]
+    ] == [
+        ("standard", False, "routes_exhausted"),
+        ("deep", False, "routes_exhausted"),
+    ]
 
 
 def test_cli_routing_routes_add_list_and_explain(
@@ -643,7 +657,7 @@ def test_free_route_resolves_without_consulting_the_pool(
 
     result = select_route(
         ExecutionRoutingSettings(
-            routes=(_free_route("opencode-ox-free", "OPENCODE", OPENCODE_FREE_MODEL),)
+            chains=_chains(_free_route("opencode-ox-free", "OPENCODE", OPENCODE_FREE_MODEL),)
         )
     )
 
@@ -657,7 +671,7 @@ def test_free_route_resolves_without_consulting_the_pool(
 def test_free_route_binds_to_no_account(pool_root: Path) -> None:
     result = select_route(
         ExecutionRoutingSettings(
-            routes=(_free_route("opencode-ox-free", "OPENCODE", OPENCODE_FREE_MODEL),)
+            chains=_chains(_free_route("opencode-ox-free", "OPENCODE", OPENCODE_FREE_MODEL),)
         )
     )
 
@@ -671,7 +685,7 @@ def test_free_route_is_skipped_when_another_model_is_preferred(
 ) -> None:
     result = select_route(
         ExecutionRoutingSettings(
-            routes=(_free_route("opencode-ox-free", "OPENCODE", OPENCODE_FREE_MODEL),)
+            chains=_chains(_free_route("opencode-ox-free", "OPENCODE", OPENCODE_FREE_MODEL),)
         ),
         preferred_model="opus",
     )
@@ -694,7 +708,7 @@ def test_free_route_may_not_claim_an_account_or_pool() -> None:
 
 def test_free_route_never_warns_about_missing_accounts(pool_root: Path) -> None:
     settings = ExecutionRoutingSettings(
-        routes=(_free_route("opencode-ox-free", "OPENCODE", OPENCODE_FREE_MODEL),)
+        chains=_chains(_free_route("opencode-ox-free", "OPENCODE", OPENCODE_FREE_MODEL),)
     )
 
     assert execution_routing.route_warnings(settings) == []
@@ -704,11 +718,279 @@ def test_free_route_survives_a_store_round_trip(tmp_path: Path) -> None:
     store = ExecutionRoutingStore(tmp_path / "execution_routing.json")
     saved = store.save(
         ExecutionRoutingSettings(
-            routes=(_free_route("opencode-ox-free", "OPENCODE", OPENCODE_FREE_MODEL),)
+            chains=_chains(_free_route("opencode-ox-free", "OPENCODE", OPENCODE_FREE_MODEL),)
         )
     )
 
     assert store.load() == saved
     assert "account" not in json.loads(
         (tmp_path / "execution_routing.json").read_text(encoding="utf-8")
-    )["executionRouting"]["routes"][0]
+    )["executionRouting"]["chains"][0]["routes"][0]
+
+
+# ---------------------------------------------------------------- route classes
+
+
+def test_a_v1_flat_route_list_migrates_into_the_standard_chain(tmp_path: Path) -> None:
+    """A settings file written before route classes existed still has to load.
+
+    v1 had one ordered list and no class concept, so that list *is* the
+    standard chain - the migration is total and invents nothing. Refusing the
+    file instead would silently leave an upgraded operator with no routes at
+    all, which reads as "everything is blocked" rather than "read your config".
+    """
+    path = tmp_path / "execution_routing.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "executionRouting": {
+                    "routes": [
+                        {
+                            "id": "codex-subs",
+                            "executor": "CODEX",
+                            "model": "gpt-5.6-luna",
+                            "billingClass": "subscription",
+                            "accountPool": "codex",
+                        }
+                    ],
+                    "meteredFallback": "ask",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    settings = ExecutionRoutingStore(path).load()
+
+    assert [chain.route_class for chain in settings.chains] == ["standard"]
+    assert [route.id for route in settings.routes_for("standard")] == ["codex-subs"]
+    assert settings.metered_fallback == "ask"
+    assert settings.routes_for("deep") == ()
+
+
+def test_saving_migrated_settings_writes_the_current_version(tmp_path: Path) -> None:
+    """Migration is forward-only: once written back, the file is v2 chains and
+    the next load takes no migration path at all."""
+    path = tmp_path / "execution_routing.json"
+    path.write_text(
+        json.dumps({"version": 1, "executionRouting": {"routes": []}}), encoding="utf-8"
+    )
+    store = ExecutionRoutingStore(path)
+
+    store.save(store.load())
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["version"] == execution_routing.SETTINGS_VERSION
+    assert "routes" not in payload["executionRouting"]
+    assert payload["executionRouting"]["chains"] == []
+
+
+def test_selection_never_leaves_the_class_it_was_asked_for(
+    pool_root: Path, monkeypatch
+) -> None:
+    """The class is frozen at dispatch so every failover walks the same chain.
+
+    A selector that fell through to another class on exhaustion would quietly
+    downgrade deep work onto the standard chain - the exact decision the
+    operator made a class for.
+    """
+    pool_core.save_pool({"accounts": [_codex_account("codex-sub1")]})
+    monkeypatch.setattr(pool_core, "quota", _no_quota)
+    settings = ExecutionRoutingSettings(
+        chains=(
+            RouteChain("standard", (_subscription_route("terra", "CODEX", "terra", "codex"),)),
+            RouteChain("deep", (_subscription_route("opus", "CLAUDE_CODE", "opus", "claude"),)),
+        )
+    )
+
+    assert select_route(settings, route_class="standard").target.route_id == "terra"
+    deep = select_route(settings, route_class="deep")
+    assert deep.status == "blocked"
+    assert deep.reason == "routes_exhausted"
+
+
+def test_a_route_id_may_repeat_across_classes_but_not_within_one() -> None:
+    """Ids are chain-scoped because a class is the unit of selection: two
+    classes naming their terminal hop `sol` is ordinary, and forcing global
+    uniqueness would make one class's naming leak into the other."""
+    hop = _subscription_route("sol", "CODEX", "gpt-5.6-sol", "codex")
+    settings = ExecutionRoutingSettings(
+        chains=(RouteChain("standard", (hop,)), RouteChain("deep", (hop,)))
+    )
+    assert settings.route("deep", "sol") == hop
+
+    with pytest.raises(ExecutionRoutingError, match="unique within class"):
+        RouteChain("standard", (hop, hop))
+
+
+def test_one_class_may_hold_only_one_chain() -> None:
+    """Two chains for one class would make "which routes does standard have"
+    ambiguous, and selection would silently answer with whichever came first."""
+    hop = _subscription_route("sol", "CODEX", "gpt-5.6-sol", "codex")
+    with pytest.raises(ExecutionRoutingError, match="only one chain"):
+        ExecutionRoutingSettings(
+            chains=(RouteChain("standard", (hop,)), RouteChain("standard", ()))
+        )
+
+
+def test_class_for_reads_scope_and_risk_and_never_a_model_name() -> None:
+    """Which class a task takes is decided from its own shape - parentage and
+    fan-out - never from its execution permission or model. Model names
+    are operator data, so a policy that branched on them would break the moment
+    a chain was reconfigured."""
+    settings = ExecutionRoutingSettings()
+    deep_shape = execution_routing.ScopeRisk(top_level=True, children=4)
+
+    assert execution_routing.class_for(deep_shape, settings) == "deep"
+    # An explicit operator choice outranks the policy in both directions.
+    assert (
+        execution_routing.class_for(
+            dataclasses.replace(deep_shape, route_class="standard"), settings
+        )
+        == "standard"
+    )
+    assert (
+        execution_routing.class_for(
+            execution_routing.ScopeRisk(route_class="deep", children=0), settings
+        )
+        == "deep"
+    )
+    # A child and a manager with no children are ordinary work.
+    for ordinary in (
+        dataclasses.replace(deep_shape, top_level=False),
+        dataclasses.replace(deep_shape, children=0),
+    ):
+        assert execution_routing.class_for(ordinary, settings) == "standard"
+
+
+def test_validate_chain_fails_closed_on_an_empty_or_dead_chain(
+    pool_root: Path, monkeypatch
+) -> None:
+    """`routing validate` has to be a proof, not a warning: an unconfigured
+    class, a disabled selector, and a chain whose every account is cooled all
+    have to come back invalid, or a dispatch gated on it opens an epoch it can
+    never fill."""
+    pool_core.save_pool({"accounts": [_codex_account("codex-sub1")]})
+    monkeypatch.setattr(pool_core, "quota", _no_quota)
+    live = _subscription_route("terra", "CODEX", "terra", "codex")
+    settings = ExecutionRoutingSettings(chains=(RouteChain("standard", (live,)),))
+
+    assert execution_routing.validate_chain(settings, "standard").valid
+    assert execution_routing.validate_chain(settings, "deep").reason == "routes_exhausted"
+    assert (
+        execution_routing.validate_chain(
+            dataclasses.replace(settings, enabled=False), "standard"
+        ).reason
+        == "routing_disabled"
+    )
+
+    pool_core.set_cooldown("codex-sub1", 3600)
+    dead = execution_routing.validate_chain(settings, "standard")
+    assert dead.valid is False
+    assert any("cooling" in line for line in dead.trace)
+
+
+def test_validate_all_covers_every_class_including_unconfigured_ones(
+    pool_root: Path, monkeypatch
+) -> None:
+    """Regression guard for the check that could not see the problem it exists
+    to find: `class_for` promotes work onto `deep`, and the v1->v2 migration
+    fills only `standard`, so on every migrated install `deep` is empty. A
+    validate that iterated only the *configured* chains reported that install
+    fully valid, and the first fanning-out manager then failed to dispatch."""
+    pool_core.save_pool({"accounts": [_codex_account("codex-sub1")]})
+    monkeypatch.setattr(pool_core, "quota", _no_quota)
+    migrated = ExecutionRoutingSettings(
+        chains=_chains(_subscription_route("terra", "CODEX", "terra", "codex"))
+    )
+
+    results = execution_routing.validate_all(migrated)
+
+    assert [(r.route_class, r.valid) for r in results] == [
+        ("standard", True),
+        ("deep", False),
+    ]
+    assert [(r.route_class, r.valid) for r in execution_routing.validate_all(
+        ExecutionRoutingSettings()
+    )] == [("standard", False), ("deep", False)]
+
+
+def test_a_metered_hop_awaiting_approval_still_counts_as_a_usable_path(
+    pool_root: Path, monkeypatch
+) -> None:
+    """Approval is a human gate, not an absence of capacity. Treating it as
+    invalid would refuse dispatch for work that has somewhere to go."""
+    pool_core.save_pool({"accounts": [_codex_account("codex-api", kind="apikey")]})
+    monkeypatch.setattr(pool_core, "quota", _no_quota)
+    settings = ExecutionRoutingSettings(
+        chains=_chains(_metered_route("sol", "CODEX", "gpt-5.6-sol", "codex-api")),
+        metered_fallback="ask",
+    )
+
+    assert execution_routing.validate_chain(settings, "standard").valid
+
+
+def test_cli_routes_edits_one_class_and_leaves_the_others_alone(
+    pool_root: Path, routing_settings_path: Path, monkeypatch, capsys
+) -> None:
+    """Editing a chain must be a per-class operation. A `routes add` that
+    rewrote the whole settings object would silently drop the other class's
+    chain, which is the kind of loss an operator only discovers at dispatch.
+    """
+    pool_core.save_pool({"accounts": [_codex_account("codex-sub1")]})
+    monkeypatch.setattr(pool_core, "quota", _no_quota)
+
+    def run(*argv: str) -> object:
+        args = cli.parser().parse_args(["--json", "routing", *argv])
+        assert args.func(args) == 0
+        return json.loads(capsys.readouterr().out)
+
+    for route_class, model in (("standard", "terra"), ("deep", "opus")):
+        run(
+            "routes", "add", "--class", route_class,
+            "--id", f"{model}-hop", "--executor", "CODEX",
+            "--model", model, "--billing-class", "subscription",
+            "--account-pool", "codex",
+        )
+
+    assert [row["id"] for row in run("routes", "list")] == ["terra-hop"]
+    assert [row["id"] for row in run("routes", "list", "--class", "deep")] == [
+        "opus-hop"
+    ]
+
+    run("routes", "remove", "--class", "deep", "opus-hop")
+    assert [row["id"] for row in run("routes", "list")] == ["terra-hop"]
+    assert run("routes", "list", "--class", "deep") == []
+
+
+def test_cli_explain_narrates_the_class_chain_it_walked(
+    pool_root: Path, routing_settings_path: Path, monkeypatch, capsys
+) -> None:
+    """`explain` is the operator's answer to "why did this land here". Naming
+    the class and the chain it walked is what makes that answer complete when
+    two classes are configured."""
+    pool_core.save_pool({"accounts": [_codex_account("codex-sub1")]})
+    monkeypatch.setattr(pool_core, "quota", _no_quota)
+    ExecutionRoutingStore(routing_settings_path).save(
+        ExecutionRoutingSettings(
+            chains=(
+                RouteChain(
+                    "standard",
+                    (_subscription_route("terra", "CODEX", "terra", "codex"),),
+                ),
+                RouteChain(
+                    "deep", (_subscription_route("opus", "CODEX", "opus", "codex"),)
+                ),
+            )
+        )
+    )
+
+    args = cli.parser().parse_args(["--json", "routing", "explain", "--class", "deep"])
+    assert args.func(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["routeClass"] == "deep"
+    assert [route["id"] for route in payload["chain"]] == ["opus"]
+    assert payload["target"]["route_id"] == "opus"
+    assert payload["target"]["route_class"] == "deep"

@@ -402,6 +402,7 @@ def test_the_reconciler_does_not_manufacture_a_second_wake(tmp_path):
         "wakes_inserted": 0,
         "wakes_delivered": 0,
         "effects_expired": 0,
+        "superseded_workspaces_stopped": 0,
         # The v1.1 liveness pass rides the same tick; a repaired cohort must
         # stay a no-op for it too, not just for the cohort predicates.
         "liveness_findings": 0,

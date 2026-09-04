@@ -163,12 +163,6 @@ def test_unidentified_messages_still_dedupe_deterministically() -> None:
 
 
 def test_an_unbridged_child_is_still_reconciled_but_never_stopped(monkeypatch) -> None:
-    """Why: an unbridged child still needs its parent notified and its quota
-    failure reconciled - that half is unchanged. What it must NOT get is the
-    old "stall recovery": a wall-clock reaper that stopped a running execution
-    from inside the same tick as the wake-only detector. A per-tick failure in
-    one session must also not stop the tick from finishing the others."""
-
     class StallClient(FakeClient):
         def __init__(self):
             super().__init__()
@@ -203,12 +197,13 @@ def test_an_unbridged_child_is_still_reconciled_but_never_stopped(monkeypatch) -
     supervisor = BridgeSupervisor(client, "ws://127.0.0.1:8377/ws")
     reconciled = []
 
-    def reconcile_quota_failure(session_id):
+    def reconcile_provider_outcome(session_id):
         reconciled.append(session_id)
         if len(reconciled) == 1:
             raise PoolError("pool state unavailable")
 
-    supervisor.managed_tasks.reconcile_quota_failure = reconcile_quota_failure
+    supervisor.managed_tasks.reconcile_provider_outcome = reconcile_provider_outcome
+    supervisor.managed_tasks.reconcile_provider_outcomes = lambda: []
     monkeypatch.setattr(bridge_module, "enabled_workspaces", lambda: set())
     monkeypatch.setattr(
         bridge_module.leases, "sync_active_workspaces", lambda *_args, **_kwargs: []
@@ -219,9 +214,6 @@ def test_an_unbridged_child_is_still_reconciled_but_never_stopped(monkeypatch) -
 
     assert client.stopped == []
     assert client.execution_processes("child")[0]["status"] == "running"
-    # No terminal notification either: the only reason the parent used to hear
-    # about this child was the kernel's own kill, reported back as the child's
-    # death. A healthy running child is not news.
     assert client.sent == []
     assert reconciled == ["child", "child"]
     assert supervisor.tasks == {}

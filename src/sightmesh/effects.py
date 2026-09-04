@@ -19,7 +19,7 @@ import logging
 import sqlite3
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -80,6 +80,9 @@ class Effect:
     outcome: str | None
     owner_instance: str
     lease_expires_at: float
+    #: Provider-advertised reset for a capacity outcome, when one was sent.
+    #: Absent for every other outcome, and never inferred.
+    retry_at: float | None = None
 
 
 class EffectJournal:
@@ -184,15 +187,133 @@ class EffectJournal:
             frozenset({"reserved", "launched"}),
         )
 
-    def mark_terminal(self, task_id: str, epoch: int, outcome: str) -> Effect:
-        """Record the typed outcome; the first terminal write wins."""
+    def mark_terminal(
+        self,
+        task_id: str,
+        epoch: int,
+        outcome: str,
+        retry_at: float | None = None,
+    ) -> Effect:
+        """Record the typed outcome; the first terminal write wins.
+
+        ``retry_at`` is written alongside it so a later reconcile can cool the
+        exhausted account until the provider's own reset without having to
+        re-derive it from anything.
+        """
         return self._advance(
             task_id,
             epoch,
-            "state = 'terminal', outcome = ?",
-            (str(outcome),),
+            "state = 'terminal', outcome = ?, retry_at = ?",
+            (str(outcome), None if retry_at is None else float(retry_at)),
             frozenset({"reserved", "launched"}),
         )
+
+    def mark_superseded(
+        self, task_id: str, epoch: int, workspace_id: str
+    ) -> Effect:
+        """Persist the native workspace that a newer task decision invalidated.
+
+        The terminal row is the cleanup intent.  It is written before the
+        stop so the reconciler can repeat a failed stop without guessing which
+        workspace the old launch created.
+        """
+        return self._advance(
+            task_id,
+            epoch,
+            "state = 'terminal', workspace_id = ?, outcome = 'superseded'",
+            (str(workspace_id),),
+            frozenset({"reserved", "launched"}),
+        )
+
+    def stop_superseded(self, client: Any, effect: Effect) -> None:
+        """Complete one durable superseded-workspace cleanup intent.
+
+        Clearing the workspace id only after a successful, idempotent stop
+        makes a transport failure retryable on the ordinary reconcile pass.
+        """
+        if effect.outcome != "superseded" or not effect.workspace_id:
+            return
+        client.stop_workspace(effect.workspace_id)
+        try:
+            with self.store.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE task_effects SET workspace_id = NULL, updated_at = ? "
+                    "WHERE task_id = ? AND epoch = ? AND state = 'terminal' "
+                    "AND outcome = 'superseded' AND workspace_id = ?",
+                    (
+                        time.time(),
+                        effect.task_id,
+                        effect.epoch,
+                        effect.workspace_id,
+                    ),
+                )
+                conn.execute("COMMIT")
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(
+                f"Cannot acknowledge superseded workspace stop: {exc}"
+            ) from exc
+
+    def reconcile_superseded(self, client: Any | None) -> int:
+        """Retry each recorded superseded-workspace stop exactly until it lands."""
+        if client is None:
+            return 0
+        try:
+            with self.store.connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM task_effects WHERE state = 'terminal' "
+                    "AND outcome = 'superseded' AND workspace_id IS NOT NULL"
+                ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(
+                f"Cannot read superseded workspace cleanup: {exc}"
+            ) from exc
+
+        stopped = 0
+        for row in rows:
+            effect = _decode(row)
+            try:
+                self.stop_superseded(client, effect)
+            except Exception as exc:  # noqa: BLE001 - retry from the durable intent
+                LOGGER.info(
+                    "Leaving superseded workspace %s for retry: %s",
+                    effect.workspace_id,
+                    exc,
+                )
+            else:
+                stopped += 1
+        return stopped
+
+    def with_outcomes(self, outcomes: Collection[str]) -> list[Effect]:
+        """Current-epoch effects that ended on one of these typed outcomes.
+
+        Joined against the task's own epoch so a superseded epoch's outcome can
+        never re-trigger the reconcile that already advanced past it, and
+        restricted to tasks that can still move: a completed or cancelled task
+        has nothing left to reroute, and neither has one whose attempt circuit
+        breaker has tripped - a terminal effect stays visible forever, so
+        without that bound the sweep would re-attempt a doomed replacement on
+        every tick for the life of the task.
+        """
+        if not outcomes:
+            return []
+        wanted = sorted(str(outcome) for outcome in outcomes)
+        placeholders = ", ".join("?" for _ in wanted)
+        try:
+            with self.store.connect() as conn:
+                rows = conn.execute(
+                    "SELECT e.* FROM task_effects AS e "
+                    "JOIN managed_tasks AS t "
+                    "  ON t.task_id = e.task_id AND t.epoch = e.epoch "
+                    f"WHERE e.state = 'terminal' AND e.outcome IN ({placeholders}) "
+                    "AND t.state IN ('active', 'blocked') "
+                    "AND t.attempts < t.max_attempts "
+                    "ORDER BY e.updated_at",
+                    tuple(wanted),
+                ).fetchall()
+            return [_decode(row) for row in rows]
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(f"Cannot read task effects: {exc}") from exc
 
     def get(self, task_id: str, epoch: int) -> Effect | None:
         try:
@@ -230,8 +351,53 @@ class EffectJournal:
 
         lost: list[Effect] = []
         for task_id, epoch in candidates:
+            superseded: Effect | None = None
             try:
-                native = self._native_effect(client, task_id, epoch)
+                with self.store.task_lock(task_id) as fence:
+                    current = self.store.get_by_id(task_id)
+                    if current is None:
+                        retired = self._retire_reservation(task_id, epoch, moment)
+                        if retired is not None:
+                            lost.append(retired)
+                        continue
+                    if current.epoch != epoch:
+                        continue
+                    version = current.version
+                    with fence.external_io():
+                        native = self._native_effect(client, task_id, epoch)
+                    current = self.store.get_by_id(task_id)
+                    if (
+                        current is None
+                        or current.epoch != epoch
+                        or current.version != version
+                    ):
+                        if native and native.get("workspace_id"):
+                            superseded = self.mark_superseded(
+                                task_id, epoch, str(native["workspace_id"])
+                            )
+                    elif native is not None:
+                        workspace_id = native.get("workspace_id")
+                        session_id = native.get("session_id")
+                        if (
+                            native.get("state") == "active"
+                            and workspace_id
+                            and session_id
+                        ):
+                            # Native is live behind the lease: adopt it rather than
+                            # orphan the running session.
+                            self.mark_launched(
+                                task_id, epoch, str(workspace_id), str(session_id)
+                            )
+                            self.store.activate(
+                                task_id,
+                                workspace_id=str(workspace_id),
+                                session_id=str(session_id),
+                                fence=fence,
+                            )
+                            continue
+                    retired = self._retire_reservation(task_id, epoch, moment)
+                    if retired is not None:
+                        lost.append(retired)
             except _UnknowableEffect as exc:
                 # The executor could not answer. Leave the reservation intact
                 # for the next tick rather than orphan a possibly-live session.
@@ -241,29 +407,6 @@ class EffectJournal:
                     epoch,
                     exc,
                 )
-                continue
-            # Each candidate settles in its own try/except: one row that moved
-            # out from under the sweep (a racing terminal or a task that left
-            # ACTIVATE_PREDECESSORS mid-adopt) must never skip the rest.
-            try:
-                if native is not None:
-                    workspace_id = native.get("workspace_id")
-                    session_id = native.get("session_id")
-                    if native.get("state") == "active" and workspace_id and session_id:
-                        # Native is live behind the lease: adopt it rather than
-                        # orphan the running session.
-                        self.mark_launched(
-                            task_id, epoch, str(workspace_id), str(session_id)
-                        )
-                        self.store.activate(
-                            task_id,
-                            workspace_id=str(workspace_id),
-                            session_id=str(session_id),
-                        )
-                        continue
-                retired = self._retire_reservation(task_id, epoch, moment)
-                if retired is not None:
-                    lost.append(retired)
             except TaskStoreError as exc:
                 LOGGER.info(
                     "Skipping expired reservation %s/%s this tick: %s",
@@ -272,6 +415,15 @@ class EffectJournal:
                     exc,
                 )
                 continue
+            if superseded is not None:
+                try:
+                    self.stop_superseded(client, superseded)
+                except Exception as exc:  # noqa: BLE001 - reconciler owns retry
+                    LOGGER.info(
+                        "Leaving superseded workspace %s for retry: %s",
+                        superseded.workspace_id,
+                        exc,
+                    )
         return lost
 
     @staticmethod
@@ -318,7 +470,9 @@ class EffectJournal:
                     "AND state = 'reserved' AND lease_expires_at < ?",
                     ("lost:reservation-expired", moment, task_id, epoch, moment),
                 )
-                effect = self._require(conn, task_id, epoch) if cursor.rowcount else None
+                effect = (
+                    self._require(conn, task_id, epoch) if cursor.rowcount else None
+                )
                 conn.execute("COMMIT")
                 return effect
         except TaskStoreError:
@@ -398,6 +552,7 @@ def _decode(row: sqlite3.Row) -> Effect:
             outcome=row["outcome"],
             owner_instance=str(row["owner_instance"]),
             lease_expires_at=float(row["lease_expires_at"]),
+            retry_at=(float(row["retry_at"]) if row["retry_at"] is not None else None),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise TaskStoreError(f"Corrupt task effect record: {exc}") from exc

@@ -12,6 +12,7 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
 
+from .fence import open_transport
 from .service_process import MAX_LOG_ENV, max_log_bytes
 from .stall_settings import THRESHOLD_ENV, threshold_minutes
 
@@ -116,7 +117,9 @@ def _service_target(label: str = LABEL) -> str:
 
 def is_healthy(port: int = DEFAULT_PORT) -> bool:
     try:
-        with urlopen(f"{service_url(port)}/api/health", timeout=1) as response:
+        with open_transport(
+            urlopen, f"{service_url(port)}/api/health", timeout=1
+        ) as response:
             return response.status == 200
     except (OSError, URLError):
         return False

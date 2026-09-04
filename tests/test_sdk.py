@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import random
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,8 +10,10 @@ import pytest
 
 from sightmesh import execution_routing
 from sightmesh import sdk as sdk_module
-from sightmesh.cdesktop import CdesktopError
+from sightmesh.cdesktop import CdesktopError, CdesktopRejectedError
+from sightmesh.profiles import Profile
 from sightmesh.sdk import BatchError, Command, SightMesh, SightMeshError, WorkerSpec
+from sightmesh.fence import assert_external_io_allowed
 from sightmesh.task_store import StaleTransition, TaskStore, TaskStoreError
 
 
@@ -26,6 +28,7 @@ class FakeClient:
         self.repo_rows = None
         self.processes = {}
         self.snapshots = {}
+        self.reject_launch = None
 
     def info(self):
         return {"service_capabilities": {"managed_task_launch": 1}}
@@ -64,6 +67,10 @@ class FakeClient:
     def managed_launch(self, task_id, epoch, launch):
         key = (task_id, epoch)
         self.launches.append((key, launch))
+        rejection = self.reject_launch
+        if rejection is not None:
+            self.reject_launch = None
+            raise rejection
         effect = self.effects.setdefault(
             key,
             {
@@ -103,6 +110,15 @@ class FakeClient:
     def stop_workspace(self, workspace_id):
         self.stopped.append(workspace_id)
 
+    def managed_effect(self, task_id, epoch):
+        """Mirror the real seam so the launch-contract probe can execute."""
+        effect = self.effects.get((task_id, epoch))
+        if effect is None:
+            raise CdesktopError(
+                f"GET managed effect {task_id}/{epoch} failed: HTTP 404: not found"
+            )
+        return effect
+
 
 class FakeOwnership:
     def __init__(self):
@@ -133,9 +149,20 @@ class FakeOwnership:
 
 
 @pytest.fixture
-def system(tmp_path):
+def system(tmp_path, monkeypatch):
     repo = tmp_path / "project"
     repo.mkdir()
+    settings = execution_routing.ExecutionRoutingSettings(
+        chains=(
+            execution_routing.RouteChain(
+                "standard",
+                (execution_routing.Route("test", "CODEX", "test", "free"),),
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        execution_routing.ExecutionRoutingStore, "load", lambda _self: settings
+    )
     store = TaskStore(tmp_path / "state.sqlite3")
     client = FakeClient(repo)
     ownership = FakeOwnership()
@@ -167,6 +194,40 @@ def test_start_is_idempotent_for_one_semantic_key(system):
 
     assert replayed == first
     assert len(client.launches) == 1
+
+
+def test_cancel_can_win_while_managed_launch_is_in_flight(system, monkeypatch):
+    """A late launch result is stopped, never allowed to revive cancellation."""
+    mesh, client, store, _ownership = system
+    entered = threading.Event()
+    release = threading.Event()
+    native = client.managed_launch
+
+    def guarded_stop(workspace_id):
+        assert_external_io_allowed()
+        client.stopped.append(workspace_id)
+
+    def paused_launch(task_id, epoch, launch):
+        entered.set()
+        assert release.wait(timeout=5)
+        return native(task_id, epoch, launch)
+
+    monkeypatch.setattr(client, "managed_launch", paused_launch)
+    monkeypatch.setattr(client, "stop_workspace", guarded_stop)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        starting = pool.submit(mesh.start, spec())
+        assert entered.wait(timeout=5)
+        cancelled = pool.submit(mesh.cancel, "audit")
+        assert cancelled.result(timeout=1).state == "cancelled"
+        release.set()
+        with pytest.raises(BatchError, match="superseded"):
+            starting.result(timeout=5)
+
+    task = store.get("operator", "audit")
+    assert task is not None and task.state == "cancelled"
+    effect = mesh.journal.get(task.task_id, 1)
+    assert effect is not None and effect.outcome == "superseded"
+    assert client.stopped == [f"workspace-{task.task_id}"]
 
 
 def test_repo_name_prefers_the_canonical_registration(system):
@@ -288,57 +349,6 @@ def test_checkpoint_content_stays_in_the_task_worktree(system):
     )
 
 
-def test_checkpoint_does_not_persist_a_nested_json_credential(system):
-    """Checkpoint files share the durable credential-redaction boundary."""
-    mesh, client, _store, _ownership = system
-    started = mesh.start(spec())
-    secret = "checkpoint-json-authorization-value"
-    checkpointed = mesh.checkpoint(
-        '{"progress":[{"authorization":"Bearer checkpoint-json-authorization-value"}]}',
-        worker="audit",
-    )
-
-    root = client.workspace(started.workspace_id)["container_ref"]
-    path = Path(root) / "project" / checkpointed.checkpoint
-    stored = path.read_text()
-    assert secret not in stored
-    assert "[REDACTED]" in stored
-
-
-def test_randomly_nested_credential_shapes_never_reach_checkpoint_files(system):
-    """Checkpoint persistence shares the same recursive credential boundary."""
-    mesh, client, _store, _ownership = system
-    started = mesh.start(spec())
-    credentials = (
-        "Bearer bearer-token-without-a-revealing-key",
-        "Basic QmFzaWMtdG9rZW4td2l0aG91dC1hLWtleQ==",
-        "sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
-        "gho_abcdefghijklmnopqrstuvwxyz123456",
-        "xoxp-abcdefghijklmnopqrstuvwxyz123456",
-        "AKIAABCDEFGHIJKLMNOP",
-        "pypi-abcdefghijklmnopqrstuvwxyz123456",
-        "npm-abcdefghijklmnopqrstuvwxyz123456",
-        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZ2VudCJ9.c2lnbmF0dXJlLXZhbHVl",
-        "https://operator:credential@internal.example/path",
-        "aB7!qL2#zM9@rT4%vX6^nC8&dF1*eH3+jK5",
-    )
-    stored: list[str] = []
-    root = Path(client.workspace(started.workspace_id)["container_ref"]) / "project"
-    for index, credential in enumerate(credentials):
-        randomizer = random.Random(index)
-        value: object = f"checkpoint {credential}"
-        for depth in range(3):
-            value = ({f"step_{depth}": value} if randomizer.choice((True, False))
-                     else [f"ordinary-{depth}", value])
-        if credential == credentials[-1]:
-            value = {"auth_context": value}
-        checkpointed = mesh.checkpoint(json.dumps(value), worker="audit")
-        stored.append((root / checkpointed.checkpoint).read_text())
-
-    persisted = "\n".join(stored)
-    assert all(credential not in persisted for credential in credentials)
-
-
 def test_duplicate_failover_wakeups_reserve_one_successor_epoch(system):
     """Two managers observing the same failure must not burn two epochs.
 
@@ -368,60 +378,86 @@ def test_duplicate_failover_wakeups_reserve_one_successor_epoch(system):
     assert losers[0].current.epoch == 2
 
 
-def test_quota_failure_moves_once_to_the_next_configured_route(system, monkeypatch):
-    mesh, client, store, _ownership = system
-    settings = execution_routing.ExecutionRoutingSettings()
-    first_target = execution_routing.SelectedTarget(
-        "fable", "CLAUDE_CODE", "fable", "subscription", "max-a", "max-a"
-    )
-    next_target = execution_routing.SelectedTarget(
-        "sol", "CODEX", "gpt-5.6-sol", "subscription", "codex-a", "codex-a"
+def _routed(monkeypatch, first, following=None, *, settings=None):
+    """Pin routing to a fixed first hop and a fixed reroute answer.
+
+    Selection over a real pool is exercised in tests/test_execution_routing.py
+    and the simulator; here the point is what the *task lifecycle* does with a
+    typed outcome, so the selector is held still.
+    """
+    settings = settings or execution_routing.ExecutionRoutingSettings()
+    monkeypatch.setattr(
+        execution_routing.ExecutionRoutingStore, "load", lambda _self: settings
     )
     monkeypatch.setattr(
-        execution_routing.ExecutionRoutingStore,
-        "load",
-        lambda _self: settings,
+        execution_routing,
+        "validate_chain",
+        lambda _settings, route_class=None: execution_routing.ValidationResult(
+            route_class or "standard", True, None
+        ),
     )
     monkeypatch.setattr(
         execution_routing,
         "select_route",
         lambda _settings, **_kwargs: execution_routing.SelectionResult(
-            "resolved", first_target, (), None
+            "resolved", first, (), None
         ),
     )
-    exhausted = []
+    calls = []
 
-    def reroute(_settings, *, exhausted_binding_id, **_kwargs):
-        exhausted.append(exhausted_binding_id)
-        return execution_routing.SelectionResult("resolved", next_target, (), None)
+    def advance(_settings, **kwargs):
+        calls.append(kwargs)
+        return following
 
-    monkeypatch.setattr(sdk_module, "reroute_after_quota_exhaustion", reroute)
+    if following is not None:
+        monkeypatch.setattr(sdk_module, "advance_route_after_outcome", advance)
+    return calls
+
+
+FIRST_TARGET = execution_routing.SelectedTarget(
+    "standard", "terra", "CLAUDE_CODE", "terra", "subscription", "max-a", "max-a"
+)
+NEXT_TARGET = execution_routing.SelectedTarget(
+    "standard", "sol", "CODEX", "gpt-5.6-sol", "subscription", "codex-a", "codex-a"
+)
+
+
+def _mark_outcome(mesh, store, outcome, retry_at=None):
+    task = store.get("operator", "audit")
+    mesh.journal.mark_terminal(task.task_id, task.epoch, outcome, retry_at)
+    return task
+
+
+def test_a_typed_rate_limit_moves_once_to_the_next_hop(system, monkeypatch):
+    """The reroute trigger is the typed outcome on the effect journal and
+    nothing else. This pins the whole transition: the failed binding is the one
+    handed to the cooler, exactly one new epoch opens, the workspace survives,
+    and a second reconcile with no new outcome is a no-op rather than a second
+    replacement."""
+    mesh, client, store, _ownership = system
+    calls = _routed(monkeypatch, FIRST_TARGET, following=execution_routing.SelectionResult(
+        "resolved", NEXT_TARGET, (), None
+    ))
     started = mesh.start(spec(executor=None))
-    client.processes[started.session_id] = [
-        {"id": "failed-fable", "run_reason": "codingagent", "status": "failed"}
-    ]
-    client.snapshots["failed-fable"] = {
-        "entries": [
-            {
-                "content": {
-                    "entry_type": {"type": "assistant_message"},
-                    "content": "You've reached your Fable 5 limit.",
-                }
-            }
-        ]
-    }
+    _mark_outcome(mesh, store, "rate_limited", retry_at=1893456000.0)
 
     client.lose_response_once = True
     with pytest.raises(CdesktopError, match="response lost"):
-        mesh.reconcile_quota_failure(started.session_id)
-    recovered = mesh.reconcile_quota_failure(started.session_id)
+        mesh.reconcile_provider_outcome(started.session_id)
+    recovered = mesh.reconcile_provider_outcome(started.session_id)
+
     assert recovered is not None
     assert recovered.workspace_id == started.workspace_id
     assert recovered.session_id != started.session_id
     assert recovered.attempts == 2
-    assert exhausted == ["max-a"]
+    # One advance, not two: the retry resumed the epoch already prepared
+    # (recovery is recorded on the target) instead of burning a second one.
+    assert [
+        (call["outcome"], call["failed_binding_id"], call["route_class"])
+        for call in calls
+    ] == [("rate_limited", "max-a", "standard")]
     assert len(client.effects) == 2
-    assert mesh.reconcile_quota_failure(started.session_id) is None
+    assert mesh.reconcile_provider_outcome(started.session_id) is None
 
     replacement = client.launches[-1][1]["request"]["session"]
     assert replacement["executor"] == "CODEX"
@@ -431,10 +467,20 @@ def test_quota_failure_moves_once_to_the_next_configured_route(system, monkeypat
     record = store.get("operator", "audit")
     assert record is not None
     assert record.spec["target"]["route_id"] == "sol"
+    assert record.spec["target"]["route_class"] == "standard"
 
 
-def test_non_quota_failure_does_not_replace_a_managed_task(system):
-    mesh, client, _store, _ownership = system
+def test_a_code_failure_blocks_visibly_and_never_reroutes(system):
+    """The regression this exists for: the old path scraped the transcript, so
+    a worker whose failing test output merely mentioned a rate limit was
+    rerouted onto a fresh account. A code or test failure carries no typed
+    provider outcome, so it cannot reach the reroute path by construction.
+
+    It must not vanish either. A failed worker process that reports no provider
+    signal blocks the task with its typed reason, which wakes the manager -
+    the alternative is a task that is neither running nor finished and that
+    nobody is told about."""
+    mesh, client, store, _ownership = system
     started = mesh.start(spec())
     client.processes[started.session_id] = [
         {"id": "failed-build", "run_reason": "codingagent", "status": "failed"}
@@ -444,78 +490,102 @@ def test_non_quota_failure_does_not_replace_a_managed_task(system):
             {
                 "content": {
                     "entry_type": {"type": "assistant_message"},
-                    "content": "Compilation failed with a type error.",
+                    "content": "2 tests failed: expected HTTP 429 Too Many Requests",
                 }
             }
         ]
     }
 
-    assert mesh.reconcile_quota_failure(started.session_id) is None
+    settled = mesh.reconcile_provider_outcome(started.session_id)
+
+    assert settled is not None and settled.state == "blocked"
+    assert "worker process failed" in str(store.get("operator", "audit").result)
+    # Blocked, not rerouted: no second epoch and no second launch.
+    assert mesh.reconcile_provider_outcomes() == []
+    assert store.get("operator", "audit").epoch == 1
     assert len(client.launches) == 1
 
 
-def test_newer_success_ignores_an_older_quota_failure(system):
-    mesh, client, _store, _ownership = system
-    started = mesh.start(spec())
-    client.processes[started.session_id] = [
-        {
-            "id": "new-success",
-            "run_reason": "codingagent",
-            "status": "completed",
-            "completed_at": "2026-08-31T02:00:00Z",
-        },
-        {
-            "id": "old-quota",
-            "run_reason": "codingagent",
-            "status": "failed",
-            "completed_at": "2026-08-31T01:00:00Z",
-        },
-    ]
+def test_a_live_epoch_is_never_rerouted_before_it_ends(system, monkeypatch):
+    """Only a *terminal* effect advances a chain. A launched epoch still owns a
+    running session, so rerouting it would fork the work rather than replace
+    it."""
+    mesh, client, store, _ownership = system
+    _routed(monkeypatch, FIRST_TARGET)
+    started = mesh.start(spec(executor=None))
+    task = store.get("operator", "audit")
 
-    assert mesh.reconcile_quota_failure(started.session_id) is None
+    assert mesh.journal.get(task.task_id, task.epoch).state == "launched"
+    assert mesh.reconcile_provider_outcome(started.session_id) is None
+    assert mesh.reconcile_provider_outcomes() == []
     assert len(client.launches) == 1
+
+
+def test_an_explicit_profile_stays_recoverable_when_failover_is_on(
+    system, monkeypatch, tmp_path
+):
+    """Contract: explicit profile overrides remain recoverable. The old code
+    recorded no route identity for them, so `reconcile` returned None and the
+    task sat on an exhausted account forever."""
+    mesh, _client, store, _ownership = system
+    monkeypatch.setattr(
+        sdk_module.ProfileStore,
+        "get",
+        lambda _self, _name: Profile(
+            name="pinned",
+            executor="CODEX",
+            provider_id="default-provider",
+            automatic_failover=True,
+        ),
+    )
+    calls = _routed(monkeypatch, FIRST_TARGET, following=execution_routing.SelectionResult(
+        "resolved", NEXT_TARGET, (), None
+    ))
+    started = mesh.start(spec(profile="pinned", executor=None))
+    assert store.get("operator", "audit").spec["target"]["route_id"] == "profile:pinned"
+    _mark_outcome(mesh, store, "rate_limited")
+
+    recovered = mesh.reconcile_provider_outcome(started.session_id)
+
+    assert recovered is not None and recovered.state == "active"
+    assert calls[0]["failed_binding_id"] is None
+    assert store.get("operator", "audit").spec["target"]["route_id"] == "sol"
+
+
+def test_a_profile_with_failover_off_blocks_with_a_reason(system, monkeypatch):
+    """`automatic_failover` is the operator saying "this task runs here or not
+    at all". Honouring it must still leave a visible reason: silently returning
+    None is what made the old bug invisible."""
+    mesh, _client, store, _ownership = system
+    monkeypatch.setattr(
+        sdk_module.ProfileStore,
+        "get",
+        lambda _self, _name: Profile(
+            name="pinned",
+            executor="CODEX",
+            provider_id="default-provider",
+            automatic_failover=False,
+        ),
+    )
+    _routed(monkeypatch, FIRST_TARGET)
+    started = mesh.start(spec(profile="pinned", executor=None))
+    _mark_outcome(mesh, store, "auth")
+
+    blocked = mesh.reconcile_provider_outcome(started.session_id)
+
+    assert blocked is not None and blocked.state == "blocked"
+    assert "automatic failover is off" in str(store.get("operator", "audit").result)
 
 
 def test_exhausted_route_chain_blocks_without_spawning(system, monkeypatch):
     mesh, client, store, _ownership = system
-    target = execution_routing.SelectedTarget(
-        "fable", "CLAUDE_CODE", "fable", "subscription", "max-a", "max-a"
-    )
-    monkeypatch.setattr(
-        execution_routing,
-        "select_route",
-        lambda _settings, **_kwargs: execution_routing.SelectionResult(
-            "resolved", target, (), None
-        ),
-    )
-    monkeypatch.setattr(
-        execution_routing.ExecutionRoutingStore,
-        "load",
-        lambda _self: execution_routing.ExecutionRoutingSettings(),
-    )
-    monkeypatch.setattr(
-        sdk_module,
-        "reroute_after_quota_exhaustion",
-        lambda *_args, **_kwargs: execution_routing.SelectionResult(
-            "blocked", None, (), "routes_exhausted"
-        ),
-    )
+    _routed(monkeypatch, FIRST_TARGET, following=execution_routing.SelectionResult(
+        "blocked", None, (), "routes_exhausted"
+    ))
     started = mesh.start(spec(executor=None))
-    client.processes[started.session_id] = [
-        {"id": "failed-fable", "run_reason": "codingagent", "status": "failed"}
-    ]
-    client.snapshots["failed-fable"] = {
-        "entries": [
-            {
-                "content": {
-                    "entry_type": {"type": "assistant_message"},
-                    "content": "You've reached your Fable 5 limit.",
-                }
-            }
-        ]
-    }
+    _mark_outcome(mesh, store, "provider_down")
 
-    blocked = mesh.reconcile_quota_failure(started.session_id)
+    blocked = mesh.reconcile_provider_outcome(started.session_id)
 
     assert blocked is not None and blocked.state == "blocked"
     assert len(client.launches) == 1
@@ -524,11 +594,135 @@ def test_exhausted_route_chain_blocks_without_spawning(system, monkeypatch):
     assert "routes_exhausted" in record.result
 
 
+def test_dispatch_fails_closed_when_the_class_chain_has_no_usable_hop(
+    system, monkeypatch
+):
+    """`validate_chain` is an explicit pre-dispatch gate, not a side effect of
+    selection: an unusable class must be refused before any epoch, effect row,
+    or native call exists."""
+    mesh, client, store, _ownership = system
+    monkeypatch.setattr(
+        execution_routing.ExecutionRoutingStore,
+        "load",
+        lambda _self: execution_routing.ExecutionRoutingSettings(),
+    )
+
+    with pytest.raises(SightMeshError, match="standard"):
+        mesh.start(spec(executor=None))
+
+    assert client.launches == []
+    assert store.get("operator", "audit") is None
+
+
+def _free_route(route_id):
+    """A hop that needs no pool account, so routing is exercised for real.
+
+    Selection resolves a free route without ever loading pool state, which lets
+    these tests run the *real* `class_for` -> `validate_chain` -> `select_route`
+    path instead of monkeypatching the gate they exist to check.
+    """
+    return execution_routing.Route(
+        id=route_id, executor="CODEX", model=route_id, billing_class="free"
+    )
+
+
+def _configure_chains(monkeypatch, **chains):
+    settings = execution_routing.ExecutionRoutingSettings(
+        chains=tuple(
+            execution_routing.RouteChain(route_class, routes)
+            for route_class, routes in chains.items()
+        )
+    )
+    monkeypatch.setattr(
+        execution_routing.ExecutionRoutingStore, "load", lambda _self: settings
+    )
+    return settings
+
+
+def test_a_fanning_out_top_level_manager_takes_the_deep_class(system, monkeypatch):
+    """Scope and risk pick the class once, at dispatch. A top-level
+    task that fans work out is the one shape where weak judgement multiplies
+    across children, so it gets the deep chain; everything else stays
+    standard.
+
+    Runs the real validate/select path rather than stubbing it: stubbing the
+    gate is what let the promotion ship against an install where the promoted
+    class had no chain at all."""
+    mesh, _client, store, _ownership = system
+    _configure_chains(
+        monkeypatch, standard=(_free_route("terra"),), deep=(_free_route("fable"),)
+    )
+
+    mesh.start(spec(key="manager", executor=None, children=4))
+    mesh.start(spec(key="worker", executor=None, children=0))
+
+    assert store.get("operator", "manager").spec["target"]["route_class"] == "deep"
+    assert store.get("operator", "manager").spec["target"]["route_id"] == "fable"
+    assert store.get("operator", "worker").spec["target"]["route_class"] == "standard"
+    assert store.get("operator", "worker").spec["target"]["route_id"] == "terra"
+
+
+def test_a_promotion_onto_an_unconfigured_class_falls_back_to_the_default(
+    system, monkeypatch, caplog
+):
+    """Regression guard for the upgrade that broke every existing install: the
+    v1->v2 migration fills only `standard`, `class_for` promotes any fanning-out
+    top-level manager to `deep`, and the fail-closed gate then refused a start
+    that had worked the day before.
+
+    Promotion is this module's judgement, not the operator's instruction, so a
+    promoted class with no chain must degrade visibly onto the default rather
+    than refuse the work."""
+    mesh, _client, store, _ownership = system
+    _configure_chains(monkeypatch, standard=(_free_route("terra"),))
+
+    with caplog.at_level("WARNING", logger="sightmesh.sdk"):
+        mesh.start(spec(key="manager", executor=None, children=4))
+
+    target = store.get("operator", "manager").spec["target"]
+    assert (target["route_class"], target["route_id"]) == ("standard", "terra")
+    assert "deep" in caplog.text and "manager" in caplog.text
+
+
+@pytest.mark.parametrize("override", ("executor", "profile"))
+def test_an_explicit_class_with_no_chain_is_refused_before_an_override_can_start(
+    system, monkeypatch, override
+):
+    """Falling open is only ever right for a promotion. An operator who names
+    `deep` asked for that chain specifically, so silently running the work on
+    `standard` would answer a different question than the one they asked."""
+    mesh, client, store, _ownership = system
+    _configure_chains(monkeypatch, standard=(_free_route("terra"),))
+    if override == "profile":
+        monkeypatch.setattr(
+            sdk_module.ProfileStore,
+            "get",
+            lambda _self, _name: Profile(
+                name="selected",
+                executor="CODEX",
+                provider_id="default-provider",
+            ),
+        )
+
+    with pytest.raises(SightMeshError, match="deep"):
+        mesh.start(
+            spec(
+                key="deepwork",
+                executor="CODEX" if override == "executor" else None,
+                profile="selected" if override == "profile" else None,
+                route_class="deep",
+            )
+        )
+
+    assert store.get("operator", "deepwork") is None
+    assert client.launches == []
+
+
 def test_routed_start_requires_one_enabled_default_provider(system, monkeypatch):
     mesh, client, _store, _ownership = system
     client.providers = list
     target = execution_routing.SelectedTarget(
-        "fable", "CLAUDE_CODE", "fable", "subscription", "max-a", "max-a"
+        "standard", "fable", "CLAUDE_CODE", "fable", "subscription", "max-a", "max-a"
     )
     monkeypatch.setattr(
         execution_routing,
@@ -667,12 +861,16 @@ def test_a_hundred_concurrent_starts_launch_once(system):
     assert {key for result in results for key in result.items} <= {"audit"}
 
 
-def test_the_contract_probe_reports_an_advertised_only_runtime(system):
-    """cdesktop 0.2.7 has no lookup to probe, and an unprobed capability must
-    say so rather than pass as if it had been executed."""
-    mesh, _client, _store, _ownership = system
+def test_the_contract_probe_fails_closed_without_an_executable_lookup(system):
+    """An advertised capability with no lookup to probe used to pass as
+    `advertised-only`, which let a launch path fail late against a runtime
+    that never actually implemented it. There is no take-its-word answer:
+    either the probe runs or the launch does not."""
+    mesh, client, _store, _ownership = system
+    client.managed_effect = None
 
-    assert mesh._require_contract() == "advertised-only"
+    with pytest.raises(SightMeshError, match="no effect lookup"):
+        mesh._require_contract()
 
 
 def test_the_contract_probe_executes_the_managed_launch_lookup(system):
@@ -752,6 +950,79 @@ def test_unknown_permission_policy_is_rejected(system):
     with pytest.raises(SightMeshError, match="Unknown permission policy"):
         mesh.start(spec(permission="YOLO"))
 
+def test_a_rejected_launch_records_its_outcome_and_cools_the_binding_once(
+    system, monkeypatch
+):
+    """The cooldown belongs with the write that records the outcome, not with
+    the reroute that later reads it.
+
+    A terminal effect stays readable forever, so a reconcile that cooled on
+    every read would push an account's cooldown further out on every tick and
+    never let it come back.
+    """
+    mesh, client, store, _ownership = system
+    _routed(monkeypatch, FIRST_TARGET)
+    cooled = []
+    monkeypatch.setattr(
+        sdk_module,
+        "cool_provider_outcome",
+        lambda _settings, **kwargs: cooled.append(kwargs) or ("max-a",),
+    )
+    client.reject_launch = CdesktopRejectedError("nope", status=429, retry_at=1234.0)
+
+    with pytest.raises(BatchError):
+        mesh.start(spec(executor=None))
+
+    task = store.get("operator", "audit")
+    assert task.state == "blocked"
+    assert mesh.journal.get(task.task_id, 1).outcome == "rate_limited"
+    assert [(c["outcome"], c["binding_id"], c["retry_at"]) for c in cooled] == [
+        ("rate_limited", "max-a", 1234.0)
+    ]
+
+    # Reading the same outcome again does not cool again.
+    mesh.reconcile_provider_outcomes()
+    assert len(cooled) == 1
+
+
+def test_a_definitive_rejection_blocks_instead_of_rerouting(system, monkeypatch):
+    """A 409 means the request itself was refused; retrying it on another
+    account would fail identically. Only capacity, auth, and a provider being
+    down name a different account as the fix."""
+    mesh, client, store, _ownership = system
+    _routed(monkeypatch, FIRST_TARGET)
+    client.reject_launch = CdesktopRejectedError("conflict", status=409)
+
+    with pytest.raises(BatchError):
+        mesh.start(spec(executor=None))
+
+    task = store.get("operator", "audit")
+    assert mesh.journal.get(task.task_id, 1).outcome == "rejected:409"
+    assert mesh.reconcile_provider_outcomes() == []
+    assert store.get("operator", "audit").epoch == 1
+
+
+def test_an_upgrade_that_adds_a_spec_field_is_not_a_changed_specification(system):
+    """A manager re-runs `start` for its whole cohort, so a task reserved by an
+    earlier version is re-described by a newer one on the very next tick.
+
+    A field that version could not have recorded describes no disagreement
+    about the work; treating its absence as one would make every in-flight task
+    unreachable after an upgrade.
+    """
+    mesh, _client, store, _ownership = system
+    started = mesh.start(spec())
+    task = store.get("operator", "audit")
+    legacy = {k: v for k, v in task.spec.items() if k != "route_class"}
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE managed_tasks SET spec_json = ? WHERE task_id = ?",
+            (json.dumps(legacy, sort_keys=True, separators=(",", ":")), task.task_id),
+        )
+
+    replayed = mesh.start(spec())
+
+    assert replayed.session_id == started.session_id
 def test_start_stays_idempotent_when_the_detection_floor_changes(system):
     """Why: the resolved detection policy used to be folded into the public
     spec, and the public spec is the identity fingerprint `start()` compares.

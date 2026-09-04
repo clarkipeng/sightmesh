@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import tempfile
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,7 @@ from websockets.exceptions import WebSocketException
 from websockets.sync.client import connect as websocket_connect
 
 from .service import DEFAULT_PORT, is_healthy, service_url
+from .fence import open_transport
 
 
 SEND_TRANSPORT_RETRIES = 3
@@ -27,11 +30,24 @@ class CdesktopError(RuntimeError):
 
 
 class CdesktopRejectedError(CdesktopError):
-    """A cdesktop server response definitively rejected the requested action."""
+    """A cdesktop server response definitively rejected the requested action.
 
-    def __init__(self, message: str, *, status: int | None = None) -> None:
+    ``status`` is the typed discriminator every routing decision reads; the
+    optional ``retry_at`` is the provider's own advertised reset, so a rate
+    limit cools its account until the provider says it is over rather than for
+    a blunt default window.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        retry_at: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
+        self.retry_at = retry_at
 
 
 class CdesktopTransportError(CdesktopError):
@@ -50,6 +66,43 @@ class CdesktopInterruptedError(CdesktopRejectedError):
 
 class CdesktopPendingError(CdesktopRejectedError):
     """A keyed operation is still owned by another cdesktop request (HTTP 425)."""
+
+
+#: HTTP statuses that carry a typed meaning routing acts on. Everything else
+#: stays an untyped ``CdesktopError``: routing must never infer a provider
+#: outcome from a status it was not told the meaning of.
+#:
+#: 5xx is deliberately absent. This status belongs to SightMesh's own localhost
+#: request to cdesktop, not to the model provider behind it, so a cdesktop
+#: process that is restarting, out of disk, or panicking would be read as the
+#: provider being down - and the whole account pool cooled for a fault that has
+#: nothing to do with any account. An unreachable local service leaves the task
+#: reserved and retryable, which is what it is.
+_REJECTION_STATUSES = (401, 403, 409, 429)
+
+
+def _rejection_type(status: int) -> type[CdesktopRejectedError] | None:
+    if status == 424:
+        return CdesktopInterruptedError
+    if status == 425:
+        return CdesktopPendingError
+    return CdesktopRejectedError if status in _REJECTION_STATUSES else None
+
+
+def _retry_at(headers: Any) -> float | None:
+    """Absolute time the provider says to retry, from ``Retry-After`` seconds.
+
+    Only the delta-seconds form is honoured. An HTTP-date form depends on the
+    provider's clock agreeing with ours, and a wrong absolute time would cool
+    an account for the wrong window; falling back to the default cooldown is
+    the safe reading.
+    """
+    raw = headers.get("Retry-After") if headers is not None else None
+    try:
+        seconds = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return time.time() + seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
 EFFECT_NOT_FOUND_MESSAGE = "Managed task effect not found"
@@ -87,6 +140,88 @@ def execution_process_event_time(process: dict[str, Any]) -> datetime | None:
     except ValueError:
         return None
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+#: An execution process in one of these statuses has stopped without finishing
+#: its work (``ExecutionProcessStatus`` in cdesktop's execution_process model).
+PROCESS_FAILURE_STATUSES = frozenset({"failed", "killed"})
+
+#: cdesktop's own normalized outcome classes (``ExecutionOutcomeClass``) mapped
+#: onto the routing outcomes a route chain advances on. Only capacity and auth
+#: are here: every other class describes the work failing, not the binding, and
+#: rerouting it would just fail the same way on a fresh account.
+#:
+#: The pinned seam does not surface this classification yet, so today the map
+#: matches nothing and a failed process blocks its task visibly. Reading it by
+#: name means the mid-run reroute starts working the moment the seam does,
+#: without anyone going back to guess from transcript text.
+PROCESS_OUTCOME_CLASSES = {
+    "quota_exhausted": "rate_limited",
+    "rate_limited_transient": "rate_limited",
+    "auth_expired": "auth",
+    "auth_invalid": "auth",
+}
+
+
+def process_provider_outcome(
+    process: Mapping[str, Any],
+) -> tuple[str | None, float | None]:
+    """The typed provider outcome a stopped process reports, and its reset.
+
+    Reads only typed fields - the outcome's class name and its advertised
+    reset. Transcript text is never consulted, which is the whole point: a
+    worker whose test output merely mentions a rate limit must be
+    indistinguishable, to this function, from one that printed nothing.
+    """
+    outcome = process.get("outcome")
+    if isinstance(outcome, str):
+        outcome = {"class": outcome}
+    if not isinstance(outcome, Mapping):
+        return None, None
+    routing_outcome = PROCESS_OUTCOME_CLASSES.get(str(outcome.get("class") or ""))
+    if routing_outcome is None:
+        return None, None
+    return routing_outcome, _outcome_reset(outcome)
+
+
+def _outcome_reset(outcome: Mapping[str, Any]) -> float | None:
+    resets_at = outcome.get("resets_at")
+    if isinstance(resets_at, str):
+        try:
+            return datetime.fromisoformat(resets_at).timestamp()
+        except ValueError:
+            return None
+    try:
+        seconds = float(outcome["retry_after_seconds"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return time.time() + seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+
+def process_failure_reason(process: Mapping[str, Any]) -> str:
+    """Why a stopped process stopped, from typed fields only.
+
+    Deliberately not the transcript. This becomes a blocked task's reason, and
+    a reason built from provider text is both a leak risk and an invitation to
+    parse it back out again later.
+    """
+    status = str(process.get("status") or "failed")
+    outcome = process.get("outcome")
+    detail = (
+        str(outcome.get("class") or "")
+        if isinstance(outcome, Mapping)
+        else str(outcome or "")
+    )
+    exit_code = process.get("exit_code")
+    parts = [
+        # A class name is a short enum value. Bounding it anyway means a seam
+        # that one day puts something longer there cannot turn a task's reason
+        # into a dump of whatever the provider said.
+        part
+        for part in (detail[:64], f"exit {exit_code}" if exit_code else "")
+        if part
+    ]
+    return f"worker process {status}" + (f" ({', '.join(parts)})" if parts else "")
 
 
 def latest_execution_process(
@@ -158,19 +293,19 @@ class CdesktopClient:
             request_headers["Content-Type"] = "application/json"
         request = Request(url, data=body, headers=request_headers, method=method)
         try:
-            with urlopen(request, timeout=15) as response:
+            with open_transport(urlopen, request, timeout=15) as response:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            error_type = {
-                409: CdesktopRejectedError,
-                424: CdesktopInterruptedError,
-                425: CdesktopPendingError,
-            }.get(exc.code)
+            error_type = _rejection_type(exc.code)
             message = f"{method} {path} failed: HTTP {exc.code}: {detail}"
             if error_type is None:
                 raise CdesktopError(message) from exc
-            raise error_type(message, status=exc.code) from exc
+            raise error_type(
+                message,
+                status=exc.code,
+                retry_at=_retry_at(exc.headers),
+            ) from exc
         except URLError as exc:
             raise CdesktopTransportError(
                 f"Cannot reach cdesktop at {self.base_url}: {exc}"
@@ -325,7 +460,9 @@ class CdesktopClient:
     def probe_connectivity(self) -> bool:
         """Bounded, side-effect-free gate used before native dispatch."""
         try:
-            with urlopen(f"{self.base_url}/api/health", timeout=1) as response:
+            with open_transport(
+                urlopen, f"{self.base_url}/api/health", timeout=1
+            ) as response:
                 return response.status == 200
         except (OSError, URLError):
             return False
@@ -424,7 +561,8 @@ class CdesktopClient:
         pending: dict[str, dict[str, Any]] = {}
         deadline = time.monotonic() + timeout_seconds
         try:
-            with websocket_connect(
+            with open_transport(
+                websocket_connect,
                 websocket_url,
                 open_timeout=timeout_seconds,
                 close_timeout=1,

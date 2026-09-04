@@ -176,11 +176,11 @@ Add one pass alongside the existing command reconciliation:
 ## Capability check (`sdk.py` `_require_contract`)
 
 Replace the advertised-int read with a probe: call the managed-launch lookup for a reserved sentinel task id and require a well-formed not-found response.
-If cdesktop 0.2.7 exposes no lookup, probe by round-tripping `client.info()` plus a `send` dedupe echo, and record `probe: advertised-only` in doctor output; full probes are Phase 4.
+A runtime that advertises the contract but exposes no lookup to probe fails closed: there is no "take it at its word" answer, because that is exactly the state that lets a launch path fail late.
 
 ## Simulator (`tests/simulator/`, standalone, `-m simulator`)
 
-`FakeCdesktop` implements the client seam in-process with fault injection: `kill_after(step)`, `duplicate_call(step)`, latency, and typed 429 responses.
+`FakeCdesktop` implements the client seam in-process with fault injection: `kill_after(step)`, `duplicate_call(step)`, latency, and `reject_after(step, status, retry_after)` for any typed rejection.
 Scenarios, each one test with a docstring naming the historical incident it replays:
 
 | id | scenario | must hold |
@@ -197,6 +197,26 @@ Scenarios, each one test with a docstring naming the historical incident it repl
 | S10 | typed 429 terminal | recorded as typed outcome on the effect, never inferred from text |
 | S11 | 1,000 terminal tasks present | `show(key)` performs zero fleet scans (assert on fake call log) |
 | S12 | two concurrent `replace` on one task | one winner, one StaleTransition |
+
+Routing failover scenarios (`tests/simulator/test_routing_scenarios.py`), over the real pool, settings, store, and journal:
+
+| id | scenario | must hold |
+|---|---|---|
+| S-D1 | typed 429 | one binding cooled, exactly one new epoch, none without a further outcome |
+| S-D2 | second account of the same model | next account before next model; next model only once both are cooled |
+| S-D3 | cooldown from `retry_at` | skipped until the reset, eligible again after it |
+| S-D4 | failing test suite naming "429" | no reroute, no cooldown, epoch unchanged |
+| S-D5 | typed 401 | short cooldown, not the capacity default; chain advances |
+| S-D6 | `provider_down` outcome; local 5xx | whole pool cooled together; a cdesktop 5xx cools nothing and stays retryable |
+| S-D7 | class with no usable hop | `validate` names it, dispatch refused before any epoch or effect row |
+| S-D8 | explicit profile override | still advances; `automatic_failover` off blocks with a reason |
+| S-D9 | upgraded v1 flat config | a promoted class with no chain degrades onto the default, not a refusal |
+| S-D10 | crash between cooling and the journal | the account is cooled anyway; cooling is monotonic |
+| S-D11 | mid-run process failure | typed capacity/auth reroutes; no signal blocks; a queued retry is left alone |
+| S-D12 | replacement epoch never filled | the sweep fills it; a manual `replace()` is left to its caller |
+| S-D13 | attempt limit reached | blocked once with a reason, then never retried again |
+| S-D14 | legacy `quota` outcome | still reroutes after the upgrade |
+| S-D15 | one task's advance raises | every other task in the sweep still settles |
 
 Red-first requirement: the suite must first run against pre-transplant `main` (77f66eb) with S1, S2, S3, S5, S6, S7, S12 failing, and the red log committed under `tests/simulator/RED-BASELINE.md`.
 

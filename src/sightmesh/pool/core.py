@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -30,16 +31,11 @@ PROBE_TTL = 60
 QUOTA_TTL = 120
 DEFAULT_COOLDOWN = 5 * 3600
 
-LIMIT_PATTERNS = [
-    r"usage limit reached",
-    r"reached your .{1,40} limit",
-    r"rate.?limit",
-    r"limit reached",
-    r"quota",
-    r"insufficient[_ ]quota",
-    r"resets? at",
-    r"\b429\b",
-]
+#: How long an auth or whole-provider failure cools an account. Short, because
+#: neither is capacity: a rotated credential or a provider outage clears on its
+#: own timescale, and cooling for the capacity default would strand a healthy
+#: account for hours.
+SHORT_COOLDOWN = 15 * 60
 
 PROVIDERS = ("claude", "codex")
 
@@ -176,20 +172,32 @@ def cooling_until(state: dict[str, Any], account_id: str) -> float:
 
 
 def set_cooldown(account_id: str, seconds: int = DEFAULT_COOLDOWN) -> float:
-    state = load_state()
-    until = time.time() + seconds
-    state.setdefault("cooldowns", {})[account_id] = until
-    state.setdefault("probes", {}).pop(account_id, None)
-    save_state(state)
-    return until
+    return cool_until_timestamp(account_id, time.time() + seconds)
 
 
 def cool_until_timestamp(account_id: str, when: float) -> float:
+    """Cool an account until at least ``when``. A cooldown never shortens.
+
+    Every caller is reporting one refusal it observed, and no refusal is
+    evidence that an earlier, longer one has ended: a 401 or a short
+    ``Retry-After`` arriving during a five-hour rate limit says nothing about
+    that limit. Taking the later of the two deadlines makes cooling monotonic,
+    so ordering between concurrent observations stops mattering and re-cooling
+    the same outcome is idempotent by construction.
+
+    Only :func:`clear_cooldown` shortens a cooldown, because only an operator
+    has the outside knowledge to say a window is really over.
+    """
     state = load_state()
-    state.setdefault("cooldowns", {})[account_id] = when
+    cooldowns = state.setdefault("cooldowns", {})
+    requested = float(when)
+    if not math.isfinite(requested):
+        requested = time.time() + DEFAULT_COOLDOWN
+    until = max(requested, float(cooldowns.get(account_id) or 0))
+    cooldowns[account_id] = until
     state.setdefault("probes", {}).pop(account_id, None)
     save_state(state)
-    return when
+    return until
 
 
 def clear_cooldown(account_id: str) -> None:
@@ -226,11 +234,6 @@ def parse_iso(text: str | None) -> float | None:
         return datetime.fromisoformat(text).timestamp()
     except ValueError:
         return None
-
-
-def looks_limited(text: str) -> bool:
-    low = text.lower()
-    return any(re.search(pattern, low) for pattern in LIMIT_PATTERNS)
 
 
 # ---------------------------------------------------------------- identity
@@ -528,10 +531,13 @@ def probe(account: dict[str, Any], timeout: int = 90) -> tuple[bool, str]:
         return False, "probe timed out"
 
     output = (run.stdout or "") + (run.stderr or "")
-    if looks_limited(output):
-        return False, "usage limit"
     if run.returncode == 0:
         return True, "ok"
+    # A failing probe reports what the executor said and nothing more. Deciding
+    # *why* it failed - capacity, auth, provider - is the job of the typed
+    # provider outcome on the effect journal, which cools the binding; guessing
+    # it from output text is what made a test transcript containing "429"
+    # indistinguishable from a real rate limit.
     reason = next((ln for ln in output.strip().splitlines() if ln.strip()), "failed")
     return False, reason.strip()[:90]
 
@@ -550,8 +556,6 @@ def probe_cached(account: dict[str, Any]) -> tuple[bool, str]:
         "reason": reason,
     }
     save_state(state)
-    if not ok and reason == "usage limit":
-        set_cooldown(account["id"])
     return ok, reason
 
 

@@ -16,6 +16,7 @@ from . import leases
 from .cdesktop import CdesktopClient, CdesktopError
 from .durable import DurableExecutionReconciler
 from .execution_routing import ExecutionRoutingError
+from .fence import open_transport
 from .pool.core import PoolError
 from .routing import (
     clear_peer_identity,
@@ -90,8 +91,8 @@ class RepowireSessionBridge:
                 delay = min(delay * 2, 15.0)
 
     async def _connection(self) -> None:
-        async with websockets.connect(
-            self.repowire_url, ping_interval=20, ping_timeout=20
+        async with open_transport(
+            websockets.connect, self.repowire_url, ping_interval=20, ping_timeout=20
         ) as ws:
             connect: dict[str, Any] = {
                 "type": "connect",
@@ -238,16 +239,7 @@ class BridgeSupervisor:
             store=self.reconciler.task_store,
             ownership=self.reconciler.ownership,
         )
-
     async def run(self) -> None:
-        """Tick forever. A failing tick is a warning, never the end of the loop.
-
-        The supervisor is the process. An exception escaping one reconcile -
-        from a hostile executor payload, a corrupt row, anything - used to end
-        the loop silently: every bridge stopped, every wake stopped being
-        delivered, and nothing said so. The next tick is two seconds away and
-        may well succeed.
-        """
         while True:
             try:
                 await self.reconcile()
@@ -262,13 +254,24 @@ class BridgeSupervisor:
         desired: dict[str, BridgedSession] = {}
         # Wake delivery reads task rows, not workspaces, so it runs once per
         # tick and cannot be starved behind a slow or failing workspace scan.
-        # ``reconcile_kernel`` isolates its own stages and does not raise, but
-        # this call sits outside the try below, so it is guarded here too
-        # rather than relying on a promise made in another module.
         try:
             await asyncio.to_thread(self.reconciler.reconcile_kernel)
-        except Exception as exc:  # noqa: BLE001 - the kernel pass never fails the tick
+        except Exception as exc:  # noqa: BLE001 - a kernel pass never ends a tick
             LOGGER.warning("Cannot reconcile the task kernel: %s", exc)
+        # A launch rejected before its task ever activated holds no session, so
+        # the per-session pass below can never reach it. This journal-keyed
+        # sweep is what advances it past its typed provider outcome.
+        try:
+            await asyncio.to_thread(self.managed_tasks.reconcile_provider_outcomes)
+        except (
+            CdesktopError,
+            ExecutionRoutingError,
+            PoolError,
+            SightMeshError,
+            SuccessionError,
+            TaskStoreError,
+        ) as exc:
+            LOGGER.warning("Cannot reconcile typed provider outcomes: %s", exc)
         try:
             await asyncio.to_thread(
                 leases.sync_active_workspaces,
@@ -294,7 +297,7 @@ class BridgeSupervisor:
                 for session in sessions:
                     try:
                         await asyncio.to_thread(
-                            self.managed_tasks.reconcile_quota_failure,
+                            self.managed_tasks.reconcile_provider_outcome,
                             str(session["id"]),
                         )
                     except (
