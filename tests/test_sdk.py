@@ -31,19 +31,23 @@ class FakeClient:
         self.reject_launch = None
 
     def info(self):
+        assert_external_io_allowed()  # the real client does HTTP here
         return {"service_capabilities": {"managed_task_launch": 1}}
 
     def repos(self):
+        assert_external_io_allowed()  # the real client does HTTP here
         return self.repo_rows or [
             {"id": "repo-1", "name": "project", "path": str(self.repo_path)}
         ]
 
     def workspace(self, workspace_id):
+        assert_external_io_allowed()  # the real client does HTTP here
         container = self.repo_path.parent / "worktrees" / workspace_id
         (container / "project").mkdir(parents=True, exist_ok=True)
         return {"id": workspace_id, "container_ref": str(container)}
 
     def providers(self):
+        assert_external_io_allowed()  # the real client does HTTP here
         return [
             {
                 "id": "default-provider",
@@ -54,10 +58,12 @@ class FakeClient:
         ]
 
     def register_repo(self, path, **_kwargs):
+        assert_external_io_allowed()  # the real client does HTTP here
         assert path.resolve() == self.repo_path.resolve()
         return self.repos()[0]
 
     def workspace_launch_request(self, **kwargs):
+        assert_external_io_allowed()  # the real client does HTTP here
         return {"workspace": kwargs}
 
     @staticmethod
@@ -65,6 +71,7 @@ class FakeClient:
         return {"session": kwargs}
 
     def managed_launch(self, task_id, epoch, launch):
+        assert_external_io_allowed()  # the real client does HTTP here
         key = (task_id, epoch)
         self.launches.append((key, launch))
         rejection = self.reject_launch
@@ -94,23 +101,29 @@ class FakeClient:
         dedupe_key=None,
         intent="continue",
     ):
+        assert_external_io_allowed()  # the real client does HTTP here
         row = (session_id, prompt, sender_session, dedupe_key, intent)
         self.sent.append(row)
         return {"queued": True}
 
     def session_commands(self, _session_id):
+        assert_external_io_allowed()  # the real client does HTTP here
         return []
 
     def execution_processes(self, session_id):
+        assert_external_io_allowed()  # the real client does HTTP here
         return self.processes.get(session_id, [])
 
     def normalized_snapshot(self, process_id):
+        assert_external_io_allowed()  # the real client does HTTP here
         return self.snapshots[process_id]
 
     def stop_workspace(self, workspace_id):
+        assert_external_io_allowed()  # the real client does HTTP here
         self.stopped.append(workspace_id)
 
     def managed_effect(self, task_id, epoch):
+        assert_external_io_allowed()  # the real client does HTTP here
         """Mirror the real seam so the launch-contract probe can execute."""
         effect = self.effects.get((task_id, epoch))
         if effect is None:
@@ -1062,3 +1075,41 @@ def test_a_worker_cannot_buy_itself_a_longer_approval_timeout(system):
     ).start(spec(approval_timeout=864_000.0))
 
     assert store.get("operator", "audit").spec["detection"]["approval_timeout"] == 1800.0
+
+
+def test_a_cold_instance_probes_the_contract_before_taking_the_fence(system):
+    # After a manager restart the contract probe cache is empty. 0.13.0's
+    # hotfix review found replace()/failover probing (HTTP) under the fence on
+    # exactly that cold instance; with the fakes tripping the fence guard this
+    # would raise FenceHeldError.
+    mesh, client, store, ownership = system
+    mesh.start(spec())
+    cold = SightMesh(client=client, store=store, ownership=ownership, environment={})
+    assert cold.contract_probe is None
+    cold.replace("audit", "carry on")
+    assert cold.contract_probe is not None
+
+
+def test_cancel_during_request_build_never_issues_a_native_launch(system, monkeypatch):
+    # Building the launch request opens the fence gate for HTTP. A cancel that
+    # lands in that window must be honoured BEFORE dispatch: the stale
+    # snapshot may not issue a native launch that is only cleaned up later.
+    mesh, client, _store, _ownership = system
+    entered = threading.Event()
+    release = threading.Event()
+    original = client.workspace_launch_request
+
+    def paused_request(**kwargs):
+        entered.set()
+        assert release.wait(timeout=5)
+        return original(**kwargs)
+
+    monkeypatch.setattr(client, "workspace_launch_request", paused_request)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(mesh.start, spec())
+        assert entered.wait(timeout=5)
+        mesh.cancel("audit")
+        release.set()
+        result = future.result(timeout=10)
+    assert result.state == "cancelled"
+    assert client.launches == []

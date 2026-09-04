@@ -19,6 +19,7 @@ import os
 import sqlite3
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -336,8 +337,16 @@ def transfer_ownership(
     spawn: Callable[[], str],
     reason: str,
     logical_key: str | None = None,
+    io: Callable[[], Any] = nullcontext,
+    before_spawn: Callable[[], None] | None = None,
 ) -> HandoffResult:
     """Quarantine the source and hand its live intent to exactly one successor.
+
+    ``io`` wraps every cdesktop request so a caller holding a task fence can
+    open its gate for the network calls (``TaskFence.external_io``); the
+    durable records are written with the fence held. ``before_spawn`` runs
+    after that first I/O and before any successor is spawned, so a caller can
+    refuse to spawn for a task that changed while the gate was open.
 
     Safe to re-run after a crash at any point: the terminal record is written
     first, the successor is spawned only while none is recorded, forwarding
@@ -350,9 +359,11 @@ def transfer_ownership(
     record = store.retire(source, state=SUPERSEDED, reason=reason, logical_key=key)
     key = record.logical_key or key
 
+    with io():
+        rows = client.session_commands(source)
     open_commands = [
         row
-        for row in client.session_commands(source)
+        for row in rows
         if str(row.get("state") or row.get("status") or "pending")
         not in COMMAND_TERMINAL_STATES
     ]
@@ -360,6 +371,8 @@ def transfer_ownership(
     if record.successor_session_id:
         successor, spawned = record.successor_session_id, False
     else:
+        if before_spawn is not None:
+            before_spawn()
         successor = str(spawn())
         if not successor:
             raise SuccessionError("Successor spawn did not return a session id")
@@ -373,19 +386,22 @@ def transfer_ownership(
         if not body:
             continue
         dedupe_key = str(row.get("dedupe_key") or f"{key}:command:{row.get('id')}")
-        client.send(successor, body, None, dedupe_key=dedupe_key, intent="continue")
+        with io():
+            client.send(successor, body, None, dedupe_key=dedupe_key, intent="continue")
         forwarded += 1
 
     cancelled = 0
     for row in open_commands:
         if hasattr(client, "interrupt_command"):
-            client.interrupt_command(str(row["id"]))
+            with io():
+                client.interrupt_command(str(row["id"]))
             cancelled += 1
         elif row.get("execution_process_id"):
-            client.stop_execution(
-                str(row["execution_process_id"]),
-                dedupe_key=f"quarantine:{row['id']}",
-            )
+            with io():
+                client.stop_execution(
+                    str(row["execution_process_id"]),
+                    dedupe_key=f"quarantine:{row['id']}",
+                )
             cancelled += 1
 
     return HandoffResult(
