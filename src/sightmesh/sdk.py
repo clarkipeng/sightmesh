@@ -279,15 +279,61 @@ class SightMesh:
                 f"task-command:{task.task_id}:{task.epoch}:{entry._operation_id}"
             )
             try:
-                results[entry.worker] = self.client.send(
-                    task.holder_session_id,
-                    entry.prompt,
-                    sender,
-                    dedupe_key=dedupe_key,
-                    intent="continue",
-                )
+                # The outgoing row is the task's durable claim over this send.
+                # A terminal writer sees it while the fence is open for HTTP,
+                # so capacity cannot be released in the enqueue/snapshot gap.
+                with self.store.task_lock(task.task_id) as fence:
+                    current = self.store.get_by_id(task.task_id)
+                    if (
+                        current is None
+                        or current.state not in {"active", "blocked"}
+                        or current.epoch != task.epoch
+                        or current.version != task.version
+                        or current.holder_session_id != task.holder_session_id
+                    ):
+                        raise SightMeshError(
+                            f"Task {entry.worker!r} is no longer active for mail"
+                        )
+                    self.ownership.assert_deliverable(current.holder_session_id)
+                    self.store.begin_outgoing_command(
+                        current.task_id, current.epoch, current.holder_session_id, dedupe_key
+                    )
+                    with fence.external_io():
+                        result = self.client.send(
+                            current.holder_session_id,
+                            entry.prompt,
+                            sender,
+                            dedupe_key=dedupe_key,
+                            intent="continue",
+                        )
+                        native_id = (
+                            str(result["id"])
+                            if isinstance(result, dict) and result.get("id") is not None
+                            else None
+                        )
+                        if native_id is None:
+                            for command in NativeCommandQueue(self.client).commands(current.holder_session_id):
+                                if command.dedupe_key == dedupe_key:
+                                    native_id = command.id
+                                    break
+                    latest = self.store.get_by_id(current.task_id)
+                    terminal = bool(
+                        latest
+                        and latest.epoch == current.epoch
+                        and latest.holder_session_id == current.holder_session_id
+                        and latest.state in {"completed", "cancelled", "lost"}
+                    )
+                    self.store.settle_outgoing_command(
+                        current.task_id, current.epoch, dedupe_key, native_id, terminal=terminal
+                    )
+                    results[entry.worker] = result
             except CdesktopError as exc:
                 errors[entry.worker] = str(exc)
+            except SightMeshError as exc:
+                errors[entry.worker] = str(exc)
+        DurableExecutionReconciler(
+            self.client, task_store=self.store, ownership=self.ownership
+        ).reconcile_cleanup_intents()
         return BatchResult(results, errors)
 
     def show(self, worker: str | None = None) -> Worker:
@@ -441,6 +487,16 @@ class SightMesh:
                 self.store.record_cleanup_intents(
                     current.task_id, current.epoch, current.holder_session_id, commands
                 )
+                for outgoing in self.store.terminal_outgoing_commands(
+                    current.task_id, current.epoch
+                ):
+                    if outgoing["native_id"]:
+                        self.store.record_cleanup_intents(
+                            current.task_id,
+                            current.epoch,
+                            current.holder_session_id,
+                            [{"id": outgoing["native_id"], "state": "pending"}],
+                        )
             updated = self._finish(current, state, result, fence)
             workspace_id = current.workspace_id if stop_workspace else None
             effect = self.journal.get(current.task_id, current.epoch)

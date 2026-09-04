@@ -106,6 +106,7 @@ def test_running_execution_processes_normalizes_pr34_response_shape() -> None:
     """PR #34 returns blocker names but no redundant status field."""
     class RunningClient(FakeClient):
         def request(self, method, path, payload=None, query=None, headers=None):
+            assert_external_io_allowed()  # this override stands in for HTTP
             self.calls.append((method, path, payload, query, headers))
             return [{
                 "id": "process-a", "name": "worker-a", "session_id": "session-a",
@@ -129,6 +130,7 @@ def test_running_execution_processes_falls_back_to_pinned_028_shape() -> None:
     """Pinned 0.2.8 requires session_id and returns the bare process model."""
     class LegacyClient(FakeClient):
         def request(self, method, path, payload=None, query=None, headers=None):
+            assert_external_io_allowed()  # this override stands in for HTTP
             self.calls.append((method, path, payload, query, headers))
             if path == "/execution-processes/running":
                 raise cdesktop.CdesktopError("HTTP 404: not found")

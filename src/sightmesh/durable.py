@@ -354,6 +354,32 @@ class DurableExecutionReconciler:
     def reconcile_cleanup_intents(self) -> int:
         """Retry terminal command cleanup from the store until cdesktop acks it."""
         acknowledged = 0
+        # A successful send can return before the native row id is available.
+        # Its durable dedupe key still pins terminal capacity; resolve that key
+        # from cdesktop before attempting command cancellation.
+        for outgoing in self.task_store.unresolved_terminal_outgoing_commands():
+            task_id = str(outgoing["task_id"])
+            try:
+                with self.task_store.task_lock(task_id) as fence:
+                    with fence.external_io():
+                        commands = self.queue.commands(str(outgoing["session_id"]))
+                    command = next(
+                        (
+                            item for item in commands
+                            if item.dedupe_key == str(outgoing["dedupe_key"])
+                        ),
+                        None,
+                    )
+                    if command is not None:
+                        self.task_store.settle_outgoing_command(
+                            task_id,
+                            int(outgoing["epoch"]),
+                            str(outgoing["dedupe_key"]),
+                            command.id,
+                            terminal=True,
+                        )
+            except Exception as exc:  # noqa: BLE001 - the durable key retries next pass
+                LOGGER.info("Leaving terminal outgoing command for retry: %s", exc)
         for intent in self.task_store.pending_cleanup_intents():
             task_id = str(intent["task_id"])
             try:

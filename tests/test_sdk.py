@@ -1020,6 +1020,75 @@ def test_terminalization_cancels_queued_command_before_releasing_capacity(system
     assert store.count_running() == 0
 
 
+def test_send_after_terminal_snapshot_is_durably_cancelled_before_capacity_releases(system):
+    """#105: an enqueue crossing terminalization cannot resurrect its task."""
+    mesh, client, store, _ownership = system
+    worker = mesh.start(spec())
+    enqueue_entered = threading.Event()
+    terminal_snapshotted = threading.Event()
+    terminalized = threading.Barrier(2)
+    allow_enqueue = threading.Event()
+    cancel_entered = threading.Event()
+
+    original_commands = client.session_commands
+
+    def commands(session_id):
+        rows = original_commands(session_id)
+        if session_id == worker.session_id:
+            terminal_snapshotted.set()
+        return rows
+
+    def send(session_id, prompt, sender_session=None, *, dedupe_key=None, intent="continue"):
+        assert_external_io_allowed()
+        enqueue_entered.set()
+        assert allow_enqueue.wait(2)
+        row = {
+            "id": "racing-1", "session_id": session_id, "state": "pending",
+            "dedupe_key": dedupe_key, "execution_process_id": None,
+        }
+        client.commands.append(row)
+        return dict(row)
+
+    def cancel(session_id, command_id):
+        assert_external_io_allowed()
+        cancel_entered.set()
+        assert store.count_running() == 1
+        row = next(row for row in client.commands if row["id"] == command_id)
+        row["state"] = "cancelled"
+        return dict(row)
+
+    client.session_commands = commands
+    client.send = send
+    client.cancel_command = cancel
+    sent = []
+    sender = threading.Thread(target=lambda: sent.append(mesh.send_all([Command("audit", "race")])))
+    def cancel():
+        mesh.cancel("audit")
+        terminalized.wait()
+
+    terminal = threading.Thread(target=cancel)
+    sender.start()
+    assert enqueue_entered.wait(2)
+    terminal.start()
+    assert terminal_snapshotted.wait(2)
+    terminalized.wait()
+    terminal.join(2)
+    assert not terminal.is_alive()
+    assert store.get("operator", "audit").state == "cancelled"
+    assert store.count_running() == 1
+    allow_enqueue.set()
+    sender.join(2)
+
+    assert not sender.is_alive()
+    assert sent[0].ok
+    assert [row["state"] for row in store.terminal_outgoing_commands(
+        store.get("operator", "audit").task_id, store.get("operator", "audit").epoch
+    )] == []
+    assert cancel_entered.is_set()
+    assert client.commands[0]["state"] == "cancelled"
+    assert store.count_running() == 0
+
+
 def test_terminalization_stops_a_running_execution_and_waits_for_its_ack(system):
     """A claimed command owns a process as well as a queue row (#105)."""
     mesh, client, store, _ownership = system
