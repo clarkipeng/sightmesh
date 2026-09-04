@@ -2,11 +2,11 @@
   "schema_version": 1,
   "cdesktop": {
     "repository": "clarkipeng/cdesktop",
-    "version": "0.2.8",
-    "tag": "v0.2.8-20260904023610",
+    "version": "0.2.9",
+    "tag": "v0.2.9-20260904140854",
     "package": {
-      "url": "https://github.com/clarkipeng/cdesktop/releases/download/v0.2.8-20260904023610/cdesktop-0.2.8.tgz",
-      "sha256": "1dc741800ca3889603896bf71b640e3c32b3de3bce8337e5c8e6be1b9c340def"
+      "url": "https://github.com/clarkipeng/cdesktop/releases/download/v0.2.9-20260904140854/cdesktop-0.2.9.tgz",
+      "sha256": "d65f990324c8133666391c60397e020586fd1b00bd9cde8061ec3c2d3e847987"
     },
     "compatibility": {
       "minimum": "0.2.5",
