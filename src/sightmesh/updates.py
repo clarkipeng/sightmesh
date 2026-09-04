@@ -21,6 +21,7 @@ from urllib.request import urlopen
 
 from . import service
 from .cdesktop import CdesktopClient, CdesktopError
+from .fence import open_transport
 from .runtime_lock import RUNTIME_LOCK
 
 SCHEMA_VERSION = 1
@@ -245,7 +246,9 @@ def _activation_lock() -> Iterator[None]:
 def _download(source: str, destination: Path) -> None:
     parsed = urlparse(source)
     if parsed.scheme in {"http", "https"}:
-        with urlopen(source, timeout=60) as response, destination.open("wb") as stream:
+        with open_transport(urlopen, source, timeout=60) as response, destination.open(
+            "wb"
+        ) as stream:
             shutil.copyfileobj(response, stream)
         return
     if parsed.scheme:

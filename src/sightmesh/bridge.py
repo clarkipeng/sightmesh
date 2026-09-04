@@ -16,6 +16,7 @@ from . import leases
 from .cdesktop import CdesktopClient, CdesktopError
 from .durable import DurableExecutionReconciler
 from .execution_routing import ExecutionRoutingError
+from .fence import open_transport
 from .pool.core import PoolError
 from .routing import (
     clear_peer_identity,
@@ -90,8 +91,8 @@ class RepowireSessionBridge:
                 delay = min(delay * 2, 15.0)
 
     async def _connection(self) -> None:
-        async with websockets.connect(
-            self.repowire_url, ping_interval=20, ping_timeout=20
+        async with open_transport(
+            websockets.connect, self.repowire_url, ping_interval=20, ping_timeout=20
         ) as ws:
             connect: dict[str, Any] = {
                 "type": "connect",

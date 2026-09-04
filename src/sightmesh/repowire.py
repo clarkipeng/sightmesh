@@ -6,6 +6,8 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from .fence import open_transport
+
 
 class RepowireError(RuntimeError):
     pass
@@ -40,7 +42,7 @@ def reply(
         method="POST",
     )
     try:
-        with urlopen(request, timeout=15) as response:
+        with open_transport(urlopen, request, timeout=15) as response:
             raw = response.read().decode("utf-8")
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")

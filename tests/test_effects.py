@@ -14,6 +14,7 @@ from sightmesh.effects import (
     new_owner_instance,
     request_hash,
 )
+from sightmesh.fence import assert_external_io_allowed
 from sightmesh.task_store import TaskStore, TaskStoreError
 
 
@@ -237,6 +238,58 @@ def test_expiry_loses_a_reservation_no_native_session_stands_behind(tmp_path):
 
     assert [effect.task_id for effect in lost] == ["gone"]
     assert journal.get("gone", 1).outcome == "lost:reservation-expired"
+
+
+def test_expiry_stops_a_native_workspace_superseded_during_its_probe(tmp_path):
+    """A probe that loses its epoch records and stops the workspace outside the fence."""
+    store = TaskStore(tmp_path / "state.sqlite3")
+    ((task, _inserted),) = store.reserve_all(
+        scope="operator",
+        parent_task_id=None,
+        specs=[{"key": "expired", "children": 0}],
+        max_attempts=3,
+    )
+    journal = EffectJournal(store)
+    journal.reserve(task.task_id, task.epoch, request_hash(LAUNCH), "owner-a", ttl=-1.0)
+
+    class SupersedingClient:
+        stopped: list[str] = []
+
+        def managed_effect(self, task_id, epoch):
+            store.finish(task_id, "cancelled")
+            return {"state": "active", "workspace_id": "ws-race", "session_id": "s-race"}
+
+        def stop_workspace(self, workspace_id):
+            assert_external_io_allowed()
+            self.stopped.append(workspace_id)
+
+    client = SupersedingClient()
+    assert journal.expire_reservations(client) == []
+    assert client.stopped == ["ws-race"]
+    effect = journal.get(task.task_id, task.epoch)
+    assert effect is not None and effect.outcome == "superseded"
+    assert effect.workspace_id is None
+
+
+def test_superseded_stop_is_retried_from_its_recorded_intent(journal):
+    """A failed stop leaves its workspace id durable for the next reconcile pass."""
+    journal.reserve("task-1", 1, request_hash(LAUNCH), "owner-a")
+    journal.mark_superseded("task-1", 1, "ws-retry")
+
+    class FlakyClient:
+        def __init__(self):
+            self.calls = 0
+
+        def stop_workspace(self, _workspace_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise CdesktopError("temporary stop failure")
+
+    client = FlakyClient()
+    assert journal.reconcile_superseded(client) == 0
+    assert journal.get("task-1", 1).workspace_id == "ws-retry"
+    assert journal.reconcile_superseded(client) == 1
+    assert journal.get("task-1", 1).workspace_id is None
 
 
 def test_get_returns_none_for_an_unreserved_epoch(journal):

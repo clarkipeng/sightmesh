@@ -13,6 +13,7 @@ from sightmesh import sdk as sdk_module
 from sightmesh.cdesktop import CdesktopError, CdesktopRejectedError
 from sightmesh.profiles import Profile
 from sightmesh.sdk import BatchError, Command, SightMesh, SightMeshError, WorkerSpec
+from sightmesh.fence import assert_external_io_allowed
 from sightmesh.task_store import StaleTransition, TaskStore, TaskStoreError
 
 
@@ -202,12 +203,17 @@ def test_cancel_can_win_while_managed_launch_is_in_flight(system, monkeypatch):
     release = threading.Event()
     native = client.managed_launch
 
+    def guarded_stop(workspace_id):
+        assert_external_io_allowed()
+        client.stopped.append(workspace_id)
+
     def paused_launch(task_id, epoch, launch):
         entered.set()
         assert release.wait(timeout=5)
         return native(task_id, epoch, launch)
 
     monkeypatch.setattr(client, "managed_launch", paused_launch)
+    monkeypatch.setattr(client, "stop_workspace", guarded_stop)
     with ThreadPoolExecutor(max_workers=2) as pool:
         starting = pool.submit(mesh.start, spec())
         assert entered.wait(timeout=5)

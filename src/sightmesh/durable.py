@@ -286,6 +286,7 @@ class DurableExecutionReconciler:
             "wakes_inserted": 0,
             "wakes_delivered": 0,
             "effects_expired": 0,
+            "superseded_workspaces_stopped": 0,
             "liveness_findings": 0,
         }
 
@@ -325,8 +326,10 @@ class DurableExecutionReconciler:
             ).pump()
 
         def expire() -> None:
-            repaired["effects_expired"] = len(
-                EffectJournal(store).expire_reservations(self.client)
+            journal = EffectJournal(store)
+            repaired["effects_expired"] = len(journal.expire_reservations(self.client))
+            repaired["superseded_workspaces_stopped"] = journal.reconcile_superseded(
+                self.client
             )
 
         def external_runs() -> None:

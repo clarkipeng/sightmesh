@@ -23,38 +23,62 @@ def test_task_fence_rejects_every_cdesktop_transport(tmp_path) -> None:
             client._pending_approvals_websocket(timeout_seconds=0.01)
 
 
-def test_cdesktop_socket_openers_are_only_passed_to_guarded_transport() -> None:
-    """Keep new client transports behind the one task-fence boundary."""
-    source = Path(cdesktop.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    openings = {"urlopen", "websocket_connect"}
-    parents = {
-        child: parent
-        for parent in ast.walk(tree)
-        for child in ast.iter_child_nodes(parent)
-    }
+def test_task_fence_rejects_default_client_discovery(tmp_path) -> None:
+    """Discovery is a transport too, so constructing the default client cannot block a task."""
+    store = TaskStore(tmp_path / "tasks.sqlite")
 
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Name) or node.id not in openings:
-            continue
-        parent = parents[node]
-        assert isinstance(parent, ast.Call)
-        assert isinstance(parent.func, ast.Attribute)
-        assert parent.func.attr == "_open_transport"
+    with store.task_lock("discovery-task"):
+        with pytest.raises(FenceHeldError, match="discovery-task"):
+            CdesktopClient()
 
-    helper = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "CdesktopClient"
-        for node in node.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_open_transport"
-    )
-    assert any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "assert_external_io_allowed"
-        for node in ast.walk(helper)
-    )
+
+def test_every_source_transport_opener_passes_through_the_task_fence() -> None:
+    """Keep every source module from adding an unguarded network escape hatch."""
+    source_root = Path(cdesktop.__file__).parent
+    bare_openers = {"urlopen", "websocket_connect"}
+    forbidden_modules = {"requests", "http.client"}
+    socket_openers = {"socket", "create_connection", "create_server"}
+
+    for path in source_root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                assert not any(
+                    alias.name == "http.client"
+                    or alias.name.split(".")[0] in forbidden_modules
+                    for alias in node.names
+                ), path
+            if isinstance(node, ast.ImportFrom):
+                assert node.module not in forbidden_modules | {"http"}, path
+            opener = (
+                isinstance(node, ast.Name) and node.id in bare_openers
+            ) or (
+                isinstance(node, ast.Attribute) and node.attr == "urlopen"
+            ) or (
+                isinstance(node, ast.Attribute)
+                and node.attr == "connect"
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "websockets"
+            ) or (
+                isinstance(node, ast.Attribute)
+                and node.attr in socket_openers
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "socket"
+            )
+            if not opener:
+                continue
+            parent = parents[node]
+            assert (
+                isinstance(parent, ast.Call)
+                and isinstance(parent.func, ast.Name)
+                and parent.func.id == "open_transport"
+                and parent.args[0] is node
+            ), path
 
 
 class FakeClient(CdesktopClient):

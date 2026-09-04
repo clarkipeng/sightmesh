@@ -927,8 +927,11 @@ class SightMesh:
         workspace_id, session_id = self._effect_ids(task, native, fence)
         current = self.store.get_by_id(task.task_id)
         if current is None or (current.epoch, current.version) != (task.epoch, task.version):
-            self.journal.mark_terminal(task.task_id, task.epoch, "superseded")
-            self.client.stop_workspace(workspace_id)
+            superseded = self.journal.mark_superseded(
+                task.task_id, task.epoch, workspace_id
+            )
+            with fence.external_io():
+                self.journal.stop_superseded(self.client, superseded)
             raise SightMeshError(f"Native launch for {task.key!r} was superseded")
         self.journal.mark_launched(task.task_id, task.epoch, workspace_id, session_id)
         return workspace_id, session_id
