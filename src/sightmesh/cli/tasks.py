@@ -131,6 +131,7 @@ def cmd_run_bind(args: argparse.Namespace) -> int:
         writer_capability=args.writer_capability,
         pid=args.pid,
         process_fingerprint=args.process_fingerprint,
+        expect_version=args.expect_version,
     )
     _emit(result.to_dict(), args.json)
     return 0
@@ -233,6 +234,7 @@ def add_parser(sub: argparse._SubParsersAction[Any]) -> None:
     bind.add_argument("--writer-capability", required=True)
     bind.add_argument("--pid", required=True, type=int)
     bind.add_argument("--process-fingerprint", required=True)
+    bind.add_argument("--expect-version", required=True, type=int)
     bind.set_defaults(func=cmd_run_bind)
     show_run = actions.add_parser(
         "show", help="Show durable external-run subscriptions"
