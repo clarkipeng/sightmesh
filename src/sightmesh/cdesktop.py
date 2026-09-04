@@ -456,6 +456,46 @@ class CdesktopClient:
             raise CdesktopError("cdesktop execution process response is not a list")
         return [dict(item) for item in result if isinstance(item, dict)]
 
+    def running_execution_processes(self) -> list[dict[str, Any]]:
+        """Return fleet-wide running processes across the old and new API seam."""
+        try:
+            result = self.request("GET", "/execution-processes/running")
+        except CdesktopError as exc:
+            if "HTTP 404" not in str(exc):
+                raise
+        else:
+            if not isinstance(result, list):
+                raise CdesktopError("cdesktop running execution response is not a list")
+            return [
+                {**dict(item), "status": "running", "session_name": item.get("name")}
+                for item in result
+                if isinstance(item, dict)
+            ]
+
+        running: list[dict[str, Any]] = []
+        for workspace in self.workspaces():
+            workspace_id = workspace.get("id")
+            if not workspace_id or workspace.get("archived"):
+                continue
+            for session in self.sessions(str(workspace_id)):
+                session_id = session.get("id")
+                if not session_id:
+                    continue
+                for process in self.execution_processes(str(session_id)):
+                    if process.get("status") != "running":
+                        continue
+                    running.append(
+                        {
+                            **process,
+                            "session_id": session_id,
+                            "session_name": session.get("name"),
+                            "workspace_id": workspace_id,
+                            "workspace_name": workspace.get("name")
+                            or workspace.get("branch"),
+                        }
+                    )
+        return running
+
     def queue_status(self, session_id: str) -> dict[str, Any]:
         result = self.request("GET", f"/sessions/{session_id}/queue")
         if not isinstance(result, dict):

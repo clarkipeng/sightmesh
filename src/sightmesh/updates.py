@@ -460,7 +460,7 @@ def activity(client: CdesktopClient) -> dict[str, Any]:
             "execution_process_id": process.get("id"),
             "run_reason": process.get("run_reason"),
         }
-        for process in client.execution_processes(status="running")
+        for process in client.running_execution_processes()
         if process.get("status") == "running"
         and process.get("run_reason") != "devserver"
     ]

@@ -949,6 +949,18 @@ def test_admission_sweep_loses_dead_tasks_across_scopes(system):
     client.processes[worker.session_id] = [
         {"id": "dead", "status": "killed", "run_reason": "codingagent"}
     ]
+    stop_attempts = 0
+    real_stop = client.stop_workspace
+
+    def flaky_stop(workspace_id):
+        nonlocal stop_attempts
+        assert_external_io_allowed()
+        stop_attempts += 1
+        if stop_attempts <= 2:
+            raise CdesktopError("transient workspace stop failure")
+        real_stop(workspace_id)
+
+    client.stop_workspace = flaky_stop
 
     other_scope = SightMesh(
         client=client,
@@ -956,9 +968,24 @@ def test_admission_sweep_loses_dead_tasks_across_scopes(system):
         ownership=ownership,
         environment={"CDESKTOP_SESSION_ID": "another-scope"},
     )
-    assert other_scope.sweep_admission()["tasks_lost"] == 1
+    first = other_scope.sweep_admission()
+    assert first["tasks_lost"] == 1
+    assert first["terminal_workspaces_stopped"] == 0
     assert store.get_by_id(task.task_id).state == "lost"
+    effect = other_scope.journal.get(task.task_id, task.epoch)
+    assert effect.state == "terminal"
+    assert effect.outcome.startswith("lost:")
+    assert effect.workspace_id == worker.workspace_id
+    retired = ownership.get(worker.session_id)
+    assert retired.state == "retired"
+    assert retired.logical_key == f"task:{task.task_id}:{task.epoch}"
     assert store.count_running() == 0
+
+    second = other_scope.sweep_admission()
+    assert second["tasks_lost"] == 0
+    assert second["terminal_workspaces_stopped"] == 1
+    assert other_scope.journal.get(task.task_id, task.epoch).workspace_id is None
+    assert client.stopped == [worker.workspace_id]
 
 
 def test_expired_reservation_can_be_reissued_with_a_new_spec(system):

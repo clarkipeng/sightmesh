@@ -114,10 +114,16 @@ class FakeClient:
         ]
 
     def workspaces(self):
-        return [{"id": "workspace-1", "archived": False}]
+        assert_external_io_allowed()
+        return [{"id": "workspace-1", "name": "workspace-one", "archived": False}]
 
     def sessions(self, _workspace_id):
-        return [{"id": "session-1"}]
+        assert_external_io_allowed()
+        return [{"id": "session-1", "name": "worker-one"}]
+
+    def running_execution_processes(self):
+        assert_external_io_allowed()
+        return self.execution_processes("session-1")
 
     def execution_processes(self, _session_id=None, *, status=None):
         assert_external_io_allowed()
@@ -404,18 +410,18 @@ def test_activity_does_not_depend_on_per_session_queue_reads() -> None:
 
 def test_drain_retries_a_transient_activity_probe_failure(monkeypatch) -> None:
     client = FakeClient()
-    real = client.execution_processes
+    real = client.running_execution_processes
     attempts = 0
 
-    def flaky(session_id=None, *, status=None):
+    def flaky():
         nonlocal attempts
         assert_external_io_allowed()
         attempts += 1
         if attempts == 1:
             raise CdesktopError("GET /execution-processes failed: HTTP 500")
-        return real(session_id, status=status)
+        return real()
 
-    client.execution_processes = flaky
+    client.running_execution_processes = flaky
     monkeypatch.setattr(updates, "QUIET_SECONDS", 0)
     monkeypatch.setattr(updates, "DRAIN_POLL_SECONDS", 0)
     monkeypatch.setattr(updates, "DRAIN_WAIT_SECONDS", 1)

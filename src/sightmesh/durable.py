@@ -720,7 +720,10 @@ class DurableExecutionReconciler:
         arms ``any_child_lost``, so the manager is told without waiting for the
         cohort.
 
-        The evidence and the terminal are one transaction. As two they could
+        The evidence, task terminal, and effect terminal are one transaction.
+        The holder is durably quarantined before that transaction commits, and
+        the effect's workspace id remains the retryable native cleanup intent.
+        As separate task/effect writes they could
         interleave: a crash between them left evidence for a loss that was
         never recorded, and a competing writer could finish the task in the
         gap so the evidence landed on somebody else's outcome. The evidence
@@ -749,6 +752,28 @@ class DurableExecutionReconciler:
                         f"WHERE task_id = ? AND state IN ({placeholders})",
                         (payload, current.task_id, *states),
                     )
+                    effect = conn.execute(
+                        "SELECT state, workspace_id FROM task_effects "
+                        "WHERE task_id = ? AND epoch = ?",
+                        (current.task_id, current.epoch),
+                    ).fetchone()
+                    if effect is None:
+                        raise TaskStoreError(
+                            f"Cannot lose task {current.task_id}: effect is missing"
+                        )
+                    if effect["state"] != "terminal":
+                        conn.execute(
+                            "UPDATE task_effects SET state = 'terminal', outcome = ?, "
+                            "updated_at = ? WHERE task_id = ? AND epoch = ? "
+                            "AND state IN ('reserved', 'launched')",
+                            (reason, self.clock(), current.task_id, current.epoch),
+                        )
+                    self.ownership.retire(
+                        current.holder_session_id,
+                        state="retired",
+                        reason="managed task lost",
+                        logical_key=f"task:{current.task_id}:{current.epoch}",
+                    )
                     _record, armed = wakes.finish_with_wake(
                         store, current.task_id, "lost", reason, fence=fence, conn=conn
                     )
@@ -756,6 +781,14 @@ class DurableExecutionReconciler:
         except TaskStoreError as exc:
             LOGGER.warning("Cannot record loss for %s: %s", task.key, exc)
             return 0
+        effect = EffectJournal(store).get(task.task_id, task.epoch)
+        if effect is not None and effect.workspace_id:
+            try:
+                with store.task_lock(task.task_id) as cleanup_fence:
+                    with cleanup_fence.external_io():
+                        EffectJournal(store).stop_terminal(self.client, effect)
+            except Exception as exc:  # noqa: BLE001 - durable intent retries later
+                LOGGER.info("Leaving lost workspace for retry: %s", exc)
         self._output_bytes.pop(task.task_id, None)
         self._raise_attention(
             task,

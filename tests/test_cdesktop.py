@@ -101,6 +101,54 @@ def test_register_repo_reuses_exact_path() -> None:
     assert client.calls == []
 
 
+def test_running_execution_processes_normalizes_pr34_response_shape() -> None:
+    """PR #34 returns blocker names but no redundant status field."""
+    class RunningClient(FakeClient):
+        def request(self, method, path, payload=None, query=None, headers=None):
+            self.calls.append((method, path, payload, query, headers))
+            return [{
+                "id": "process-a", "name": "worker-a", "session_id": "session-a",
+                "workspace_id": "workspace-a", "workspace_name": "repo-a",
+                "run_reason": "codingagent", "started_at": "2026-09-04T00:00:00Z",
+            }]
+
+    client = RunningClient()
+    assert client.running_execution_processes() == [{
+        "id": "process-a", "name": "worker-a", "session_id": "session-a",
+        "workspace_id": "workspace-a", "workspace_name": "repo-a",
+        "run_reason": "codingagent", "started_at": "2026-09-04T00:00:00Z",
+        "status": "running", "session_name": "worker-a",
+    }]
+    assert client.calls == [
+        ("GET", "/execution-processes/running", None, None, None)
+    ]
+
+
+def test_running_execution_processes_falls_back_to_pinned_028_shape() -> None:
+    """Pinned 0.2.8 requires session_id and returns the bare process model."""
+    class LegacyClient(FakeClient):
+        def request(self, method, path, payload=None, query=None, headers=None):
+            self.calls.append((method, path, payload, query, headers))
+            if path == "/execution-processes/running":
+                raise cdesktop.CdesktopError("HTTP 404: not found")
+            if path == "/workspaces":
+                return [{"id": "workspace-a", "name": "repo-a", "archived": False}]
+            if path == "/sessions":
+                assert query == {"workspace_id": "workspace-a"}
+                return [{"id": "session-a", "name": "worker-a"}]
+            assert path == "/execution-processes"
+            assert query == {"session_id": "session-a"}
+            return [{
+                "id": "process-a", "session_id": "session-a",
+                "status": "running", "run_reason": "codingagent",
+            }]
+
+    row = LegacyClient().running_execution_processes()[0]
+    assert row["session_name"] == "worker-a"
+    assert row["workspace_name"] == "repo-a"
+    assert row["status"] == "running"
+
+
 def test_set_parent_rejects_self_link_before_request() -> None:
     client = FakeClient()
 

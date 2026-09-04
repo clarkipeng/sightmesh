@@ -1254,9 +1254,14 @@ def test_s15_a_killed_process_is_lost_and_wakes_before_its_siblings(
     assert [row for row in client.sent if row[0] == parent.session_id]
     assert EscalationStore(store.path).pending()
 
-    # No kill and no respawn: the process was already dead, and replacing it is
-    # the manager's call, not the kernel's.
-    assert client.stopped == []
+    # The process was already dead, but its session must be quarantined and its
+    # queued workspace commands removed before capacity is freed.
+    effect = EffectJournal(store).get(lost.task_id, lost.epoch)
+    assert effect.state == "terminal"
+    assert effect.outcome == "lost:restart"
+    assert effect.workspace_id is None, "successful cleanup clears durable intent"
+    assert ownership.get(victim.session_id).state == "retired"
+    assert client.stopped == [victim.workspace_id]
     effects_before = client.distinct_effects()
 
     for _ in range(3):
