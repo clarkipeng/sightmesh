@@ -26,7 +26,9 @@ _COMMAND_MODULE_NAMES = frozenset(_COMMAND_MODULES)
 
 def _command_modules() -> tuple[types.ModuleType, ...]:
     """Load command handlers only when a command needs the SDK runtime."""
-    return tuple(importlib.import_module(f"{__name__}.{name}") for name in _COMMAND_MODULES)
+    return tuple(
+        importlib.import_module(f"{__name__}.{name}") for name in _COMMAND_MODULES
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -101,6 +103,7 @@ def main() -> None:
         print(__version__)
         raise SystemExit(0)
     from ..cdesktop import CdesktopError
+    from ..external_runs import ExternalRunError
     from ..pool import PoolError
     from ..profiles import ProfileError
     from ..repowire import RepowireError
@@ -112,6 +115,7 @@ def main() -> None:
         code = args.func(args)
     except (
         CdesktopError,
+        ExternalRunError,
         PoolError,
         ProfileError,
         RepowireError,

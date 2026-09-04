@@ -5,6 +5,15 @@ Principle: the kernel never kills and never respawns.
 Every liveness failure becomes a typed observation that satisfies a wake predicate; the owning manager holds all replace/cancel authority, under the existing epoch fencing.
 Wall-clock kill timers are banned: the incident record shows every automatic reaper caused damage (30-minute approval SIGKILLs, restart deaths misread as worker deaths, infrastructure failure recorded as result failure).
 
+External runs use the same reconciler tick and delivery pipe: a runner first
+creates a version-fenced output-root lease plus subscription, then binds only a
+stable process fingerprint it owns. Its append-only terminal receipt is the
+authoritative terminal evidence. A vanished or PID-reused fingerprint without
+that receipt becomes the typed `lost/unknown` outcome, never success or a
+guessed crash; terminal and loss notifications use the existing parked
+escalation and cdesktop durable-command path with the subscription's one stable
+dedupe key.
+
 ## Solutions per stall cause
 
 | # | cause | detection signal | resulting state | action |
