@@ -363,47 +363,7 @@ class EscalationStore:
                     "CREATE INDEX IF NOT EXISTS idx_escalations_status "
                     "ON escalations(status, created_at DESC)"
                 )
-                # External runners own their process and receipt.  These rows only
-                # retain the return address and exclusive output-root claim while
-                # SightMesh is away; no process token belongs in this store.
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS external_run_leases (
-                        output_root TEXT PRIMARY KEY,
-                        subscription_id TEXT NOT NULL UNIQUE,
-                        state TEXT NOT NULL CHECK (state IN ('active', 'released')),
-                        version INTEGER NOT NULL DEFAULT 0,
-                        created_at REAL NOT NULL,
-                        released_at REAL
-                    )
-                    """
-                )
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS external_run_subscriptions (
-                        subscription_id TEXT PRIMARY KEY,
-                        run_id TEXT NOT NULL UNIQUE,
-                        output_root TEXT NOT NULL UNIQUE,
-                        return_session_id TEXT NOT NULL,
-                        return_workspace_id TEXT,
-                        writer_capability_digest TEXT NOT NULL,
-                        dedupe_key TEXT NOT NULL UNIQUE,
-                        state TEXT NOT NULL CHECK (state IN
-                            ('subscribed', 'running', 'terminal', 'lost', 'notified')),
-                        version INTEGER NOT NULL DEFAULT 0,
-                        pid INTEGER,
-                        process_fingerprint TEXT,
-                        receipt_path TEXT NOT NULL,
-                        receipt_digest TEXT,
-                        outcome TEXT,
-                        diagnostic TEXT,
-                        created_at REAL NOT NULL,
-                        updated_at REAL NOT NULL,
-                        terminal_at REAL,
-                        notified_at REAL
-                    )
-                    """
-                )
+                self._migrate_external_run_schema(conn)
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_external_run_subscriptions_pending "
                     "ON external_run_subscriptions(state, updated_at)"
@@ -433,6 +393,87 @@ class EscalationStore:
             raise EscalationStoreError(
                 f"Cannot initialize escalation store {self.path}: {exc}"
             ) from exc
+
+    @staticmethod
+    def _external_run_schema(conn: sqlite3.Connection) -> None:
+        """Create lease-instance history and live-only root exclusion."""
+        conn.execute(
+            """
+            CREATE TABLE external_run_leases (
+                subscription_id TEXT PRIMARY KEY,
+                output_root TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('active', 'released')),
+                version INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                released_at REAL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_external_run_leases_live_root "
+            "ON external_run_leases(output_root) WHERE state = 'active'"
+        )
+        conn.execute(
+            """
+            CREATE TABLE external_run_subscriptions (
+                subscription_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL UNIQUE,
+                output_root TEXT NOT NULL,
+                return_session_id TEXT NOT NULL,
+                return_workspace_id TEXT,
+                writer_capability_digest TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK (state IN
+                    ('subscribed', 'running', 'terminal', 'lost', 'delivering', 'notified')),
+                version INTEGER NOT NULL DEFAULT 0,
+                pid INTEGER,
+                process_fingerprint TEXT,
+                receipt_path TEXT NOT NULL,
+                receipt_digest TEXT,
+                outcome TEXT,
+                diagnostic TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                terminal_at REAL,
+                notified_at REAL
+            )
+            """
+        )
+
+    def _migrate_external_run_schema(self, conn: sqlite3.Connection) -> None:
+        """Replace the original lifetime-root tables without losing evidence."""
+        rows = conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('external_run_leases', 'external_run_subscriptions')"
+        ).fetchall()
+        existing = {str(row['name']): str(row['sql'] or '') for row in rows}
+        if not existing:
+            self._external_run_schema(conn)
+            return
+        legacy = (
+            'output_root TEXT PRIMARY KEY' in existing.get('external_run_leases', '')
+            or 'output_root TEXT NOT NULL UNIQUE' in existing.get('external_run_subscriptions', '')
+        )
+        if not legacy:
+            return
+        conn.execute('ALTER TABLE external_run_leases RENAME TO external_run_leases_old')
+        conn.execute(
+            'ALTER TABLE external_run_subscriptions RENAME TO '
+            'external_run_subscriptions_old'
+        )
+        self._external_run_schema(conn)
+        conn.execute(
+            "INSERT INTO external_run_leases "
+            "(subscription_id, output_root, state, version, created_at, released_at) "
+            "SELECT subscription_id, output_root, state, version, created_at, released_at "
+            "FROM external_run_leases_old"
+        )
+        conn.execute(
+            "INSERT INTO external_run_subscriptions "
+            "SELECT * FROM external_run_subscriptions_old"
+        )
+        conn.execute('DROP TABLE external_run_leases_old')
+        conn.execute('DROP TABLE external_run_subscriptions_old')
 
     def record_launcher(
         self,

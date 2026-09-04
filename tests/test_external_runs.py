@@ -14,6 +14,7 @@ from sightmesh.external_runs import (
     ExternalRunError,
     ExternalRunReconciler,
     ExternalRunStore,
+    StaleExternalRunTransition,
 )
 
 
@@ -77,6 +78,7 @@ def test_binding_requires_the_runner_capability_and_a_live_stable_fingerprint(tm
             writer_capability="other",
             pid=2,
             process_fingerprint="start",
+            expect_version=result.run.version,
             observer=lambda _: "start",
         )
     bound = store.bind(
@@ -84,6 +86,7 @@ def test_binding_requires_the_runner_capability_and_a_live_stable_fingerprint(tm
         writer_capability=result.writer_capability,
         pid=2,
         process_fingerprint="start",
+        expect_version=result.run.version,
         observer=lambda _: "start",
     )
     assert bound.state == "running" and bound.pid == 2
@@ -113,6 +116,7 @@ def test_disappeared_process_without_receipt_is_typed_lost_unknown_not_a_guessed
         writer_capability=result.writer_capability,
         pid=2,
         process_fingerprint="old",
+        expect_version=result.run.version,
         observer=lambda _: "old",
     )
     ExternalRunReconciler(Client(), store, observer=lambda _: "new").reconcile_one(run)
@@ -152,6 +156,7 @@ def test_pid_reuse_is_rejected_as_loss(tmp_path):
         writer_capability=result.writer_capability,
         pid=2,
         process_fingerprint="first",
+        expect_version=result.run.version,
         observer=lambda _: "first",
     )
     ExternalRunReconciler(Client(), store, observer=lambda _: "reused").reconcile_one(
@@ -174,14 +179,74 @@ def test_competing_root_claim_has_one_winner_and_keeps_its_directory(tmp_path):
     assert (tmp_path / "root").is_dir()
 
 
-def test_launch_failure_receipt_before_bind_and_unreachable_parent_both_stay_durable(
+@pytest.mark.parametrize("terminal", ["receipt", "lost"])
+def test_released_root_is_reclaimable_while_terminal_history_is_retained(tmp_path, terminal):
+    store, result = subscribed(tmp_path)
+    if terminal == "receipt":
+        receipt(result.run)
+        reconciler = ExternalRunReconciler(Client(), store)
+    else:
+        bound = store.bind(
+            result.run.subscription_id,
+            writer_capability=result.writer_capability,
+            pid=2,
+            process_fingerprint="first",
+            expect_version=result.run.version,
+            observer=lambda _: "first",
+        )
+        reconciler = ExternalRunReconciler(Client(), store, observer=lambda _: "gone")
+        assert bound.state == "running"
+    reconciler.reconcile()
+    if terminal == "receipt":
+        Path(result.run.receipt_path).unlink()
+    next_run = store.subscribe(
+        run_id=f"r2-{terminal}",
+        output_root=tmp_path / "output",
+        return_session_id="parent",
+    )
+    assert store.get(result.run.subscription_id).state == "notified"
+    assert next_run.run.output_root == result.run.output_root
+
+
+def test_parked_delivery_retries_the_same_durable_command_when_parent_recovers(
     tmp_path,
 ):
     store, result = subscribed(tmp_path)
     receipt(result.run, "failed")
-    ExternalRunReconciler(Client(reachable=False), store).reconcile()
-    assert store.get(result.run.subscription_id).state == "notified"
+    unavailable = Client(reachable=False)
+    ExternalRunReconciler(unavailable, store).reconcile()
+    assert store.get(result.run.subscription_id).state == "delivering"
     assert store.escalations.pending()[0].dedupe_key == result.run.dedupe_key
+    recovered = Client()
+    reconciler = ExternalRunReconciler(recovered, store)
+    reconciler.reconcile()
+    reconciler.reconcile()
+    assert store.get(result.run.subscription_id).state == "notified"
+    assert len(recovered.sent) == 1
+    assert recovered.sent[0][0] == "parent"
+    assert recovered.sent[0][2] == result.run.dedupe_key
+
+
+def test_stale_runner_version_cannot_bind_after_restart(tmp_path):
+    store, result = subscribed(tmp_path)
+    store.bind(
+        result.run.subscription_id,
+        writer_capability=result.writer_capability,
+        pid=2,
+        process_fingerprint="first",
+        expect_version=result.run.version,
+        observer=lambda _: "first",
+    )
+    restarted = ExternalRunStore(store.path)
+    with pytest.raises(StaleExternalRunTransition):
+        restarted.bind(
+            result.run.subscription_id,
+            writer_capability=result.writer_capability,
+            pid=3,
+            process_fingerprint="second",
+            expect_version=result.run.version,
+            observer=lambda _: "second",
+        )
 
 
 def test_cli_exposes_the_minimal_external_run_verbs():
@@ -215,6 +280,8 @@ def test_cli_exposes_the_minimal_external_run_verbs():
                 "1",
                 "--process-fingerprint",
                 "start",
+                "--expect-version",
+                "0",
             ]
         )
         .run_action

@@ -165,8 +165,8 @@ class ExternalRunStore:
                     created = True
                 root.chmod(0o700)
                 conn.execute(
-                    "INSERT INTO external_run_leases (output_root, subscription_id, state, created_at) VALUES (?, ?, 'active', ?)",
-                    (str(root), subscription_id, now),
+                    "INSERT INTO external_run_leases (subscription_id, output_root, state, created_at) VALUES (?, ?, 'active', ?)",
+                    (subscription_id, str(root), now),
                 )
                 conn.execute(
                     """INSERT INTO external_run_subscriptions
@@ -233,7 +233,7 @@ class ExternalRunStore:
         writer_capability: str,
         pid: int,
         process_fingerprint: str,
-        expect_version: int | None = None,
+        expect_version: int,
         observer: Callable[[int], str | None] = observe_process_fingerprint,
     ) -> ExternalRun:
         if pid <= 0 or not process_fingerprint or observer(pid) != process_fingerprint:
@@ -280,6 +280,13 @@ class ExternalRunStore:
             (diagnostic, time.time()),
         )
 
+    def begin_delivery(self, run: ExternalRun) -> ExternalRun:
+        if run.state == "delivering":
+            return run
+        return self._transition(
+            run, frozenset({"terminal", "lost"}), "delivering", run.version, "", ()
+        )
+
     def mark_notified(self, run: ExternalRun) -> ExternalRun:
         with self.escalations._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -287,7 +294,7 @@ class ExternalRunStore:
             cursor = conn.execute(
                 "UPDATE external_run_subscriptions SET state = 'notified', notified_at = ?, "
                 "version = version + 1, updated_at = ? WHERE subscription_id = ? "
-                "AND state IN ('terminal', 'lost') AND version = ?",
+                "AND state = 'delivering' AND version = ?",
                 (now, now, run.subscription_id, run.version),
             )
             if not cursor.rowcount:
@@ -330,15 +337,16 @@ class ExternalRunStore:
         run: ExternalRun,
         states: frozenset[str],
         target: str,
-        expected: int | None,
+        expected: int,
         assign: str,
         values: tuple[object, ...],
     ) -> ExternalRun:
         choices = ", ".join("?" for _ in states)
+        assignments = f"state = ?, {assign}, " if assign else "state = ?, "
         with self.escalations._connect() as conn:
             cursor = conn.execute(
-                f"UPDATE external_run_subscriptions SET state = ?, {assign}, version = version + 1, updated_at = ? "
-                f"WHERE subscription_id = ? AND state IN ({choices}) AND (? IS NULL OR version = ?)",
+                f"UPDATE external_run_subscriptions SET {assignments}version = version + 1, updated_at = ? "
+                f"WHERE subscription_id = ? AND state IN ({choices}) AND version = ?",
                 (
                     target,
                     *values,
@@ -346,13 +354,10 @@ class ExternalRunStore:
                     run.subscription_id,
                     *sorted(states),
                     expected,
-                    expected,
                 ),
             )
         if not cursor.rowcount:
             current = self.get(run.subscription_id)
-            if current.state == target:
-                return current
             raise StaleExternalRunTransition(
                 f"stale {target} transition for {run.subscription_id}; current={current.state}"
             )
@@ -398,8 +403,9 @@ class ExternalRunReconciler:
                 run = self.store.preserve_lost(
                     run, "process fingerprint disappeared without terminal receipt"
                 )
-        if run.state not in {"terminal", "lost"}:
+        if run.state not in {"terminal", "lost", "delivering"}:
             return 0
+        run = self.store.begin_delivery(run)
         message = f"STATUS: external run {run.run_id} {run.outcome}; output_root={run.output_root}; receipt={run.receipt_path}"
         try:
             result = escalate(
@@ -413,8 +419,7 @@ class ExternalRunReconciler:
             )
         except (CdesktopError, OSError, EscalationStoreError):
             return 0
-        # A parked escalation is durable command delivery, not a dropped wake.
-        if result.get("delivered") or result.get("parked"):
+        if result.get("delivered"):
             self.store.mark_notified(run)
             return 1
         return 0
