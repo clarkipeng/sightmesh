@@ -374,7 +374,7 @@ def test_s8_stale_epoch_writer_after_transfer_is_rejected(store: TaskStore) -> N
 
     store.prepare_replacement(activated.task_id)  # bumps epoch/version underneath the stale writer
 
-    with pytest.raises(StaleTransition):
+    with store.task_lock(activated.task_id) as fence, pytest.raises(StaleTransition):
         store.transition(
             activated.task_id,
             expect_states=frozenset({"active"}),
@@ -382,6 +382,7 @@ def test_s8_stale_epoch_writer_after_transfer_is_rejected(store: TaskStore) -> N
             assign="state = 'completed', result = ?",
             values=("stale write",),
             attempted="completed",
+            fence=fence,
         )
 
 

@@ -36,8 +36,8 @@ from .effects import (
     request_hash,
 )
 from .escalation import CDESKTOP_SESSION_ENV, EscalationStore, LauncherIdentity
-from .liveness import Budget, resolve_policy, trusted_policy
 from .execution_routing import ExecutionRoutingError
+from .liveness import Budget, resolve_policy, trusted_policy
 from .pool.core import PoolError
 from .profiles import ProfileStore, validate_provider
 from .succession import (
@@ -51,7 +51,13 @@ from .succession import (
     routing_outcome,
     transfer_ownership,
 )
-from .task_store import StaleTransition, TaskRecord, TaskStore, TaskStoreError
+from .task_store import (
+    StaleTransition,
+    TaskFence,
+    TaskRecord,
+    TaskStore,
+    TaskStoreError,
+)
 
 LOGGER = logging.getLogger("sightmesh.sdk")
 
@@ -74,7 +80,9 @@ class BatchError(SightMeshError):
         super().__init__(message)
 
 
-PERMISSION_POLICIES = frozenset({"BYPASS_PERMISSIONS", "ACCEPT_EDITS", "PLAN", "SUPERVISED"})
+PERMISSION_POLICIES = frozenset(
+    {"BYPASS_PERMISSIONS", "ACCEPT_EDITS", "PLAN", "SUPERVISED"}
+)
 
 
 @dataclass(frozen=True)
@@ -313,7 +321,7 @@ class SightMesh:
 
     def replace(self, worker: str, prompt: str | None = None) -> Worker:
         task = self._find(worker)
-        with self.store.task_lock(task.task_id):
+        with self.store.task_lock(task.task_id) as fence:
             # The snapshot used to find the task may have waited behind an
             # automatic recovery. Reloading under the same lock makes this
             # replacement and that recovery one indivisible choice.
@@ -322,7 +330,9 @@ class SightMesh:
                 raise SightMeshError(f"Task {worker!r} has no session to replace")
             replacement_prompt = prompt or self._read_checkpoint(task)
             if not replacement_prompt or not replacement_prompt.strip():
-                raise SightMeshError("Replacement requires a prompt or saved checkpoint")
+                raise SightMeshError(
+                    "Replacement requires a prompt or saved checkpoint"
+                )
             self._require_contract()
             target = {**task.spec["target"]}
             automatic_recovery = routing_outcome(target.get("recovery"))
@@ -337,19 +347,35 @@ class SightMesh:
                         if automatic_recovery is not None
                         else "spec_json = ?"
                     ),
-                    values=(json.dumps({**task.spec, "target": target}, sort_keys=True, separators=(",", ":")),),
+                    values=(
+                        json.dumps(
+                            {**task.spec, "target": target},
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
                     attempted="manual replacement resume",
+                    fence=fence,
                 )
                 if task.state == "replacing"
-                else self.store.prepare_replacement(task.task_id, target=target, expect_version=task.version)
+                else self.store.prepare_replacement(
+                    task.task_id,
+                    target=target,
+                    expect_version=task.version,
+                    fence=fence,
+                )
             )
-            return Worker.from_record(self._replace_prepared(prepared, replacement_prompt))
+            return Worker.from_record(
+                self._replace_prepared(prepared, replacement_prompt, fence)
+            )
 
-    def _finish(self, task: TaskRecord, state: str, result: str | None) -> TaskRecord:
+    def _finish(
+        self, task: TaskRecord, state: str, result: str | None, fence: TaskFence
+    ) -> TaskRecord:
         """Make the durable terminal decision and enqueue its parent wake."""
         try:
             updated, _created = wakes.finish_with_wake(
-                self.store, task.task_id, state, result
+                self.store, task.task_id, state, result, fence=fence
             )
         except StaleTransition as exc:
             if exc.current.state == state:
@@ -373,11 +399,11 @@ class SightMesh:
         delivery are intentionally outside it: a slow HTTP request cannot hold
         a task's lifecycle gate. Re-entry fences delivery against a newer row.
         """
-        with self.store.task_lock(task.task_id):
+        with self.store.task_lock(task.task_id) as fence:
             current = self.store.get_by_id(task.task_id)
             if current is None:
                 raise SightMeshError(f"Task {task.key!r} no longer exists")
-            updated = self._finish(current, state, result)
+            updated = self._finish(current, state, result, fence)
             workspace_id = current.workspace_id if stop_workspace else None
 
         if workspace_id:
@@ -470,6 +496,15 @@ class SightMesh:
         and wakes its manager, rather than hanging or being rerouted on a
         guess.
         """
+        with self.store.task_lock(task.task_id) as fence:
+            current = self.store.get_by_id(task.task_id)
+            if current is None:
+                return None
+            return self._observe_session_failure_locked(current, session_id, fence)
+
+    def _observe_session_failure_locked(
+        self, task: TaskRecord, session_id: str, fence: TaskFence
+    ) -> Worker | None:
         if task.state != "active":
             return None
         effect = self.journal.get(task.task_id, task.epoch)
@@ -504,7 +539,7 @@ class SightMesh:
             # and `blocked` is not a legal predecessor of `active`, so nothing
             # could put it back.
             return None
-        return self._block_unroutable(task, process_failure_reason(process))
+        return self._block_unroutable(task, process_failure_reason(process), fence)
 
     def _queue_still_owns(self, session_id: str) -> bool:
         """Whether the native command queue has unfinished work for a session."""
@@ -528,13 +563,15 @@ class SightMesh:
         superseded epoch's outcome reroutes a run that already moved on; taking
         no effect as an argument makes that pairing impossible to get wrong.
         """
-        with self.store.task_lock(task.task_id):
+        with self.store.task_lock(task.task_id) as fence:
             current = self.store.get_by_id(task.task_id)
             if current is None:
                 return None
-            return self._advance_past_outcome_locked(current)
+            return self._advance_past_outcome_locked(current, fence)
 
-    def _advance_past_outcome_locked(self, task: TaskRecord) -> Worker | None:
+    def _advance_past_outcome_locked(
+        self, task: TaskRecord, fence: TaskFence
+    ) -> Worker | None:
         """Advance a fresh task snapshot while its launch intent is locked."""
         target = task.spec.get("target", {})
         effect = self.journal.get(task.task_id, task.epoch)
@@ -548,7 +585,7 @@ class SightMesh:
             recovery = routing_outcome(target.get("recovery"))
             if recovery is None:
                 return None
-            return self._resume_replacement(task, effect)
+            return self._resume_replacement(task, effect, fence)
         if task.state not in {"active", "blocked"}:
             return None
         outcome = (
@@ -565,6 +602,7 @@ class SightMesh:
                 task,
                 f"{outcome} on route {target.get('route_id')}; "
                 f"{task.max_attempts}-attempt circuit breaker tripped",
+                fence,
             )
 
         route_id = target.get("route_id")
@@ -576,6 +614,7 @@ class SightMesh:
             return self._block_unroutable(
                 task,
                 f"{outcome} on {route_id}; automatic failover is off",
+                fence,
             )
 
         selection = advance_route_after_outcome(
@@ -587,8 +626,8 @@ class SightMesh:
         if selection.status != "resolved" or selection.target is None:
             return self._block_unroutable(
                 task,
-                f"{outcome} on route {route_id} "
-                f"({route_class}); {selection.reason}",
+                f"{outcome} on route {route_id} ({route_class}); {selection.reason}",
+                fence,
             )
 
         selected = selection.target
@@ -606,13 +645,15 @@ class SightMesh:
         }
         self._require_contract()
         prepared = self.store.prepare_replacement(
-            task.task_id, target=next_target, expect_version=task.version
+            task.task_id, target=next_target, expect_version=task.version, fence=fence
         )
         return Worker.from_record(
-            self._launch_prepared(prepared, str(task.spec["prompt"]))
+            self._launch_prepared(prepared, str(task.spec["prompt"]), fence)
         )
 
-    def _resume_replacement(self, task: TaskRecord, effect: Effect | None) -> Worker | None:
+    def _resume_replacement(
+        self, task: TaskRecord, effect: Effect | None, fence: TaskFence
+    ) -> Worker | None:
         """Settle a task whose replacement epoch was opened but never filled.
 
         ``prepare_replacement`` and the launch that fills it are two steps, so
@@ -631,12 +672,16 @@ class SightMesh:
         """
         if effect is not None and effect.state == "terminal":
             return self._block_unroutable(
-                task, f"replacement epoch ended: {effect.outcome}"
+                task, f"replacement epoch ended: {effect.outcome}", fence
             )
         self._require_contract()
-        return Worker.from_record(self._launch_prepared(task, str(task.spec["prompt"])))
+        return Worker.from_record(
+            self._launch_prepared(task, str(task.spec["prompt"]), fence)
+        )
 
-    def _block_unroutable(self, task: TaskRecord, reason: str) -> Worker | None:
+    def _block_unroutable(
+        self, task: TaskRecord, reason: str, fence: TaskFence
+    ) -> Worker | None:
         """Block a task that cannot advance, and report only a real change.
 
         A task blocked at launch already carries its typed outcome as its
@@ -647,7 +692,7 @@ class SightMesh:
         """
         if task.state == "blocked":
             return None
-        return Worker.from_record(self._finish(task, "blocked", reason))
+        return Worker.from_record(self._finish(task, "blocked", reason, fence))
 
     def _record_provider_outcome(
         self, task: TaskRecord, outcome: str, retry_at: float | None
@@ -680,7 +725,7 @@ class SightMesh:
         return outcome
 
     def _launch_prepared(
-        self, prepared: TaskRecord, replacement_prompt: str
+        self, prepared: TaskRecord, replacement_prompt: str, fence: TaskFence
     ) -> TaskRecord:
         """Fill the epoch ``prepare_replacement`` opened.
 
@@ -690,22 +735,26 @@ class SightMesh:
         workspace exactly as the first attempt would have.
         """
         if prepared.workspace_id and prepared.holder_session_id:
-            return self._replace_prepared(prepared, replacement_prompt)
+            return self._replace_prepared(prepared, replacement_prompt, fence)
         workspace_id, session_id = self._journaled_launch(
             prepared,
             {
                 "kind": "workspace",
                 "request": self._workspace_request(prepared, replacement_prompt),
             },
+            fence,
         )
         active = self.store.activate(
-            prepared.task_id, workspace_id=workspace_id, session_id=session_id
+            prepared.task_id,
+            workspace_id=workspace_id,
+            session_id=session_id,
+            fence=fence,
         )
         self._record_launcher(active)
         return active
 
     def _replace_prepared(
-        self, prepared: TaskRecord, replacement_prompt: str
+        self, prepared: TaskRecord, replacement_prompt: str, fence: TaskFence
     ) -> TaskRecord:
         target = prepared.spec["target"]
         request = self.client.session_launch_request(
@@ -727,7 +776,7 @@ class SightMesh:
         }
 
         def spawn() -> str:
-            return self._journaled_launch(prepared, launch)[1]
+            return self._journaled_launch(prepared, launch, fence)[1]
 
         transfer = transfer_ownership(
             self.client,
@@ -741,6 +790,7 @@ class SightMesh:
             prepared.task_id,
             workspace_id=prepared.workspace_id,
             session_id=transfer.successor_session_id,
+            fence=fence,
         )
         self._record_launcher(active)
         return active
@@ -761,24 +811,25 @@ class SightMesh:
             setup_script=task.spec.get("setup_script"),
             auth_binding_id=target.get("auth_binding_id"),
         )
+
     def _start_reserved(self, task: TaskRecord) -> TaskRecord:
         """Launch a reservation while sharing terminal writers' task fence."""
-        with self.store.task_lock(task.task_id):
+        with self.store.task_lock(task.task_id) as fence:
             current = self.store.get_by_id(task.task_id)
             if current is None:
                 raise SightMeshError(f"Task {task.key!r} no longer exists")
-            return self._start_reserved_locked(current)
+            return self._start_reserved_locked(current, fence)
 
-    def _start_reserved_locked(self, task: TaskRecord) -> TaskRecord:
+    def _start_reserved_locked(self, task: TaskRecord, fence: TaskFence) -> TaskRecord:
         if task.state != "reserved":
             return task
         request = self._workspace_request(task, str(task.spec["prompt"]))
         self._wait_for_launch_capacity(task)
         workspace_id, session_id = self._journaled_launch(
-            task, {"kind": "workspace", "request": request}
+            task, {"kind": "workspace", "request": request}, fence
         )
         active = self.store.activate(
-            task.task_id, workspace_id=workspace_id, session_id=session_id
+            task.task_id, workspace_id=workspace_id, session_id=session_id, fence=fence
         )
         self._record_launcher(active)
         return active
@@ -791,7 +842,9 @@ class SightMesh:
         instead of stampeding the host.
         """
         cap = int(os.environ.get("SIGHTMESH_MAX_ACTIVE_WORKERS", "4"))
-        deadline = time.monotonic() + float(os.environ.get("SIGHTMESH_LAUNCH_WAIT_SECONDS", "90"))
+        deadline = time.monotonic() + float(
+            os.environ.get("SIGHTMESH_LAUNCH_WAIT_SECONDS", "90")
+        )
         delay = 0.5
         while True:
             running = self.store.count_running()
@@ -806,7 +859,7 @@ class SightMesh:
             delay = min(delay * 2, 5.0)
 
     def _journaled_launch(
-        self, task: TaskRecord, launch: Mapping[str, Any]
+        self, task: TaskRecord, launch: Mapping[str, Any], fence: TaskFence
     ) -> tuple[str, str]:
         """Reserve, launch once, and record the native identifiers.
 
@@ -850,20 +903,20 @@ class SightMesh:
                 outcome = self._record_provider_outcome(
                     task, _rejection_outcome(exc.status), exc.retry_at
                 )
-                self._finish(task, "blocked", f"launch rejected: {outcome}")
+                self._finish(task, "blocked", f"launch rejected: {outcome}", fence)
             raise
-        workspace_id, session_id = self._effect_ids(task, native)
+        workspace_id, session_id = self._effect_ids(task, native, fence)
         self.journal.mark_launched(task.task_id, task.epoch, workspace_id, session_id)
         return workspace_id, session_id
 
     def _effect_ids(
-        self, task: TaskRecord, effect: Mapping[str, Any]
+        self, task: TaskRecord, effect: Mapping[str, Any], fence: TaskFence
     ) -> tuple[str, str]:
         state = str(effect.get("state") or "")
         if state == "lost":
             reason = str(effect.get("reason") or "lost")
             self.journal.mark_terminal(task.task_id, task.epoch, f"lost:{reason}")
-            self._finish(task, "lost", reason)
+            self._finish(task, "lost", reason, fence)
             raise SightMeshError(f"Native launch for {task.key!r} was lost")
         workspace_id = effect.get("workspace_id")
         session_id = effect.get("session_id")
@@ -1219,6 +1272,8 @@ class SightMesh:
                 ".conductor/settings.toml scripts.setup must be a string"
             )
         return setup.strip() if setup and setup.strip() else None
+
+
 ADOPT_TIMEOUT_SECONDS = 30.0
 
 

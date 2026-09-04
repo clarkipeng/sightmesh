@@ -24,6 +24,9 @@ from sightmesh import execution_routing
 from sightmesh import sdk as sdk_module
 from sightmesh.cdesktop import CdesktopError
 from sightmesh.cli import parser
+from sightmesh.durable import DurableExecutionReconciler
+from sightmesh.escalation import EscalationStore
+from sightmesh.liveness import Finding, ProgressEvidence
 from sightmesh.pool import core as pool_core
 from sightmesh.profiles import Profile, ProfileStore
 from sightmesh.sdk import BatchError, SightMesh, SightMeshError
@@ -72,9 +75,7 @@ def test_sd1_a_typed_429_advances_the_chain_exactly_once(
     happens repeatedly off one stale outcome.
     """
     seed_pool(claude_account("acct-a"), claude_account("acct-b"))
-    configure_chains(
-        standard=(subscription("terra", "terra", "claude"),)
-    )
+    configure_chains(standard=(subscription("terra", "terra", "claude"),))
 
     start_rejected(mesh, 429)
     task = store.get("operator", "audit")
@@ -367,9 +368,9 @@ def test_sd7_validate_fails_closed_before_any_epoch_exists(
 
     payload = json.loads(capsys.readouterr().out)
     assert payload["valid"] is False
-    assert [entry["routeClass"] for entry in payload["classes"] if not entry["valid"]] == [
-        "deep"
-    ]
+    assert [
+        entry["routeClass"] for entry in payload["classes"] if not entry["valid"]
+    ] == ["deep"]
 
     with pytest.raises(SightMeshError, match="deep"):
         mesh.start(routed_spec(key="deepwork", route_class="deep"))
@@ -386,7 +387,12 @@ def test_sd7_validate_fails_closed_before_any_epoch_exists(
 
 
 def test_sd8_an_explicit_profile_override_remains_recoverable(
-    mesh: SightMesh, store: TaskStore, pool_root, routing_settings, tmp_path, monkeypatch
+    mesh: SightMesh,
+    store: TaskStore,
+    pool_root,
+    routing_settings,
+    tmp_path,
+    monkeypatch,
 ) -> None:
     """S-D8: a task launched from an explicit profile still advances on a typed
     outcome instead of dying where it stands.
@@ -423,7 +429,12 @@ def test_sd8_an_explicit_profile_override_remains_recoverable(
 
 
 def test_sd8_a_profile_that_forbids_failover_blocks_with_a_reason(
-    mesh: SightMesh, store: TaskStore, pool_root, routing_settings, tmp_path, monkeypatch
+    mesh: SightMesh,
+    store: TaskStore,
+    pool_root,
+    routing_settings,
+    tmp_path,
+    monkeypatch,
 ) -> None:
     """S-D8 (contrast): ``automatic_failover`` off is the operator saying this
     task runs here or not at all - but the task must still say so.
@@ -652,7 +663,9 @@ def test_sd12_a_replacement_epoch_that_already_ended_blocks_and_then_advances(
 
     monkeypatch.setattr(mesh, "_advance_past_outcome", advance)
 
-    assert [worker.state for worker in mesh.reconcile_provider_outcomes()] == ["blocked"]
+    assert [worker.state for worker in mesh.reconcile_provider_outcomes()] == [
+        "blocked"
+    ]
     assert calls == [stranded.task_id]
     blocked = store.get("operator", "audit")
     assert blocked.epoch == 2 and "rejected:400" in str(blocked.result)
@@ -1011,6 +1024,63 @@ def test_sd16_a_human_override_waits_for_recovery_authorized_at_native_boundary(
     launches = [call for call in mesh.client.call_log if call[0] == "managed_launch"]
     assert [call[1][1] for call in launches] == [1, stale.epoch, stale.epoch + 1]
     assert launches[-1][1][2]["request"]["session"]["prompt"] == "Human override prompt"
+
+
+def test_sd16_liveness_loss_wins_over_a_paused_replacement_without_orphaning(
+    mesh: SightMesh, store: TaskStore, routing_settings, monkeypatch
+) -> None:
+    """A loss and replacement serialize at the task fence before either launches.
+
+    The old liveness writer could mark this epoch lost while failover was between
+    its durable replacement and native PUT.  That left the successor running
+    behind a terminal row.  Here loss holds the fence first; failover reloads
+    the lost row and opens neither a successor epoch nor a native session.
+    """
+    configure_chains(
+        standard=(execution_routing.Route("test", "CODEX", "test", "free"),)
+    )
+    mesh.start(worker_spec())
+    task = store.get("operator", "audit")
+    assert task is not None
+    mesh.journal.mark_terminal(task.task_id, task.epoch, "rate_limited")
+    reconciler = DurableExecutionReconciler(
+        mesh.client,
+        task_store=store,
+        ownership=mesh.ownership,
+        signal_store=EscalationStore(store.path),
+    )
+    finding = Finding(
+        "lost", ProgressEvidence(observed=True, lost_reason="native-exit"), time.time()
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    original_get = store.get_by_id
+
+    def pause_loss(task_id: str):
+        if threading.current_thread().name.endswith("_0"):
+            entered.set()
+            assert release.wait(timeout=5)
+        return original_get(task_id)
+
+    monkeypatch.setattr(store, "get_by_id", pause_loss)
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="loss") as pool:
+        losing = pool.submit(
+            reconciler._record_loss, store, task, finding, finding.payload()
+        )
+        assert entered.wait(timeout=5)
+        replacement = pool.submit(mesh._advance_past_outcome, task)
+        assert not replacement.done()
+        release.set()
+        assert losing.result(timeout=5) >= 0
+        assert replacement.result(timeout=5) is None
+
+    current = store.get_by_id(task.task_id)
+    launches = [call for call in mesh.client.call_log if call[0] == "managed_launch"]
+    assert current is not None and (current.state, current.epoch) == (
+        "lost",
+        task.epoch,
+    )
+    assert [call[1][1] for call in launches] == [task.epoch]
 
 
 def test_sd16_one_tasks_native_launch_does_not_serialize_another_task(
