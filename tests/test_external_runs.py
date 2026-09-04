@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -177,6 +178,50 @@ def test_competing_root_claim_has_one_winner_and_keeps_its_directory(tmp_path):
         outcomes = [pool.submit(claim, key) for key in ("a", "b")]
     assert sum(f.exception() is None for f in outcomes) == 1
     assert (tmp_path / "root").is_dir()
+
+
+def test_concurrent_fresh_store_initialization_has_a_complete_external_run_schema(
+    tmp_path,
+):
+    """Why: first-open DDL used to autocommit table-by-table, letting a peer
+    create the subscription index after seeing only the lease table."""
+    path = tmp_path / "state.sqlite3"
+    workers = 12
+    barrier = threading.Barrier(workers)
+
+    def open_store(_: int) -> ExternalRunStore:
+        barrier.wait(timeout=10)
+        return ExternalRunStore(path)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        stores = list(pool.map(open_store, range(workers)))
+
+    assert len(stores) == workers
+    with stores[0].escalations._connect() as conn:
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('external_run_leases', 'external_run_subscriptions')"
+            )
+        }
+        indexes = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND name IN ("
+                "'idx_external_run_leases_live_root', "
+                "'idx_external_run_subscriptions_pending')"
+            )
+        }
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+
+    assert tables == {"external_run_leases", "external_run_subscriptions"}
+    assert indexes == {
+        "idx_external_run_leases_live_root",
+        "idx_external_run_subscriptions_pending",
+    }
+    assert version == 1
 
 
 @pytest.mark.parametrize("terminal", ["receipt", "lost"])

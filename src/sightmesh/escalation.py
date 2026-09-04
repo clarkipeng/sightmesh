@@ -43,6 +43,7 @@ INTERRUPT_TAGS = frozenset({"BLOCKED", "DECISION"})
 ESCALATION_KINDS = frozenset({"routine", "interrupt"})
 DELIVERY_INTENTS = frozenset({"continue", "replace"})
 WAL_ADOPTION_TIMEOUT_SECONDS = 30.0
+ESCALATION_SCHEMA_VERSION = 1
 SIGNAL_CONDITION_RE = re.compile(
     r"^(?:terminal|context-pressure:(0(?:\.\d+)?|1(?:\.0+)?)|idle:(\d+))$"
 )
@@ -405,6 +406,11 @@ class EscalationStore:
         try:
             with self._connect() as conn:
                 self._adopt_wal(conn)
+                # Schema inspection, migration, and every dependent index share
+                # one write transaction. A peer opening a fresh database waits
+                # here, then observes the completed schema rather than a table
+                # created by an initializer that has not reached its indexes.
+                conn.execute("BEGIN IMMEDIATE")
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS launcher_identities (
@@ -476,10 +482,6 @@ class EscalationStore:
                 )
                 self._migrate_external_run_schema(conn)
                 conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_external_run_subscriptions_pending "
-                    "ON external_run_subscriptions(state, updated_at)"
-                )
-                conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS signal_policies (
                         session_id TEXT PRIMARY KEY,
@@ -500,6 +502,8 @@ class EscalationStore:
                     )
                     """
                 )
+                conn.execute(f"PRAGMA user_version = {ESCALATION_SCHEMA_VERSION}")
+                conn.execute("COMMIT")
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(
                 f"Cannot initialize escalation store {self.path}: {exc}"
@@ -507,10 +511,10 @@ class EscalationStore:
 
     @staticmethod
     def _external_run_schema(conn: sqlite3.Connection) -> None:
-        """Create lease-instance history and live-only root exclusion."""
+        """Converge the external-run tables and their dependent indexes."""
         conn.execute(
             """
-            CREATE TABLE external_run_leases (
+            CREATE TABLE IF NOT EXISTS external_run_leases (
                 subscription_id TEXT PRIMARY KEY,
                 output_root TEXT NOT NULL,
                 state TEXT NOT NULL CHECK (state IN ('active', 'released')),
@@ -521,12 +525,8 @@ class EscalationStore:
             """
         )
         conn.execute(
-            "CREATE UNIQUE INDEX idx_external_run_leases_live_root "
-            "ON external_run_leases(output_root) WHERE state = 'active'"
-        )
-        conn.execute(
             """
-            CREATE TABLE external_run_subscriptions (
+            CREATE TABLE IF NOT EXISTS external_run_subscriptions (
                 subscription_id TEXT PRIMARY KEY,
                 run_id TEXT NOT NULL UNIQUE,
                 output_root TEXT NOT NULL,
@@ -550,6 +550,14 @@ class EscalationStore:
             )
             """
         )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_external_run_leases_live_root "
+            "ON external_run_leases(output_root) WHERE state = 'active'"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_external_run_subscriptions_pending "
+            "ON external_run_subscriptions(state, updated_at)"
+        )
 
     def _migrate_external_run_schema(self, conn: sqlite3.Connection) -> None:
         """Replace the original lifetime-root tables without losing evidence."""
@@ -558,14 +566,16 @@ class EscalationStore:
             "AND name IN ('external_run_leases', 'external_run_subscriptions')"
         ).fetchall()
         existing = {str(row['name']): str(row['sql'] or '') for row in rows}
-        if not existing:
-            self._external_run_schema(conn)
-            return
+        expected = {"external_run_leases", "external_run_subscriptions"}
         legacy = (
             'output_root TEXT PRIMARY KEY' in existing.get('external_run_leases', '')
             or 'output_root TEXT NOT NULL UNIQUE' in existing.get('external_run_subscriptions', '')
         )
-        if not legacy:
+        if not legacy or set(existing) != expected:
+            # Absent and interrupted current schemas use the same convergent
+            # path. In particular, an initializer can never leave a follower
+            # with the subscription index targeting a missing table.
+            self._external_run_schema(conn)
             return
         conn.execute('ALTER TABLE external_run_leases RENAME TO external_run_leases_old')
         conn.execute(
