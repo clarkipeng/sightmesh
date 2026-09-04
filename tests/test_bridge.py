@@ -1,6 +1,5 @@
 import asyncio
 import json
-from datetime import timedelta
 
 from sightmesh import bridge as bridge_module
 from sightmesh.bridge import (
@@ -163,7 +162,7 @@ def test_unidentified_messages_still_dedupe_deterministically() -> None:
     assert first == second
 
 
-def test_no_bridge_child_still_gets_stall_recovery(monkeypatch) -> None:
+def test_an_unbridged_child_is_still_reconciled_but_never_stopped(monkeypatch) -> None:
     class StallClient(FakeClient):
         def __init__(self):
             super().__init__()
@@ -205,7 +204,6 @@ def test_no_bridge_child_still_gets_stall_recovery(monkeypatch) -> None:
 
     supervisor.managed_tasks.reconcile_provider_outcome = reconcile_provider_outcome
     supervisor.managed_tasks.reconcile_provider_outcomes = lambda: []
-    supervisor.stalls.threshold = timedelta(0)
     monkeypatch.setattr(bridge_module, "enabled_workspaces", lambda: set())
     monkeypatch.setattr(
         bridge_module.leases, "sync_active_workspaces", lambda *_args, **_kwargs: []
@@ -214,8 +212,9 @@ def test_no_bridge_child_still_gets_stall_recovery(monkeypatch) -> None:
     asyncio.run(supervisor.reconcile())
     asyncio.run(supervisor.reconcile())
 
-    assert client.stopped == ["process-1"]
-    assert client.sent[0][0] == "parent"
+    assert client.stopped == []
+    assert client.execution_processes("child")[0]["status"] == "running"
+    assert client.sent == []
     assert reconciled == ["child", "child"]
     assert supervisor.tasks == {}
 
