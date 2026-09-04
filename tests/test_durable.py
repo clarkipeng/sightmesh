@@ -1,10 +1,6 @@
 from __future__ import annotations
 
 from sightmesh import wakes
-from sightmesh.cdesktop import (
-    CdesktopInterruptedError,
-    CdesktopPendingError,
-)
 from sightmesh.durable import (
     DurableCommand,
     DurableExecutionReconciler,
@@ -60,21 +56,6 @@ class Client:
         self.stops.append((process, dedupe_key))
 
 
-class KeyedStopClient(Client):
-    """cdesktop's keyed-stop contract: one outcome per key."""
-
-    def __init__(self, *args):
-        super().__init__(*args)
-        self.stop_outcomes = []
-        self.keys = set()
-
-    def stop_execution(self, process, *, dedupe_key=None):
-        super().stop_execution(process, dedupe_key=dedupe_key)
-        if dedupe_key not in self.keys:
-            self.keys.add(dedupe_key)
-            self.stop_outcomes.append((process, dedupe_key))
-
-
 def command(state="claimed"):
     from sightmesh.durable import DurableCommand
 
@@ -127,7 +108,13 @@ def test_restart_after_claim_interrupts_and_requeues_same_command():
     assert queue.requeued == [("command-1", "same-key")]
 
 
-def test_stream_death_requeues_and_offline_gate_backoffs():
+def test_a_dead_stream_over_a_running_process_is_never_stopped():
+    """Why: this branch used to stop the execution, in the same tick as the
+    wake-only detector. The kernel woke the manager about `limbo` and then
+    killed the process, then read its own kill back as `lost` - so the
+    manager's first and only accurate signal arrived after the work was gone.
+    The contract bans liveness-driven kills; the offline gate still has to
+    hold, so both are pinned here."""
     client = Client(
         {"id": "process-1", "status": "running"},
         {"stream_alive": False},
@@ -137,9 +124,34 @@ def test_stream_death_requeues_and_offline_gate_backoffs():
     reconciler = DurableExecutionReconciler(client, queue)
 
     reconciler.reconcile_session({"id": "session-1"})
-    assert client.stops == [("process-1", "durable:command-1:stop")]
+    assert client.stops == []
     assert queue.requeued == []
     assert client.dispatches == []
+
+
+def test_an_idle_running_process_is_never_stopped_however_many_sweeps():
+    """Why: the wall-clock idle reaper. `SuiteLiveness.stale()` stopped any
+    running execution whose snapshot had not changed within a threshold that
+    defaulted to 30 minutes - the exact reaper the incident record blames for
+    SIGKILLing approvals and long builds. It is gone; nothing may reintroduce
+    a timer that stops work."""
+    client = Client({"id": "process-1", "status": "running"}, {"entries": []})
+    reconciler = DurableExecutionReconciler(client, Queue([command()]))
+
+    for _ in range(10):
+        reconciler.reconcile_session({"id": "session-1", "parent_session_id": "parent"})
+
+    assert client.stops == []
+
+
+def test_the_reconciler_exposes_no_liveness_driven_stop_at_all():
+    """Why: a structural negative, not a behavioural one. Every regression in
+    this family came back as a new caller of an existing stop helper, so the
+    helper itself is gone and this test fails if one reappears. The explicit
+    stops - quarantine cancel through the command queue - deliberately still
+    exist and are not attributes of the reconciler."""
+    assert not hasattr(DurableExecutionReconciler, "recover_stalled_process")
+    assert not hasattr(DurableExecutionReconciler, "liveness")
 
 
 def test_delivery_lifecycle_is_derived_only_from_native_records():
@@ -255,17 +267,6 @@ def test_lifecycle_notification_completion_does_not_generate_another_wake():
     assert queue.notifications == []
 
 
-def test_suite_child_activity_prevents_recovery():
-    client = Client(
-        {"id": "process-1", "status": "running"},
-        {"entries": [{"tool_name": "bun test", "status": "running"}]},
-    )
-    queue = Queue([command()])
-    DurableExecutionReconciler(client, queue).reconcile_session({"id": "session-1"})
-
-    assert queue.interrupted == []
-
-
 def test_child_terminal_notification_is_a_durable_parent_command():
     client = Client({"id": "process-1", "status": "killed"}, {})
     queue = Queue([])
@@ -277,122 +278,6 @@ def test_child_terminal_notification_is_a_durable_parent_command():
 
     assert queue.notifications[0][0:2] == ("parent", "child")
     assert queue.notifications[0][3] == "child-terminal:child:interrupted"
-
-
-def test_keyed_stop_is_exactly_once_across_repeated_sweeps():
-    """Why: cdesktop's keyed stop fence makes repeated sweep observations one stop."""
-    client = KeyedStopClient({"id": "process-1", "status": "running"}, {})
-    reconciler = DurableExecutionReconciler(client, Queue([command()]))
-
-    reconciler.recover_stalled_process({}, client.process, command())
-    reconciler.recover_stalled_process({}, client.process, command())
-
-    assert client.stop_outcomes == [("process-1", "durable:command-1:stop")]
-
-
-def test_keyed_stop_is_exactly_once_after_reconciler_restart():
-    """Why: a restarted reconciler replays the command key, never a new stop."""
-    client = KeyedStopClient({"id": "process-1", "status": "running"}, {})
-    for _ in range(2):
-        DurableExecutionReconciler(client, Queue([command()])).recover_stalled_process(
-            {}, client.process, command()
-        )
-
-    assert client.stops == [
-        ("process-1", "durable:command-1:stop"),
-        ("process-1", "durable:command-1:stop"),
-    ]
-    assert client.stop_outcomes == [("process-1", "durable:command-1:stop")]
-
-
-def test_native_stale_child_stops_and_active_suite_suppresses():
-    from datetime import timedelta
-
-    from sightmesh.durable import SuiteLiveness
-
-    client = Client({"id": "process-1", "status": "running"}, {"entries": []})
-    queue = Queue([command()])
-    reconciler = DurableExecutionReconciler(
-        client, queue, liveness=SuiteLiveness(threshold=timedelta(0))
-    )
-    reconciler.reconcile_session({"id": "session-1", "parent_session_id": "parent"})
-    reconciler.reconcile_session({"id": "session-1", "parent_session_id": "parent"})
-    assert client.stops == [("process-1", "durable:command-1:stop")]
-
-    active = Client(
-        {"id": "process-1", "status": "running"},
-        {"entries": [{"tool_name": "bun test", "status": "running"}]},
-    )
-    active_queue = Queue([command()])
-    active_reconciler = DurableExecutionReconciler(
-        active, active_queue, liveness=SuiteLiveness(threshold=timedelta(0))
-    )
-    active_reconciler.reconcile_session(
-        {"id": "session-1", "parent_session_id": "parent"}
-    )
-    active_reconciler.reconcile_session(
-        {"id": "session-1", "parent_session_id": "parent"}
-    )
-    assert active.stops == []
-
-
-def test_424_waits_for_native_terminal_observation_before_requeue_and_wake():
-    class Interrupted(Client):
-        def stop_execution(self, process, *, dedupe_key=None):
-            super().stop_execution(process, dedupe_key=dedupe_key)
-            raise CdesktopInterruptedError("unknown", status=424)
-
-    client = Interrupted({"id": "process-1", "status": "running"}, {})
-    queue = Queue([command()])
-    reconciler = DurableExecutionReconciler(client, queue)
-    reconciler.recover_stalled_process(
-        {"id": "child", "parent_session_id": "parent"}, client.process, command()
-    )
-    reconciler.recover_stalled_process(
-        {"id": "child", "parent_session_id": "parent"}, client.process, command()
-    )
-
-    assert len(client.stops) == 1
-    assert queue.requeued == []
-    assert queue.notifications == []
-
-    client.process["status"] = "killed"
-    child = {"id": "child", "parent_session_id": "parent"}
-    reconciler.reconcile_session(child)
-    reconciler.reconcile_session(child)
-
-    assert queue.requeued == [("command-1", "same-key")]
-    assert queue.notifications == [
-        (
-            "parent",
-            "child",
-            "CHILD_TERMINAL: child killed",
-            "child-terminal:child:killed",
-        )
-    ]
-
-
-def test_425_retries_the_same_command_key():
-    class Pending(Client):
-        def __init__(self, *args):
-            super().__init__(*args)
-            self.first = True
-
-        def stop_execution(self, process, *, dedupe_key=None):
-            super().stop_execution(process, dedupe_key=dedupe_key)
-            if self.first:
-                self.first = False
-                raise CdesktopPendingError("pending", status=425)
-
-    client = Pending({"id": "process-1", "status": "running"}, {})
-    queue = Queue([])
-    reconciler = DurableExecutionReconciler(client, queue)
-    reconciler.recover_stalled_process({}, client.process, command())
-    reconciler.recover_stalled_process({}, client.process, command())
-    assert client.stops == [
-        ("process-1", "durable:command-1:stop"),
-        ("process-1", "durable:command-1:stop"),
-    ]
 
 
 class KernelClient:
@@ -513,7 +398,14 @@ def test_the_reconciler_does_not_manufacture_a_second_wake(tmp_path):
     reconciler.reconcile_kernel()
     second = reconciler.reconcile_kernel()
 
-    assert second == {"wakes_inserted": 0, "wakes_delivered": 0, "effects_expired": 0}
+    assert second == {
+        "wakes_inserted": 0,
+        "wakes_delivered": 0,
+        "effects_expired": 0,
+        # The v1.1 liveness pass rides the same tick; a repaired cohort must
+        # stay a no-op for it too, not just for the cohort predicates.
+        "liveness_findings": 0,
+    }
     assert len(client.sent) == 1
 
 

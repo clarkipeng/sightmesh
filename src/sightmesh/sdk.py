@@ -26,6 +26,7 @@ from .cdesktop import (
 )
 from .effects import EffectBusy, EffectJournal, new_owner_instance, request_hash
 from .escalation import CDESKTOP_SESSION_ENV, EscalationStore, LauncherIdentity
+from .liveness import Budget, resolve_policy, trusted_policy
 from .pool import core as pool_core
 from .profiles import ProfileStore, validate_provider
 from .succession import (
@@ -42,6 +43,11 @@ MAX_ATTEMPTS = 3
 #: A task id no ``uuid5`` derivation can produce, reserved for the launch
 #: contract probe so the lookup can only ever answer "not found".
 CONTRACT_PROBE_TASK_ID = "00000000-0000-0000-0000-000000000000"
+#: Spec keys that describe *how this run was resolved* rather than *what was
+#: asked for*, and so must stay out of the identity fingerprint ``start()``
+#: compares. All three are environment- or upgrade-dependent; including any of
+#: them makes an unchanged ``start()`` call fail after a config change.
+_SPEC_FINGERPRINT_EXCLUSIONS = frozenset({"target", "setup_script", "detection"})
 T = TypeVar("T")
 
 
@@ -70,6 +76,14 @@ class WorkerSpec:
     reasoning: str | None = None
     permission: str = "BYPASS_PERMISSIONS"
     children: int = 0
+    #: Liveness detection settings (docs/liveness-spec.md, "WorkerSpec
+    #: additions"). ``None`` means "inherit the trusted floor". These are
+    #: requests, not grants: ``liveness.resolve_policy`` takes the stricter of
+    #: the request and the manager's configured floor on every axis, so a
+    #: worker can tighten its own detection but never weaken it.
+    progress_timeout: float | None = None
+    approval_timeout: float | None = None
+    budget: Budget | None = None
 
 
 @dataclass(frozen=True)
@@ -565,7 +579,7 @@ class SightMesh:
             old_public = {
                 key: value
                 for key, value in existing.spec.items()
-                if key not in {"target", "setup_script"}
+                if key not in _SPEC_FINGERPRINT_EXCLUSIONS
             }
             if old_public != public:
                 raise SightMeshError(
@@ -576,6 +590,22 @@ class SightMesh:
             **public,
             "setup_script": self._setup_script(repo_path, requested.base),
             "target": self._select_target(requested),
+            # Resolved once, at reserve time, so the detector reads a settled
+            # policy off the durable row instead of re-deriving it - and so a
+            # worker cannot loosen its detection later by re-specifying.
+            #
+            # Stored *beside* the public spec rather than inside it, because
+            # the public spec is the identity fingerprint `start()` compares
+            # for idempotence. A resolved policy depends on the manager's
+            # environment and on the shipped defaults, so folding it in made
+            # an unchanged `start()` call raise "already exists with a
+            # different specification" after any upgrade or config change.
+            "detection": resolve_policy(
+                progress_timeout=requested.progress_timeout,
+                approval_timeout=requested.approval_timeout,
+                budget=requested.budget,
+                trusted=trusted_policy(dict(self.environment)),
+            ).to_dict(),
         }
 
     def _select_target(self, spec: WorkerSpec) -> dict[str, Any]:

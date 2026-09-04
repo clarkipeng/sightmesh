@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import getpass
+import importlib
 import json
 import os
 import re
@@ -23,13 +24,13 @@ from .. import (
     conductor_migrate,
     escalation,
     execution_routing,
-    fleet,
     leases,
     routing,
     service,
     succession,
     updates,
 )
+fleet = importlib.import_module("sightmesh.fleet")
 from ..bridge import run_bridge
 from ..cdesktop import CdesktopClient, CdesktopError
 from ..pool import core as pool_core

@@ -44,7 +44,14 @@ any_child_over_budget        (new - soft)
 
 All wakes are `intent="continue"`, deduped per stall *episode*: `{child_task_id}:{epoch}:{reason}:{episode}`.
 An episode opens when the condition first holds and closes when progress evidence resumes; the same silent child cannot wake its manager twice in one episode.
+Re-labelling one unbroken silence (`stalled` becoming `limbo`, say) is not an episode boundary: only resumed progress is.
+`parked` is its own stretch rather than part of a silence, so the approval clock starts when the parking did.
+
 If a manager's intervention does not restore progress within one further `progress_timeout`, the wake escalates to the attention queue for a human.
+The escalation carries its own dedupe key, `...:{episode}:escalation`, because uniqueness binds to un-consumed wakes and the escalation's whole purpose is to be heard while the first wake is still undelivered.
+A task with no manager to wake, and an incident that persists after the manager was told, both park a human attention item directly.
+
+A replacement is a fresh subject: bumping the epoch clears the liveness classification, episode, phase clock, wake count, evidence, budget latch, and checkpoint time.
 
 ## WorkerSpec additions
 
@@ -74,6 +81,30 @@ Executor prerequisites (Phase 4 seam, tracked in the seam contract):
 
 Until Phase 4 lands, the detector runs in degraded mode on what 0.2.7 exposes (transcript timestamps, process liveness, command states) and marks its own confidence in the wake payload rather than guessing.
 
+### Degraded mode today
+
+Detectable now: `stalled` (no process, snapshot, or checkpoint timestamp advanced for `progress_timeout`), `limbo` (snapshot reports a dead stream over a running process), `over_budget` on turns and tokens, and `lost` when a process row carries an explicit `exit_reason` or a `killed` status.
+
+Not detectable without the Phase 4 seam: `idle_unreported` and `parked`, which need the typed `turn_ended` and `parked(approval)` markers; `lost:restart` versus `lost:oom` versus `lost:killed`, which needs restart markers; cost budgets, which the client does not report.
+
+A process that has merely vanished from a list read is `unknown`, never `lost` - a partial read looks identical, and no attribution is better than a wrong one.
+Every finding carries `confidence` (`typed` or `degraded`) and its evidence sources into the wake payload.
+
+Degraded mode reads one execution per task - the running one, else the newest - after dropping `dropped` and `devserver` rows.
+Loss evidence comes only from that current execution, and a running process vetoes `lost`: a session keeps its whole process history, and one stale `killed` row must never mark a working task terminal.
+
+A coding-agent process is `running` only during a turn, so "no running process" is the ordinary between-turns shape, not absence of evidence.
+The judgement is made on timestamps; what it requires is that the executor answered at all.
+An unreadable read, an implausible timestamp (future, `NaN`, epoch-milliseconds), and an output-byte counter with no baseline to compare against are all `unknown`.
+
+No cdesktop process row carries `output_bytes` today; when the field is absent the timestamp path decides, and the byte path is exercised only where an executor actually reports it.
+
+## Cost and isolation
+
+The detector is one capped pass inside the existing tick, not a fleet scan: a task budget and a wall-clock budget bound it, and a cursor carries the remainder to the next tick.
+Each task is isolated, and so is each stage of the reconcile - wake delivery and reservation expiry run whatever the detector did.
+A malformed stored policy is an attention item for that task, never a raise through the pass.
+
 ## Simulator scenarios (v1.1 additions)
 
 | id | scenario | must hold |
@@ -81,8 +112,11 @@ Until Phase 4 lands, the detector runs in degraded mode on what 0.2.7 exposes (t
 | S13 | leaf worker ends turn without lifecycle call | one `any_child_stalled` wake after grace; no kill; no respawn |
 | S14 | child parked on approval past timeout | `blocked(approval)`; process alive; attention item; excluded from stall |
 | S15 | process killed mid-turn (simulated restart) | `lost:restart` terminal; immediate wake; retry adopts, never duplicates |
-| S16 | long command with live output for 2x progress_timeout | never flagged; output bytes are progress |
+| S16 | long command still working for 2x progress_timeout | never flagged; S16 uses the production shape (advancing process row, frozen transcript), S16b the output-byte one |
 | S17 | same child stalls, manager nudges, child stays silent | exactly two wakes total: episode wake + escalation; then human attention |
+
+S13-S17 assert their no-kill negatives around the *whole* bridge tick, both passes.
+Every liveness-driven kill this spec bans lived in the session pass, so a negative that only ran the kernel pass could not have caught one.
 
 ## Rollout
 
