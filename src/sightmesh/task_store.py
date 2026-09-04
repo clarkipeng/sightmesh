@@ -268,6 +268,7 @@ class TaskStore:
                         workspace_id TEXT,
                         session_id TEXT,
                         outcome TEXT,
+                        retry_at REAL,
                         owner_instance TEXT NOT NULL,
                         lease_expires_at REAL NOT NULL,
                         created_at REAL NOT NULL,
@@ -276,6 +277,7 @@ class TaskStore:
                     )
                     """
                 )
+                self._ensure_effect_retry_at(conn)
                 self._migrate_task_wakes(conn)
                 conn.execute("COMMIT")
         except sqlite3.DatabaseError as exc:
@@ -410,6 +412,16 @@ class TaskStore:
             # Only on the first upgrade, when the counter was just introduced -
             # never on a re-open, which would clobber live counters.
             TaskStore._backfill_child_event_seq(conn)
+
+    @staticmethod
+    def _ensure_effect_retry_at(conn: sqlite3.Connection) -> None:
+        """Add the provider reset timestamp to existing effect journals."""
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(task_effects)").fetchall()
+        }
+        if "retry_at" not in columns:
+            conn.execute("ALTER TABLE task_effects ADD COLUMN retry_at REAL")
 
     @staticmethod
     def _ensure_liveness_columns(conn: sqlite3.Connection) -> None:
