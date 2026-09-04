@@ -26,7 +26,7 @@ import re
 import sqlite3
 import time
 import uuid
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +43,7 @@ INTERRUPT_TAGS = frozenset({"BLOCKED", "DECISION"})
 ESCALATION_KINDS = frozenset({"routine", "interrupt"})
 DELIVERY_INTENTS = frozenset({"continue", "replace"})
 WAL_ADOPTION_TIMEOUT_SECONDS = 30.0
+ESCALATION_SCHEMA_VERSION = 1
 SIGNAL_CONDITION_RE = re.compile(
     r"^(?:terminal|context-pressure:(0(?:\.\d+)?|1(?:\.0+)?)|idle:(\d+))$"
 )
@@ -319,8 +320,17 @@ def redact_credentials(payload: Any) -> Any:
 class EscalationStore:
     """Durable, restart-proof home for launcher identity and parked escalations."""
 
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        initialization_hook: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> None:
         self.path = path or escalation_db_path()
+        # Tests use this at the table/index boundary to prove that every DDL
+        # phase remains inside the one initialization transaction. It is not a
+        # runtime callback or a second schema path.
+        self._initialization_hook = initialization_hook
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path.parent.chmod(0o700)
         self._initialize()
@@ -405,6 +415,11 @@ class EscalationStore:
         try:
             with self._connect() as conn:
                 self._adopt_wal(conn)
+                # Schema inspection, migration, and every dependent index share
+                # one write transaction. A peer opening a fresh database waits
+                # here, then observes the completed schema rather than a table
+                # created by an initializer that has not reached its indexes.
+                conn.execute("BEGIN IMMEDIATE")
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS launcher_identities (
@@ -474,6 +489,7 @@ class EscalationStore:
                     "CREATE INDEX IF NOT EXISTS idx_escalations_status "
                     "ON escalations(status, created_at DESC)"
                 )
+                self._migrate_external_run_schema(conn)
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS signal_policies (
@@ -495,10 +511,100 @@ class EscalationStore:
                     )
                     """
                 )
+                conn.execute(f"PRAGMA user_version = {ESCALATION_SCHEMA_VERSION}")
+                conn.execute("COMMIT")
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(
                 f"Cannot initialize escalation store {self.path}: {exc}"
             ) from exc
+
+    def _external_run_schema(self, conn: sqlite3.Connection) -> None:
+        """Converge the external-run tables and their dependent indexes."""
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS external_run_leases (
+                subscription_id TEXT PRIMARY KEY,
+                output_root TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('active', 'released')),
+                version INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                released_at REAL
+            )
+            """
+        )
+        if self._initialization_hook is not None:
+            self._initialization_hook(conn)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS external_run_subscriptions (
+                subscription_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL UNIQUE,
+                output_root TEXT NOT NULL,
+                return_session_id TEXT NOT NULL,
+                return_workspace_id TEXT,
+                writer_capability_digest TEXT NOT NULL,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK (state IN
+                    ('subscribed', 'running', 'terminal', 'lost', 'delivering', 'notified')),
+                version INTEGER NOT NULL DEFAULT 0,
+                pid INTEGER,
+                process_fingerprint TEXT,
+                receipt_path TEXT NOT NULL,
+                receipt_digest TEXT,
+                outcome TEXT,
+                diagnostic TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                terminal_at REAL,
+                notified_at REAL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_external_run_leases_live_root "
+            "ON external_run_leases(output_root) WHERE state = 'active'"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_external_run_subscriptions_pending "
+            "ON external_run_subscriptions(state, updated_at)"
+        )
+
+    def _migrate_external_run_schema(self, conn: sqlite3.Connection) -> None:
+        """Replace the original lifetime-root tables without losing evidence."""
+        rows = conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('external_run_leases', 'external_run_subscriptions')"
+        ).fetchall()
+        existing = {str(row['name']): str(row['sql'] or '') for row in rows}
+        expected = {"external_run_leases", "external_run_subscriptions"}
+        legacy = (
+            'output_root TEXT PRIMARY KEY' in existing.get('external_run_leases', '')
+            or 'output_root TEXT NOT NULL UNIQUE' in existing.get('external_run_subscriptions', '')
+        )
+        if not legacy or set(existing) != expected:
+            # Absent and interrupted current schemas use the same convergent
+            # path. In particular, an initializer can never leave a follower
+            # with the subscription index targeting a missing table.
+            self._external_run_schema(conn)
+            return
+        conn.execute('ALTER TABLE external_run_leases RENAME TO external_run_leases_old')
+        conn.execute(
+            'ALTER TABLE external_run_subscriptions RENAME TO '
+            'external_run_subscriptions_old'
+        )
+        self._external_run_schema(conn)
+        conn.execute(
+            "INSERT INTO external_run_leases "
+            "(subscription_id, output_root, state, version, created_at, released_at) "
+            "SELECT subscription_id, output_root, state, version, created_at, released_at "
+            "FROM external_run_leases_old"
+        )
+        conn.execute(
+            "INSERT INTO external_run_subscriptions "
+            "SELECT * FROM external_run_subscriptions_old"
+        )
+        conn.execute('DROP TABLE external_run_leases_old')
+        conn.execute('DROP TABLE external_run_subscriptions_old')
 
     def record_launcher(
         self,
@@ -590,7 +696,8 @@ class EscalationStore:
             with self._connect() as conn:
                 return bool(
                     conn.execute(
-                        "DELETE FROM signal_policies WHERE session_id = ?", (session_id,)
+                        "DELETE FROM signal_policies WHERE session_id = ?",
+                        (session_id,),
                     ).rowcount
                 )
         except sqlite3.DatabaseError as exc:
@@ -606,7 +713,9 @@ class EscalationStore:
                     (dedupe_key, dedupe_key),
                 ).fetchone()
         except sqlite3.DatabaseError as exc:
-            raise EscalationStoreError(f"Cannot read delivery dedupe state: {exc}") from exc
+            raise EscalationStoreError(
+                f"Cannot read delivery dedupe state: {exc}"
+            ) from exc
         return row is not None
 
     def has_terminal_dedupe_key(self, dedupe_key: str) -> bool:
@@ -667,7 +776,9 @@ class EscalationStore:
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(f"Cannot park escalation: {exc}") from exc
         if row is None:
-            raise EscalationStoreError(f"Escalation is missing after park: {dedupe_key}")
+            raise EscalationStoreError(
+                f"Escalation is missing after park: {dedupe_key}"
+            )
         return _from_row(row)
 
     def resolve(self, escalation_id: str) -> ParkedEscalation:
@@ -808,18 +919,31 @@ class EscalationStore:
                         body_digest, created_at, satisfied_at
                     ) VALUES (?, ?, ?, ?, ?, ?, NULL)
                     """,
-                    (key, sender_session_id, recipient_session_id, safe_body, digest, now),
+                    (
+                        key,
+                        sender_session_id,
+                        recipient_session_id,
+                        safe_body,
+                        digest,
+                        now,
+                    ),
                 )
                 row = conn.execute(
                     "SELECT * FROM order_expectations WHERE order_id = ?", (key,)
                 ).fetchone()
         except sqlite3.DatabaseError as exc:
-            raise EscalationStoreError(f"Cannot record order expectation: {exc}") from exc
+            raise EscalationStoreError(
+                f"Cannot record order expectation: {exc}"
+            ) from exc
         if row is None:
-            raise EscalationStoreError(f"Order expectation is missing after record: {key}")
+            raise EscalationStoreError(
+                f"Order expectation is missing after record: {key}"
+            )
         return _order_from_row(row)
 
-    def satisfy_orders(self, recipient_session_id: str, *, order_id: str | None = None) -> int:
+    def satisfy_orders(
+        self, recipient_session_id: str, *, order_id: str | None = None
+    ) -> int:
         """Any later outbound report closes the recipient's outstanding orders."""
         now = time.time()
         where = "recipient_session_id = ? AND satisfied_at IS NULL"
@@ -830,10 +954,13 @@ class EscalationStore:
         try:
             with self._connect() as conn:
                 return conn.execute(
-                    f"UPDATE order_expectations SET satisfied_at = ? WHERE {where}", values
+                    f"UPDATE order_expectations SET satisfied_at = ? WHERE {where}",
+                    values,
                 ).rowcount
         except sqlite3.DatabaseError as exc:
-            raise EscalationStoreError(f"Cannot satisfy order expectation: {exc}") from exc
+            raise EscalationStoreError(
+                f"Cannot satisfy order expectation: {exc}"
+            ) from exc
 
     def _order_filter(
         self,

@@ -21,6 +21,7 @@ from . import liveness as liveness_detector
 from . import wakes
 from .cdesktop import CdesktopClient, CdesktopError
 from .effects import EffectJournal
+from .external_runs import ExternalRunReconciler, ExternalRunStore
 from .escalation import EscalationStore, escalate
 from .liveness import DetectionPolicy, DetectionPolicyError
 from .runtime_lock import RUNTIME_LOCK
@@ -328,10 +329,16 @@ class DurableExecutionReconciler:
                 EffectJournal(store).expire_reservations(self.client)
             )
 
+        def external_runs() -> None:
+            ExternalRunReconciler(
+                self.client, ExternalRunStore(self.signal_store.path)
+            ).reconcile()
+
         stage("record cohort wakes", cohort_wakes)
         stage("detect liveness", detect)
         stage("deliver wakes", deliver)
         stage("expire effect reservations", expire)
+        stage("reconcile external runs", external_runs)
         return repaired
 
     def detect_liveness(self) -> dict[str, int]:
@@ -439,9 +446,7 @@ class DurableExecutionReconciler:
             trusted=trusted,
         )
 
-    def _detection_slice(
-        self, store: TaskStore
-    ) -> tuple[list[TaskRecord], set[str]]:
+    def _detection_slice(self, store: TaskStore) -> tuple[list[TaskRecord], set[str]]:
         """The tasks this pass will classify, resuming from the cursor.
 
         Returns the capped slice plus the *full* watched set. Baseline
