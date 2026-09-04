@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -45,6 +46,29 @@ def test_runtime_lock_schema_is_typed_and_coherent() -> None:
         runtime.compatibility.minimum_tuple
         <= runtime.compatibility.durable_recovery_tuple
     )
+
+
+def test_runtime_lock_import_does_not_require_the_sdk_runtime_dependency() -> None:
+    """Why: source-only compatibility tooling reads this lock before installing
+    runtime dependencies. Importing the package must not pull in the SDK."""
+    environment = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.modules['websockets'] = None; "
+            "from sightmesh.runtime_lock import RUNTIME_LOCK; "
+            "from sightmesh.cli import main; "
+            "assert RUNTIME_LOCK.schema_version == 1; "
+            "sys.argv = ['sightmesh', '--version']; "
+            "main()",
+        ],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(
