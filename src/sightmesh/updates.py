@@ -71,6 +71,8 @@ def read_state() -> dict[str, Any]:
     if not path.exists():
         return {"schema_version": SCHEMA_VERSION, "status": "idle", "pending": None}
     value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise RuntimeError("Unsupported update state: expected an object")
     if value.get("schema_version") != SCHEMA_VERSION:
         raise RuntimeError(
             f"Unsupported update state schema: {value.get('schema_version')!r}"

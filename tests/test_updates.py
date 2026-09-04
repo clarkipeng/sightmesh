@@ -34,6 +34,17 @@ class FakeClock:
         self.now += max(0.0, float(seconds))
 
 
+@pytest.mark.parametrize("contents", ["[]", "null"])
+def test_read_state_rejects_valid_json_that_is_not_an_object(tmp_path, monkeypatch, contents):
+    """A syntactically valid but malformed state follows the normal error path."""
+    path = tmp_path / "update.json"
+    path.write_text(contents, encoding="utf-8")
+    monkeypatch.setattr(updates, "state_path", lambda: path)
+
+    with pytest.raises(RuntimeError, match="expected an object"):
+        updates.read_state()
+
+
 class FakeClient:
     #: cdesktop refuses anything longer; see `CdesktopClient.set_update_drain`.
     DRAIN_CAP_SECONDS = 30

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from sightmesh import cli, fleet, observability
+from sightmesh import cli, fleet, observability, updates
 from sightmesh.escalation import EscalationStore
 from sightmesh.leases import LeaseStore
 from sightmesh.task_store import TaskStore, TaskStoreError
@@ -295,6 +295,32 @@ def test_unacked_deliveries_stop_at_the_bound_and_summarize_the_rest(
     assert rows[-1]["summary"] == "report 249"
 
 
+def test_unacked_deliveries_keep_the_newest_parked_escalations_at_the_bound(
+    store: TaskStore, monkeypatch
+) -> None:
+    """A parked decision is live work too, so its bound mirrors unmet orders."""
+    escalations = EscalationStore(store.path)
+    timestamps = iter(range(250))
+    monkeypatch.setattr("sightmesh.escalation.time.time", lambda: next(timestamps))
+    for index in range(250):
+        escalations.park(
+            child_session_id=f"child-{index}",
+            child_workspace_id=None,
+            recorded_parent_session_id=None,
+            reason="no_parent",
+            message=f"decision {index}",
+            dedupe_key=f"parked-{index}",
+        )
+
+    rows = observability.unacked_deliveries(escalations)
+
+    assert rows[0]["summary"] == "150 older unacknowledged deliveries suppressed"
+    assert rows[-1]["session_id"] == "child-249"
+    assert {row["session_id"] for row in rows[1:]} == {
+        f"child-{index}" for index in range(150, 250)
+    }
+
+
 def test_a_satisfied_order_leaves_the_attention_queue(store: TaskStore) -> None:
     """Otherwise the queue only grows and operators learn to ignore it."""
     escalations = EscalationStore(store.path)
@@ -426,6 +452,14 @@ def test_task_reads_are_bounded_to_the_newest_unless_all_is_asked_for(
 
     assert cli.cmd_status(_args("status", "--limit", "5")) == 0
     assert len(json.loads(capsys.readouterr().out)["tasks"]) == 5
+
+
+def test_task_limit_must_be_positive_for_every_bounded_surface() -> None:
+    """Zero cannot mean newest-N because the bounded read asks for N + 1."""
+    with pytest.raises(ValueError, match="at least 1"):
+        cli._bounded_tasks(object(), argparse.Namespace(all=False, limit=0))
+    with pytest.raises(SystemExit):
+        cli.parser().parse_args(["list", "--limit", "0"])
 
 
 def test_overview_is_task_local_too(task_cli: TaskStore, capsys) -> None:
@@ -871,3 +905,19 @@ def test_an_unreadable_update_state_still_fails_doctor(monkeypatch) -> None:
 
     assert check["ok"] is False
     assert check["warning_only"] is False
+
+
+@pytest.mark.parametrize("contents", ["[]", "null"])
+def test_doctor_treats_non_object_update_state_as_unreadable(
+    monkeypatch, tmp_path: Path, contents: str
+) -> None:
+    """Syntactically valid JSON must still follow doctor's stable error result."""
+    path = tmp_path / "update.json"
+    path.write_text(contents, encoding="utf-8")
+    monkeypatch.setattr(updates, "state_path", lambda: path)
+
+    check = cli._version_skew_check("0.2.5-sightmesh.1", "cdesktop/0.2.5-sightmesh.1")
+
+    assert check["ok"] is False
+    assert check["warning_only"] is False
+    assert "update state is unreadable" in check["detail"]["error"]

@@ -159,6 +159,47 @@ def test_routine_delivery_records_durable_acknowledgment(tmp_path):
     assert acks[0].message == "STATUS: lane complete"
 
 
+@pytest.mark.parametrize(
+    ("method", "message", "credential"),
+    [
+        ("park", "Authorization: Bearer live-bearer-secret", "live-bearer-secret"),
+        ("acknowledge", "Authorization: Basic live-basic-secret", "live-basic-secret"),
+    ],
+)
+def test_durable_escalation_records_never_retain_credential_values(
+    tmp_path, method, message, credential
+):
+    """The store is the persistence boundary, so direct callers cannot leak."""
+    path = tmp_path / "escalations.sqlite3"
+    store = EscalationStore(path)
+    if method == "park":
+        record = store.park(
+            child_session_id="child-a",
+            child_workspace_id=None,
+            recorded_parent_session_id=None,
+            reason="no_parent",
+            message=message,
+            dedupe_key="parked-secret",
+        )
+        table = "escalations"
+    else:
+        record = store.acknowledge(
+            child_session_id="child-a",
+            parent_session_id="parent-a",
+            kind="routine",
+            intent="continue",
+            message=message,
+            dedupe_key="ack-secret",
+        )
+        table = "acknowledgments"
+
+    assert credential not in record.message
+    with sqlite3.connect(path) as connection:
+        stored = connection.execute(f"SELECT message FROM {table}").fetchone()[0]
+    assert credential not in stored
+    assert "[REDACTED]" in stored
+
+
 def test_blocked_and_decision_escalations_replace_the_active_turn(tmp_path):
     client = FakeClient(
         sessions={"parent-a": {"id": "parent-a", "workspace_id": "parent-workspace"}},

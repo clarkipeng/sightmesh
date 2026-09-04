@@ -197,11 +197,19 @@ class OrderExpectation:
 
 def redact_credentials(message: str) -> str:
     """Keep operational records useful without retaining obvious credentials."""
-    return re.sub(
-        r"(?im)\b(token|secret|password|authorization|cookie|credential|api[_-]?key)"
-        r"\s*([:=])\s*[^\s]+",
-        r"\1\2 [REDACTED]",
+    # Header values can contain a scheme and spaces (``Bearer secret``), so
+    # redact an entire credential header before handling inline key/value forms.
+    without_headers = re.sub(
+        r"(?im)\b(authorization|cookie)\b\s*:\s*[^\r\n]*",
+        r"\1: [REDACTED]",
         message,
+    )
+    return re.sub(
+        r"(?im)\b(token|secret|password|credential|api[_-]?key)\b\s*([:=])\s*"
+        r"(?:(?:bearer|basic)\s+(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\r\n]+)"
+        r"|\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\r\n]+)",
+        r"\1\2 [REDACTED]",
+        without_headers,
     )
 
 
@@ -526,6 +534,7 @@ class EscalationStore:
     ) -> ParkedEscalation:
         if reason not in PARK_REASONS:
             raise ValueError(f"Unknown park reason: {reason}")
+        message = redact_credentials(message)
         now = time.time()
         try:
             with self._connect() as conn:
@@ -623,6 +632,7 @@ class EscalationStore:
             raise ValueError(f"Unknown escalation kind: {kind}")
         if intent not in DELIVERY_INTENTS:
             raise ValueError(f"Unknown delivery intent: {intent}")
+        message = redact_credentials(message)
         now = time.time()
         try:
             with self._connect() as conn:
@@ -818,14 +828,14 @@ class EscalationStore:
                     """
                     SELECT * FROM escalations
                     WHERE status = 'parked'
-                    ORDER BY created_at ASC
+                    ORDER BY created_at DESC
                     LIMIT ?
                     """,
                     (limit,),
                 ).fetchall()
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(f"Cannot read parked escalations: {exc}") from exc
-        return [_from_row(row) for row in rows]
+        return [_from_row(row) for row in reversed(rows)]
 
 
 def _ack_from_row(row: sqlite3.Row) -> DeliveryAck:

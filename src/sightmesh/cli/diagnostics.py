@@ -210,7 +210,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def _task_limit(args: argparse.Namespace) -> int | None:
     """Newest-N bound for one task read; ``--all`` is the explicit opt-out."""
-    return None if args.all else int(args.limit)
+    if args.all:
+        return None
+    limit = int(args.limit)
+    if limit < 1:
+        raise ValueError("--limit must be at least 1")
+    return limit
+
+
+def _positive_task_limit(value: str) -> int:
+    limit = int(value)
+    if limit < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return limit
 
 
 def _bounded_tasks(
@@ -581,7 +593,7 @@ def _add_task_bounds(command: argparse.ArgumentParser) -> None:
     bound = command.add_mutually_exclusive_group()
     bound.add_argument(
         "--limit",
-        type=int,
+        type=_positive_task_limit,
         default=observability.DEFAULT_TASK_LIMIT,
         help="Show only the newest N managed tasks",
     )
