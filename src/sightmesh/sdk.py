@@ -337,7 +337,11 @@ class SightMesh:
             task = self._find(worker)
             if not task.workspace_id or not task.holder_session_id:
                 raise SightMeshError(f"Task {worker!r} has no session to replace")
-            replacement_prompt = prompt or self._read_checkpoint(task)
+            if prompt:
+                replacement_prompt: str | None = prompt
+            else:
+                with fence.external_io():
+                    replacement_prompt = self._read_checkpoint(task)
             if not replacement_prompt or not replacement_prompt.strip():
                 raise SightMeshError(
                     "Replacement requires a prompt or saved checkpoint"
@@ -521,12 +525,10 @@ class SightMesh:
             # Nothing launched under this epoch, or its outcome is already
             # recorded; either way the process tells us nothing new.
             return None
+        with fence.external_io():
+            processes = self.client.execution_processes(session_id)
         process = latest_execution_process(
-            [
-                item
-                for item in self.client.execution_processes(session_id)
-                if item.get("run_reason") == "codingagent"
-            ]
+            [item for item in processes if item.get("run_reason") == "codingagent"]
         )
         if (
             process is None
@@ -541,7 +543,9 @@ class SightMesh:
             # that queue on the way out.
             self._record_provider_outcome(task, outcome, retry_at)
             return None
-        if self._queue_still_owns(session_id):
+        with fence.external_io():
+            queue_owns = self._queue_still_owns(session_id)
+        if queue_owns:
             # cdesktop's own durable recovery requeues a claimed command whose
             # execution died, so this failure is one it is about to retry.
             # Blocking here would strand a task that is still being worked -
@@ -640,11 +644,13 @@ class SightMesh:
             )
 
         selected = selection.target
+        with fence.external_io():
+            provider_id = self._default_provider_id()
         next_target = {
             "executor": selected.executor,
             "model": selected.model,
             "reasoning": task.spec.get("reasoning"),
-            "provider_id": self._default_provider_id(),
+            "provider_id": provider_id,
             "auth_binding_id": selected.auth_binding_id,
             "route_class": selected.route_class,
             "route_id": selected.route_id,
@@ -745,12 +751,13 @@ class SightMesh:
         """
         if prepared.workspace_id and prepared.holder_session_id:
             return self._replace_prepared(prepared, replacement_prompt, fence)
+        # Building the request resolves the repository over HTTP; the fence
+        # covers durable decisions only, so open its gate for that call.
+        with fence.external_io():
+            request = self._workspace_request(prepared, replacement_prompt)
         workspace_id, session_id = self._journaled_launch(
             prepared,
-            {
-                "kind": "workspace",
-                "request": self._workspace_request(prepared, replacement_prompt),
-            },
+            {"kind": "workspace", "request": request},
             fence,
         )
         active = self.store.activate(
@@ -794,6 +801,7 @@ class SightMesh:
             spawn=spawn,
             reason="managed task replacement",
             logical_key=f"task:{prepared.task_id}:epoch:{prepared.epoch}",
+            io=fence.external_io,
         )
         active = self.store.activate(
             prepared.task_id,
@@ -832,7 +840,11 @@ class SightMesh:
     def _start_reserved_locked(self, task: TaskRecord, fence: TaskFence) -> TaskRecord:
         if task.state != "reserved":
             return task
-        request = self._workspace_request(task, str(task.spec["prompt"]))
+        # Building the launch request resolves the repository over HTTP
+        # (register_repo -> GET /repos). The fence covers durable decisions
+        # only, so that I/O runs with the gate open like every other request.
+        with fence.external_io():
+            request = self._workspace_request(task, str(task.spec["prompt"]))
         self._wait_for_launch_capacity(task)
         workspace_id, session_id = self._journaled_launch(
             task, {"kind": "workspace", "request": request}, fence

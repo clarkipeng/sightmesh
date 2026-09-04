@@ -31,19 +31,23 @@ class FakeClient:
         self.reject_launch = None
 
     def info(self):
+        assert_external_io_allowed()  # the real client does HTTP here
         return {"service_capabilities": {"managed_task_launch": 1}}
 
     def repos(self):
+        assert_external_io_allowed()  # the real client does HTTP here
         return self.repo_rows or [
             {"id": "repo-1", "name": "project", "path": str(self.repo_path)}
         ]
 
     def workspace(self, workspace_id):
+        assert_external_io_allowed()  # the real client does HTTP here
         container = self.repo_path.parent / "worktrees" / workspace_id
         (container / "project").mkdir(parents=True, exist_ok=True)
         return {"id": workspace_id, "container_ref": str(container)}
 
     def providers(self):
+        assert_external_io_allowed()  # the real client does HTTP here
         return [
             {
                 "id": "default-provider",
@@ -54,10 +58,12 @@ class FakeClient:
         ]
 
     def register_repo(self, path, **_kwargs):
+        assert_external_io_allowed()  # the real client does HTTP here
         assert path.resolve() == self.repo_path.resolve()
         return self.repos()[0]
 
     def workspace_launch_request(self, **kwargs):
+        assert_external_io_allowed()  # the real client does HTTP here
         return {"workspace": kwargs}
 
     @staticmethod
@@ -65,6 +71,7 @@ class FakeClient:
         return {"session": kwargs}
 
     def managed_launch(self, task_id, epoch, launch):
+        assert_external_io_allowed()  # the real client does HTTP here
         key = (task_id, epoch)
         self.launches.append((key, launch))
         rejection = self.reject_launch
@@ -94,20 +101,25 @@ class FakeClient:
         dedupe_key=None,
         intent="continue",
     ):
+        assert_external_io_allowed()  # the real client does HTTP here
         row = (session_id, prompt, sender_session, dedupe_key, intent)
         self.sent.append(row)
         return {"queued": True}
 
     def session_commands(self, _session_id):
+        assert_external_io_allowed()  # the real client does HTTP here
         return []
 
     def execution_processes(self, session_id):
+        assert_external_io_allowed()  # the real client does HTTP here
         return self.processes.get(session_id, [])
 
     def normalized_snapshot(self, process_id):
+        assert_external_io_allowed()  # the real client does HTTP here
         return self.snapshots[process_id]
 
     def stop_workspace(self, workspace_id):
+        assert_external_io_allowed()  # the real client does HTTP here
         self.stopped.append(workspace_id)
 
     def managed_effect(self, task_id, epoch):

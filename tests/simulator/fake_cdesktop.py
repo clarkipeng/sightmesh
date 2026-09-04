@@ -23,6 +23,8 @@ be idempotent".
 
 from __future__ import annotations
 
+from sightmesh.fence import assert_external_io_allowed
+
 import threading
 import time
 from dataclasses import dataclass, field
@@ -202,6 +204,7 @@ class FakeCdesktop:
     # Contract surface used by sdk.py
     # ------------------------------------------------------------------
     def info(self) -> dict[str, Any]:
+        assert_external_io_allowed()  # the real client does HTTP here
         self._log("info")
         return {
             # A version the durable reconciler accepts, so a scenario can run
@@ -214,12 +217,14 @@ class FakeCdesktop:
         }
 
     def repos(self) -> list[dict[str, Any]]:
+        assert_external_io_allowed()  # the real client does HTTP here
         self._log("repos")
         return self.repo_rows or [
             {"id": "repo-1", "name": "project", "path": str(self.repo_path)}
         ]
 
     def providers(self) -> list[dict[str, Any]]:
+        assert_external_io_allowed()  # the real client does HTTP here
         self._log("providers")
         return [
             {
@@ -231,17 +236,20 @@ class FakeCdesktop:
         ]
 
     def register_repo(self, path: Path, **_kwargs: Any) -> dict[str, Any]:
+        assert_external_io_allowed()  # the real client does HTTP here
         self._log("register_repo", path)
         assert Path(path).resolve() == self.repo_path.resolve()
         return self.repos()[0]
 
     def workspace(self, workspace_id: str) -> dict[str, Any]:
+        assert_external_io_allowed()  # the real client does HTTP here
         self._log("workspace", workspace_id)
         container = self.repo_path.parent / "worktrees" / workspace_id
         (container / "project").mkdir(parents=True, exist_ok=True)
         return {"id": workspace_id, "container_ref": str(container)}
 
     def workspace_launch_request(self, **kwargs: Any) -> dict[str, Any]:
+        assert_external_io_allowed()  # the real client does HTTP here
         self._log("workspace_launch_request", **kwargs)
         return {"workspace": kwargs}
 
@@ -252,6 +260,7 @@ class FakeCdesktop:
     def managed_launch(
         self, task_id: str, epoch: int, launch: dict[str, Any]
     ) -> dict[str, Any]:
+        assert_external_io_allowed()  # the real client does HTTP here
         self._log("managed_launch", task_id, epoch, launch)
         result = self._do_managed_launch(task_id, epoch, launch)
         if self._consume_duplicate("launch"):
@@ -339,6 +348,7 @@ class FakeCdesktop:
         dedupe_key: str | None = None,
         intent: str = "continue",
     ) -> Any:
+        assert_external_io_allowed()  # the real client does HTTP here
         self._log(
             "send",
             session_id,
@@ -359,18 +369,22 @@ class FakeCdesktop:
             return result
 
     def stop_workspace(self, workspace_id: str) -> Any:
+        assert_external_io_allowed()  # the real client does HTTP here
         self._log("stop_workspace", workspace_id)
         self.stopped.append(workspace_id)
 
     def session_commands(self, session_id: str) -> list[dict[str, Any]]:
+        assert_external_io_allowed()  # the real client does HTTP here
         self._log("session_commands", session_id)
         return self.commands.get(session_id, [])
 
     def execution_processes(self, session_id: str) -> list[dict[str, Any]]:
+        assert_external_io_allowed()  # the real client does HTTP here
         self._log("execution_processes", session_id)
         return self.processes.get(session_id, [])
 
     def normalized_snapshot(self, process_id: str) -> dict[str, Any]:
+        assert_external_io_allowed()  # the real client does HTTP here
         self._log("normalized_snapshot", process_id)
         return self.snapshots[process_id]
 
@@ -461,10 +475,12 @@ class FakeCdesktop:
         self.queued_mail[session_id] = pending
 
     def dispatch_queued(self, session_id: str) -> Any:
+        assert_external_io_allowed()  # the real client does HTTP here
         self._log("dispatch_queued", session_id)
         return {"dispatched": 0}
 
     def stop_execution(self, execution_process_id: str, **kwargs: Any) -> Any:
+        assert_external_io_allowed()  # the real client does HTTP here
         self._log("stop_execution", execution_process_id, **kwargs)
         return {"stopped": True}
 
