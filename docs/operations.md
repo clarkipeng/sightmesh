@@ -2,11 +2,20 @@
 
 ## Fleet status and idle prompting
 
-`sightmesh status` joins managed service state, active cdesktop workspaces, latest process state, pending approvals, unseen turns, Repowire route policy, ownership leases, redacted cdesktop providers, and named SightMesh profiles. Add `--include-archived` only when historical workspaces are relevant. Use `sightmesh peers` for the compact agent-facing roster and `sightmesh peek @AGENT` for a coalesced current-activity snapshot.
+Task surfaces answer from the kernel store and never call cdesktop. Native inventory is a separate command, so a routine status check cannot fan out over every workspace and session.
 
-`sightmesh overview` is the human fleet view. It selects the latest non-dropped, non-dev-server process for each visible session, then groups those agent cards into **Needs attention**, **Running**, and **Done since view**, with a stable selector, one reason, and one safe next action. The default retains every latest active process plus latest inactive processes updated or completed in the last 24 hours; pass `--since ISO_TIME` to choose another inactive-history boundary. This bound is derived at read time and adds no view-state persistence.
+`sightmesh status` shows managed service state, managed task rows and counts, staged/active update versions, ownership leases, and named profiles.
+`sightmesh list` lists managed tasks across every scope; `sightmesh tasks` lists the caller's scope.
+`sightmesh attention` is the single queue of work needing a human: blocked approvals, tripped breakers, lost tasks, and unacknowledged deliveries. A task that has spent its attempt budget is reported as a tripped breaker whatever state it is in, because it cannot be replaced. Dirty closeouts and failing checks are cdesktop-owned facts; when no caller supplies them the queue reports them as `reported-degraded` rather than implying a clean fleet.
 
-`sightmesh --json overview` uses the fixed privacy-safe fleet projection and does not copy transcripts. Model comes from the native execution action. Its selected cdesktop provider ID is used only to join the native provider kind; it is not reported as a SightMesh subscription account. Token usage, context limit, and derived context pressure appear only when cdesktop supplies numeric values in a normalized `token_usage_info` entry for the selected process, with that provenance recorded. Account, quota, monetary cost, and any other unavailable fact remain `null`; SightMesh does not infer them.
+`status`, `list`, `attention`, and `overview` read the newest 200 managed tasks. Use `--limit N` to narrow that and `--all` to read every task; a bounded read says on stderr that it was bounded. Unacknowledged deliveries are bounded the same way, and everything past the bound is reported as one `suppressed_unacked` row carrying the count rather than as rows nobody will read.
+`sightmesh workspaces` is the explicit native inventory (workspaces, sessions, providers, profiles) and fans out on purpose. Add `--include-archived` for history and `--overview` for the native execution projection.
+
+Use `sightmesh peers` for the compact agent-facing roster and `sightmesh peek @AGENT` for a coalesced current-activity snapshot.
+
+`sightmesh overview` groups managed tasks into **Needs attention**, **Running**, and **Done since view**, with a stable selector, one reason, and one safe next action. The default view bound is the last 24 hours; pass `--since ISO_TIME` to choose another boundary. The bound is derived at read time and adds no view-state persistence.
+
+`sightmesh --json workspaces --overview` uses the fixed privacy-safe fleet projection and does not copy transcripts. Model comes from the native execution action. Its selected cdesktop provider ID is used only to join the native provider kind; it is not reported as a SightMesh subscription account. Token usage, context limit, and derived context pressure appear only when cdesktop supplies numeric values in a normalized `token_usage_info` entry for the selected process, with that provenance recorded. Account, quota, monetary cost, and any other unavailable fact remain `null`; SightMesh does not infer them.
 
 Use `sightmesh prompt-idle @AGENT --message-file FILE` for automation that must not append work behind an active turn or bypass a pending approval. It reads that session's process state immediately before sending and fails closed unless the target is active and idle.
 
@@ -41,10 +50,16 @@ checks the platform-specific backend ZIP and every member without executing the 
 backend, and records pending state atomically under `~/.local/state/sightmesh/update.json`. It
 does not overwrite the globally installed cdesktop package or restart a worker.
 
-Run `sightmesh update activate` when you want to apply the staged release. Busy coding,
-setup, cleanup, or archive processes and pending questions or approvals cause it to
-return without changing the service. Dev servers do not block activation because they
-are disposable children of the backend.
+Run `sightmesh update activate` when you want to apply the staged release. Activation
+drains first: it asks cdesktop to refuse new launches, then waits a bounded window for
+in-flight turns to reach terminal. cdesktop caps one drain request at 30 seconds, so the
+wait renews the refusal on a shorter cadence and stops as soon as a renewal fails,
+reporting `rearms` and `lapsed` alongside the time it actually waited. A loaded host
+converges because no new work is admitted behind the drain. If the window expires the
+drain is released and the result reports `drain-timed-out` with the activity actually
+observed. The bridge stays up for the whole wait and is stopped only for the swap
+itself, so a refused activation costs no bridge downtime at all. Dev servers do not
+block activation because they are disposable children of the backend.
 
 Activation checks the new backend health endpoint and exact reported version before
 restarting the bridge. Failure is recorded, clears pending activation, and is never
@@ -54,10 +69,16 @@ restart. CLI and skill updates are one-shot and can take effect while cdesktop w
 continue.
 
 The one supported bootstrap exception is `0.2.3-sightmesh.1`, which predates the drain
-endpoint. Its transition to `.2` still stops bridge intake, waits for a completely idle
-fleet, observes the quiet period, and rechecks before restart. An unknown backend that
-lacks the drain endpoint fails closed. After `.2` is active, every update uses the
-native bounded drain.
+endpoint. Its transition to `.2` still waits the bounded window before restart, keeps
+the bridge up throughout, and reports `enforced: false` for the drain it could not
+request. An
+unknown backend that lacks the drain endpoint fails closed.
+
+`sightmesh doctor` reports `cdesktop-version-skew`, comparing the installed CLI, the
+running service, and the active release as normalized version tokens. It fails when the
+running service disagrees with the active release, or when stale releases remain past
+the prune budget. A globally installed CLI that lags the active release is reported as
+`warning_only`, because it is not what the service runs.
 
 ## Plan approvals
 
@@ -127,10 +148,18 @@ Archive, restore, and delete use cdesktop's native workspace lifecycle. Archive 
 
 `sightmesh workspace restore WORKSPACE_ID` makes an archive active, reacquires its ownership lease, and re-enables its Repowire bridge route. It rolls the workspace back to archived if lease synchronization fails. `sightmesh workspace delete WORKSPACE_ID --confirm-delete` requires an already archived workspace. It deletes the cdesktop record, transcript, process logs, and owned managed worktree while deliberately preserving the Git branch. Dirty managed worktrees are always refused. A dirty direct repository is never deleted and requires `--preserve-dirty` before only its cdesktop history is removed. A repository path that has already disappeared is reconciled by definition, so archive and delete both proceed and record it under `missing_repositories`; only directories that still exist can hold dirty state. Branch deletion remains an explicit native Git operation after reconciliation.
 
-Use `sightmesh --json lease list` for token-free inspection. Normal status, spawn, restore, archive, recovery, and diagnostic output also uses the public lease representation. Only the explicit `lease acquire`, `lease renew`, and `lease release` capability commands return the raw token needed for the next capability operation. Workspace-to-token mappings are stored separately under the lease state directory so archival can release only the owning workspace.
+No command ever prints a capability token. `lease renew` and `lease release` return the public lease representation, because the caller already holds the token it passed in. `lease acquire` is the single deliberate capability exit: it writes the token to a 0600 file under the lease directory's `capabilities/` and emits only `capability_path`. The file dies with the lease - releasing it, or the expiry sweep reclaiming it, unlinks the capability too, so no bearer token outlives the lease it authorized. The CLI's one output path rejects any credential-shaped field it built itself, so a future leak fails loudly instead of serializing into a transcript. Payloads the CLI only relays - an agent's tool action in the approval inbox, an executor response - have those values redacted instead: one nested `Authorization` header must not hide every other pending request. Reporting an action that already completed can never fail it either; a result that cannot be rendered degrades to a warning plus the minimal outcome. Workspace-to-token mappings are stored separately under the lease state directory so archival can release only the owning workspace.
 
 ## Recovery smoke boundary
 
 `scripts/recovery-smoke.sh` defaults to dry-run mode. With `DRY_RUN=0`, it creates a temporary `HOME`, fake disposable `cdesktop` and `sightmesh` executables, installs SightMesh LaunchAgent plists without starting launchd, and verifies lease workspace release inside that temporary state root. It never stops Conductor workers, provider sessions, cdesktop sessions, or unmanaged launchd labels.
 
 Managed service operations remain scoped to `io.sightmesh.cdesktop` and `io.sightmesh.bridge`. Installation removes the obsolete updater label. Cutover touches the former two legacy labels only and saves their plist definitions for rollback.
+
+## Install ownership
+
+`scripts/install-local.sh` never displaces a path it does not own. A skill link belonging to another product makes install refuse with that path named; remove it with its own uninstaller first. Every ownership check runs before the first side effect, so a refusal leaves the host exactly as it was rather than half installed. Because nothing is ever displaced, uninstall is a pure delete of created paths and has nothing to restore.
+
+Install records what it created in `~/.local/state/sightmesh/install-manifest.json` (0600, written to a temporary file and moved into place): the `uv tool` entry, the `~/.claude/skills` and `~/.codex/skills` links, and the state roots (`~/.local/share/sightmesh`, `~/.local/state/sightmesh`, the `io.sightmesh.*` LaunchAgent plists).
+
+`scripts/uninstall-local.sh` reads the manifest's `created_paths` and removes only those links once each is ownership-verified, plus the plists and the `uv tool` install, then removes the manifest. An installation with no manifest falls back to the paths install has always created. Durable state under `~/.local/share/sightmesh` and `~/.local/state/sightmesh` is kept on purpose; delete it explicitly to finish.

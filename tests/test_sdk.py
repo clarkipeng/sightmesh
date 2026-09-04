@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import random
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -284,6 +286,57 @@ def test_checkpoint_content_stays_in_the_task_worktree(system):
         client.launches[-1][1]["request"]["session"]["prompt"]
         == "Tests pass; docs remain"
     )
+
+
+def test_checkpoint_does_not_persist_a_nested_json_credential(system):
+    """Checkpoint files share the durable credential-redaction boundary."""
+    mesh, client, _store, _ownership = system
+    started = mesh.start(spec())
+    secret = "checkpoint-json-authorization-value"
+    checkpointed = mesh.checkpoint(
+        '{"progress":[{"authorization":"Bearer checkpoint-json-authorization-value"}]}',
+        worker="audit",
+    )
+
+    root = client.workspace(started.workspace_id)["container_ref"]
+    path = Path(root) / "project" / checkpointed.checkpoint
+    stored = path.read_text()
+    assert secret not in stored
+    assert "[REDACTED]" in stored
+
+
+def test_randomly_nested_credential_shapes_never_reach_checkpoint_files(system):
+    """Checkpoint persistence shares the same recursive credential boundary."""
+    mesh, client, _store, _ownership = system
+    started = mesh.start(spec())
+    credentials = (
+        "Bearer bearer-token-without-a-revealing-key",
+        "Basic QmFzaWMtdG9rZW4td2l0aG91dC1hLWtleQ==",
+        "sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+        "gho_abcdefghijklmnopqrstuvwxyz123456",
+        "xoxp-abcdefghijklmnopqrstuvwxyz123456",
+        "AKIAABCDEFGHIJKLMNOP",
+        "pypi-abcdefghijklmnopqrstuvwxyz123456",
+        "npm-abcdefghijklmnopqrstuvwxyz123456",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZ2VudCJ9.c2lnbmF0dXJlLXZhbHVl",
+        "https://operator:credential@internal.example/path",
+        "aB7!qL2#zM9@rT4%vX6^nC8&dF1*eH3+jK5",
+    )
+    stored: list[str] = []
+    root = Path(client.workspace(started.workspace_id)["container_ref"]) / "project"
+    for index, credential in enumerate(credentials):
+        randomizer = random.Random(index)
+        value: object = f"checkpoint {credential}"
+        for depth in range(3):
+            value = ({f"step_{depth}": value} if randomizer.choice((True, False))
+                     else [f"ordinary-{depth}", value])
+        if credential == credentials[-1]:
+            value = {"auth_context": value}
+        checkpointed = mesh.checkpoint(json.dumps(value), worker="audit")
+        stored.append((root / checkpointed.checkpoint).read_text())
+
+    persisted = "\n".join(stored)
+    assert all(credential not in persisted for credential in credentials)
 
 
 def test_duplicate_failover_wakeups_reserve_one_successor_epoch(system):

@@ -26,6 +26,21 @@ from .runtime_lock import RUNTIME_LOCK
 SCHEMA_VERSION = 1
 QUIET_SECONDS = 2.0
 UNDRAINED_BOOTSTRAP_VERSIONS = {"0.2.3-sightmesh.1"}
+#: Seconds of admission refusal requested from the executor. The kernel
+#: decides to drain; cdesktop enforces it by refusing new launches, and it
+#: caps one request at 30 seconds (``CdesktopClient.set_update_drain``).
+DRAIN_SECONDS = 30
+#: How often the wait re-arms the drain. One request can never cover a wait
+#: measured in minutes, so the refusal is renewed well inside its own TTL;
+#: anything at or above ``DRAIN_SECONDS`` would leave a hole a host can
+#: launch new work through.
+DRAIN_REARM_SECONDS = 10.0
+#: Bounded window the kernel waits for in-flight turns to reach terminal
+#: after the drain is in force. A busy host converges here because no new
+#: work is admitted; an unanswered approval does not, so the wait is bounded
+#: and reports what it actually observed instead of hanging.
+DRAIN_WAIT_SECONDS = 900.0
+DRAIN_POLL_SECONDS = 5.0
 
 
 def root_dir() -> Path:
@@ -56,6 +71,8 @@ def read_state() -> dict[str, Any]:
     if not path.exists():
         return {"schema_version": SCHEMA_VERSION, "status": "idle", "pending": None}
     value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise RuntimeError("Unsupported update state: expected an object")
     if value.get("schema_version") != SCHEMA_VERSION:
         raise RuntimeError(
             f"Unsupported update state schema: {value.get('schema_version')!r}"
@@ -497,12 +514,55 @@ def _restore_bridge() -> None:
     service._bootstrap(service.BRIDGE_LABEL, service.bridge_plist_path())
 
 
-def activate_if_idle(client: CdesktopClient, *, port: int) -> dict[str, Any]:
+def activate_after_drain(client: CdesktopClient, *, port: int) -> dict[str, Any]:
     try:
         with _activation_lock():
             return _activate_locked(client, port=port)
     except BlockingIOError:
         return {**read_state(), "action": "activation-already-running"}
+
+
+def _drain_and_wait(
+    client: CdesktopClient,
+    *,
+    enforced: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Wait for in-flight work while keeping the drain in force.
+
+    The executor's drain is a short-lived TTL, not a latch: one request
+    expires long before a fleet of live turns reaches terminal, and once it
+    expires new work is admitted again, so the fleet stops shrinking and the
+    wait can never converge. The wait therefore re-arms the refusal on a
+    cadence inside its own TTL and gives up as soon as it can no longer
+    prove the refusal is in force. Returns the last observed activity and
+    what the wait actually did, so a caller reports observed state rather
+    than a configured intention.
+    """
+    started = time.monotonic()
+    armed_at = started
+    rearms = 0
+    lapsed: str | None = None
+    time.sleep(QUIET_SECONDS)
+    current = activity(client)
+    while not current["idle"] and time.monotonic() - started < DRAIN_WAIT_SECONDS:
+        if enforced and time.monotonic() - armed_at >= DRAIN_REARM_SECONDS:
+            try:
+                client.set_update_drain(DRAIN_SECONDS)
+            except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+                lapsed = f"the executor stopped honouring the drain: {exc}"
+                break
+            armed_at = time.monotonic()
+            rearms += 1
+        time.sleep(DRAIN_POLL_SECONDS)
+        current = activity(client)
+    waited = {
+        "waited_seconds": round(time.monotonic() - started, 3),
+        "configured_wait_seconds": DRAIN_WAIT_SECONDS,
+        "ttl_seconds": DRAIN_SECONDS if enforced else 0,
+        "rearms": rearms,
+        "lapsed": lapsed,
+    }
+    return current, waited
 
 
 def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
@@ -511,46 +571,52 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
     if not pending:
         return {**state, "action": "no-staged-update"}
 
-    current_activity = activity(client)
-    if not current_activity["idle"]:
-        waiting = {
-            **state,
-            "status": "waiting-for-idle",
-            "activity": current_activity,
-            "updated_at": time.time(),
-        }
-        _write_json_atomic(state_path(), waiting)
-        return {**waiting, "action": "waiting-for-idle"}
-
-    service._bootout(service.BRIDGE_LABEL)
-    service._wait_until_unloaded(service.BRIDGE_LABEL)
+    # Drain first, then wait. Gating on a pre-existing idle never fires on a
+    # loaded host, which is how three cdesktop versions accumulated locally.
+    # The bridge stays up for the whole wait: it is only in the way of the
+    # swap itself, so taking it down before a wait measured in minutes buys
+    # nothing and costs the fleet its message path for that entire window.
     drain_enabled = False
     bootstrap_without_drain = False
+    bridge_down = False
     bridge_restored = False
     try:
         running_version = str(client.info().get("version") or "")
         try:
-            client.set_update_drain(15)
+            client.set_update_drain(DRAIN_SECONDS)
             drain_enabled = True
         except Exception:
             if running_version not in UNDRAINED_BOOTSTRAP_VERSIONS:
                 raise
             bootstrap_without_drain = True
-        time.sleep(QUIET_SECONDS)
-        current_activity = activity(client)
+        drain_report = {
+            "requested_seconds": DRAIN_SECONDS,
+            "enforced": drain_enabled,
+            "reason": None
+            if drain_enabled
+            else f"{running_version} predates the drain endpoint",
+        }
+        current_activity, waited = _drain_and_wait(client, enforced=drain_enabled)
+        drain_report.update(waited)
         if not current_activity["idle"]:
-            client.set_update_drain(0)
+            if drain_enabled:
+                client.set_update_drain(0)
             drain_enabled = False
-            _restore_bridge()
             waiting = {
                 **state,
-                "status": "waiting-for-idle",
+                "status": "drain-timed-out",
+                "drain": drain_report,
                 "activity": current_activity,
                 "updated_at": time.time(),
             }
             _write_json_atomic(state_path(), waiting)
-            return {**waiting, "action": "activity-resumed"}
+            return {**waiting, "action": "drain-timed-out"}
 
+        # Converged: the bridge is only now in the way, so its downtime is
+        # the swap and nothing else.
+        service._bootout(service.BRIDGE_LABEL)
+        service._wait_until_unloaded(service.BRIDGE_LABEL)
+        bridge_down = True
         target = service.plist_path()
         new_definition = plistlib.dumps(
             service.definition(port, executable=Path(str(pending["executable"])))
@@ -560,6 +626,7 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
             **state,
             "status": "activating",
             "bootstrap_without_drain": bootstrap_without_drain,
+            "drain": drain_report,
             "updated_at": time.time(),
         }
         _write_json_atomic(state_path(), activating)
@@ -585,11 +652,13 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
                     CdesktopClient(service.service_url(port)).set_update_drain(0)
                 except Exception:
                     pass
-                try:
-                    _restore_bridge()
-                    bridge_restored = True
-                except Exception:
-                    pass
+            # The bridge was taken down for this swap alone, so it goes back
+            # up whether or not the replacement backend came up healthy.
+            try:
+                _restore_bridge()
+                bridge_restored = True
+            except Exception:
+                pass
             failed = {
                 **activating,
                 "status": "failed",
@@ -613,6 +682,7 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
             },
             "last_error": None,
             "native_state_migration": native_state_migration,
+            "drain": drain_report,
             "updated_at": time.time(),
         }
         _write_json_atomic(state_path(), active)
@@ -624,7 +694,7 @@ def _activate_locked(client: CdesktopClient, *, port: int) -> dict[str, Any]:
                 client.set_update_drain(0)
             except Exception:
                 pass
-        if not bridge_restored and service.is_healthy(port):
+        if bridge_down and not bridge_restored:
             _restore_bridge()
         raise
 

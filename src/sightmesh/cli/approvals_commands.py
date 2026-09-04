@@ -115,7 +115,9 @@ def cmd_inbox(args: argparse.Namespace) -> int:
         details["response_template"] = _approval_response_template(details)
         rows.append(details)
     rows.extend(_idle_unmet_orders(client, fleet_rows))
-    _emit(rows, args.json)
+    # Every row carries cdesktop's raw action verbatim, so the inbox relays
+    # it with credentials redacted rather than refusing to show any of it.
+    _emit(rows, args.json, external=True)
     return 0
 
 
@@ -313,7 +315,17 @@ def cmd_respond(args: argparse.Namespace) -> int:
     reporter = args.reviewer_session or os.environ.get("CDESKTOP_SESSION_ID")
     if reporter and failures == 0:
         escalation.EscalationStore().satisfy_orders(reporter)
-    _emit({"results": results, "failed": failures}, args.json)
+    _emit_action_result(
+        {"results": results, "failed": failures},
+        args.json,
+        fallback={
+            "results": [
+                {"approval_id": row["approval_id"], "status": row["status"]}
+                for row in results
+            ],
+            "failed": failures,
+        },
+    )
     return int(failures > 0)
 
 
@@ -371,12 +383,12 @@ def cmd_approval(args: argparse.Namespace) -> int:
             rows = [item for item in rows if item["workspace_id"] == args.workspace_id]
         if args.session_id:
             rows = [item for item in rows if item["session_id"] == args.session_id]
-        _emit(rows, args.json)
+        _emit(rows, args.json, external=True)
         return 0
 
     approval = _pending_approval(client, args.approval_id)
     if args.approval_action == "show":
-        _emit(approval, args.json)
+        _emit(approval, args.json, external=True)
         return 0
     if approval.get("is_question"):
         raise ValueError(
@@ -419,13 +431,20 @@ def cmd_approval(args: argparse.Namespace) -> int:
         store.finish(attempt.decision_id, succeeded=False, error=str(exc))
         raise
     completed = store.finish(attempt.decision_id, succeeded=True)
-    _emit(
+    # The approval has already been answered. Reporting it must not be able
+    # to fail the command that answered it.
+    _emit_action_result(
         {
             "approval": approval,
             "decision": completed.to_dict(),
             "cdesktop_response": response,
         },
         args.json,
+        fallback={
+            "approval_id": str(approval["approval_id"]),
+            "decision": completed.decision,
+            "status": "responded",
+        },
     )
     return 0
 

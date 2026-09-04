@@ -17,6 +17,22 @@ from urllib.parse import quote
 
 TERMINAL = frozenset({"completed", "done", "failed", "cancelled", "stopped", "killed"})
 RUNNING = frozenset({"queued", "claimed", "running", "active"})
+#: Managed task states, as the kernel store writes them.
+TASK_RUNNING_STATES = frozenset({"reserved", "active", "replacing"})
+TASK_DONE_STATES = frozenset({"completed", "cancelled"})
+#: Facts only the executor can produce, named here so an absent one is
+#: reported as degraded rather than silently dropped from the queue.
+DEGRADABLE_SOURCES = ("dirty_closeouts", "failing_checks")
+_ATTENTION_PRIORITY = {
+    "blocked_approval": 0,
+    "tripped_breaker": 1,
+    "blocked": 2,
+    "lost": 3,
+    "dirty_closeout": 4,
+    "failing_check": 5,
+    "unacked_delivery": 6,
+    "suppressed_unacked": 7,
+}
 _QUOTA_FIELDS = ("known", "remaining", "resetsAt", "resetsIn", "reason")
 _EVENT_FIELDS = ("at", "kind", "status", "summary")
 _TOKEN_USAGE_FIELDS = (
@@ -129,6 +145,272 @@ def overview(
         key=_order,
     )
     return FleetOverview(tuple(attention), tuple(running), tuple(done))
+
+
+@dataclass(frozen=True)
+class AttentionFacts:
+    """Kernel-owned facts, plus the two the executor alone can supply.
+
+    ``dirty_closeouts`` and ``failing_checks`` are ``None`` when the caller
+    does not already hold them; the queue then reports those sources as
+    degraded instead of pretending they are empty.
+    """
+
+    tasks: tuple[Mapping[str, Any], ...] = ()
+    unacked: tuple[Mapping[str, Any], ...] = ()
+    dirty_closeouts: tuple[Mapping[str, Any], ...] | None = None
+    failing_checks: tuple[Mapping[str, Any], ...] | None = None
+
+
+@dataclass(frozen=True)
+class AttentionItem:
+    selector: str
+    kind: str
+    reason: str
+    next_action: str
+    scope: str | None
+    task_key: str | None
+    state: str | None
+    workspace_id: str | None
+    session_id: str | None
+    age_seconds: int | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "selector": self.selector,
+            "kind": self.kind,
+            "reason": self.reason,
+            "next_action": self.next_action,
+            "scope": self.scope,
+            "task_key": self.task_key,
+            "state": self.state,
+            "workspace_id": self.workspace_id,
+            "session_id": self.session_id,
+            "age_seconds": self.age_seconds,
+        }
+
+
+@dataclass(frozen=True)
+class AttentionQueue:
+    items: tuple[AttentionItem, ...]
+    degraded: tuple[Mapping[str, Any], ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "items": [item.to_dict() for item in self.items],
+            "degraded": [dict(entry) for entry in self.degraded],
+        }
+
+
+@dataclass(frozen=True)
+class TaskGroups:
+    needs_attention: tuple[Mapping[str, Any], ...]
+    running: tuple[Mapping[str, Any], ...]
+    done_since_view: tuple[Mapping[str, Any], ...]
+
+    def to_dict(self) -> dict[str, list[dict[str, Any]]]:
+        return {
+            "needs_attention": [dict(row) for row in self.needs_attention],
+            "running": [dict(row) for row in self.running],
+            "done_since_view": [dict(row) for row in self.done_since_view],
+        }
+
+
+def attention(facts: AttentionFacts, *, now: datetime) -> AttentionQueue:
+    """Project one ordered queue of everything a human must act on.
+
+    The contract (docs/kernel-contract.md, "Observability") names five rows:
+    unacknowledged deliveries, dirty closeouts, tripped breakers, blocked
+    approvals, and failing checks. Three of them are kernel facts and are
+    always answerable; the other two are executor facts and are reported as
+    degraded when the caller holds none.
+    """
+    items = [_task_attention_item(task, now) for task in facts.tasks]
+    items.extend(_delivery_attention_item(row, now) for row in facts.unacked)
+    items.extend(
+        _native_attention_item("dirty_closeout", row, now)
+        for row in facts.dirty_closeouts or ()
+    )
+    items.extend(
+        _native_attention_item("failing_check", row, now)
+        for row in facts.failing_checks or ()
+    )
+    present = [item for item in items if item is not None]
+    degraded = tuple(
+        {
+            "source": source,
+            "status": "reported-degraded",
+            "owner": "cdesktop",
+            "reason": f"{source} is an executor-owned fact and was not supplied",
+        }
+        for source in DEGRADABLE_SOURCES
+        if getattr(facts, source) is None
+    )
+    return AttentionQueue(tuple(sorted(present, key=_attention_order)), degraded)
+
+
+def task_groups(
+    tasks: Iterable[Mapping[str, Any]],
+    *,
+    now: datetime,
+    viewed_at: datetime | None = None,
+) -> TaskGroups:
+    """Group managed tasks the way ``overview`` groups native executions."""
+    rows = list(tasks)
+    needs_attention = [row for row in rows if _task_attention_kind(row) is not None]
+    running = [row for row in rows if str(row.get("state")) in TASK_RUNNING_STATES]
+    done = [
+        row
+        for row in rows
+        if str(row.get("state")) in TASK_DONE_STATES
+        and (viewed_at is None or _task_time(row) >= viewed_at)
+    ]
+    def order(row: Mapping[str, Any]) -> tuple[int, str]:
+        return -(_task_age(row, now) or 0), str(row.get("key") or "")
+
+    return TaskGroups(
+        tuple(sorted(needs_attention, key=order)),
+        tuple(sorted(running, key=order)),
+        tuple(sorted(done, key=order)),
+    )
+
+
+def breaker_tripped(task: Mapping[str, Any]) -> bool:
+    """The one definition of an exhausted attempt budget, for every surface.
+
+    ``status`` counts breakers, the attention queue classifies them and
+    ``to_dict`` reports them. While each answered the question its own way
+    the surfaces disagreed: ``status`` counted a tripped breaker that the
+    queue described as merely "blocked" and advised replacing - which
+    ``TaskStore.prepare_replacement`` rejects outright. A finished task never
+    counts, however many attempts it spent.
+    """
+    if str(task.get("state") or "") in TASK_DONE_STATES:
+        return False
+    try:
+        return int(task["attempts"]) >= int(task["max_attempts"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _task_attention_kind(task: Mapping[str, Any]) -> str | None:
+    # Budget first: an exhausted task cannot be replaced, so classifying it
+    # by its state would hand the operator advice the store refuses.
+    if breaker_tripped(task):
+        return "tripped_breaker"
+    state = str(task.get("state") or "")
+    if state == "blocked":
+        reason = str(task.get("result") or "").casefold()
+        return "blocked_approval" if "approval" in reason else "blocked"
+    if state == "lost":
+        return "lost"
+    return None
+
+
+_ATTENTION_COPY = {
+    "blocked_approval": (
+        "Task is blocked on an approval.",
+        "Answer the approval, then replace or complete the task.",
+    ),
+    "blocked": (
+        "Task is blocked.",
+        "Read the recorded block reason and replace or cancel the task.",
+    ),
+    "lost": (
+        "Task lost its holder session.",
+        "Replace the task to start a fresh epoch.",
+    ),
+    "tripped_breaker": (
+        "Task has spent its whole attempt budget.",
+        "Raise the budget deliberately or cancel the task; it cannot be replaced.",
+    ),
+}
+
+
+def _task_attention_item(
+    task: Mapping[str, Any], now: datetime
+) -> AttentionItem | None:
+    kind = _task_attention_kind(task)
+    if kind is None:
+        return None
+    reason, next_action = _ATTENTION_COPY[kind]
+    scope = _text(task.get("scope"))
+    key = _text(task.get("key"))
+    return AttentionItem(
+        selector=f"task/{quote(scope or 'unknown', safe='')}/{quote(key or '', safe='')}",
+        kind=kind,
+        reason=reason,
+        next_action=next_action,
+        scope=scope,
+        task_key=key,
+        state=_text(task.get("state")),
+        workspace_id=_text(task.get("workspace_id")),
+        session_id=_text(task.get("session_id")),
+        age_seconds=_task_age(task, now),
+    )
+
+
+def _delivery_attention_item(row: Mapping[str, Any], now: datetime) -> AttentionItem:
+    kind = _text(row.get("kind")) or "delivery"
+    identifier = _text(row.get("id")) or "unknown"
+    # The bounded read summarizes its own overflow in one row rather than
+    # emitting rows a human will never work through.
+    suppressed = kind == "suppressed_unacked"
+    return AttentionItem(
+        selector=f"delivery/{quote(kind, safe='')}/{quote(identifier, safe='')}",
+        kind="suppressed_unacked" if suppressed else "unacked_delivery",
+        reason=f"{_text(row.get('summary'))}."
+        if suppressed
+        else f"Delivery is unacknowledged ({kind}).",
+        next_action="Re-read with a higher limit, or --all, to see them."
+        if suppressed
+        else "Resolve the escalation or collect the outstanding report.",
+        scope=None,
+        task_key=None,
+        state=kind,
+        workspace_id=_text(row.get("workspace_id")),
+        session_id=_text(row.get("session_id")),
+        age_seconds=_age({"at": row.get("created_at")}, now),
+    )
+
+
+def _native_attention_item(
+    kind: str, row: Mapping[str, Any], now: datetime
+) -> AttentionItem:
+    identifier = _text(row.get("id")) or _text(row.get("workspace_id")) or "unknown"
+    reason = (
+        "Closeout is dirty."
+        if kind == "dirty_closeout"
+        else "A delivery check is failing."
+    )
+    return AttentionItem(
+        selector=f"{kind}/{quote(identifier, safe='')}",
+        kind=kind,
+        reason=reason,
+        next_action="Reconcile the reported worktree or delivery reference.",
+        scope=None,
+        task_key=None,
+        state=_text(row.get("status")),
+        workspace_id=_text(row.get("workspace_id")),
+        session_id=_text(row.get("session_id")),
+        age_seconds=_age({"at": row.get("at")}, now),
+    )
+
+
+def _attention_order(item: AttentionItem) -> tuple[int, int, str]:
+    return (
+        _ATTENTION_PRIORITY[item.kind],
+        -(item.age_seconds or 0),
+        item.selector,
+    )
+
+
+def _task_time(task: Mapping[str, Any]) -> datetime:
+    return _event_time({"at": task.get("updated_at")})
+
+
+def _task_age(task: Mapping[str, Any], now: datetime) -> int | None:
+    return _age({"at": task.get("updated_at")}, now)
 
 
 def _item(
@@ -281,6 +563,9 @@ def _event_time(event: Mapping[str, Any] | None) -> datetime:
     value = event.get("at")
     if isinstance(value, datetime):
         return _utc(value)
+    # Kernel store rows carry POSIX seconds, native rows carry ISO strings.
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return datetime.fromtimestamp(float(value), tz=UTC)
     if isinstance(value, str):
         try:
             return _utc(datetime.fromisoformat(value))

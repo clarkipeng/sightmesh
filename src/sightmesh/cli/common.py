@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -25,6 +26,7 @@ from .. import (
     escalation,
     execution_routing,
     leases,
+    observability,
     routing,
     service,
     succession,
@@ -74,13 +76,130 @@ def _with_coordination_contract(prompt: str) -> str:
     return f"{prompt.rstrip()}\n\n{COORDINATION_CONTRACT.rstrip()}\n"
 
 
-def _emit(data: Any, as_json: bool) -> None:
+#: Keys whose *values* are credentials. The CLI has exactly one output path,
+#: so rejecting these here makes a future leak fail loudly instead of
+#: silently serializing a live capability into a transcript
+#: (docs/kernel-contract.md, "Observability").
+SECRET_KEYS = frozenset(
+    {
+        "token",
+        "secret",
+        "password",
+        "passphrase",
+        "api_key",
+        "apikey",
+        "authorization",
+        "credential",
+        "capability",
+        "private_key",
+    }
+)
+
+
+def _reject_secret_keys(data: Any, path: str = "") -> None:
+    if isinstance(data, dict):
+        for key, value in data.items():
+            where = f"{path}.{key}" if path else str(key)
+            if str(key).casefold() in SECRET_KEYS:
+                raise ValueError(
+                    f"Refusing to emit credential-shaped field {where!r}. "
+                    "Write the value to a private file and emit its path."
+                )
+            _reject_secret_keys(value, where)
+    elif isinstance(data, (list, tuple)):
+        for index, value in enumerate(data):
+            _reject_secret_keys(value, f"{path}[{index}]")
+
+
+#: What a pass-through payload's credential-shaped values are replaced with.
+REDACTED = "[redacted]"
+
+
+def _redact_secret_values(data: Any) -> Any:
+    """Return a copy of a pass-through payload with credential values removed.
+
+    External payloads are authored by agents and executors, not by this CLI:
+    the approval inbox attaches cdesktop's raw tool action verbatim, so one
+    nested ``Authorization`` header in one request would otherwise take down
+    the whole inbox. Refusing to emit is the right answer for a dict the
+    kernel built - that is a bug here - but for a payload we are only
+    relaying, the credential is what must go, not the operator's view of the
+    fleet.
+    """
+    if isinstance(data, dict):
+        return {
+            key: REDACTED
+            if str(key).casefold() in SECRET_KEYS
+            else _redact_secret_values(value)
+            for key, value in data.items()
+        }
+    if isinstance(data, (list, tuple)):
+        return [_redact_secret_values(item) for item in data]
+    return data
+
+
+def _emit(data: Any, as_json: bool, *, external: bool = False) -> None:
+    """Print one command result through the CLI's single output path.
+
+    ``external=True`` marks a payload the kernel did not construct and is
+    only relaying; its credential-shaped values are redacted. Kernel-built
+    dicts keep the loud guard, because a credential in one of those is a
+    defect in this repository and failing is how it gets found.
+    """
+    # The guard rejects on key name, so it is the kernel-payload rule; a
+    # redacted pass-through payload has already lost every value it names.
+    data = _redact_secret_values(data) if external else data
+    if not external:
+        _reject_secret_keys(data)
     if as_json:
         print(json.dumps(data, indent=2, sort_keys=True))
     elif isinstance(data, str):
         print(data)
     else:
         print(json.dumps(data, indent=2))
+
+
+def _emit_action_result(data: Any, as_json: bool, *, fallback: Any) -> None:
+    """Report a completed action's outcome without ever contradicting it.
+
+    The action already happened when this runs. An approval that went
+    through and then printed an error - because rendering its pass-through
+    payload raised - tells the operator the exact opposite of the truth, so
+    a rendering failure degrades to a warning plus the minimal kernel-owned
+    summary and the command still succeeds.
+    """
+    try:
+        _emit(data, as_json, external=True)
+    except Exception as exc:  # noqa: BLE001 - reported, never fatal
+        print(
+            f"warning: the action succeeded but its full result could not be "
+            f"rendered: {exc}",
+            file=sys.stderr,
+        )
+        _emit(fallback, as_json)
+
+
+def emit_capability(directory: Path, name: str, value: str) -> Path:
+    """Deliver a capability through a private file, never through stdout.
+
+    The founder rule is absolute: never print a credential value. ``acquire``
+    is the one command that must hand a caller a live token, so it writes it
+    0600 next to the store that owns it and reports only the path.
+    """
+    root = Path(directory).expanduser()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root.chmod(0o700)
+    path = root / f"{name}.token"
+    handle, temporary = tempfile.mkstemp(prefix=f".{name}.", dir=root)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(value)
+        temporary_path.chmod(0o600)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return path
 
 
 def _repowire_status_ok(returncode: int, detail: str) -> bool:

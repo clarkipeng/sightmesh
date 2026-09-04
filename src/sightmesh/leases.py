@@ -16,6 +16,8 @@ from typing import Any, Self
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_TTL_SECONDS = 4 * 60 * 60
+#: Suffix `emit_capability` appends to the capability file it writes.
+CAPABILITY_SUFFIX = ".token"
 
 
 class LeaseError(RuntimeError):
@@ -128,6 +130,18 @@ class LeaseStore:
 
     def _workspace_path(self, workspace_id: str) -> Path:
         return self.root / "workspaces" / f"{workspace_id}.json"
+
+    def capability_path(self, lease: Lease) -> Path:
+        """Where ``lease acquire`` delivers this identity's bearer token.
+
+        One definition, so the writer and the cleanup below can never point
+        at different files.
+        """
+        return (
+            self.root
+            / "capabilities"
+            / f"{_identity_key(lease.repo_path, lease.worktree_path)}{CAPABILITY_SUFFIX}"
+        )
 
     def _read(self, path: Path) -> Lease | None:
         try:
@@ -357,7 +371,12 @@ class LeaseStore:
         raise LeaseError("No lease found for token")
 
     def _remove_locked(self, path: Path, lease: Lease) -> None:
+        # The single choke point every removal goes through: release, the
+        # expiry sweep, and the stale cleanup inside acquire. A capability
+        # file that outlives its lease is a bearer token on disk for a
+        # lease nobody holds, so it dies with the lease by construction.
         path.unlink(missing_ok=True)
+        self.capability_path(lease).unlink(missing_ok=True)
         if lease.workspace_id:
             self._workspace_path(lease.workspace_id).unlink(missing_ok=True)
 
