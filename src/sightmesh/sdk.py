@@ -330,6 +330,8 @@ class SightMesh:
 
     def replace(self, worker: str, prompt: str | None = None) -> Worker:
         task = self._find(worker)
+        # The contract probe is HTTP; it runs before the fence, never under it.
+        self._require_contract()
         with self.store.task_lock(task.task_id) as fence:
             # The snapshot used to find the task may have waited behind an
             # automatic recovery. Reloading under the same lock makes this
@@ -346,7 +348,6 @@ class SightMesh:
                 raise SightMeshError(
                     "Replacement requires a prompt or saved checkpoint"
                 )
-            self._require_contract()
             target = {**task.spec["target"]}
             automatic_recovery = routing_outcome(target.get("recovery"))
             target.pop("recovery", None)
@@ -576,6 +577,8 @@ class SightMesh:
         superseded epoch's outcome reroutes a run that already moved on; taking
         no effect as an argument makes that pairing impossible to get wrong.
         """
+        # The contract probe is HTTP; it runs before the fence, never under it.
+        self._require_contract()
         with self.store.task_lock(task.task_id) as fence:
             current = self.store.get_by_id(task.task_id)
             if current is None:
@@ -658,7 +661,6 @@ class SightMesh:
             "failover": "auto",
             "recovery": outcome,
         }
-        self._require_contract()
         prepared = self.store.prepare_replacement(
             task.task_id, target=next_target, expect_version=task.version, fence=fence
         )
@@ -689,7 +691,6 @@ class SightMesh:
             return self._block_unroutable(
                 task, f"replacement epoch ended: {effect.outcome}", fence
             )
-        self._require_contract()
         return Worker.from_record(
             self._launch_prepared(task, str(task.spec["prompt"]), fence)
         )
@@ -755,6 +756,7 @@ class SightMesh:
         # covers durable decisions only, so open its gate for that call.
         with fence.external_io():
             request = self._workspace_request(prepared, replacement_prompt)
+        self._require_unchanged(prepared)
         workspace_id, session_id = self._journaled_launch(
             prepared,
             {"kind": "workspace", "request": request},
@@ -802,6 +804,7 @@ class SightMesh:
             reason="managed task replacement",
             logical_key=f"task:{prepared.task_id}:epoch:{prepared.epoch}",
             io=fence.external_io,
+            before_spawn=lambda: self._require_unchanged(prepared),
         )
         active = self.store.activate(
             prepared.task_id,
@@ -829,6 +832,23 @@ class SightMesh:
             auth_binding_id=target.get("auth_binding_id"),
         )
 
+    def _reload_unchanged(self, task: TaskRecord) -> TaskRecord | None:
+        """The task's current row if its epoch and version still match, else None."""
+        current = self.store.get_by_id(task.task_id)
+        if current is None or (current.epoch, current.version) != (task.epoch, task.version):
+            return None
+        return current
+
+    def _require_unchanged(self, task: TaskRecord) -> TaskRecord:
+        """Refuse to dispatch for a task that moved while a gate was open."""
+        current = self._reload_unchanged(task)
+        if current is None:
+            raise SightMeshError(
+                f"Task {task.key!r} changed while its launch was being prepared; "
+                "not launching from a stale snapshot"
+            )
+        return current
+
     def _start_reserved(self, task: TaskRecord) -> TaskRecord:
         """Launch a reservation while sharing terminal writers' task fence."""
         with self.store.task_lock(task.task_id) as fence:
@@ -845,6 +865,12 @@ class SightMesh:
         # only, so that I/O runs with the gate open like every other request.
         with fence.external_io():
             request = self._workspace_request(task, str(task.spec["prompt"]))
+        # Anything may have happened while the gate was open (cancel, replace,
+        # loss). Re-read the row before dispatching; a changed task never
+        # issues a native launch from a stale snapshot.
+        current = self._reload_unchanged(task)
+        if current is None or current.state != "reserved":
+            return self.store.get_by_id(task.task_id) or task
         self._wait_for_launch_capacity(task)
         workspace_id, session_id = self._journaled_launch(
             task, {"kind": "workspace", "request": request}, fence

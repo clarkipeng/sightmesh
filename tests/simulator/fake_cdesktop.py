@@ -304,6 +304,7 @@ class FakeCdesktop:
             self._effect_errors.extend(errors)
 
     def managed_effect(self, task_id: str, epoch: int) -> dict[str, Any]:
+        assert_external_io_allowed()  # the real client does HTTP here
         """Look up the native effect behind a task epoch, or 404 if absent.
 
         Mirrors ``CdesktopClient.managed_effect`` (a ``GET`` that raises on a

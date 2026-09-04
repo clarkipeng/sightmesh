@@ -338,12 +338,15 @@ def transfer_ownership(
     reason: str,
     logical_key: str | None = None,
     io: Callable[[], Any] = nullcontext,
+    before_spawn: Callable[[], None] | None = None,
 ) -> HandoffResult:
     """Quarantine the source and hand its live intent to exactly one successor.
 
     ``io`` wraps every cdesktop request so a caller holding a task fence can
     open its gate for the network calls (``TaskFence.external_io``); the
-    durable records are written with the fence held.
+    durable records are written with the fence held. ``before_spawn`` runs
+    after that first I/O and before any successor is spawned, so a caller can
+    refuse to spawn for a task that changed while the gate was open.
 
     Safe to re-run after a crash at any point: the terminal record is written
     first, the successor is spawned only while none is recorded, forwarding
@@ -368,6 +371,8 @@ def transfer_ownership(
     if record.successor_session_id:
         successor, spawned = record.successor_session_id, False
     else:
+        if before_spawn is not None:
+            before_spawn()
         successor = str(spawn())
         if not successor:
             raise SuccessionError("Successor spawn did not return a session id")
