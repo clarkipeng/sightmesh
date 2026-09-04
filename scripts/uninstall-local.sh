@@ -2,38 +2,58 @@
 set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+manifest="$HOME/.local/state/sightmesh/install-manifest.json"
+skill_names="orchestrate-visible-agents reconcile-agent-work"
+skill_roots="$HOME/.claude/skills $HOME/.codex/skills"
 
-check_link() {
-  skill_name=$1
-  source_path="$repo_root/skills/$skill_name"
-  for skill_root in "$HOME/.claude/skills" "$HOME/.codex/skills"; do
-    destination="$skill_root/$skill_name"
-    if [ -L "$destination" ]; then
-      if [ "$(readlink "$destination")" = "$source_path" ]; then
-        :
-      else
+# The manifest is the record of what this installation created, so it is
+# what uninstall reads. An installation that predates the manifest, or whose
+# manifest was removed by hand, falls back to the paths install has always
+# created.
+manifest_created_paths() {
+  [ -f "$manifest" ] || return 0
+  sed -n '/"created_paths": \[/,/^  \]/p' "$manifest" |
+    sed -n 's/^ *"\(.*\)",\{0,1\}$/\1/p'
+}
+
+owned_skill_paths() {
+  recorded=$(manifest_created_paths)
+  if [ -n "$recorded" ]; then
+    printf '%s\n' "$recorded"
+    return 0
+  fi
+  for skill_name in $skill_names; do
+    for skill_root in $skill_roots; do
+      printf '%s\n' "$skill_root/$skill_name"
+    done
+  done
+}
+
+check_owned_link() {
+  destination=$1
+  if [ -L "$destination" ]; then
+    case "$(readlink "$destination")" in
+      "$repo_root"/skills/*) return 0 ;;
+      *)
         echo "Refusing to remove unrelated skill link: $destination" >&2
         exit 1
-      fi
-    elif [ -e "$destination" ]; then
-      echo "Refusing to remove non-link skill path: $destination" >&2
-      exit 1
-    fi
-  done
+        ;;
+    esac
+  elif [ -e "$destination" ]; then
+    echo "Refusing to remove non-link skill path: $destination" >&2
+    exit 1
+  fi
 }
 
-remove_link() {
-  skill_name=$1
-  for skill_root in "$HOME/.claude/skills" "$HOME/.codex/skills"; do
-    destination="$skill_root/$skill_name"
-    if [ -L "$destination" ]; then
-      rm "$destination"
-    fi
-  done
-}
+owned=$(owned_skill_paths)
 
-check_link orchestrate-visible-agents
-check_link reconcile-agent-work
+# Validate every recorded path before removing any of it.
+if ! printf '%s\n' "$owned" | while IFS= read -r destination; do
+  [ -n "$destination" ] || continue
+  check_owned_link "$destination"
+done; then
+  exit 1
+fi
 
 for label in io.sightmesh.cdesktop io.sightmesh.bridge io.sightmesh.updater; do
   plist="$HOME/Library/LaunchAgents/$label.plist"
@@ -50,8 +70,12 @@ for label in io.sightmesh.cdesktop io.sightmesh.bridge io.sightmesh.updater; do
   fi
 done
 
-remove_link orchestrate-visible-agents
-remove_link reconcile-agent-work
+printf '%s\n' "$owned" | while IFS= read -r destination; do
+  [ -n "$destination" ] || continue
+  if [ -L "$destination" ]; then
+    rm "$destination"
+  fi
+done
 
 remove_owned_tool() {
   tool_dir=$(uv tool dir 2>/dev/null || true)
@@ -73,4 +97,9 @@ for label in io.sightmesh.cdesktop io.sightmesh.bridge io.sightmesh.updater; do
   fi
 done
 
+# The manifest lists only paths install created, so removing it last leaves
+# no record of an installation that no longer exists.
+rm -f "$manifest"
+
 echo "Removed this SightMesh installation and its owned local links."
+echo "Durable state under ~/.local/share/sightmesh and ~/.local/state/sightmesh is kept; delete it explicitly to finish."

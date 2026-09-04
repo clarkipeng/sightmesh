@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -195,13 +196,123 @@ class OrderExpectation:
     satisfied_at: float | None
 
 
-def redact_credentials(message: str) -> str:
-    """Keep operational records useful without retaining obvious credentials."""
+_CREDENTIAL_KEY_PARTS = (
+    "authorization",
+    "bearer",
+    "cookie",
+    "auth",
+    "token",
+    "key",
+    "apikey",
+    "secret",
+    "password",
+    "credential",
+)
+
+_CREDENTIAL_VALUE_PATTERNS = (
+    (re.compile(r"(?i)\b(bearer|basic)\s+(?:[A-Za-z0-9._~+/=-]+)"), r"\1 [REDACTED]"),
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9_])(?:sk-ant-|sk-|ghp_|gho_|github_pat_|xox[abp]-|AKIA|pypi-|npm-)[A-Za-z0-9_-]+"
+        ),
+        "[REDACTED]",
+    ),
+    (
+        re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])"),
+        "[REDACTED]",
+    ),
+)
+_URL_USERINFO_RE = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/\s@]+@")
+_SAFE_ROUTING_VALUE_RE = re.compile(
+    r"^(?:[0-9a-f]{7,64}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[A-Za-z][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+)$",
+    re.IGNORECASE,
+)
+_SAFE_ROUTING_KEY_PARTS = ("dedupe", "session", "sha", "commit", "path", "uuid")
+
+
+def _is_credential_key(key: object) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return any(part in normalized for part in _CREDENTIAL_KEY_PARTS)
+
+
+def _is_routing_key(key: object) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return any(part in normalized for part in _SAFE_ROUTING_KEY_PARTS)
+
+
+def _has_high_entropy(value: str) -> bool:
+    """Identify opaque secrets without treating ordinary routing ids as secrets."""
+    if len(value) <= 24 or _SAFE_ROUTING_VALUE_RE.fullmatch(value):
+        return False
+    frequencies = {character: value.count(character) for character in set(value)}
+    entropy = -sum(
+        (count / len(value)) * math.log2(count / len(value))
+        for count in frequencies.values()
+    )
+    return entropy >= 4.0
+
+
+def _redact_string(value: str, key: object | None = None) -> str:
+    """Redact credential shapes whether or not callers gave them a revealing key."""
+    if key is not None and _is_credential_key(key):
+        if not _is_routing_key(key) and _has_high_entropy(value):
+            return "[REDACTED]"
+    redacted = _URL_USERINFO_RE.sub(r"\1***@", value)
+    for pattern, replacement in _CREDENTIAL_VALUE_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def _redact_structured_credentials(payload: Any, key: object | None = None) -> Any:
+    if isinstance(payload, dict):
+        return {
+            child_key: "[REDACTED]"
+            if _is_credential_key(child_key) and not _is_routing_key(child_key)
+            else _redact_structured_credentials(value, child_key)
+            for child_key, value in payload.items()
+        }
+    if isinstance(payload, list):
+        return [_redact_structured_credentials(value, key) for value in payload]
+    if isinstance(payload, str):
+        return _redact_string(payload, key)
+    return payload
+
+
+def redact_credentials(payload: Any) -> Any:
+    """Redact credential-bearing fields before a payload becomes durable.
+
+    JSON is decoded and walked so formatting cannot hide a nested credential;
+    free-form prose keeps the header and inline-value redaction used by logs.
+    """
+    if isinstance(payload, (dict, list)):
+        return _redact_structured_credentials(payload)
+    if not isinstance(payload, str):
+        return payload
+    try:
+        structured = json.loads(payload)
+    except json.JSONDecodeError:
+        structured = None
+    else:
+        if isinstance(structured, (dict, list)):
+            return json.dumps(
+                _redact_structured_credentials(structured),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+    # Header values can contain a scheme and spaces (``Bearer secret``), so
+    # redact an entire credential header before handling inline key/value forms.
+    without_headers = re.sub(
+        r"(?im)\b(authorization|cookie)\b\s*:\s*[^\r\n]*",
+        r"\1: [REDACTED]",
+        _redact_string(payload),
+    )
     return re.sub(
-        r"(?im)\b(token|secret|password|authorization|cookie|credential|api[_-]?key)"
-        r"\s*([:=])\s*[^\s]+",
+        r"(?im)\b(token|secret|password|credential|api[_-]?key)\b\s*([:=])\s*"
+        r"(?:(?:bearer|basic)\s+(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\r\n]+)"
+        r"|\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\r\n]+)",
         r"\1\2 [REDACTED]",
-        message,
+        without_headers,
     )
 
 
@@ -526,6 +637,7 @@ class EscalationStore:
     ) -> ParkedEscalation:
         if reason not in PARK_REASONS:
             raise ValueError(f"Unknown park reason: {reason}")
+        message = redact_credentials(message)
         now = time.time()
         try:
             with self._connect() as conn:
@@ -623,6 +735,7 @@ class EscalationStore:
             raise ValueError(f"Unknown escalation kind: {kind}")
         if intent not in DELIVERY_INTENTS:
             raise ValueError(f"Unknown delivery intent: {intent}")
+        message = redact_credentials(message)
         now = time.time()
         try:
             with self._connect() as conn:
@@ -722,25 +835,92 @@ class EscalationStore:
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(f"Cannot satisfy order expectation: {exc}") from exc
 
-    def orders(
-        self, *, recipient_session_id: str | None = None, unmet_only: bool = False
-    ) -> list[OrderExpectation]:
-        query = "SELECT * FROM order_expectations"
-        values: tuple[str, ...] = ()
-        where = []
+    def _order_filter(
+        self,
+        *,
+        recipient_session_id: str | None,
+        unmet_only: bool,
+        recipient_session_ids: Collection[str] | None,
+    ) -> tuple[str, list[object]]:
+        where: list[str] = []
+        values: list[object] = []
         if recipient_session_id is not None:
             where.append("recipient_session_id = ?")
-            values = (recipient_session_id,)
+            values.append(recipient_session_id)
+        if recipient_session_ids is not None:
+            recipients = sorted({str(item) for item in recipient_session_ids})
+            if not recipients:
+                return " WHERE 0", []
+            placeholders = ", ".join("?" for _ in recipients)
+            where.append(f"recipient_session_id IN ({placeholders})")
+            values.extend(recipients)
         if unmet_only:
             where.append("satisfied_at IS NULL")
-        if where:
-            query += " WHERE " + " AND ".join(where)
+        return (" WHERE " + " AND ".join(where)) if where else "", values
+
+    def orders(
+        self,
+        *,
+        recipient_session_id: str | None = None,
+        unmet_only: bool = False,
+        recipient_session_ids: Collection[str] | None = None,
+        limit: int | None = None,
+    ) -> list[OrderExpectation]:
+        """Read order expectations, oldest first.
+
+        ``limit`` keeps the *newest* rows and still returns them oldest
+        first: an unbounded read of this table emitted every unmet order the
+        host had ever recorded (33k rows in one measured case), and the old
+        ones are stale noise while the recent ones are the live question.
+        """
+        if limit is not None and limit < 1:
+            raise ValueError("Order expectation limit must be positive")
+        clause, values = self._order_filter(
+            recipient_session_id=recipient_session_id,
+            unmet_only=unmet_only,
+            recipient_session_ids=recipient_session_ids,
+        )
+        query = f"SELECT * FROM order_expectations{clause} ORDER BY created_at"
+        if limit is None:
+            query += " ASC"
+        else:
+            query += " DESC LIMIT ?"
+            values = [*values, limit]
         try:
             with self._connect() as conn:
-                rows = conn.execute(query + " ORDER BY created_at ASC", values).fetchall()
+                rows = conn.execute(query, values).fetchall()
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(f"Cannot read order expectations: {exc}") from exc
+        if limit is not None:
+            rows = list(reversed(rows))
         return [_order_from_row(row) for row in rows]
+
+    def unacked_counts(
+        self, *, recipient_session_ids: Collection[str] | None = None
+    ) -> dict[str, int]:
+        """Total parked escalations and unmet orders.
+
+        A bounded read needs these to say how much it suppressed, instead of
+        showing a truncated list as if it were the whole queue.
+        """
+        clause, values = self._order_filter(
+            recipient_session_id=None,
+            unmet_only=True,
+            recipient_session_ids=recipient_session_ids,
+        )
+        try:
+            with self._connect() as conn:
+                parked = conn.execute(
+                    "SELECT COUNT(*) FROM escalations WHERE status = 'parked'"
+                ).fetchone()[0]
+                unmet = conn.execute(
+                    f"SELECT COUNT(*) FROM order_expectations{clause}", values
+                ).fetchone()[0]
+        except sqlite3.DatabaseError as exc:
+            raise EscalationStoreError(
+                f"Cannot count unacknowledged deliveries: {exc}"
+            ) from exc
+        return {"parked_escalation": int(parked), "unmet_order": int(unmet)}
 
     def pending(self, *, limit: int = 100) -> list[ParkedEscalation]:
         if limit < 1 or limit > 1000:
@@ -751,14 +931,14 @@ class EscalationStore:
                     """
                     SELECT * FROM escalations
                     WHERE status = 'parked'
-                    ORDER BY created_at ASC
+                    ORDER BY created_at DESC
                     LIMIT ?
                     """,
                     (limit,),
                 ).fetchall()
         except sqlite3.DatabaseError as exc:
             raise EscalationStoreError(f"Cannot read parked escalations: {exc}") from exc
-        return [_from_row(row) for row in rows]
+        return [_from_row(row) for row in reversed(rows)]
 
 
 def _ack_from_row(row: sqlite3.Row) -> DeliveryAck:

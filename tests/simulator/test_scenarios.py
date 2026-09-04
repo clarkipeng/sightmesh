@@ -1414,3 +1414,47 @@ def test_s17_a_persistently_silent_child_wakes_twice_then_goes_quiet(
     )
     assert store.get_by_session(child.session_id).state == "active"
     assert client.stopped == []
+
+
+def test_s13_task_surfaces_at_a_thousand_tasks_perform_zero_fleet_scans(
+    monkeypatch, capsys, client, store: TaskStore
+) -> None:
+    """Task-listing surfaces answer from the kernel store without a fleet scan."""
+    import argparse
+
+    from sightmesh import cli, observability
+
+    specs = [
+        {"key": f"terminal-{index}", "repo": "project", "base": "main", "children": 0}
+        for index in range(1000)
+    ]
+    reservations = store.reserve_all(
+        scope="operator", parent_task_id=None, specs=specs, max_attempts=3
+    )
+    for record, _inserted in reservations:
+        store.finish(record.task_id, "cancelled")
+
+    class RefusedClient:
+        def __init__(self, _url=None) -> None:
+            raise AssertionError("a task surface must not open a cdesktop client")
+
+    monkeypatch.setattr(observability, "task_store", lambda path=None: store)
+    monkeypatch.setattr(cli, "CdesktopClient", RefusedClient)
+    monkeypatch.setattr(cli.service, "status", lambda _port: {"running": True})
+    monkeypatch.setattr(cli.updates, "read_state", lambda: {"status": "idle"})
+    monkeypatch.setattr(cli.ProfileStore, "list", lambda _self: [])
+    monkeypatch.setattr(
+        cli.leases.LeaseStore, "list", lambda _self, include_stale=True: []
+    )
+
+    def args(*command: str) -> argparse.Namespace:
+        return cli.parser().parse_args(["--json", *command])
+
+    before = len(client.call_log)
+    assert cli.cmd_list(args("list", "--all")) == 0
+    assert cli.cmd_status(args("status", "--all")) == 0
+    assert cli.cmd_attention(args("attention", "--all")) == 0
+    assert cli.cmd_overview(args("overview", "--all")) == 0
+    capsys.readouterr()
+
+    assert len(client.call_log) == before

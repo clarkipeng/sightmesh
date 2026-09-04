@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+import random
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -16,6 +18,7 @@ from sightmesh.escalation import (
     classify_escalation,
     detect_launcher,
     escalate,
+    redact_credentials,
 )
 
 
@@ -157,6 +160,178 @@ def test_routine_delivery_records_durable_acknowledgment(tmp_path):
     assert len(acks) == 1
     assert acks[0].ack_id == ack["ack_id"]
     assert acks[0].message == "STATUS: lane complete"
+
+
+@pytest.mark.parametrize(
+    ("method", "message", "credential"),
+    [
+        ("park", "Authorization: Bearer live-bearer-secret", "live-bearer-secret"),
+        ("acknowledge", "Authorization: Basic live-basic-secret", "live-basic-secret"),
+    ],
+)
+def test_durable_escalation_records_never_retain_credential_values(
+    tmp_path, method, message, credential
+):
+    """The store is the persistence boundary, so direct callers cannot leak."""
+    path = tmp_path / "escalations.sqlite3"
+    store = EscalationStore(path)
+    if method == "park":
+        record = store.park(
+            child_session_id="child-a",
+            child_workspace_id=None,
+            recorded_parent_session_id=None,
+            reason="no_parent",
+            message=message,
+            dedupe_key="parked-secret",
+        )
+        table = "escalations"
+    else:
+        record = store.acknowledge(
+            child_session_id="child-a",
+            parent_session_id="parent-a",
+            kind="routine",
+            intent="continue",
+            message=message,
+            dedupe_key="ack-secret",
+        )
+        table = "acknowledgments"
+
+    assert credential not in record.message
+    with sqlite3.connect(path) as connection:
+        stored = connection.execute(f"SELECT message FROM {table}").fetchone()[0]
+    assert credential not in stored
+    assert "[REDACTED]" in stored
+
+
+def test_durable_records_redact_nested_json_credentials_at_every_message_boundary(tmp_path):
+    """A JSON callback cannot bypass the one durable-message redaction boundary."""
+    secret = "nested-json-authorization-value"
+    payload = (
+        '{"event":"status","children":[{"request":'
+        '{"Authorization":"Bearer nested-json-authorization-value"}}]}'
+    )
+    path = tmp_path / "escalations.sqlite3"
+    store = EscalationStore(path)
+    parked = store.park(
+        child_session_id="child-a",
+        child_workspace_id=None,
+        recorded_parent_session_id=None,
+        reason="no_parent",
+        message=payload,
+        dedupe_key="nested-parked",
+    )
+    acknowledged = store.acknowledge(
+        child_session_id="child-a",
+        parent_session_id="parent-a",
+        kind="routine",
+        intent="continue",
+        message=payload,
+        dedupe_key="nested-acknowledged",
+    )
+    order = store.expect_order(
+        order_id="nested-order",
+        sender_session_id="parent-a",
+        recipient_session_id="child-a",
+        body=payload,
+    )
+
+    assert all(secret not in value for value in (parked.message, acknowledged.message, order.body))
+    with sqlite3.connect(path) as connection:
+        stored = [
+            connection.execute("SELECT message FROM escalations").fetchone()[0],
+            connection.execute("SELECT message FROM acknowledgments").fetchone()[0],
+            connection.execute("SELECT body FROM order_expectations").fetchone()[0],
+        ]
+    assert all(secret not in value and "[REDACTED]" in value for value in stored)
+
+
+def test_recursive_redactor_covers_unkeyed_credential_shapes_and_keeps_routing_ids() -> None:
+    """Neutral JSON keys cannot make a credential durable; routing ids remain data."""
+    credentials = (
+        "Bearer bearer-token-without-a-revealing-key",
+        "Basic QmFzaWMtdG9rZW4td2l0aG91dC1hLWtleQ==",
+        "sk-ant-api03-abcdefghijklmnopqrstuvwxyz",
+        "github_pat_abcdefghijklmnopqrstuvwxyz123456",
+        "xoxb-abcdefghijklmnopqrstuvwxyz123456",
+        "AKIAABCDEFGHIJKLMNOP",
+        "pypi-abcdefghijklmnopqrstuvwxyz123456",
+        "npm-abcdefghijklmnopqrstuvwxyz123456",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZ2VudCJ9.c2lnbmF0dXJlLXZhbHVl",
+        "https://operator:credential@internal.example/path",
+        "aB7!qL2#zM9@rT4%vX6^nC8&dF1*eH3+jK5",
+    )
+    for credential in credentials:
+        payload = {"neutral": {"items": [f"before {credential} after"]}}
+        if credential == credentials[-1]:
+            payload = {"auth_context": {"items": [credential]}}
+        assert credential not in str(redact_credentials(payload))
+    assert redact_credentials("https://operator:credential@internal.example/path") == (
+        "https://***@internal.example/path"
+    )
+
+    routing = {
+        "uuid": "123e4567-e89b-12d3-a456-426614174000",
+        "dedupe_key": "task-42:epoch-3:delivery",
+        "session_id": "session-operator-42",
+        "git_sha": "a3f4e5d6c7b8a9f0e1d2c3b4a5f6e7d8c9b0a1f2",
+        "path": ".context/sightmesh/checkpoints/audit.txt",
+    }
+    assert redact_credentials(routing) == routing
+
+
+def test_randomly_nested_credentials_never_reach_durable_escalation_rows(tmp_path) -> None:
+    """Structural guard: every durable message table uses the one recursive redactor."""
+    credentials = (
+        "Bearer bearer-token-without-a-revealing-key",
+        "Basic QmFzaWMtdG9rZW4td2l0aG91dC1hLWtleQ==",
+        "sk-abcdefghijklmnopqrstuvwxyz123456",
+        "ghp_abcdefghijklmnopqrstuvwxyz123456",
+        "xoxa-abcdefghijklmnopqrstuvwxyz123456",
+        "AKIAABCDEFGHIJKLMNOP",
+        "pypi-abcdefghijklmnopqrstuvwxyz123456",
+        "npm-abcdefghijklmnopqrstuvwxyz123456",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZ2VudCJ9.c2lnbmF0dXJlLXZhbHVl",
+        "https://operator:credential@internal.example/path",
+        "aB7!qL2#zM9@rT4%vX6^nC8&dF1*eH3+jK5",
+    )
+
+    def nested(credential: str, seed: int) -> object:
+        randomizer = random.Random(seed)
+        value: object = f"status: {credential}"
+        for depth in range(4):
+            if randomizer.choice((True, False)):
+                value = {f"context_{depth}": value}
+            else:
+                value = [f"ordinary-{depth}", value]
+        if credential == credentials[-1]:
+            value = {"auth_context": value}
+        return value
+
+    path = tmp_path / "escalations.sqlite3"
+    store = EscalationStore(path)
+    for index, credential in enumerate(credentials):
+        message = json.dumps(nested(credential, index))
+        store.park(
+            child_session_id=f"child-{index}", child_workspace_id=None,
+            recorded_parent_session_id=None, reason="no_parent", message=message,
+            dedupe_key=f"park-{index}",
+        )
+        store.acknowledge(
+            child_session_id=f"child-{index}", parent_session_id="parent-a", kind="routine",
+            intent="continue", message=message, dedupe_key=f"ack-{index}",
+        )
+        store.expect_order(
+            order_id=f"order-{index}", sender_session_id="parent-a",
+            recipient_session_id=f"child-{index}", body=message,
+        )
+
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(
+            "SELECT message FROM escalations UNION ALL SELECT message FROM acknowledgments "
+            "UNION ALL SELECT body FROM order_expectations"
+        ).fetchall()
+    stored = "\n".join(row[0] for row in rows)
+    assert all(credential not in stored for credential in credentials)
 
 
 def test_blocked_and_decision_escalations_replace_the_active_turn(tmp_path):

@@ -62,7 +62,7 @@ def cmd_update(args: argparse.Namespace) -> int:
             expected_sha256=sha256,
         )
     elif args.update_action == "activate":
-        result = updates.activate_if_idle(
+        result = updates.activate_after_drain(
             CdesktopClient(args.url),
             port=args.port,
         )
