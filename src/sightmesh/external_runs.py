@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .cdesktop import CdesktopClient, CdesktopError
-from .escalation import EscalationStore, EscalationStoreError, escalate
+from .escalation import EscalationStore, EscalationStoreError, escalate, redact_credentials
 
 RECEIPT_NAME = "terminal-receipt.json"
 TERMINAL_OUTCOMES = frozenset({"completed", "failed"})
@@ -133,8 +133,13 @@ def _receipt(run: ExternalRun) -> Receipt | None:
 class ExternalRunStore:
     """Version-fenced rows and output leases in the escalation database."""
 
-    def __init__(self, path: Path | None = None) -> None:
-        self.escalations = EscalationStore(path)
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        initialization_hook: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> None:
+        self.escalations = EscalationStore(path, initialization_hook=initialization_hook)
         self.path = self.escalations.path
 
     def subscribe(
@@ -148,6 +153,7 @@ class ExternalRunStore:
         if not run_id or not return_session_id:
             raise ExternalRunError("run_id and return_session must not be empty")
         root = _root(output_root)
+        safe_root = _durable_text(str(root))
         subscription_id, capability, now = (
             str(uuid.uuid4()),
             secrets.token_urlsafe(32),
@@ -166,7 +172,7 @@ class ExternalRunStore:
                 root.chmod(0o700)
                 conn.execute(
                     "INSERT INTO external_run_leases (subscription_id, output_root, state, created_at) VALUES (?, ?, 'active', ?)",
-                    (subscription_id, str(root), now),
+                    (subscription_id, safe_root, now),
                 )
                 conn.execute(
                     """INSERT INTO external_run_subscriptions
@@ -175,13 +181,13 @@ class ExternalRunStore:
                     VALUES (?, ?, ?, ?, ?, ?, ?, 'subscribed', ?, ?, ?)""",
                     (
                         subscription_id,
-                        run_id,
-                        str(root),
-                        return_session_id,
-                        return_workspace_id,
+                        _durable_text(run_id),
+                        safe_root,
+                        _durable_text(return_session_id),
+                        _durable_text(return_workspace_id),
                         _digest(capability),
                         f"external-run:{subscription_id}",
-                        str(root / RECEIPT_NAME),
+                        _durable_text(str(root / RECEIPT_NAME)),
                         now,
                         now,
                     ),
@@ -328,7 +334,7 @@ class ExternalRunStore:
         with self.escalations._connect() as conn:
             conn.execute(
                 "UPDATE external_run_subscriptions SET diagnostic = ?, updated_at = ? WHERE subscription_id = ? AND version = ?",
-                (message, time.time(), run.subscription_id, run.version),
+                (_durable_text(message), time.time(), run.subscription_id, run.version),
             )
         return self.get(run.subscription_id)
 
@@ -434,3 +440,8 @@ class ExternalRunReconciler:
 
 def _run(row: sqlite3.Row) -> ExternalRun:
     return ExternalRun(**{name: row[name] for name in ExternalRun.__dataclass_fields__})
+
+
+def _durable_text(value: str | None) -> str | None:
+    """Use escalation's one structural redactor for every external-run write."""
+    return None if value is None else str(redact_credentials(value))

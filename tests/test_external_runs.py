@@ -188,10 +188,18 @@ def test_concurrent_fresh_store_initialization_has_a_complete_external_run_schem
     path = tmp_path / "state.sqlite3"
     workers = 12
     barrier = threading.Barrier(workers)
+    ddl_phases: list[bool] = []
+    ddl_lock = threading.Lock()
+
+    def between_tables_and_indexes(conn):
+        # This is the former interleaving point. A concurrent first-open may
+        # only arrive here after it owns the initialization transaction.
+        with ddl_lock:
+            ddl_phases.append(conn.in_transaction)
 
     def open_store(_: int) -> ExternalRunStore:
         barrier.wait(timeout=10)
-        return ExternalRunStore(path)
+        return ExternalRunStore(path, initialization_hook=between_tables_and_indexes)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         stores = list(pool.map(open_store, range(workers)))
@@ -222,6 +230,19 @@ def test_concurrent_fresh_store_initialization_has_a_complete_external_run_schem
         "idx_external_run_subscriptions_pending",
     }
     assert version == 1
+    assert ddl_phases == [True] * workers
+
+
+def test_external_run_durable_writes_use_the_shared_structural_redactor(tmp_path):
+    store = ExternalRunStore(tmp_path / "state.sqlite3")
+    result = store.subscribe(
+        run_id="run token=top-secret",
+        output_root=tmp_path / "output",
+        return_session_id="parent authorization: Bearer top-secret",
+    )
+    saved = store.get(result.run.subscription_id)
+    assert "top-secret" not in saved.run_id
+    assert "top-secret" not in saved.return_session_id
 
 
 @pytest.mark.parametrize("terminal", ["receipt", "lost"])

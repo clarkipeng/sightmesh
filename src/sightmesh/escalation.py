@@ -26,7 +26,7 @@ import re
 import sqlite3
 import time
 import uuid
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -320,8 +320,17 @@ def redact_credentials(payload: Any) -> Any:
 class EscalationStore:
     """Durable, restart-proof home for launcher identity and parked escalations."""
 
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        initialization_hook: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> None:
         self.path = path or escalation_db_path()
+        # Tests use this at the table/index boundary to prove that every DDL
+        # phase remains inside the one initialization transaction. It is not a
+        # runtime callback or a second schema path.
+        self._initialization_hook = initialization_hook
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path.parent.chmod(0o700)
         self._initialize()
@@ -509,8 +518,7 @@ class EscalationStore:
                 f"Cannot initialize escalation store {self.path}: {exc}"
             ) from exc
 
-    @staticmethod
-    def _external_run_schema(conn: sqlite3.Connection) -> None:
+    def _external_run_schema(self, conn: sqlite3.Connection) -> None:
         """Converge the external-run tables and their dependent indexes."""
         conn.execute(
             """
@@ -524,6 +532,8 @@ class EscalationStore:
             )
             """
         )
+        if self._initialization_hook is not None:
+            self._initialization_hook(conn)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS external_run_subscriptions (
