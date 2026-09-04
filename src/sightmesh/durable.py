@@ -19,7 +19,7 @@ from typing import Any
 
 from . import liveness as liveness_detector
 from . import wakes
-from .cdesktop import CdesktopClient, CdesktopError
+from .cdesktop import CdesktopClient, CdesktopError, CdesktopRejectedError
 from .effects import EffectJournal
 from .external_runs import ExternalRunReconciler, ExternalRunStore
 from .escalation import EscalationStore, escalate
@@ -224,7 +224,6 @@ class DurableExecutionReconciler:
         self.tasks_per_pass = tasks_per_pass
         self.pass_budget_seconds = pass_budget_seconds
         self._requeued: set[str] = set()
-        self._cancelled: set[str] = set()
         self._notified: set[str] = set()
         #: Last observed output-byte total per task, recorded only from a
         #: complete, successful read. A failed read reports no bytes at all,
@@ -320,6 +319,9 @@ class DurableExecutionReconciler:
             repaired["liveness_findings"] = detected["findings"]
             repaired["wakes_inserted"] += detected["wakes_inserted"]
 
+        def sweep_losses() -> None:
+            self.sweep_losses()
+
         def deliver() -> None:
             repaired["wakes_delivered"] = wakes.WakeDelivery(
                 self.client, store, self.ownership
@@ -328,9 +330,12 @@ class DurableExecutionReconciler:
         def expire() -> None:
             journal = EffectJournal(store)
             repaired["effects_expired"] = len(journal.expire_reservations(self.client))
-            repaired["superseded_workspaces_stopped"] = journal.reconcile_superseded(
+            repaired["superseded_workspaces_stopped"] = journal.reconcile_terminal(
                 self.client
             )
+
+        def cleanup() -> None:
+            self.reconcile_cleanup_intents()
 
         def external_runs() -> None:
             ExternalRunReconciler(
@@ -338,11 +343,133 @@ class DurableExecutionReconciler:
             ).reconcile()
 
         stage("record cohort wakes", cohort_wakes)
+        stage("sweep executor losses", sweep_losses)
         stage("detect liveness", detect)
         stage("deliver wakes", deliver)
         stage("expire effect reservations", expire)
+        stage("cancel terminal commands", cleanup)
         stage("reconcile external runs", external_runs)
         return repaired
+
+    def reconcile_cleanup_intents(self) -> int:
+        """Retry terminal command cleanup from the store until cdesktop acks it."""
+        acknowledged = 0
+        # A successful send can return before the native row id is available.
+        # Its durable dedupe key still pins terminal capacity; resolve that key
+        # from cdesktop before attempting command cancellation.
+        for outgoing in self.task_store.unresolved_terminal_outgoing_commands():
+            task_id = str(outgoing["task_id"])
+            try:
+                with self.task_store.task_lock(task_id) as fence:
+                    with fence.external_io():
+                        commands = self.queue.commands(str(outgoing["session_id"]))
+                    command = next(
+                        (
+                            item for item in commands
+                            if item.dedupe_key == str(outgoing["dedupe_key"])
+                        ),
+                        None,
+                    )
+                    if command is not None:
+                        self.task_store.settle_outgoing_command(
+                            task_id,
+                            int(outgoing["epoch"]),
+                            str(outgoing["dedupe_key"]),
+                            command.id,
+                            terminal=True,
+                        )
+            except Exception as exc:  # noqa: BLE001 - the durable key retries next pass
+                LOGGER.info("Leaving terminal outgoing command for retry: %s", exc)
+        for intent in self.task_store.pending_cleanup_intents():
+            task_id = str(intent["task_id"])
+            try:
+                with self.task_store.task_lock(task_id) as fence:
+                    with fence.external_io():
+                        if intent["kind"] == "command_cancel":
+                            try:
+                                row = self.client.cancel_command(
+                                    str(intent["session_id"]), str(intent["native_id"])
+                                )
+                            except CdesktopRejectedError as exc:
+                                # 409 means cdesktop found a running execution. Its
+                                # separately durable stop intent is retried below;
+                                # the command cancel itself remains pending until the
+                                # row says terminal.  A 404 is also pending: pinned
+                                # 0.2.8 lacks this route, so it proves nothing.
+                                if exc.status != 409:
+                                    raise
+                                # The executor has authoritatively told us this
+                                # command gained an execution after our terminal
+                                # snapshot. Refresh inside the same fence and
+                                # durably add that stop before the next pass.
+                                commands = self.queue.commands(str(intent["session_id"]))
+                                self.task_store.record_cleanup_intents(
+                                    task_id, int(intent["epoch"]),
+                                    str(intent["session_id"]), commands,
+                                )
+                                continue
+                            state = str(row.get("state") or row.get("status") or "")
+                            if state not in COMMAND_TERMINAL_STATES:
+                                continue
+                        else:
+                            stopped = self.client.stop_execution(
+                                str(intent["native_id"]),
+                                dedupe_key=f"terminal:{task_id}:{intent['native_id']}",
+                            )
+                            state = (
+                                str(stopped.get("status") or stopped.get("state") or "")
+                                if isinstance(stopped, dict)
+                                else ""
+                            )
+                            if state not in COMMAND_TERMINAL_STATES | {"completed", "killed", "stopped", "terminated"}:
+                                process = self.client.execution_process(str(intent["native_id"]))
+                                state = str(process.get("status") or process.get("state") or "")
+                            if state not in COMMAND_TERMINAL_STATES | {"completed", "killed", "stopped", "terminated"}:
+                                continue
+                    self.task_store.acknowledge_cleanup_intent(
+                        task_id, int(intent["epoch"]), str(intent["kind"]), str(intent["native_id"])
+                    )
+                    acknowledged += 1
+            except Exception as exc:  # noqa: BLE001 - a durable intent retries next pass
+                LOGGER.info("Leaving terminal cleanup intent for retry: %s", exc)
+        return acknowledged
+
+    def sweep_losses(self) -> int:
+        """Record executor-declared loss for every live task, across scopes."""
+        lost = 0
+        for task in self.task_store.list_state("active"):
+            if not task.holder_session_id:
+                continue
+            try:
+                with self.task_store.task_lock(task.task_id) as fence:
+                    current = self.task_store.get_by_id(task.task_id)
+                    if (
+                        current is None
+                        or current.state != "active"
+                        or current.epoch != task.epoch
+                    ):
+                        continue
+                    with fence.external_io():
+                        evidence = liveness_detector.gather_evidence(
+                            self.client,
+                            current.holder_session_id,
+                            now=self.clock(),
+                            checkpoint_at=current.checkpoint_at,
+                        )
+                    if not evidence.lost_reason:
+                        continue
+                    finding = liveness_detector.Finding(
+                        reason="lost",
+                        evidence=evidence,
+                        now=self.clock(),
+                    )
+                self._record_loss(
+                    self.task_store, task, finding, finding.payload()
+                )
+                lost += 1
+            except Exception as exc:  # noqa: BLE001 - one scope never masks another
+                LOGGER.warning("Cannot sweep loss for %s: %s", task.key, exc)
+        return lost
 
     def detect_liveness(self) -> dict[str, int]:
         """Classify every live task's progress evidence and arm what it satisfies.
@@ -679,7 +806,10 @@ class DurableExecutionReconciler:
         arms ``any_child_lost``, so the manager is told without waiting for the
         cohort.
 
-        The evidence and the terminal are one transaction. As two they could
+        The evidence, task terminal, and effect terminal are one transaction.
+        The holder is durably quarantined before that transaction commits, and
+        the effect's workspace id remains the retryable native cleanup intent.
+        As separate task/effect writes they could
         interleave: a crash between them left evidence for a loss that was
         never recorded, and a competing writer could finish the task in the
         gap so the evidence landed on somebody else's outcome. The evidence
@@ -689,6 +819,11 @@ class DurableExecutionReconciler:
         reason = f"lost:{finding.evidence.lost_reason}"
         states = sorted(LIVE_STATES)
         placeholders = ", ".join("?" for _ in states)
+        commands: list[DurableCommand] = []
+        if task.holder_session_id:
+            with store.task_lock(task.task_id) as snapshot_fence:
+                with snapshot_fence.external_io():
+                    commands = self.queue.commands(task.holder_session_id)
         try:
             with store.task_lock(task.task_id) as fence:
                 # The detector's snapshot may have waited behind a replacement.
@@ -701,12 +836,38 @@ class DurableExecutionReconciler:
                     or current.epoch != task.epoch
                 ):
                     return 0
+                if current.holder_session_id == task.holder_session_id:
+                    store.record_cleanup_intents(
+                        current.task_id, current.epoch, current.holder_session_id, commands
+                    )
                 with store.connect() as conn:
                     conn.execute("BEGIN IMMEDIATE")
                     conn.execute(
                         "UPDATE managed_tasks SET liveness_evidence = ? "
                         f"WHERE task_id = ? AND state IN ({placeholders})",
                         (payload, current.task_id, *states),
+                    )
+                    effect = conn.execute(
+                        "SELECT state, workspace_id FROM task_effects "
+                        "WHERE task_id = ? AND epoch = ?",
+                        (current.task_id, current.epoch),
+                    ).fetchone()
+                    if effect is None:
+                        raise TaskStoreError(
+                            f"Cannot lose task {current.task_id}: effect is missing"
+                        )
+                    if effect["state"] != "terminal":
+                        conn.execute(
+                            "UPDATE task_effects SET state = 'terminal', outcome = ?, "
+                            "updated_at = ? WHERE task_id = ? AND epoch = ? "
+                            "AND state IN ('reserved', 'launched')",
+                            (reason, self.clock(), current.task_id, current.epoch),
+                        )
+                    self.ownership.retire(
+                        current.holder_session_id,
+                        state="retired",
+                        reason="managed task lost",
+                        logical_key=f"task:{current.task_id}:{current.epoch}",
                     )
                     _record, armed = wakes.finish_with_wake(
                         store, current.task_id, "lost", reason, fence=fence, conn=conn
@@ -715,6 +876,15 @@ class DurableExecutionReconciler:
         except TaskStoreError as exc:
             LOGGER.warning("Cannot record loss for %s: %s", task.key, exc)
             return 0
+        effect = EffectJournal(store).get(task.task_id, task.epoch)
+        if effect is not None and effect.workspace_id:
+            try:
+                with store.task_lock(task.task_id) as cleanup_fence:
+                    with cleanup_fence.external_io():
+                        EffectJournal(store).stop_terminal(self.client, effect)
+            except Exception as exc:  # noqa: BLE001 - durable intent retries later
+                LOGGER.info("Leaving lost workspace for retry: %s", exc)
+        self.reconcile_cleanup_intents()
         self._output_bytes.pop(task.task_id, None)
         self._raise_attention(
             task,
@@ -880,13 +1050,12 @@ class DurableExecutionReconciler:
         return False
 
     def _cancel_quarantined(self, commands: Iterable[DurableCommand]) -> None:
+        # Legacy quarantines have no managed task row to bind an intent to.
+        # Keep this adapter only for that older ownership path; managed task
+        # terminalization records and acknowledges cleanup through TaskStore.
         for command in commands:
-            if command.state in COMMAND_TERMINAL_STATES:
-                continue
-            if command.id in self._cancelled:
-                continue
-            self.queue.interrupt(command)
-            self._cancelled.add(command.id)
+            if command.state not in COMMAND_TERMINAL_STATES:
+                self.queue.interrupt(command)
 
     def reconcile_child_terminal(
         self,

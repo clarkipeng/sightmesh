@@ -11,6 +11,7 @@ import pytest
 
 from sightmesh import service, updates
 from sightmesh.cdesktop import CdesktopError
+from sightmesh.fence import assert_external_io_allowed
 
 
 class FakeClock:
@@ -101,6 +102,7 @@ class FakeClient:
         )
 
     def pending_approvals(self):
+        assert_external_io_allowed()
         if not self.approvals:
             return []
         return [
@@ -112,12 +114,20 @@ class FakeClient:
         ]
 
     def workspaces(self):
-        return [{"id": "workspace-1", "archived": False}]
+        assert_external_io_allowed()
+        return [{"id": "workspace-1", "name": "workspace-one", "archived": False}]
 
     def sessions(self, _workspace_id):
-        return [{"id": "session-1"}]
+        assert_external_io_allowed()
+        return [{"id": "session-1", "name": "worker-one"}]
 
-    def execution_processes(self, _session_id):
+    def running_execution_processes(self):
+        assert_external_io_allowed()
+        return self.execution_processes("session-1")
+
+    def execution_processes(self, _session_id=None, *, status=None):
+        assert_external_io_allowed()
+        assert status in {None, "running"}
         if self.turn_seconds:
             if not self.admission_refused:
                 # Admission is open again, so the host starts another turn.
@@ -128,6 +138,9 @@ class FakeClient:
                 "id": "process-1",
                 "status": "running" if self.running else "completed",
                 "run_reason": "codingagent",
+                "session_id": "session-1",
+                "session_name": "worker-one",
+                "workspace_id": "workspace-1",
             }
         ]
 
@@ -367,6 +380,7 @@ def test_activity_ignores_devservers_and_reports_agent_work() -> None:
     result = updates.activity(client)
     assert result["idle"] is False
     assert result["running"][0]["execution_process_id"] == "process-1"
+    assert result["running"][0]["session_name"] == "worker-one"
     assert result["pending_approvals"][0]["approval_id"] == "approval-1"
 
     client.running = False
@@ -374,16 +388,14 @@ def test_activity_ignores_devservers_and_reports_agent_work() -> None:
     assert updates.activity(client)["idle"] is True
 
 
-def test_activity_reports_durable_follow_ups_without_blocking_activation() -> None:
+def test_activity_does_not_walk_queues_to_find_durable_follow_ups() -> None:
     result = updates.activity(FakeClient(queued=True))
 
     assert result["idle"] is True
-    assert result["queued_follow_ups"] == [
-        {"workspace_id": "workspace-1", "session_id": "session-1"}
-    ]
+    assert result["queued_follow_ups"] == []
 
 
-def test_activity_stays_busy_when_an_idle_session_cannot_be_read() -> None:
+def test_activity_does_not_depend_on_per_session_queue_reads() -> None:
     client = FakeClient()
 
     def fail_queue(_session_id):
@@ -392,8 +404,35 @@ def test_activity_stays_busy_when_an_idle_session_cannot_be_read() -> None:
     client.queue_status = fail_queue
     result = updates.activity(client)
 
-    assert result["idle"] is False
-    assert result["unreadable_sessions"][0]["session_id"] == "session-1"
+    assert result["idle"] is True
+    assert result["unreadable_sessions"] == []
+
+
+def test_drain_retries_a_transient_activity_probe_failure(monkeypatch) -> None:
+    client = FakeClient()
+    real = client.running_execution_processes
+    attempts = 0
+
+    def flaky():
+        nonlocal attempts
+        assert_external_io_allowed()
+        attempts += 1
+        if attempts == 1:
+            raise CdesktopError("GET /execution-processes failed: HTTP 500")
+        return real()
+
+    client.running_execution_processes = flaky
+    monkeypatch.setattr(updates, "QUIET_SECONDS", 0)
+    monkeypatch.setattr(updates, "DRAIN_POLL_SECONDS", 0)
+    monkeypatch.setattr(updates, "DRAIN_WAIT_SECONDS", 1)
+
+    current, report = updates._drain_and_wait(client, enforced=True)
+
+    assert current["idle"] is True
+    assert attempts == 2
+    assert report["probe_errors"] == [
+        "GET /execution-processes failed: HTTP 500"
+    ]
 
 
 def test_native_state_migration_imports_then_archives(monkeypatch, tmp_path) -> None:

@@ -443,13 +443,58 @@ class CdesktopClient:
     def execution_process(self, execution_process_id: str) -> dict[str, Any]:
         return self.request("GET", f"/execution-processes/{execution_process_id}")
 
-    def execution_processes(self, session_id: str) -> list[dict[str, Any]]:
-        result = self.request(
-            "GET", "/execution-processes", query={"session_id": session_id}
-        )
+    def execution_processes(
+        self, session_id: str | None = None, *, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        query = {
+            key: value
+            for key, value in (("session_id", session_id), ("status", status))
+            if value is not None
+        }
+        result = self.request("GET", "/execution-processes", query=query or None)
         if not isinstance(result, list):
             raise CdesktopError("cdesktop execution process response is not a list")
         return [dict(item) for item in result if isinstance(item, dict)]
+
+    def running_execution_processes(self) -> list[dict[str, Any]]:
+        """Return fleet-wide running processes across the old and new API seam."""
+        try:
+            result = self.request("GET", "/execution-processes/running")
+        except CdesktopError as exc:
+            if "HTTP 404" not in str(exc):
+                raise
+        else:
+            if not isinstance(result, list):
+                raise CdesktopError("cdesktop running execution response is not a list")
+            return [
+                {**dict(item), "status": "running", "session_name": item.get("name")}
+                for item in result
+                if isinstance(item, dict)
+            ]
+
+        running: list[dict[str, Any]] = []
+        for workspace in self.workspaces():
+            workspace_id = workspace.get("id")
+            if not workspace_id or workspace.get("archived"):
+                continue
+            for session in self.sessions(str(workspace_id)):
+                session_id = session.get("id")
+                if not session_id:
+                    continue
+                for process in self.execution_processes(str(session_id)):
+                    if process.get("status") != "running":
+                        continue
+                    running.append(
+                        {
+                            **process,
+                            "session_id": session_id,
+                            "session_name": session.get("name"),
+                            "workspace_id": workspace_id,
+                            "workspace_name": workspace.get("name")
+                            or workspace.get("branch"),
+                        }
+                    )
+        return running
 
     def queue_status(self, session_id: str) -> dict[str, Any]:
         result = self.request("GET", f"/sessions/{session_id}/queue")
@@ -472,6 +517,20 @@ class CdesktopClient:
         if not isinstance(result, list):
             raise CdesktopError("cdesktop command response is not a list")
         return [dict(item) for item in result if isinstance(item, dict)]
+
+    def cancel_command(self, session_id: str, command_id: str) -> dict[str, Any]:
+        """Atomically terminalize one queued command in cdesktop.
+
+        A 404 is deliberately left for the caller to treat as unacknowledged:
+        pinned 0.2.8 has no route, and guessing that a missing response means a
+        cancelled command would reopen the resurrection window.
+        """
+        result = self.request(
+            "POST", f"/sessions/{session_id}/commands/{command_id}/cancel"
+        )
+        if not isinstance(result, dict):
+            raise CdesktopError("cdesktop command cancel response is invalid")
+        return dict(result)
 
     def requeue_execution_commands(
         self, session_id: str, execution_process_id: str

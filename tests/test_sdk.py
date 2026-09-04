@@ -10,7 +10,8 @@ import pytest
 
 from sightmesh import execution_routing
 from sightmesh import sdk as sdk_module
-from sightmesh.cdesktop import CdesktopError, CdesktopRejectedError
+from sightmesh.cdesktop import CdesktopError, CdesktopRejectedError, CdesktopPendingError
+from sightmesh.durable import DurableExecutionReconciler
 from sightmesh.profiles import Profile
 from sightmesh.sdk import BatchError, Command, SightMesh, SightMeshError, WorkerSpec
 from sightmesh.fence import assert_external_io_allowed
@@ -29,6 +30,9 @@ class FakeClient:
         self.processes = {}
         self.snapshots = {}
         self.reject_launch = None
+        self.commands = []
+        self.cancel_calls = []
+        self.execution_stops = []
 
     def info(self):
         assert_external_io_allowed()  # the real client does HTTP here
@@ -106,9 +110,21 @@ class FakeClient:
         self.sent.append(row)
         return {"queued": True}
 
-    def session_commands(self, _session_id):
+    def session_commands(self, session_id):
         assert_external_io_allowed()  # the real client does HTTP here
-        return []
+        return [dict(row) for row in self.commands if row["session_id"] == session_id]
+
+    def cancel_command(self, session_id, command_id):
+        assert_external_io_allowed()  # the real client does HTTP here
+        self.cancel_calls.append((session_id, command_id))
+        row = next(row for row in self.commands if row["id"] == command_id)
+        row["state"] = "cancelled"
+        return dict(row)
+
+    def stop_execution(self, execution_process_id, *, dedupe_key=None):
+        assert_external_io_allowed()  # the real client does HTTP here
+        self.execution_stops.append((execution_process_id, dedupe_key))
+        return {"id": execution_process_id, "status": "killed"}
 
     def execution_processes(self, session_id):
         assert_external_io_allowed()  # the real client does HTTP here
@@ -942,6 +958,196 @@ def test_start_waits_for_capacity_then_refuses_with_a_typed_error(monkeypatch, t
         mesh._wait_for_launch_capacity(task)
 
 
+def test_admission_sweep_loses_dead_tasks_across_scopes(system):
+    mesh, client, store, ownership = system
+    worker = mesh.start(spec())
+    task = store.get("operator", "audit")
+    client.processes[worker.session_id] = [
+        {"id": "dead", "status": "killed", "run_reason": "codingagent"}
+    ]
+    stop_attempts = 0
+    real_stop = client.stop_workspace
+
+    def flaky_stop(workspace_id):
+        nonlocal stop_attempts
+        assert_external_io_allowed()
+        stop_attempts += 1
+        if stop_attempts <= 2:
+            raise CdesktopError("transient workspace stop failure")
+        real_stop(workspace_id)
+
+    client.stop_workspace = flaky_stop
+
+    other_scope = SightMesh(
+        client=client,
+        store=store,
+        ownership=ownership,
+        environment={"CDESKTOP_SESSION_ID": "another-scope"},
+    )
+    first = other_scope.sweep_admission()
+    assert first["tasks_lost"] == 1
+    assert first["terminal_workspaces_stopped"] == 0
+    assert store.get_by_id(task.task_id).state == "lost"
+    effect = other_scope.journal.get(task.task_id, task.epoch)
+    assert effect.state == "terminal"
+    assert effect.outcome.startswith("lost:")
+    assert effect.workspace_id == worker.workspace_id
+    retired = ownership.get(worker.session_id)
+    assert retired.state == "retired"
+    assert retired.logical_key == f"task:{task.task_id}:{task.epoch}"
+    assert store.count_running() == 0
+
+    second = other_scope.sweep_admission()
+    assert second["tasks_lost"] == 0
+    assert second["terminal_workspaces_stopped"] == 1
+    assert other_scope.journal.get(task.task_id, task.epoch).workspace_id is None
+    assert client.stopped == [worker.workspace_id]
+
+
+def test_terminalization_cancels_queued_command_before_releasing_capacity(system):
+    """#105: a terminal task cannot leave a pending native command dispatchable."""
+    mesh, client, store, _ownership = system
+    worker = mesh.start(spec())
+    client.commands = [{
+        "id": "queued-1", "session_id": worker.session_id, "state": "pending",
+        "execution_process_id": None,
+    }]
+
+    mesh.cancel("audit")
+
+    assert client.commands[0]["state"] == "cancelled"
+    assert client.cancel_calls == [(worker.session_id, "queued-1")]
+    assert store.count_running() == 0
+
+
+def test_send_after_terminal_snapshot_is_durably_cancelled_before_capacity_releases(system):
+    """#105: an enqueue crossing terminalization cannot resurrect its task."""
+    mesh, client, store, _ownership = system
+    worker = mesh.start(spec())
+    enqueue_entered = threading.Event()
+    terminal_snapshotted = threading.Event()
+    terminalized = threading.Barrier(2)
+    allow_enqueue = threading.Event()
+    cancel_entered = threading.Event()
+
+    original_commands = client.session_commands
+
+    def commands(session_id):
+        rows = original_commands(session_id)
+        if session_id == worker.session_id:
+            terminal_snapshotted.set()
+        return rows
+
+    def send(session_id, prompt, sender_session=None, *, dedupe_key=None, intent="continue"):
+        assert_external_io_allowed()
+        enqueue_entered.set()
+        assert allow_enqueue.wait(2)
+        row = {
+            "id": "racing-1", "session_id": session_id, "state": "pending",
+            "dedupe_key": dedupe_key, "execution_process_id": None,
+        }
+        client.commands.append(row)
+        return dict(row)
+
+    def cancel(session_id, command_id):
+        assert_external_io_allowed()
+        cancel_entered.set()
+        assert store.count_running() == 1
+        row = next(row for row in client.commands if row["id"] == command_id)
+        row["state"] = "cancelled"
+        return dict(row)
+
+    client.session_commands = commands
+    client.send = send
+    client.cancel_command = cancel
+    sent = []
+    sender = threading.Thread(target=lambda: sent.append(mesh.send_all([Command("audit", "race")])))
+    def cancel():
+        mesh.cancel("audit")
+        terminalized.wait()
+
+    terminal = threading.Thread(target=cancel)
+    sender.start()
+    assert enqueue_entered.wait(2)
+    terminal.start()
+    assert terminal_snapshotted.wait(2)
+    terminalized.wait()
+    terminal.join(2)
+    assert not terminal.is_alive()
+    assert store.get("operator", "audit").state == "cancelled"
+    assert store.count_running() == 1
+    allow_enqueue.set()
+    sender.join(2)
+
+    assert not sender.is_alive()
+    assert sent[0].ok
+    assert [row["state"] for row in store.terminal_outgoing_commands(
+        store.get("operator", "audit").task_id, store.get("operator", "audit").epoch
+    )] == []
+    assert cancel_entered.is_set()
+    assert client.commands[0]["state"] == "cancelled"
+    assert store.count_running() == 0
+
+
+def test_terminalization_stops_a_running_execution_and_waits_for_its_ack(system):
+    """A claimed command owns a process as well as a queue row (#105)."""
+    mesh, client, store, _ownership = system
+    worker = mesh.start(spec())
+    client.commands = [{
+        "id": "claimed-1", "session_id": worker.session_id, "state": "claimed",
+        "execution_process_id": "process-1",
+    }]
+
+    mesh.cancel("audit")
+
+    assert client.execution_stops == [
+        ("process-1", f"terminal:{store.get('operator', 'audit').task_id}:process-1")
+    ]
+    assert store.count_running() == 0
+
+
+def test_missing_cancel_route_keeps_terminal_capacity_and_retries_after_restart(system):
+    """Pinned 0.2.8's missing cancel route is not a cancellation acknowledgement."""
+    mesh, client, store, ownership = system
+    worker = mesh.start(spec())
+    client.commands = [{
+        "id": "queued-1", "session_id": worker.session_id, "state": "pending",
+        "execution_process_id": None,
+    }]
+
+    def missing_route(session_id, command_id):
+        assert_external_io_allowed()
+        client.cancel_calls.append((session_id, command_id))
+        raise CdesktopError("POST cancel failed: HTTP 404")
+
+    client.cancel_command = missing_route
+    mesh.cancel("audit")
+    assert store.count_running() == 1
+    assert store.pending_cleanup_intents()[0]["state"] == "pending"
+
+    # A fresh reconciler sees the stored intent, not a former process's memory.
+    client.cancel_command = FakeClient.cancel_command.__get__(client, FakeClient)
+    DurableExecutionReconciler(client, task_store=store, ownership=ownership).reconcile_cleanup_intents()
+    assert client.commands[0]["state"] == "cancelled"
+    assert store.count_running() == 0
+
+
+def test_expired_reservation_can_be_reissued_with_a_new_spec(system):
+    mesh, client, store, _ownership = system
+    resolved = mesh._prepare_spec("operator", spec())
+    ((task, _inserted),) = store.reserve_all(
+        scope="operator", parent_task_id=None, specs=[resolved], max_attempts=3
+    )
+    mesh.journal.reserve(task.task_id, task.epoch, "old", "dead-owner", ttl=-1)
+
+    restarted = mesh.start(spec(prompt="new prompt"))
+
+    current = store.get("operator", "audit")
+    assert current.epoch == 2
+    assert current.spec["prompt"] == "new prompt"
+    assert restarted.state == "active"
+
+
 def test_tasks_launch_unattended_by_default(system):
     # Workers used to start with ACCEPT_EDITS, so every shell call parked on a
     # human approval and the whole mesh stalled the moment nobody was watching.
@@ -1113,3 +1319,39 @@ def test_cancel_during_request_build_never_issues_a_native_launch(system, monkey
         result = future.result(timeout=10)
     assert result.state == "cancelled"
     assert client.launches == []
+
+
+@pytest.mark.parametrize(
+    "make_state",
+    ["reserved", "blocked", "completed", "cancelled", "lost"],
+)
+def test_only_an_active_task_accepts_mail(system, make_state):
+    # Round-4 review of #110: blocked tasks were mail-admissible, so send_all
+    # persisted a native command for a task with no running turn and reported
+    # success - the exact stale mail that resurrects a task. Every non-active
+    # state must be a typed refusal with nothing enqueued.
+    mesh, client, store, _ownership = system
+    if make_state == "reserved":
+        client.reject_launch = CdesktopPendingError("still owned", status=425)
+        with pytest.raises(BatchError):
+            mesh.start(spec())
+    else:
+        mesh.start(spec())
+        if make_state == "blocked":
+            mesh.blocked("needs a decision", "audit")
+        elif make_state == "completed":
+            mesh.complete("done", "audit")
+        elif make_state == "cancelled":
+            mesh.cancel("audit")
+        else:
+            from sightmesh import wakes
+
+            task = mesh._find("audit")
+            with store.task_lock(task.task_id) as fence:
+                wakes.finish_with_wake(store, task.task_id, "lost", "executor session gone", fence=fence)
+    task = mesh._find("audit")
+    assert task.state == make_state
+    sent_before = list(client.sent)
+    with pytest.raises((SightMeshError, BatchError), match=make_state):
+        mesh.send("audit", "hello")
+    assert client.sent == sent_before

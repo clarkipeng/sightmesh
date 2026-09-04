@@ -12,7 +12,9 @@ from .common import _emit
 
 
 def _mesh(args: argparse.Namespace) -> SightMesh:
-    return SightMesh(url=args.url)
+    mesh = SightMesh(url=args.url)
+    mesh.sweep_admission()
+    return mesh
 
 
 def _json_file(path: str) -> Any:

@@ -6,7 +6,7 @@ import json
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -315,6 +315,45 @@ class TaskStore:
                 )
                 self._ensure_effect_retry_at(conn)
                 self._migrate_task_wakes(conn)
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS task_cleanup_intents (
+                        task_id TEXT NOT NULL,
+                        epoch INTEGER NOT NULL,
+                        kind TEXT NOT NULL CHECK (kind IN ('command_cancel', 'execution_stop')),
+                        native_id TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK (state IN ('pending', 'acknowledged')),
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (task_id, epoch, kind, native_id)
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_task_cleanup_pending "
+                    "ON task_cleanup_intents(state, created_at)"
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS task_outgoing_commands (
+                        task_id TEXT NOT NULL,
+                        epoch INTEGER NOT NULL,
+                        dedupe_key TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        native_id TEXT,
+                        state TEXT NOT NULL CHECK (state IN
+                            ('sending', 'settled', 'cleanup', 'acknowledged')),
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (task_id, epoch, dedupe_key)
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_task_outgoing_pending "
+                    "ON task_outgoing_commands(state, created_at)"
+                )
                 conn.execute("COMMIT")
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(f"Cannot initialize managed tasks: {exc}") from exc
@@ -663,11 +702,133 @@ class TaskStore:
         try:
             with self._database._connect() as conn:
                 row = conn.execute(
-                    "SELECT COUNT(*) FROM managed_tasks WHERE state IN ('active', 'replacing')"
+                    "SELECT COUNT(*) FROM managed_tasks AS t WHERE "
+                    "(t.state IN ('active', 'replacing') AND NOT EXISTS ("
+                    "SELECT 1 FROM task_effects AS e WHERE e.task_id = t.task_id "
+                    "AND e.epoch = t.epoch AND e.state = 'terminal')) OR EXISTS ("
+                    "SELECT 1 FROM task_cleanup_intents AS i WHERE i.task_id = t.task_id "
+                    "AND i.epoch = t.epoch AND i.state = 'pending') OR EXISTS ("
+                    "SELECT 1 FROM task_outgoing_commands AS o WHERE o.task_id = t.task_id "
+                    "AND o.epoch = t.epoch AND o.state IN ('sending', 'cleanup'))"
                 ).fetchone()
             return int(row[0]) if row else 0
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(f"Cannot count running tasks: {exc}") from exc
+
+    def record_cleanup_intents(
+        self, task_id: str, epoch: int, session_id: str, commands: Iterable[Any]
+    ) -> None:
+        """Durably fence every live native command before terminalization.
+
+        The command snapshot is taken under the task fence by the caller.  The
+        idempotent inserts make a retry and a restarted reconciler converge on
+        the same native rows rather than on process-local memory.
+        """
+        now = time.time()
+        rows: list[tuple[str, str]] = []
+        for command in commands:
+            state = str(command.get("state", "") if isinstance(command, dict) else command.state)
+            if state in {"done", "failed", "cancelled", "completed", "killed"}:
+                continue
+            command_id = str(command.get("id") if isinstance(command, dict) else command.id)
+            rows.append(("command_cancel", command_id))
+            process_id = command.get("execution_process_id") if isinstance(command, dict) else command.execution_process_id
+            if process_id:
+                rows.append(("execution_stop", str(process_id)))
+        if not rows:
+            return
+        try:
+            with self.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.executemany(
+                    "INSERT OR IGNORE INTO task_cleanup_intents "
+                    "(task_id, epoch, kind, native_id, session_id, state, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+                    [(str(task_id), int(epoch), kind, native_id, str(session_id), now, now) for kind, native_id in rows],
+                )
+                conn.execute("COMMIT")
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(f"Cannot record terminal cleanup intents: {exc}") from exc
+
+    def begin_outgoing_command(self, task_id: str, epoch: int, session_id: str, dedupe_key: str) -> None:
+        """Persist the send admission before opening the task fence for HTTP."""
+        now = time.time()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT OR IGNORE INTO task_outgoing_commands "
+                "(task_id, epoch, dedupe_key, session_id, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'sending', ?, ?)",
+                (str(task_id), int(epoch), str(dedupe_key), str(session_id), now, now),
+            )
+            conn.execute("COMMIT")
+
+    def settle_outgoing_command(
+        self, task_id: str, epoch: int, dedupe_key: str, native_id: str | None, *, terminal: bool
+    ) -> None:
+        """Publish the native id, then bind a terminal send to durable cleanup."""
+        now = time.time()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE task_outgoing_commands SET native_id = COALESCE(?, native_id), "
+                "state = ?, updated_at = ? WHERE task_id = ? AND epoch = ? AND dedupe_key = ?",
+                (native_id, "cleanup" if terminal else "settled", now, str(task_id), int(epoch), str(dedupe_key)),
+            )
+            if terminal and native_id:
+                row = conn.execute(
+                    "SELECT session_id FROM task_outgoing_commands WHERE task_id = ? "
+                    "AND epoch = ? AND dedupe_key = ?",
+                    (str(task_id), int(epoch), str(dedupe_key)),
+                ).fetchone()
+                conn.execute(
+                    "INSERT OR IGNORE INTO task_cleanup_intents "
+                    "(task_id, epoch, kind, native_id, session_id, state, created_at, updated_at) "
+                    "VALUES (?, ?, 'command_cancel', ?, ?, 'pending', ?, ?)",
+                    (str(task_id), int(epoch), str(native_id), str(row["session_id"]), now, now),
+                )
+            conn.execute("COMMIT")
+
+    def terminal_outgoing_commands(self, task_id: str, epoch: int) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM task_outgoing_commands WHERE task_id = ? AND epoch = ? "
+                "AND state IN ('sending', 'cleanup') ORDER BY created_at",
+                (str(task_id), int(epoch)),
+            ).fetchall()
+
+    def unresolved_terminal_outgoing_commands(self) -> list[sqlite3.Row]:
+        """Sends whose durable key survived terminalization without a native id."""
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT o.* FROM task_outgoing_commands AS o JOIN managed_tasks AS t "
+                "ON t.task_id = o.task_id AND t.epoch = o.epoch "
+                "WHERE t.state IN ('completed', 'cancelled', 'lost') "
+                "AND o.native_id IS NULL AND o.state IN ('sending', 'cleanup') "
+                "ORDER BY o.created_at"
+            ).fetchall()
+
+    def pending_cleanup_intents(self) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM task_cleanup_intents WHERE state = 'pending' ORDER BY created_at"
+            ).fetchall()
+
+    def acknowledge_cleanup_intent(self, task_id: str, epoch: int, kind: str, native_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE task_cleanup_intents SET state = 'acknowledged', updated_at = ? "
+                "WHERE task_id = ? AND epoch = ? AND kind = ? AND native_id = ? AND state = 'pending'",
+                (time.time(), str(task_id), int(epoch), str(kind), str(native_id)),
+            )
+            if kind == "command_cancel":
+                conn.execute(
+                    "UPDATE task_outgoing_commands SET state = 'acknowledged', updated_at = ? "
+                    "WHERE task_id = ? AND epoch = ? AND native_id = ? AND state = 'cleanup'",
+                    (time.time(), str(task_id), int(epoch), str(native_id)),
+                )
+            conn.execute("COMMIT")
 
     def get_by_id(self, task_id: str) -> TaskRecord | None:
         return self._one("task_id = ?", (str(task_id),))
