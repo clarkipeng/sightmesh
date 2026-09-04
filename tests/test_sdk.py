@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,8 +11,8 @@ import pytest
 from sightmesh import execution_routing
 from sightmesh import sdk as sdk_module
 from sightmesh.cdesktop import CdesktopError, CdesktopRejectedError
-from sightmesh.sdk import BatchError, Command, SightMesh, SightMeshError, WorkerSpec
 from sightmesh.profiles import Profile
+from sightmesh.sdk import BatchError, Command, SightMesh, SightMeshError, WorkerSpec
 from sightmesh.task_store import StaleTransition, TaskStore, TaskStoreError
 
 
@@ -192,6 +193,35 @@ def test_start_is_idempotent_for_one_semantic_key(system):
 
     assert replayed == first
     assert len(client.launches) == 1
+
+
+def test_cancel_can_win_while_managed_launch_is_in_flight(system, monkeypatch):
+    """A late launch result is stopped, never allowed to revive cancellation."""
+    mesh, client, store, _ownership = system
+    entered = threading.Event()
+    release = threading.Event()
+    native = client.managed_launch
+
+    def paused_launch(task_id, epoch, launch):
+        entered.set()
+        assert release.wait(timeout=5)
+        return native(task_id, epoch, launch)
+
+    monkeypatch.setattr(client, "managed_launch", paused_launch)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        starting = pool.submit(mesh.start, spec())
+        assert entered.wait(timeout=5)
+        cancelled = pool.submit(mesh.cancel, "audit")
+        assert cancelled.result(timeout=1).state == "cancelled"
+        release.set()
+        with pytest.raises(BatchError, match="superseded"):
+            starting.result(timeout=5)
+
+    task = store.get("operator", "audit")
+    assert task is not None and task.state == "cancelled"
+    effect = mesh.journal.get(task.task_id, 1)
+    assert effect is not None and effect.outcome == "superseded"
+    assert client.stopped == [f"workspace-{task.task_id}"]
 
 
 def test_repo_name_prefers_the_canonical_registration(system):
@@ -491,7 +521,7 @@ def test_an_explicit_profile_stays_recoverable_when_failover_is_on(
     """Contract: explicit profile overrides remain recoverable. The old code
     recorded no route identity for them, so `reconcile` returned None and the
     task sat on an exhausted account forever."""
-    mesh, client, store, _ownership = system
+    mesh, _client, store, _ownership = system
     monkeypatch.setattr(
         sdk_module.ProfileStore,
         "get",
