@@ -264,9 +264,13 @@ class SightMesh:
             if not entry.prompt.strip():
                 raise SightMeshError(f"Command for {entry.worker!r} must not be empty")
             task = self._find(entry.worker)
-            if task.state not in {"active", "blocked"} or not task.holder_session_id:
+            # Only an active task accepts mail. A reserved, blocked or terminal
+            # task has no running turn to receive it; mail persisted for such a
+            # task is exactly the stale command that resurrects it later. The
+            # way to resume a blocked task is replace(), never a send.
+            if task.state != "active" or not task.holder_session_id:
                 raise SightMeshError(
-                    f"Task {entry.worker!r} has no active session ({task.state})"
+                    f"Task {entry.worker!r} does not accept mail: it is {task.state}"
                 )
             self.ownership.assert_deliverable(task.holder_session_id)
             targets.append((entry, task))
@@ -286,7 +290,7 @@ class SightMesh:
                     current = self.store.get_by_id(task.task_id)
                     if (
                         current is None
-                        or current.state not in {"active", "blocked"}
+                        or current.state != "active"
                         or current.epoch != task.epoch
                         or current.version != task.version
                         or current.holder_session_id != task.holder_session_id

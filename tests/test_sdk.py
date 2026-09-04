@@ -10,7 +10,7 @@ import pytest
 
 from sightmesh import execution_routing
 from sightmesh import sdk as sdk_module
-from sightmesh.cdesktop import CdesktopError, CdesktopRejectedError
+from sightmesh.cdesktop import CdesktopError, CdesktopRejectedError, CdesktopPendingError
 from sightmesh.durable import DurableExecutionReconciler
 from sightmesh.profiles import Profile
 from sightmesh.sdk import BatchError, Command, SightMesh, SightMeshError, WorkerSpec
@@ -1319,3 +1319,39 @@ def test_cancel_during_request_build_never_issues_a_native_launch(system, monkey
         result = future.result(timeout=10)
     assert result.state == "cancelled"
     assert client.launches == []
+
+
+@pytest.mark.parametrize(
+    "make_state",
+    ["reserved", "blocked", "completed", "cancelled", "lost"],
+)
+def test_only_an_active_task_accepts_mail(system, make_state):
+    # Round-4 review of #110: blocked tasks were mail-admissible, so send_all
+    # persisted a native command for a task with no running turn and reported
+    # success - the exact stale mail that resurrects a task. Every non-active
+    # state must be a typed refusal with nothing enqueued.
+    mesh, client, store, _ownership = system
+    if make_state == "reserved":
+        client.reject_launch = CdesktopPendingError("still owned", status=425)
+        with pytest.raises(BatchError):
+            mesh.start(spec())
+    else:
+        mesh.start(spec())
+        if make_state == "blocked":
+            mesh.blocked("needs a decision", "audit")
+        elif make_state == "completed":
+            mesh.complete("done", "audit")
+        elif make_state == "cancelled":
+            mesh.cancel("audit")
+        else:
+            from sightmesh import wakes
+
+            task = mesh._find("audit")
+            with store.task_lock(task.task_id) as fence:
+                wakes.finish_with_wake(store, task.task_id, "lost", "executor session gone", fence=fence)
+    task = mesh._find("audit")
+    assert task.state == make_state
+    sent_before = list(client.sent)
+    with pytest.raises((SightMeshError, BatchError), match=make_state):
+        mesh.send("audit", "hello")
+    assert client.sent == sent_before
