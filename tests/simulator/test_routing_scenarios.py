@@ -1077,3 +1077,76 @@ def test_sd16_cancel_waits_for_recovery_then_stops_the_successor(
     current = store.get("operator", "audit")
     assert current is not None and current.state == "cancelled"
     assert mesh.client.stopped == [successor.workspace_id]
+
+
+def test_sd16_cancel_during_initial_launch_stops_the_only_native_session(
+    mesh: SightMesh, store: TaskStore, routing_settings, monkeypatch
+) -> None:
+    """Initial and recovery launches share the terminal fence.
+
+    The old initial path skipped ``task_lock``. Cancellation could then commit
+    while the native PUT was paused, leaving its later successful workspace
+    unmanaged because activation correctly rejected the terminal row.
+    """
+    configure_chains(
+        standard=(execution_routing.Route("test", "CODEX", "test", "free"),)
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    native = mesh.client.managed_launch
+
+    def pause_initial(task_id, epoch, launch):
+        if epoch == 1:
+            entered.set()
+            assert release.wait(timeout=5)
+        return native(task_id, epoch, launch)
+
+    monkeypatch.setattr(mesh.client, "managed_launch", pause_initial)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        starting = pool.submit(mesh.start, worker_spec())
+        assert entered.wait(timeout=5)
+        cancelling = pool.submit(mesh.cancel, "audit")
+        assert not cancelling.done()
+        release.set()
+        launched = starting.result(timeout=5)
+        cancelled = cancelling.result(timeout=5)
+
+    task = store.get("operator", "audit")
+    effect = mesh.journal.get(task.task_id, task.epoch)
+    assert launched.state == "active"
+    assert cancelled.state == task.state == "cancelled"
+    assert effect is not None and effect.state == "launched"
+    assert mesh.client.stopped == [launched.workspace_id]
+
+
+def test_sd16_terminal_lock_is_released_before_stop_http(
+    mesh: SightMesh, routing_settings, monkeypatch
+) -> None:
+    """A slow cdesktop stop cannot serialize a task's durable lifecycle gate."""
+    configure_chains(
+        standard=(execution_routing.Route("test", "CODEX", "test", "free"),)
+    )
+    started = mesh.start(worker_spec())
+    entered = threading.Event()
+    release = threading.Event()
+    stop = mesh.client.stop_workspace
+
+    def pause_stop(workspace_id):
+        entered.set()
+        assert release.wait(timeout=5)
+        return stop(workspace_id)
+
+    def acquire_task_lock():
+        task = mesh.store.get("operator", "audit")
+        with mesh.store.task_lock(task.task_id):
+            return True
+
+    monkeypatch.setattr(mesh.client, "stop_workspace", pause_stop)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        cancelling = pool.submit(mesh.cancel, "audit")
+        assert entered.wait(timeout=5)
+        assert pool.submit(acquire_task_lock).result(timeout=2)
+        release.set()
+        assert cancelling.result(timeout=5).state == "cancelled"
+
+    assert mesh.client.stopped == [started.workspace_id]

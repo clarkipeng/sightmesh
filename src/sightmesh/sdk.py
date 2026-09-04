@@ -36,10 +36,7 @@ from .effects import (
     request_hash,
 )
 from .escalation import CDESKTOP_SESSION_ENV, EscalationStore, LauncherIdentity
-<<<<<<< HEAD
 from .liveness import Budget, resolve_policy, trusted_policy
-=======
->>>>>>> 2c935b5 (docs(routing): describe the fallback, monotonic cooling, and the mid-run observer)
 from .execution_routing import ExecutionRoutingError
 from .pool.core import PoolError
 from .profiles import ProfileStore, validate_provider
@@ -349,7 +346,7 @@ class SightMesh:
             return Worker.from_record(self._replace_prepared(prepared, replacement_prompt))
 
     def _finish(self, task: TaskRecord, state: str, result: str | None) -> TaskRecord:
-        """Terminate one task, record its parent's wake, then try to deliver."""
+        """Make the durable terminal decision and enqueue its parent wake."""
         try:
             updated, _created = wakes.finish_with_wake(
                 self.store, task.task_id, state, result
@@ -360,7 +357,6 @@ class SightMesh:
                 # the caller repeating itself, not a conflict.
                 return exc.current
             raise
-        self.wakes.pump()
         return updated
 
     def _finish_locked(
@@ -373,18 +369,26 @@ class SightMesh:
     ) -> TaskRecord:
         """Finish one task without racing the epoch it may be launching.
 
-        A task lock covers an intent until its native launch activates. Terminal
-        writers take that same lock and discard their pre-wait snapshot, so
-        cancellation stops whichever workspace owns the task after recovery,
-        never the predecessor it happened to observe first.
+        The lock protects only the durable decision. The cdesktop stop and wake
+        delivery are intentionally outside it: a slow HTTP request cannot hold
+        a task's lifecycle gate. Re-entry fences delivery against a newer row.
         """
         with self.store.task_lock(task.task_id):
             current = self.store.get_by_id(task.task_id)
             if current is None:
                 raise SightMeshError(f"Task {task.key!r} no longer exists")
-            if stop_workspace and current.workspace_id:
-                self.client.stop_workspace(current.workspace_id)
-            return self._finish(current, state, result)
+            updated = self._finish(current, state, result)
+            workspace_id = current.workspace_id if stop_workspace else None
+
+        if workspace_id:
+            self.client.stop_workspace(workspace_id)
+
+        with self.store.task_lock(task.task_id):
+            current = self.store.get_by_id(task.task_id)
+            if current is None or current.version != updated.version:
+                return current or updated
+        self.wakes.pump()
+        return updated
 
     def reconcile_provider_outcome(self, session_id: str) -> Worker | None:
         """Settle the task holding this session against what its worker did.
@@ -758,6 +762,14 @@ class SightMesh:
             auth_binding_id=target.get("auth_binding_id"),
         )
     def _start_reserved(self, task: TaskRecord) -> TaskRecord:
+        """Launch a reservation while sharing terminal writers' task fence."""
+        with self.store.task_lock(task.task_id):
+            current = self.store.get_by_id(task.task_id)
+            if current is None:
+                raise SightMeshError(f"Task {task.key!r} no longer exists")
+            return self._start_reserved_locked(current)
+
+    def _start_reserved_locked(self, task: TaskRecord) -> TaskRecord:
         if task.state != "reserved":
             return task
         request = self._workspace_request(task, str(task.spec["prompt"]))
