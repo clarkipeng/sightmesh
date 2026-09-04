@@ -699,7 +699,6 @@ def test_unknown_permission_policy_is_rejected(system):
     with pytest.raises(SightMeshError, match="Unknown permission policy"):
         mesh.start(spec(permission="YOLO"))
 
-
 def test_start_stays_idempotent_when_the_detection_floor_changes(system):
     """Why: the resolved detection policy used to be folded into the public
     spec, and the public spec is the identity fingerprint `start()` compares.
