@@ -7,6 +7,21 @@ import pytest
 
 from sightmesh import cdesktop
 from sightmesh.cdesktop import CdesktopClient, _apply_approval_patches
+from sightmesh.fence import FenceHeldError
+from sightmesh.task_store import TaskStore
+
+
+def test_task_fence_rejects_http_until_external_io(tmp_path) -> None:
+    """A new client request cannot silently pin a task lifecycle gate."""
+    store = TaskStore(tmp_path / "tasks.sqlite")
+    client = CdesktopClient("http://127.0.0.1:1")
+
+    with store.task_lock("task-a") as fence:
+        with pytest.raises(FenceHeldError, match="task-a"):
+            client.info()
+        with fence.external_io():
+            with pytest.raises(cdesktop.CdesktopError):
+                client.info()
 
 
 class FakeClient(CdesktopClient):

@@ -296,7 +296,8 @@ class EffectJournal:
                     ):
                         if native and native.get("workspace_id"):
                             self.mark_terminal(task_id, epoch, "superseded")
-                            client.stop_workspace(str(native["workspace_id"]))
+                            with fence.external_io():
+                                client.stop_workspace(str(native["workspace_id"]))
                         continue
                     if native is not None:
                         workspace_id = native.get("workspace_id")

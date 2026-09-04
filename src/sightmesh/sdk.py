@@ -330,6 +330,7 @@ class SightMesh:
 
     def replace(self, worker: str, prompt: str | None = None) -> Worker:
         task = self._find(worker)
+        self._require_contract()
         with self.store.task_lock(task.task_id) as fence:
             # The snapshot used to find the task may have waited behind an
             # automatic recovery. Reloading under the same lock makes this
@@ -342,7 +343,6 @@ class SightMesh:
                 raise SightMeshError(
                     "Replacement requires a prompt or saved checkpoint"
                 )
-            self._require_contract()
             target = {**task.spec["target"]}
             automatic_recovery = routing_outcome(target.get("recovery"))
             target.pop("recovery", None)
@@ -521,10 +521,21 @@ class SightMesh:
             # Nothing launched under this epoch, or its outcome is already
             # recorded; either way the process tells us nothing new.
             return None
+        version = task.version
+        with fence.external_io():
+            processes = self.client.execution_processes(session_id)
+            queue_owned = self._queue_still_owns(session_id)
+        current = self.store.get_by_id(task.task_id)
+        if (
+            current is None
+            or (current.epoch, current.version) != (task.epoch, version)
+        ):
+            return None
+        task = current
         process = latest_execution_process(
             [
                 item
-                for item in self.client.execution_processes(session_id)
+                for item in processes
                 if item.get("run_reason") == "codingagent"
             ]
         )
@@ -541,7 +552,7 @@ class SightMesh:
             # that queue on the way out.
             self._record_provider_outcome(task, outcome, retry_at)
             return None
-        if self._queue_still_owns(session_id):
+        if queue_owned:
             # cdesktop's own durable recovery requeues a claimed command whose
             # execution died, so this failure is one it is about to retry.
             # Blocking here would strand a task that is still being worked -
@@ -640,11 +651,22 @@ class SightMesh:
             )
 
         selected = selection.target
+        version = task.version
+        with fence.external_io():
+            provider_id = self._default_provider_id()
+            self._require_contract()
+        current = self.store.get_by_id(task.task_id)
+        if (
+            current is None
+            or (current.epoch, current.version) != (task.epoch, version)
+        ):
+            return None
+        task = current
         next_target = {
             "executor": selected.executor,
             "model": selected.model,
             "reasoning": task.spec.get("reasoning"),
-            "provider_id": self._default_provider_id(),
+            "provider_id": provider_id,
             "auth_binding_id": selected.auth_binding_id,
             "route_class": selected.route_class,
             "route_id": selected.route_id,
@@ -652,7 +674,6 @@ class SightMesh:
             "failover": "auto",
             "recovery": outcome,
         }
-        self._require_contract()
         prepared = self.store.prepare_replacement(
             task.task_id, target=next_target, expect_version=task.version, fence=fence
         )
@@ -683,7 +704,12 @@ class SightMesh:
             return self._block_unroutable(
                 task, f"replacement epoch ended: {effect.outcome}", fence
             )
-        self._require_contract()
+        with fence.external_io():
+            self._require_contract()
+        current = self.store.get_by_id(task.task_id)
+        if current is None or (current.epoch, current.version) != (task.epoch, task.version):
+            return None
+        task = current
         return Worker.from_record(
             self._launch_prepared(task, str(task.spec["prompt"]), fence)
         )
@@ -787,14 +813,22 @@ class SightMesh:
         def spawn() -> str:
             return self._journaled_launch(prepared, launch, fence)[1]
 
-        transfer = transfer_ownership(
-            self.client,
-            self.ownership,
-            source_session_id=prepared.holder_session_id,
-            spawn=spawn,
-            reason="managed task replacement",
-            logical_key=f"task:{prepared.task_id}:epoch:{prepared.epoch}",
-        )
+        with fence.external_io():
+            transfer = transfer_ownership(
+                self.client,
+                self.ownership,
+                source_session_id=prepared.holder_session_id,
+                spawn=spawn,
+                reason="managed task replacement",
+                logical_key=f"task:{prepared.task_id}:epoch:{prepared.epoch}",
+            )
+        current = self.store.get_by_id(prepared.task_id)
+        if (
+            current is None
+            or (current.epoch, current.version) != (prepared.epoch, prepared.version)
+        ):
+            self.journal.mark_terminal(prepared.task_id, prepared.epoch, "superseded")
+            raise SightMeshError(f"Replacement for {prepared.key!r} was superseded")
         active = self.store.activate(
             prepared.task_id,
             workspace_id=prepared.workspace_id,
@@ -928,7 +962,8 @@ class SightMesh:
         current = self.store.get_by_id(task.task_id)
         if current is None or (current.epoch, current.version) != (task.epoch, task.version):
             self.journal.mark_terminal(task.task_id, task.epoch, "superseded")
-            self.client.stop_workspace(workspace_id)
+            with fence.external_io():
+                self.client.stop_workspace(workspace_id)
             raise SightMeshError(f"Native launch for {task.key!r} was superseded")
         self.journal.mark_launched(task.task_id, task.epoch, workspace_id, session_id)
         return workspace_id, session_id

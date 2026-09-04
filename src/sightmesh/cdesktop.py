@@ -18,6 +18,7 @@ from websockets.exceptions import WebSocketException
 from websockets.sync.client import connect as websocket_connect
 
 from .service import DEFAULT_PORT, is_healthy, service_url
+from .fence import assert_external_io_allowed
 
 
 SEND_TRANSPORT_RETRIES = 3
@@ -278,6 +279,7 @@ class CdesktopClient:
         query: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
     ) -> Any:
+        assert_external_io_allowed()
         url = f"{self.base_url}/api{path}"
         if query:
             encoded_query = {

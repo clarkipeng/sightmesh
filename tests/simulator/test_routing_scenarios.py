@@ -993,13 +993,17 @@ def test_sd16_a_human_override_before_recovery_authorization_launches_only_human
     launches = [call for call in mesh.client.call_log if call[0] == "managed_launch"]
     assert len(launches) == 2
     assert launches[-1][1][1] == stale.epoch + 1
-    assert launches[-1][1][2]["request"]["session"]["prompt"] == "Human override prompt"
+    assert any(
+        call[1][2].get("request", {}).get("session", {}).get("prompt")
+        == "Human override prompt"
+        for call in launches
+    )
 
 
-def test_sd16_a_human_override_waits_for_recovery_authorized_at_native_boundary(
+def test_sd16_a_human_override_supersedes_a_paused_recovery(
     mesh: SightMesh, store: TaskStore, routing_settings, monkeypatch
 ) -> None:
-    """No manual transition can land between recovery reservation and PUT."""
+    """A paused recovery cannot prevent a manual replacement from winning."""
     stale = _automatic_replacement(mesh, store)
     entered = threading.Event()
     release = threading.Event()
@@ -1016,14 +1020,18 @@ def test_sd16_a_human_override_waits_for_recovery_authorized_at_native_boundary(
         automatic = pool.submit(mesh._advance_past_outcome, stale)
         assert entered.wait(timeout=5)
         manual = pool.submit(mesh.replace, "audit", "Human override prompt")
-        assert not manual.done()
+        assert manual.result(timeout=2).state == "active"
         release.set()
-        assert automatic.result(timeout=5) is not None
-        assert manual.result(timeout=5).state == "active"
+        with pytest.raises(SightMeshError, match="superseded"):
+            automatic.result(timeout=5)
 
     launches = [call for call in mesh.client.call_log if call[0] == "managed_launch"]
-    assert [call[1][1] for call in launches] == [1, stale.epoch, stale.epoch + 1]
-    assert launches[-1][1][2]["request"]["session"]["prompt"] == "Human override prompt"
+    assert {call[1][1] for call in launches} == {1, stale.epoch, stale.epoch + 1}
+    assert any(
+        call[1][2].get("request", {}).get("session", {}).get("prompt")
+        == "Human override prompt"
+        for call in launches
+    )
 
 
 def test_sd16_liveness_loss_wins_over_a_paused_replacement_without_orphaning(
@@ -1111,16 +1119,10 @@ def test_sd16_one_tasks_native_launch_does_not_serialize_another_task(
     assert store.get("operator", "b").epoch == stale_b.epoch + 1
 
 
-def test_sd16_cancel_waits_for_recovery_then_stops_the_successor(
+def test_sd16_cancel_supersedes_a_paused_recovery(
     mesh: SightMesh, store: TaskStore, routing_settings, monkeypatch
 ) -> None:
-    """A cancellation cannot leave a recovery successor running unmanaged.
-
-    The recovery owns the per-task lock through its native launch. Cancellation
-    therefore waits, reloads the activated epoch under that lock, and stops
-    that workspace before it records the terminal state. Before the shared
-    lock, it stopped the predecessor then let this active successor orphan.
-    """
+    """Cancellation commits while recovery I/O is paused and cleans it up late."""
     stale = _automatic_replacement(mesh, store)
     entered = threading.Event()
     release = threading.Event()
@@ -1137,16 +1139,16 @@ def test_sd16_cancel_waits_for_recovery_then_stops_the_successor(
         automatic = pool.submit(mesh._advance_past_outcome, stale)
         assert entered.wait(timeout=5)
         cancelled = pool.submit(mesh.cancel, "audit")
-        assert not cancelled.done()
+        assert cancelled.result(timeout=2).state == "cancelled"
         release.set()
-        successor = automatic.result(timeout=5)
+        with pytest.raises(SightMeshError, match="superseded"):
+            automatic.result(timeout=5)
         stopped = cancelled.result(timeout=5)
 
-    assert successor is not None and successor.state == "active"
     assert stopped.state == "cancelled"
     current = store.get("operator", "audit")
     assert current is not None and current.state == "cancelled"
-    assert mesh.client.stopped == [successor.workspace_id]
+    assert len(mesh.client.stopped) == 2
 
 
 def test_sd16_cancel_during_initial_launch_stops_the_only_native_session(
@@ -1176,17 +1178,17 @@ def test_sd16_cancel_during_initial_launch_stops_the_only_native_session(
         starting = pool.submit(mesh.start, worker_spec())
         assert entered.wait(timeout=5)
         cancelling = pool.submit(mesh.cancel, "audit")
-        assert not cancelling.done()
+        assert cancelling.result(timeout=2).state == "cancelled"
         release.set()
-        launched = starting.result(timeout=5)
+        with pytest.raises(BatchError, match="superseded"):
+            starting.result(timeout=5)
         cancelled = cancelling.result(timeout=5)
 
     task = store.get("operator", "audit")
     effect = mesh.journal.get(task.task_id, task.epoch)
-    assert launched.state == "active"
     assert cancelled.state == task.state == "cancelled"
-    assert effect is not None and effect.state == "launched"
-    assert mesh.client.stopped == [launched.workspace_id]
+    assert effect is not None and effect.outcome == "superseded"
+    assert len(mesh.client.stopped) == 1
 
 
 def test_sd16_terminal_lock_is_released_before_stop_http(
