@@ -38,7 +38,6 @@ from .effects import (
 from .escalation import CDESKTOP_SESSION_ENV, EscalationStore, LauncherIdentity
 from .execution_routing import ExecutionRoutingError
 from .liveness import Budget, resolve_policy, trusted_policy
-from .pool import core as pool_core
 from .pool.core import PoolError
 from .profiles import ProfileStore, validate_provider
 from .succession import (
@@ -896,12 +895,19 @@ class SightMesh:
             except EffectBusy:
                 if time.monotonic() >= deadline:
                     raise
-                time.sleep(delay)
+                # The owner that made the native call must reacquire the fence
+                # to publish it.  Waiting here while holding it deadlocks a
+                # duplicate starter behind that owner.
+                with fence.external_io():
+                    time.sleep(delay)
                 delay = min(delay * 2, 0.5)
         if effect.state == "launched" and effect.workspace_id and effect.session_id:
             return effect.workspace_id, effect.session_id
         try:
-            native = self.client.managed_launch(task.task_id, task.epoch, dict(launch))
+            with fence.external_io():
+                native = self.client.managed_launch(
+                    task.task_id, task.epoch, dict(launch)
+                )
         except CdesktopRejectedError as exc:
             # 424/425 mean the outcome is unknowable or still owned; the
             # reservation must stay adoptable for a retry. Anything else is a
@@ -909,13 +915,21 @@ class SightMesh:
             # effect so callers never have to grep error text, and block the
             # task so it is not left `reserved` and relaunchable - a retry is an
             # explicit new epoch via replace().
-            if not isinstance(exc, (CdesktopInterruptedError, CdesktopPendingError)):
+            current = self.store.get_by_id(task.task_id)
+            if current is None or (current.epoch, current.version) != (task.epoch, task.version):
+                self.journal.mark_terminal(task.task_id, task.epoch, "superseded")
+            elif not isinstance(exc, (CdesktopInterruptedError, CdesktopPendingError)):
                 outcome = self._record_provider_outcome(
                     task, _rejection_outcome(exc.status), exc.retry_at
                 )
                 self._finish(task, "blocked", f"launch rejected: {outcome}", fence)
             raise
         workspace_id, session_id = self._effect_ids(task, native, fence)
+        current = self.store.get_by_id(task.task_id)
+        if current is None or (current.epoch, current.version) != (task.epoch, task.version):
+            self.journal.mark_terminal(task.task_id, task.epoch, "superseded")
+            self.client.stop_workspace(workspace_id)
+            raise SightMeshError(f"Native launch for {task.key!r} was superseded")
         self.journal.mark_launched(task.task_id, task.epoch, workspace_id, session_id)
         return workspace_id, session_id
 

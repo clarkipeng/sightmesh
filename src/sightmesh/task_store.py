@@ -203,12 +203,28 @@ class StaleTransition(TaskStoreError):
         )
 
 
-@dataclass(frozen=True)
+@dataclass
 class TaskFence:
     """Unforgeable-in-practice capability yielded only by ``task_lock``."""
 
     _store: TaskStore
     task_id: str
+    _stream: Any
+
+    @contextmanager
+    def external_io(self) -> Iterator[None]:
+        """Release this task's lifecycle gate while asking cdesktop.
+
+        The durable row/version is the claim across the call.  Reacquiring the
+        same gate before examining its result lets a terminal or replacement
+        writer proceed during a slow request without letting that old result
+        revive the task.
+        """
+        fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
+        try:
+            yield
+        finally:
+            fcntl.flock(self._stream.fileno(), fcntl.LOCK_EX)
 
 
 @dataclass(frozen=True)
@@ -295,12 +311,13 @@ class TaskStore:
 
     @contextmanager
     def task_lock(self, task_id: str) -> Iterator[TaskFence]:
-        """Serialize one task's intent through its native launch.
+        """Serialize one task's durable lifecycle decisions.
 
         This is deliberately a per-task advisory file lock rather than a
-        SQLite transaction: it spans the executor request without holding the
-        database writer lock, survives separate SightMesh processes, and the
-        kernel releases it if its owner crashes.
+        SQLite transaction: it survives separate SightMesh processes and the
+        kernel releases it if its owner crashes.  cdesktop I/O explicitly
+        releases it; the row's version and epoch carry the claim across that
+        external boundary.
         """
         digest = hashlib.sha256(str(task_id).encode("utf-8")).hexdigest()
         directory = self.path.parent / f".{self.path.name}.task-locks"
@@ -309,7 +326,7 @@ class TaskStore:
         with lock_path.open("a+") as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
             try:
-                yield TaskFence(self, str(task_id))
+                yield TaskFence(self, str(task_id), stream)
             finally:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 

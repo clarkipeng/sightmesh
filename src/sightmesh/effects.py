@@ -285,7 +285,19 @@ class EffectJournal:
                         continue
                     if current.epoch != epoch:
                         continue
-                    native = self._native_effect(client, task_id, epoch)
+                    version = current.version
+                    with fence.external_io():
+                        native = self._native_effect(client, task_id, epoch)
+                    current = self.store.get_by_id(task_id)
+                    if (
+                        current is None
+                        or current.epoch != epoch
+                        or current.version != version
+                    ):
+                        if native and native.get("workspace_id"):
+                            self.mark_terminal(task_id, epoch, "superseded")
+                            client.stop_workspace(str(native["workspace_id"]))
+                        continue
                     if native is not None:
                         workspace_id = native.get("workspace_id")
                         session_id = native.get("session_id")
