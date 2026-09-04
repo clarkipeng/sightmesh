@@ -1,3 +1,4 @@
+import ast
 import time
 from io import BytesIO
 from pathlib import Path
@@ -7,6 +8,53 @@ import pytest
 
 from sightmesh import cdesktop
 from sightmesh.cdesktop import CdesktopClient, _apply_approval_patches
+from sightmesh.fence import FenceHeldError
+from sightmesh.task_store import TaskStore
+
+
+def test_task_fence_rejects_every_cdesktop_transport(tmp_path) -> None:
+    store = TaskStore(tmp_path / "tasks.sqlite")
+    client = CdesktopClient("http://127.0.0.1:1")
+
+    with store.task_lock("task-a"):
+        with pytest.raises(FenceHeldError, match="task-a"):
+            client.probe_connectivity()
+        with pytest.raises(FenceHeldError, match="task-a"):
+            client._pending_approvals_websocket(timeout_seconds=0.01)
+
+
+def test_cdesktop_socket_openers_are_only_passed_to_guarded_transport() -> None:
+    """Keep new client transports behind the one task-fence boundary."""
+    source = Path(cdesktop.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    openings = {"urlopen", "websocket_connect"}
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Name) or node.id not in openings:
+            continue
+        parent = parents[node]
+        assert isinstance(parent, ast.Call)
+        assert isinstance(parent.func, ast.Attribute)
+        assert parent.func.attr == "_open_transport"
+
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "CdesktopClient"
+        for node in node.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_open_transport"
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "assert_external_io_allowed"
+        for node in ast.walk(helper)
+    )
 
 
 class FakeClient(CdesktopClient):

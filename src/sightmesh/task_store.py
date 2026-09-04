@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .escalation import EscalationStore, escalation_db_path
+from .fence import HELD_TASK_FENCE
 
 TASK_NAMESPACE = uuid.UUID("620f9fa2-f939-4a9f-aed5-2a558f2ed107")
 
@@ -210,6 +211,8 @@ class TaskFence:
     _store: TaskStore
     task_id: str
     _stream: Any
+    _token: Any
+    _external_depth: int = 0
 
     @contextmanager
     def external_io(self) -> Iterator[None]:
@@ -220,11 +223,18 @@ class TaskFence:
         writer proceed during a slow request without letting that old result
         revive the task.
         """
-        fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
+        outermost = self._external_depth == 0
+        self._external_depth += 1
+        if outermost:
+            HELD_TASK_FENCE.reset(self._token)
+            fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
         try:
             yield
         finally:
-            fcntl.flock(self._stream.fileno(), fcntl.LOCK_EX)
+            self._external_depth -= 1
+            if outermost:
+                fcntl.flock(self._stream.fileno(), fcntl.LOCK_EX)
+                self._token = HELD_TASK_FENCE.set(self.task_id)
 
 
 @dataclass(frozen=True)
@@ -325,9 +335,12 @@ class TaskStore:
         lock_path = directory / digest
         with lock_path.open("a+") as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            token = HELD_TASK_FENCE.set(str(task_id))
+            fence = TaskFence(self, str(task_id), stream, token)
             try:
-                yield TaskFence(self, str(task_id), stream)
+                yield fence
             finally:
+                HELD_TASK_FENCE.reset(fence._token)
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
     @staticmethod

@@ -9,7 +9,7 @@ import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
@@ -18,6 +18,7 @@ from websockets.exceptions import WebSocketException
 from websockets.sync.client import connect as websocket_connect
 
 from .service import DEFAULT_PORT, is_healthy, service_url
+from .fence import assert_external_io_allowed
 
 
 SEND_TRANSPORT_RETRIES = 3
@@ -270,6 +271,14 @@ class CdesktopClient:
             raise CdesktopError(f"Invalid cdesktop port file: {raw!r}") from exc
         return f"http://127.0.0.1:{int(port)}"
 
+    @staticmethod
+    def _open_transport(
+        opener: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> Any:
+        """Open the client transport only after the task fence is released."""
+        assert_external_io_allowed()
+        return opener(*args, **kwargs)
+
     def request(
         self,
         method: str,
@@ -292,7 +301,7 @@ class CdesktopClient:
             request_headers["Content-Type"] = "application/json"
         request = Request(url, data=body, headers=request_headers, method=method)
         try:
-            with urlopen(request, timeout=15) as response:
+            with self._open_transport(urlopen, request, timeout=15) as response:
                 raw = response.read().decode("utf-8")
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
@@ -459,7 +468,9 @@ class CdesktopClient:
     def probe_connectivity(self) -> bool:
         """Bounded, side-effect-free gate used before native dispatch."""
         try:
-            with urlopen(f"{self.base_url}/api/health", timeout=1) as response:
+            with self._open_transport(
+                urlopen, f"{self.base_url}/api/health", timeout=1
+            ) as response:
                 return response.status == 200
         except (OSError, URLError):
             return False
@@ -558,7 +569,8 @@ class CdesktopClient:
         pending: dict[str, dict[str, Any]] = {}
         deadline = time.monotonic() + timeout_seconds
         try:
-            with websocket_connect(
+            with self._open_transport(
+                websocket_connect,
                 websocket_url,
                 open_timeout=timeout_seconds,
                 close_timeout=1,
