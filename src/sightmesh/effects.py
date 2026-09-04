@@ -225,6 +225,27 @@ class EffectJournal:
             frozenset({"reserved", "launched"}),
         )
 
+    def mark_cleanup_workspace(
+        self, task_id: str, epoch: int, workspace_id: str
+    ) -> Effect:
+        """Attach a late native workspace to an already-terminal cleanup intent."""
+        try:
+            with self.store.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE task_effects SET workspace_id = ?, outcome = 'superseded', "
+                    "updated_at = ? "
+                    "WHERE task_id = ? AND epoch = ? AND state = 'terminal'",
+                    (str(workspace_id), time.time(), str(task_id), int(epoch)),
+                )
+                effect = self._require(conn, task_id, epoch)
+                conn.execute("COMMIT")
+                return effect
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(
+                f"Cannot record terminal workspace cleanup: {exc}"
+            ) from exc
+
     def stop_superseded(self, client: Any, effect: Effect) -> None:
         """Complete one durable superseded-workspace cleanup intent.
 
@@ -233,6 +254,12 @@ class EffectJournal:
         """
         if effect.outcome != "superseded" or not effect.workspace_id:
             return
+        self.stop_terminal(client, effect)
+
+    def stop_terminal(self, client: Any, effect: Effect) -> None:
+        """Stop and acknowledge one terminal effect's native workspace."""
+        if effect.state != "terminal" or not effect.workspace_id:
+            return
         client.stop_workspace(effect.workspace_id)
         try:
             with self.store.connect() as conn:
@@ -240,7 +267,7 @@ class EffectJournal:
                 conn.execute(
                     "UPDATE task_effects SET workspace_id = NULL, updated_at = ? "
                     "WHERE task_id = ? AND epoch = ? AND state = 'terminal' "
-                    "AND outcome = 'superseded' AND workspace_id = ?",
+                    "AND workspace_id = ?",
                     (
                         time.time(),
                         effect.task_id,
@@ -251,8 +278,35 @@ class EffectJournal:
                 conn.execute("COMMIT")
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(
-                f"Cannot acknowledge superseded workspace stop: {exc}"
+                f"Cannot acknowledge terminal workspace stop: {exc}"
             ) from exc
+
+    def reconcile_terminal(self, client: Any | None) -> int:
+        """Retry terminal workspace stops until their durable markers clear."""
+        if client is None:
+            return 0
+        try:
+            with self.store.connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM task_effects WHERE state = 'terminal' "
+                    "AND workspace_id IS NOT NULL"
+                ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(
+                f"Cannot read terminal workspace cleanup: {exc}"
+            ) from exc
+        stopped = 0
+        for row in rows:
+            effect = _decode(row)
+            try:
+                with self.store.task_lock(effect.task_id) as fence:
+                    with fence.external_io():
+                        self.stop_terminal(client, effect)
+            except Exception as exc:  # noqa: BLE001 - durable marker remains retryable
+                LOGGER.info("Leaving terminal workspace for retry: %s", exc)
+            else:
+                stopped += 1
+        return stopped
 
     def reconcile_superseded(self, client: Any | None) -> int:
         """Retry each recorded superseded-workspace stop exactly until it lands."""
@@ -397,6 +451,12 @@ class EffectJournal:
                             continue
                     retired = self._retire_reservation(task_id, epoch, moment)
                     if retired is not None:
+                        self.store.finish(
+                            task_id,
+                            "lost",
+                            "reservation expired",
+                            fence=fence,
+                        )
                         lost.append(retired)
             except _UnknowableEffect as exc:
                 # The executor could not answer. Leave the reservation intact

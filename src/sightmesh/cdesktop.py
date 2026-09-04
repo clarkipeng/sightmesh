@@ -443,10 +443,15 @@ class CdesktopClient:
     def execution_process(self, execution_process_id: str) -> dict[str, Any]:
         return self.request("GET", f"/execution-processes/{execution_process_id}")
 
-    def execution_processes(self, session_id: str) -> list[dict[str, Any]]:
-        result = self.request(
-            "GET", "/execution-processes", query={"session_id": session_id}
-        )
+    def execution_processes(
+        self, session_id: str | None = None, *, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        query = {
+            key: value
+            for key, value in (("session_id", session_id), ("status", status))
+            if value is not None
+        }
+        result = self.request("GET", "/execution-processes", query=query or None)
         if not isinstance(result, list):
             raise CdesktopError("cdesktop execution process response is not a list")
         return [dict(item) for item in result if isinstance(item, dict)]

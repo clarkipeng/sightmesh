@@ -320,6 +320,9 @@ class DurableExecutionReconciler:
             repaired["liveness_findings"] = detected["findings"]
             repaired["wakes_inserted"] += detected["wakes_inserted"]
 
+        def sweep_losses() -> None:
+            self.sweep_losses()
+
         def deliver() -> None:
             repaired["wakes_delivered"] = wakes.WakeDelivery(
                 self.client, store, self.ownership
@@ -328,7 +331,7 @@ class DurableExecutionReconciler:
         def expire() -> None:
             journal = EffectJournal(store)
             repaired["effects_expired"] = len(journal.expire_reservations(self.client))
-            repaired["superseded_workspaces_stopped"] = journal.reconcile_superseded(
+            repaired["superseded_workspaces_stopped"] = journal.reconcile_terminal(
                 self.client
             )
 
@@ -338,11 +341,49 @@ class DurableExecutionReconciler:
             ).reconcile()
 
         stage("record cohort wakes", cohort_wakes)
+        stage("sweep executor losses", sweep_losses)
         stage("detect liveness", detect)
         stage("deliver wakes", deliver)
         stage("expire effect reservations", expire)
         stage("reconcile external runs", external_runs)
         return repaired
+
+    def sweep_losses(self) -> int:
+        """Record executor-declared loss for every live task, across scopes."""
+        lost = 0
+        for task in self.task_store.list_state("active"):
+            if not task.holder_session_id:
+                continue
+            try:
+                with self.task_store.task_lock(task.task_id) as fence:
+                    current = self.task_store.get_by_id(task.task_id)
+                    if (
+                        current is None
+                        or current.state != "active"
+                        or current.epoch != task.epoch
+                    ):
+                        continue
+                    with fence.external_io():
+                        evidence = liveness_detector.gather_evidence(
+                            self.client,
+                            current.holder_session_id,
+                            now=self.clock(),
+                            checkpoint_at=current.checkpoint_at,
+                        )
+                    if not evidence.lost_reason:
+                        continue
+                    finding = liveness_detector.Finding(
+                        reason="lost",
+                        evidence=evidence,
+                        now=self.clock(),
+                    )
+                self._record_loss(
+                    self.task_store, task, finding, finding.payload()
+                )
+                lost += 1
+            except Exception as exc:  # noqa: BLE001 - one scope never masks another
+                LOGGER.warning("Cannot sweep loss for %s: %s", task.key, exc)
+        return lost
 
     def detect_liveness(self) -> dict[str, int]:
         """Classify every live task's progress evidence and arm what it satisfies.

@@ -942,6 +942,41 @@ def test_start_waits_for_capacity_then_refuses_with_a_typed_error(monkeypatch, t
         mesh._wait_for_launch_capacity(task)
 
 
+def test_admission_sweep_loses_dead_tasks_across_scopes(system):
+    mesh, client, store, ownership = system
+    worker = mesh.start(spec())
+    task = store.get("operator", "audit")
+    client.processes[worker.session_id] = [
+        {"id": "dead", "status": "killed", "run_reason": "codingagent"}
+    ]
+
+    other_scope = SightMesh(
+        client=client,
+        store=store,
+        ownership=ownership,
+        environment={"CDESKTOP_SESSION_ID": "another-scope"},
+    )
+    assert other_scope.sweep_admission()["tasks_lost"] == 1
+    assert store.get_by_id(task.task_id).state == "lost"
+    assert store.count_running() == 0
+
+
+def test_expired_reservation_can_be_reissued_with_a_new_spec(system):
+    mesh, client, store, _ownership = system
+    resolved = mesh._prepare_spec("operator", spec())
+    ((task, _inserted),) = store.reserve_all(
+        scope="operator", parent_task_id=None, specs=[resolved], max_attempts=3
+    )
+    mesh.journal.reserve(task.task_id, task.epoch, "old", "dead-owner", ttl=-1)
+
+    restarted = mesh.start(spec(prompt="new prompt"))
+
+    current = store.get("operator", "audit")
+    assert current.epoch == 2
+    assert current.spec["prompt"] == "new prompt"
+    assert restarted.state == "active"
+
+
 def test_tasks_launch_unattended_by_default(system):
     # Workers used to start with ACCEPT_EDITS, so every shell call parked on a
     # human approval and the whole mesh stalled the moment nobody was watching.

@@ -451,57 +451,28 @@ def stage(
 
 def activity(client: CdesktopClient) -> dict[str, Any]:
     approvals = client.pending_approvals()
-    running: list[dict[str, Any]] = []
-    queued: list[dict[str, Any]] = []
-    unreadable: list[dict[str, Any]] = []
-    for workspace in client.workspaces():
-        if workspace.get("archived"):
-            continue
-        for session in client.sessions(str(workspace["id"])):
-            session_running = False
-            for process in client.execution_processes(str(session["id"])):
-                if (
-                    process.get("status") == "running"
-                    and process.get("run_reason") != "devserver"
-                ):
-                    session_running = True
-                    running.append(
-                        {
-                            "workspace_id": workspace["id"],
-                            "session_id": session["id"],
-                            "execution_process_id": process.get("id"),
-                            "run_reason": process.get("run_reason"),
-                        }
-                    )
-            if session_running:
-                continue
-            try:
-                queue_status = client.queue_status(str(session["id"]))
-            except CdesktopError as exc:
-                unreadable.append(
-                    {
-                        "workspace_id": workspace["id"],
-                        "session_id": session["id"],
-                        "error": str(exc),
-                    }
-                )
-            else:
-                if queue_status.get("status") == "queued":
-                    queued.append(
-                        {
-                            "workspace_id": workspace["id"],
-                            "session_id": session["id"],
-                        }
-                    )
+    running = [
+        {
+            "workspace_id": process.get("workspace_id"),
+            "workspace_name": process.get("workspace_name"),
+            "session_id": process.get("session_id"),
+            "session_name": process.get("session_name") or process.get("name"),
+            "execution_process_id": process.get("id"),
+            "run_reason": process.get("run_reason"),
+        }
+        for process in client.execution_processes(status="running")
+        if process.get("status") == "running"
+        and process.get("run_reason") != "devserver"
+    ]
     return {
         # A queued follow-up has no live executor or approval responder to
         # preserve. It remains durable in cdesktop's database and can resume
         # after the replacement backend starts, so it must not deadlock an
         # otherwise idle update.
-        "idle": not running and not approvals and not unreadable,
+        "idle": not running and not approvals,
         "running": running,
-        "queued_follow_ups": queued,
-        "unreadable_sessions": unreadable,
+        "queued_follow_ups": [],
+        "unreadable_sessions": [],
         "pending_approvals": [
             {
                 "approval_id": item.get("approval_id"),
@@ -546,7 +517,12 @@ def _drain_and_wait(
     rearms = 0
     lapsed: str | None = None
     time.sleep(QUIET_SECONDS)
-    current = activity(client)
+    probe_errors: list[str] = []
+    try:
+        current = activity(client)
+    except CdesktopError as exc:
+        probe_errors.append(str(exc))
+        current = {"idle": False, "running": [], "probe_error": str(exc)}
     while not current["idle"] and time.monotonic() - started < DRAIN_WAIT_SECONDS:
         if enforced and time.monotonic() - armed_at >= DRAIN_REARM_SECONDS:
             try:
@@ -557,13 +533,18 @@ def _drain_and_wait(
             armed_at = time.monotonic()
             rearms += 1
         time.sleep(DRAIN_POLL_SECONDS)
-        current = activity(client)
+        try:
+            current = activity(client)
+        except CdesktopError as exc:
+            probe_errors.append(str(exc))
+            current = {"idle": False, "running": [], "probe_error": str(exc)}
     waited = {
         "waited_seconds": round(time.monotonic() - started, 3),
         "configured_wait_seconds": DRAIN_WAIT_SECONDS,
         "ttl_seconds": DRAIN_SECONDS if enforced else 0,
         "rearms": rearms,
         "lapsed": lapsed,
+        "probe_errors": probe_errors,
     }
     return current, waited
 

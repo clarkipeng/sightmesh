@@ -35,6 +35,7 @@ from .effects import (
     new_owner_instance,
     request_hash,
 )
+from .durable import DurableExecutionReconciler
 from .escalation import CDESKTOP_SESSION_ENV, EscalationStore, LauncherIdentity
 from .execution_routing import ExecutionRoutingError
 from .liveness import Budget, resolve_policy, trusted_policy
@@ -196,6 +197,7 @@ class SightMesh:
         self.journal = EffectJournal(self.store)
         self.wakes = wakes.WakeDelivery(self.client, self.store, self.ownership)
         self.contract_probe: str | None = None
+        self._admission_swept = False
 
     def start(self, spec: WorkerSpec | None = None, **kwargs: Any) -> Worker:
         requested = spec or WorkerSpec(**kwargs)
@@ -208,6 +210,8 @@ class SightMesh:
 
     def start_all(self, specs: Iterable[WorkerSpec]) -> BatchResult[Worker]:
         requested = list(specs)
+        if not self._admission_swept:
+            self.sweep_admission()
         scope, parent = self._context()
         if parent is not None and parent.state != "active":
             raise SightMeshError(
@@ -217,6 +221,8 @@ class SightMesh:
             self._prepare_spec(scope, spec, top_level=parent is None)
             for spec in requested
         ]
+        for spec, resolved in zip(requested, prepared, strict=True):
+            self._reissue_expired(scope, spec.key, resolved)
         self._require_contract()
         reservations = self.store.reserve_all(
             scope=scope,
@@ -314,7 +320,9 @@ class SightMesh:
 
     def complete(self, summary: str | None = None, worker: str | None = None) -> Worker:
         task = self._current() if worker is None else self._find(worker)
-        return Worker.from_record(self._finish_locked(task, "completed", summary))
+        return Worker.from_record(
+            self._finish_locked(task, "completed", summary, stop_workspace=True)
+        )
 
     def blocked(self, reason: str, worker: str | None = None) -> Worker:
         if not reason.strip():
@@ -419,9 +427,29 @@ class SightMesh:
                 raise SightMeshError(f"Task {task.key!r} no longer exists")
             updated = self._finish(current, state, result, fence)
             workspace_id = current.workspace_id if stop_workspace else None
+            effect = self.journal.get(current.task_id, current.epoch)
+            if state in {"completed", "cancelled", "lost"} and effect is not None:
+                if effect.state != "terminal":
+                    effect = self.journal.mark_terminal(
+                        current.task_id, current.epoch, state
+                    )
+                if effect.workspace_id is None:
+                    workspace_id = None
+            if state in {"completed", "cancelled", "lost"} and current.holder_session_id:
+                self.ownership.retire(
+                    current.holder_session_id,
+                    state="retired",
+                    reason=f"managed task {state}",
+                    logical_key=f"task:{current.task_id}:{current.epoch}",
+                )
 
         if workspace_id:
-            self.client.stop_workspace(workspace_id)
+            with self.store.task_lock(task.task_id) as cleanup_fence:
+                with cleanup_fence.external_io():
+                    if effect is not None and effect.workspace_id:
+                        self.journal.stop_terminal(self.client, effect)
+                    else:
+                        self.client.stop_workspace(workspace_id)
 
         with self.store.task_lock(task.task_id):
             current = self.store.get_by_id(task.task_id)
@@ -429,6 +457,55 @@ class SightMesh:
                 return current or updated
         self.wakes.pump()
         return updated
+
+    def sweep_admission(self) -> dict[str, int]:
+        """Reconcile all-scope loss and expiry before any admission count."""
+        reconciler = DurableExecutionReconciler(
+            self.client,
+            task_store=self.store,
+            ownership=self.ownership,
+            environment=self.environment,
+        )
+        result = {
+            "tasks_lost": reconciler.sweep_losses(),
+            "effects_expired": len(self.journal.expire_reservations(self.client)),
+            "terminal_workspaces_stopped": self.journal.reconcile_terminal(self.client),
+        }
+        self._admission_swept = True
+        return result
+
+    def _reissue_expired(
+        self, scope: str, key: str, resolved_spec: Mapping[str, Any]
+    ) -> None:
+        task = self.store.get(scope, key)
+        if task is None or task.state != "lost" or task.result != "reservation expired":
+            return
+        with self.store.task_lock(task.task_id) as fence:
+            current = self.store.get_by_id(task.task_id)
+            if (
+                current is None
+                or current.state != "lost"
+                or current.result != "reservation expired"
+            ):
+                return
+            if current.attempts >= current.max_attempts:
+                raise SightMeshError(
+                    f"Task {key!r} expired and tripped its "
+                    f"{current.max_attempts}-attempt circuit breaker"
+                )
+            self.store.transition(
+                current.task_id,
+                expect_states=frozenset({"lost"}),
+                expect_version=current.version,
+                assign=(
+                    "state = 'reserved', epoch = epoch + 1, attempts = attempts + 1, "
+                    "spec_json = ?, workspace_id = NULL, holder_session_id = NULL, "
+                    "result = NULL"
+                ),
+                values=(json.dumps(resolved_spec, sort_keys=True, separators=(",", ":")),),
+                attempted="reservation retry",
+                fence=fence,
+            )
 
     def reconcile_provider_outcome(self, session_id: str) -> Worker | None:
         """Settle the task holding this session against what its worker did.
@@ -965,11 +1042,18 @@ class SightMesh:
         workspace_id, session_id = self._effect_ids(task, native, fence)
         current = self.store.get_by_id(task.task_id)
         if current is None or (current.epoch, current.version) != (task.epoch, task.version):
-            superseded = self.journal.mark_superseded(
-                task.task_id, task.epoch, workspace_id
+            existing = self.journal.get(task.task_id, task.epoch)
+            superseded = (
+                self.journal.mark_cleanup_workspace(
+                    task.task_id, task.epoch, workspace_id
+                )
+                if existing is not None and existing.state == "terminal"
+                else self.journal.mark_superseded(
+                    task.task_id, task.epoch, workspace_id
+                )
             )
             with fence.external_io():
-                self.journal.stop_superseded(self.client, superseded)
+                self.journal.stop_terminal(self.client, superseded)
             raise SightMeshError(f"Native launch for {task.key!r} was superseded")
         self.journal.mark_launched(task.task_id, task.epoch, workspace_id, session_id)
         return workspace_id, session_id
@@ -1024,13 +1108,18 @@ class SightMesh:
             # this version added is one the running task's version could not
             # have recorded, and its absence describes no disagreement about
             # the work - so an upgrade mid-flight must not read as one.
-            if old_public != {
+            expired = (
+                existing.state == "lost"
+                and existing.result == "reservation expired"
+            )
+            if not expired and old_public != {
                 key: value for key, value in public.items() if key in old_public
             }:
                 raise SightMeshError(
                     f"Task {requested.key!r} already exists with a different specification"
                 )
-            return existing.spec
+            if not expired:
+                return existing.spec
         return {
             **public,
             "setup_script": self._setup_script(repo_path, requested.base),

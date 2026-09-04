@@ -663,7 +663,10 @@ class TaskStore:
         try:
             with self._database._connect() as conn:
                 row = conn.execute(
-                    "SELECT COUNT(*) FROM managed_tasks WHERE state IN ('active', 'replacing')"
+                    "SELECT COUNT(*) FROM managed_tasks AS t "
+                    "WHERE t.state IN ('active', 'replacing') AND NOT EXISTS ("
+                    "SELECT 1 FROM task_effects AS e WHERE e.task_id = t.task_id "
+                    "AND e.epoch = t.epoch AND e.state = 'terminal')"
                 ).fetchone()
             return int(row[0]) if row else 0
         except sqlite3.DatabaseError as exc:

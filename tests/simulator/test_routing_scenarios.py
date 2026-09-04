@@ -1111,15 +1111,14 @@ def test_sd16_one_tasks_native_launch_does_not_serialize_another_task(
     assert store.get("operator", "b").epoch == stale_b.epoch + 1
 
 
-def test_sd16_cancel_waits_for_recovery_then_stops_the_successor(
+def test_sd16_cancel_during_recovery_stops_the_late_successor(
     mesh: SightMesh, store: TaskStore, routing_settings, monkeypatch
 ) -> None:
     """A cancellation cannot leave a recovery successor running unmanaged.
 
-    The recovery owns the per-task lock through its native launch. Cancellation
-    therefore waits, reloads the activated epoch under that lock, and stops
-    that workspace before it records the terminal state. Before the shared
-    lock, it stopped the predecessor then let this active successor orphan.
+    Native launch runs with the lifecycle gate open. Cancellation can therefore
+    win while the PUT is in flight; its terminal effect becomes the durable
+    cleanup intent, and the late native workspace is stopped, never activated.
     """
     stale = _automatic_replacement(mesh, store)
     entered = threading.Event()
@@ -1137,16 +1136,15 @@ def test_sd16_cancel_waits_for_recovery_then_stops_the_successor(
         automatic = pool.submit(mesh._advance_past_outcome, stale)
         assert entered.wait(timeout=5)
         cancelled = pool.submit(mesh.cancel, "audit")
-        assert not cancelled.done()
-        release.set()
-        successor = automatic.result(timeout=5)
         stopped = cancelled.result(timeout=5)
+        release.set()
+        with pytest.raises(SightMeshError, match="superseded"):
+            automatic.result(timeout=5)
 
-    assert successor is not None and successor.state == "active"
     assert stopped.state == "cancelled"
     current = store.get("operator", "audit")
     assert current is not None and current.state == "cancelled"
-    assert mesh.client.stopped == [successor.workspace_id]
+    assert len(mesh.client.stopped) == 1
 
 
 def test_sd16_cancel_during_initial_launch_stops_the_only_native_session(
@@ -1185,7 +1183,9 @@ def test_sd16_cancel_during_initial_launch_stops_the_only_native_session(
     effect = mesh.journal.get(task.task_id, task.epoch)
     assert launched.state == "active"
     assert cancelled.state == task.state == "cancelled"
-    assert effect is not None and effect.state == "launched"
+    assert effect is not None and effect.state == "terminal"
+    assert effect.outcome == "cancelled"
+    assert effect.workspace_id is None
     assert mesh.client.stopped == [launched.workspace_id]
 
 
