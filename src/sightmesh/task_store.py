@@ -19,8 +19,8 @@ TASK_NAMESPACE = uuid.UUID("620f9fa2-f939-4a9f-aed5-2a558f2ed107")
 
 #: States a task can still leave under its own power.
 LIVE_STATES = frozenset({"reserved", "active", "replacing", "blocked"})
-#: Legal predecessors per finish target. ``completed``, ``cancelled`` and
-#: ``lost`` appear in no set, which is what makes them immutable terminals:
+#: Legal predecessors per finish target. ``completed``, ``cancelled``, ``lost``
+#: and ``exhausted`` appear in no set, which is what makes them immutable terminals:
 #: the first legal terminal transition wins and every later one is stale.
 FINISH_PREDECESSORS: dict[str, frozenset[str]] = {
     "completed": frozenset({"active", "replacing", "blocked"}),
@@ -31,6 +31,7 @@ FINISH_PREDECESSORS: dict[str, frozenset[str]] = {
     "blocked": frozenset({"reserved", "active", "replacing"}),
     "cancelled": frozenset({"reserved", "active", "replacing", "blocked"}),
     "lost": frozenset({"reserved", "active", "replacing"}),
+    "exhausted": frozenset({"active", "blocked"}),
 }
 #: ``replacing`` is included because a replacement launch activates the
 #: successor session it just spawned for the prepared epoch.
@@ -87,9 +88,9 @@ _MANAGED_TASKS_DDL = """
         parent_task_id TEXT,
         state TEXT NOT NULL CHECK (state IN
             ('reserved', 'active', 'replacing', 'blocked',
-             'completed', 'cancelled', 'lost')),
+             'completed', 'cancelled', 'lost', 'exhausted')),
         epoch INTEGER NOT NULL CHECK (epoch > 0),
-        attempts INTEGER NOT NULL CHECK (attempts > 0),
+        attempts INTEGER NOT NULL CHECK (attempts >= 0),
         max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
         child_limit INTEGER NOT NULL CHECK (child_limit >= 0),
         spec_json TEXT NOT NULL,
@@ -131,6 +132,15 @@ _MANAGED_TASKS_COLUMNS = (
     "checkpoint",
     "result",
     "version",
+    "child_event_seq",
+    "last_woken_seq",
+    "liveness",
+    "liveness_episode",
+    "liveness_since",
+    "liveness_wakes",
+    "liveness_evidence",
+    "over_budget",
+    "checkpoint_at",
     "created_at",
     "updated_at",
 )
@@ -420,7 +430,12 @@ class TaskStore:
             for row in conn.execute("PRAGMA table_info(managed_tasks)").fetchall()
         }
         has_version = "version" in columns
-        if has_version and _SELF_PARENT_CHECK in str(existing["sql"]):
+        current_sql = str(existing["sql"])
+        if (
+            has_version
+            and _SELF_PARENT_CHECK in current_sql
+            and "attempts >= 0" in current_sql
+        ):
             # The table is already at the kernel-v1 shape; only the watermark
             # and liveness columns may still be missing. Re-read table_info
             # under the same write lock and add them forward-only, never a
@@ -440,9 +455,23 @@ class TaskStore:
             "SELECT CASE WHEN parent_task_id = task_id THEN NULL "
             "ELSE parent_task_id END, "
             + ", ".join(
-                ("version" if has_version else "0") if name == "version" else name
-                for name in _MANAGED_TASKS_COLUMNS
-                if name != "parent_task_id"
+                # Pre-#119 attempts counted launches, not failures. That
+                # number has no recoverable failure meaning, so migration
+                # starts the new failure budget at its only sound value: zero.
+                "0" if name == "attempts" else
+                name if name in columns else {
+                    "version": "0",
+                    "child_event_seq": "0",
+                    "last_woken_seq": "0",
+                    "liveness": "'live'",
+                    "liveness_episode": "0",
+                    "liveness_since": "NULL",
+                    "liveness_wakes": "0",
+                    "liveness_evidence": "NULL",
+                    "over_budget": "0",
+                    "checkpoint_at": "NULL",
+                }[name]
+                for name in _MANAGED_TASKS_COLUMNS if name != "parent_task_id"
             )
             + " FROM managed_tasks"
         )
@@ -473,7 +502,7 @@ class TaskStore:
             "UPDATE managed_tasks SET child_event_seq = ("
             "  SELECT COUNT(*) FROM managed_tasks AS child"
             "  WHERE child.parent_task_id = managed_tasks.task_id"
-            "    AND child.state IN ('blocked', 'completed', 'cancelled', 'lost')"
+            "    AND child.state IN ('blocked', 'completed', 'cancelled', 'lost', 'exhausted')"
             ") WHERE EXISTS ("
             "  SELECT 1 FROM managed_tasks AS child"
             "  WHERE child.parent_task_id = managed_tasks.task_id"
@@ -679,7 +708,7 @@ class TaskStore:
                             (task_id, scope, task_key, parent_task_id, state, epoch,
                              attempts, max_attempts, child_limit, spec_json,
                              created_at, updated_at)
-                            VALUES (?, ?, ?, ?, 'reserved', 1, 1, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, 'reserved', 1, 0, ?, ?, ?, ?, ?)
                             """,
                             (
                                 task_id,
@@ -813,7 +842,7 @@ class TaskStore:
             return conn.execute(
                 "SELECT o.* FROM task_outgoing_commands AS o JOIN managed_tasks AS t "
                 "ON t.task_id = o.task_id AND t.epoch = o.epoch "
-                "WHERE t.state IN ('completed', 'cancelled', 'lost') "
+                "WHERE t.state IN ('completed', 'cancelled', 'lost', 'exhausted') "
                 "AND o.native_id IS NULL AND o.state IN ('sending', 'cleanup') "
                 "ORDER BY o.created_at"
             ).fetchall()
@@ -1006,6 +1035,7 @@ class TaskStore:
         task_id: str,
         *,
         target: dict[str, Any] | None = None,
+        charge_failure: bool = False,
         expect_version: int | None = None,
         fence: TaskFence | None = None,
     ) -> TaskRecord:
@@ -1014,6 +1044,7 @@ class TaskStore:
                 return self.prepare_replacement(
                     task_id,
                     target=target,
+                    charge_failure=charge_failure,
                     expect_version=expect_version,
                     fence=held,
                 )
@@ -1046,7 +1077,8 @@ class TaskStore:
                     # dated the replacement's silence from its predecessor's.
                     assign=(
                         "state = 'replacing', epoch = epoch + 1, "
-                        "attempts = attempts + 1, spec_json = ?, "
+                        + ("attempts = attempts + 1, " if charge_failure else "")
+                        + "spec_json = ?, "
                         "liveness = 'live', liveness_episode = 0, "
                         "liveness_since = NULL, liveness_wakes = 0, "
                         "liveness_evidence = NULL, over_budget = 0, "
@@ -1268,6 +1300,14 @@ class TaskStore:
                     fence=held,
                     conn=conn,
                 )
+        if state == "lost":
+            return self._record_loss(
+                task_id, result, expect_version=expect_version, fence=fence, conn=conn
+            )
+        if state == "exhausted":
+            return self._record_exhaustion(
+                task_id, result, expect_version=expect_version, fence=fence, conn=conn
+            )
         return self.transition(
             task_id,
             expect_states=predecessors,
@@ -1275,6 +1315,100 @@ class TaskStore:
             assign="state = ?, result = ?",
             values=(state, result),
             attempted=state,
+            fence=fence,
+            conn=conn,
+        )
+
+    def _record_loss(
+        self,
+        task_id: str,
+        result: str | None,
+        *,
+        expect_version: int | None,
+        fence: TaskFence,
+        conn: sqlite3.Connection | None,
+    ) -> TaskRecord:
+        """Charge one durable loss, or expose the final one as exhausted.
+
+        A loss is terminal for an epoch. The guarded transition therefore also
+        makes repeated reconciliation of that loss a no-op rather than a second
+        budget charge.
+        """
+        owned = conn is None
+        if owned:
+            with self._database._connect() as opened:
+                opened.execute("BEGIN IMMEDIATE")
+                record = self._record_loss(
+                    task_id, result, expect_version=expect_version, fence=fence, conn=opened
+                )
+                opened.execute("COMMIT")
+                return record
+        assert conn is not None
+        row = conn.execute(
+            "SELECT * FROM managed_tasks WHERE task_id = ?", (str(task_id),)
+        ).fetchone()
+        if row is None:
+            raise TaskStoreError("Managed task not found")
+        task = self._decode(row)
+        if task.attempts >= task.max_attempts:
+            raise TaskStoreError(
+                f"Task {task.key!r} tripped its {task.max_attempts}-attempt circuit breaker"
+            )
+        exhausted = task.attempts + 1 >= task.max_attempts
+        return self.transition(
+            task_id,
+            expect_states=FINISH_PREDECESSORS["lost"],
+            expect_version=expect_version,
+            assign=(
+                "state = 'exhausted', attempts = attempts + 1, result = ?"
+                if exhausted
+                else "state = 'lost', attempts = attempts + 1, result = ?"
+            ),
+            values=(f"exhausted: {result or 'lost'}" if exhausted else result,),
+            attempted="exhausted" if exhausted else "lost",
+            fence=fence,
+            conn=conn,
+        )
+
+    def exhaust(
+        self,
+        task_id: str,
+        reason: str,
+        *,
+        expect_version: int,
+        fence: TaskFence,
+    ) -> TaskRecord:
+        """Persist the final failure as the immutable exhausted outcome."""
+        self._require_fence(task_id, fence)
+        return self.finish(
+            task_id, "exhausted", reason, expect_version=expect_version, fence=fence
+        )
+
+    def _record_exhaustion(
+        self,
+        task_id: str,
+        result: str | None,
+        *,
+        expect_version: int | None,
+        fence: TaskFence,
+        conn: sqlite3.Connection | None,
+    ) -> TaskRecord:
+        if conn is None:
+            return self._transaction(
+                task_id=task_id,
+                expect_states=FINISH_PREDECESSORS["exhausted"],
+                expect_version=expect_version,
+                assign="state = 'exhausted', attempts = attempts + 1, result = ?",
+                values=(f"exhausted: {result or 'failed'}",),
+                attempted="exhausted",
+            )
+        return self.transition(
+            task_id,
+            expect_states=FINISH_PREDECESSORS["exhausted"],
+            expect_version=expect_version,
+            assign="state = 'exhausted', attempts = attempts + 1, result = ?",
+            values=(f"exhausted: {result or 'failed'}",),
+            attempted="exhausted",
             fence=fence,
             conn=conn,
         )

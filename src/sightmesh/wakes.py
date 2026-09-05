@@ -307,7 +307,7 @@ def record_liveness_wakes(
     """
     moment = time.time() if now is None else now
     row = conn.execute(
-        "SELECT task_id, parent_task_id, epoch, state, liveness, liveness_episode, "
+        "SELECT task_id, parent_task_id, epoch, state, result, liveness, liveness_episode, "
         "liveness_since, liveness_wakes, liveness_evidence, over_budget "
         "FROM managed_tasks WHERE task_id = ?",
         (str(child_task_id),),
@@ -318,7 +318,9 @@ def record_liveness_wakes(
     epoch = int(row["epoch"])
     created: list[str] = []
 
-    if str(row["state"]) == "lost":
+    if str(row["state"]) == "lost" or (
+        str(row["state"]) == "exhausted" and str(row["result"] or "").startswith("exhausted: lost:")
+    ):
         # A dead child has no stall episode and no budget left to run; the
         # loss is the whole report.
         return _arm_liveness(
@@ -584,7 +586,7 @@ def _payload(
         if child.result:
             line += f" | {child.result}"
         if child.liveness_evidence and (
-            child.liveness != "live" or child.over_budget or child.state == "lost"
+            child.liveness != "live" or child.over_budget or child.state in {"lost", "exhausted"}
         ):
             line += f" | evidence={child.liveness_evidence}"
         lines.append(line)

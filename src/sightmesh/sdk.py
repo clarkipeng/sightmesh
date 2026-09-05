@@ -325,7 +325,7 @@ class SightMesh:
                         latest
                         and latest.epoch == current.epoch
                         and latest.holder_session_id == current.holder_session_id
-                        and latest.state in {"completed", "cancelled", "lost"}
+                        and latest.state in {"completed", "cancelled", "lost", "exhausted"}
                     )
                     self.store.settle_outgoing_command(
                         current.task_id, current.epoch, dedupe_key, native_id, terminal=terminal
@@ -472,7 +472,7 @@ class SightMesh:
         a task's lifecycle gate. Re-entry fences delivery against a newer row.
         """
         commands = []
-        if state in {"completed", "cancelled", "lost"} and task.holder_session_id:
+        if state in {"completed", "cancelled", "lost", "exhausted"} and task.holder_session_id:
             with self.store.task_lock(task.task_id) as snapshot_fence:
                 with snapshot_fence.external_io():
                     commands = NativeCommandQueue(self.client).commands(task.holder_session_id)
@@ -485,7 +485,7 @@ class SightMesh:
             # terminal task cannot release admission while cdesktop can still
             # dispatch one of its commands.
             if (
-                state in {"completed", "cancelled", "lost"}
+                state in {"completed", "cancelled", "lost", "exhausted"}
                 and current.holder_session_id == task.holder_session_id
             ):
                 self.store.record_cleanup_intents(
@@ -504,14 +504,14 @@ class SightMesh:
             updated = self._finish(current, state, result, fence)
             workspace_id = current.workspace_id if stop_workspace else None
             effect = self.journal.get(current.task_id, current.epoch)
-            if state in {"completed", "cancelled", "lost"} and effect is not None:
+            if state in {"completed", "cancelled", "lost", "exhausted"} and effect is not None:
                 if effect.state != "terminal":
                     effect = self.journal.mark_terminal(
                         current.task_id, current.epoch, state
                     )
                 if effect.workspace_id is None:
                     workspace_id = None
-            if state in {"completed", "cancelled", "lost"} and current.holder_session_id:
+            if state in {"completed", "cancelled", "lost", "exhausted"} and current.holder_session_id:
                 self.ownership.retire(
                     current.holder_session_id,
                     state="retired",
@@ -768,14 +768,22 @@ class SightMesh:
         if outcome is None:
             return None
         if task.attempts >= task.max_attempts:
+            return None
+        if task.attempts + 1 >= task.max_attempts:
             # The circuit breaker has tripped. Saying so once is the whole
-            # difference between a stopped task and a hung one.
-            return self._block_unroutable(
-                task,
-                f"{outcome} on route {target.get('route_id')}; "
-                f"{task.max_attempts}-attempt circuit breaker tripped",
-                fence,
+            # difference between a stopped task and a hung one. Exhaustion is
+            # a terminal task outcome carrying the final failure.
+            exhausted = self._finish(
+                task, "exhausted", f"{outcome} on route {target.get('route_id')}", fence
             )
+            if task.holder_session_id:
+                self.ownership.retire(
+                    task.holder_session_id,
+                    state="retired",
+                    reason="managed task exhausted",
+                    logical_key=f"task:{task.task_id}:{task.epoch}",
+                )
+            return Worker.from_record(exhausted)
 
         route_id = target.get("route_id")
         route_class = target.get("route_class") or execution_routing.DEFAULT_ROUTE_CLASS
@@ -818,7 +826,11 @@ class SightMesh:
             "recovery": outcome,
         }
         prepared = self.store.prepare_replacement(
-            task.task_id, target=next_target, expect_version=task.version, fence=fence
+            task.task_id,
+            target=next_target,
+            charge_failure=True,
+            expect_version=task.version,
+            fence=fence,
         )
         return Worker.from_record(
             self._launch_prepared(prepared, str(task.spec["prompt"]), fence)
