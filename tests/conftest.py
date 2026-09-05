@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from sightmesh import escalation, succession
+from sightmesh import escalation, succession, task_store
 
 
 @pytest.fixture(autouse=True)
@@ -19,9 +19,22 @@ def _isolated_ownership(monkeypatch, tmp_path: Path) -> Path:
 def _isolate_escalation_store(monkeypatch, tmp_path):
     """Every test gets its own escalation store so spawn-path tests never
     touch the real ~/.local/state/sightmesh directory."""
-    monkeypatch.setattr(
-        escalation, "escalation_db_path", lambda: tmp_path / "escalations.sqlite3"
-    )
+    isolated = tmp_path / "escalations.sqlite3"
+    monkeypatch.setattr(escalation, "escalation_db_path", lambda: isolated)
+    # TaskStore imported the path function directly, so patching only
+    # ``escalation`` left SDK/CLI default construction pointed at the live
+    # operator store. Guard the constructor too: an explicit test path must be
+    # below this test's tmp root, and an implicit one resolves to ``isolated``.
+    monkeypatch.setattr(task_store, "escalation_db_path", lambda: isolated)
+    original_init = task_store.TaskStore.__init__
+
+    def isolated_task_store(self, path=None):
+        chosen = Path(path) if path is not None else isolated
+        if not chosen.resolve().is_relative_to(tmp_path.resolve()):
+            raise AssertionError(f"test attempted to open non-isolated TaskStore: {chosen}")
+        original_init(self, chosen)
+
+    monkeypatch.setattr(task_store.TaskStore, "__init__", isolated_task_store)
 
 
 @pytest.fixture(autouse=True)

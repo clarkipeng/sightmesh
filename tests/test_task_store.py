@@ -89,6 +89,14 @@ def _active(store, key, *, parent_task_id=None, children=0):
     )
 
 
+def test_test_store_guard_rejects_any_path_outside_its_tmp_root(tmp_path):
+    """A test must fail before SQLite can initialize a non-isolated store (#123)."""
+    implicit = TaskStore()
+    assert implicit.path.is_relative_to(tmp_path)
+    with pytest.raises(AssertionError, match="non-isolated TaskStore"):
+        TaskStore(tmp_path.parent / "forbidden.sqlite3")
+
+
 ROUND1_KERNEL_DDL = """
     CREATE TABLE managed_tasks (
         task_id TEXT PRIMARY KEY,

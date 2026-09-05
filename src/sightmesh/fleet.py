@@ -285,7 +285,7 @@ def breaker_tripped(task: Mapping[str, Any]) -> bool:
     ``TaskStore.prepare_replacement`` rejects outright. A finished task never
     counts, however many attempts it spent.
     """
-    if str(task.get("state") or "") in TASK_DONE_STATES:
+    if str(task.get("state") or "") in TASK_DONE_STATES - {"exhausted"}:
         return False
     try:
         return int(task["attempts"]) >= int(task["max_attempts"])
