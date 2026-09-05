@@ -208,6 +208,28 @@ class EffectJournal:
             frozenset({"reserved", "launched"}),
         )
 
+    def mark_refused(
+        self,
+        task_id: str,
+        epoch: int,
+        reason: str,
+        retry_after_seconds: float | None = None,
+    ) -> Effect:
+        """Record a temporary executor refusal without ending the epoch.
+
+        The effect stays ``reserved`` so the next ``start`` adopts it instead
+        of forking a new epoch; the executor's own sentence is the outcome the
+        operator reads, and ``retry_at`` says when trying again makes sense.
+        """
+        retry_at = None if retry_after_seconds is None else time.time() + float(retry_after_seconds)
+        return self._advance(
+            task_id,
+            epoch,
+            "outcome = ?, retry_at = ?",
+            (f"refused:{reason}", retry_at),
+            frozenset({"reserved"}),
+        )
+
     def mark_superseded(
         self, task_id: str, epoch: int, workspace_id: str
     ) -> Effect:
