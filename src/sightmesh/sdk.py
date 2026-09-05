@@ -1141,11 +1141,25 @@ class SightMesh:
         self, task: TaskRecord, effect: Mapping[str, Any], fence: TaskFence
     ) -> tuple[str, str]:
         state = str(effect.get("state") or "")
+        reason = str(effect.get("reason") or "").strip()
+        if state == "pending" and effect.get("retryable"):
+            # The executor refused for a temporary reason (host process budget,
+            # disk reserve, drain in force) and said so in its own words. The
+            # reservation stays adoptable: re-issuing start adopts it once the
+            # condition clears. Nothing is terminalized, and the operator reads
+            # the executor's sentence, never a bare "lost".
+            retry_after = effect.get("retry_after_seconds")
+            self.journal.mark_refused(task.task_id, task.epoch, reason or "refused", retry_after)
+            wait = f"; retry after {int(retry_after)}s" if retry_after else ""
+            raise CdesktopPendingError(
+                f"launch refused for {task.key!r}: {reason or 'temporary refusal'}{wait}",
+                status=503,
+            )
         if state == "lost":
-            reason = str(effect.get("reason") or "lost")
+            reason = reason or "lost"
             self.journal.mark_terminal(task.task_id, task.epoch, f"lost:{reason}")
             self._finish(task, "lost", reason, fence)
-            raise SightMeshError(f"Native launch for {task.key!r} was lost")
+            raise SightMeshError(f"Native launch for {task.key!r} was lost: {reason}")
         workspace_id = effect.get("workspace_id")
         session_id = effect.get("session_id")
         if state != "active" or not workspace_id or not session_id:

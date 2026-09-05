@@ -1355,3 +1355,48 @@ def test_only_an_active_task_accepts_mail(system, make_state):
     with pytest.raises((SightMeshError, BatchError), match=make_state):
         mesh.send("audit", "hello")
     assert client.sent == sent_before
+
+
+def test_a_temporary_refusal_keeps_the_reservation_and_says_why(system):
+    # The executor refuses temporarily (host process budget, drain) and says so
+    # in its own words. 0.13.x flattened that to "Native launch was lost" and
+    # blocked the task. The reservation must stay adoptable, the sentence must
+    # reach the operator, and the next start must adopt and activate.
+    mesh, client, store, _ownership = system
+    native = client.managed_launch
+    refused = {"state": "pending", "retryable": True, "retry_after_seconds": 30,
+               "reason": "spawn refused: 2810 live processes plus reserve would exceed the 3002 process ceiling"}
+
+    def refusing_launch(task_id, epoch, launch):
+        client.effects[(task_id, epoch)] = {**refused, "created": False}
+        return dict(refused)
+
+    client.managed_launch = refusing_launch
+    with pytest.raises(BatchError) as excinfo:
+        mesh.start(spec())
+    assert "2810 live processes" in str(excinfo.value)
+    assert "lost" not in str(excinfo.value)
+    task = mesh._find("audit")
+    assert task.state == "reserved"
+    effect = mesh.journal.get(task.task_id, task.epoch)
+    assert effect.state == "reserved" and effect.outcome.startswith("refused:spawn refused")
+    assert effect.retry_at is not None
+    client.managed_launch = native
+    client.effects.pop((task.task_id, task.epoch), None)
+    started = mesh.start(spec())
+    assert started.state == "active"
+
+
+def test_a_definitive_launch_failure_reports_the_executor_reason(system):
+    # A real failure stays terminal, but the error names the executor's reason
+    # instead of the bare word "lost".
+    mesh, client, _store, _ownership = system
+
+    def failing_launch(task_id, epoch, launch):
+        return {"state": "lost", "reason": "git worktree add failed: disk full"}
+
+    client.managed_launch = failing_launch
+    with pytest.raises(BatchError) as excinfo:
+        mesh.start(spec())
+    assert "disk full" in str(excinfo.value)
+    assert mesh._find("audit").state == "lost"
