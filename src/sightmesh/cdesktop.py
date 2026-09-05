@@ -478,10 +478,13 @@ class CdesktopClient:
         else:
             if not isinstance(result, list):
                 raise CdesktopError("cdesktop running execution response is not a list")
+            if any(not isinstance(item, dict) for item in result):
+                raise CdesktopError(
+                    "cdesktop running execution response contains a malformed member"
+                )
             return [
                 {**dict(item), "status": "running", "session_name": item.get("name")}
                 for item in result
-                if isinstance(item, dict)
             ]
 
         running: list[dict[str, Any]] = []

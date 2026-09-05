@@ -384,6 +384,17 @@ class FakeCdesktop:
         self._log("execution_processes", session_id)
         return self.processes.get(session_id, [])
 
+    def running_execution_processes(self) -> list[dict[str, Any]]:
+        """Return the executor's fleet-wide live-process truth for admission."""
+        assert_external_io_allowed()
+        self._log("running_execution_processes")
+        return [
+            {**process, "session_id": session_id}
+            for session_id, processes in self.processes.items()
+            for process in processes
+            if process.get("status") == "running"
+        ]
+
     def normalized_snapshot(self, process_id: str) -> dict[str, Any]:
         assert_external_io_allowed()  # the real client does HTTP here
         self._log("normalized_snapshot", process_id)

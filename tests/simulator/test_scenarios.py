@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from sightmesh.cdesktop import CdesktopRejectedError
+from sightmesh.cdesktop import CdesktopError, CdesktopRejectedError
 from sightmesh.durable import DurableExecutionReconciler
 from sightmesh.effects import EffectJournal, request_hash
 from sightmesh.escalation import EscalationStore
@@ -1464,3 +1464,111 @@ def test_s13_task_surfaces_at_a_thousand_tasks_perform_zero_fleet_scans(
     capsys.readouterr()
 
     assert len(client.call_log) == before
+
+
+# ---------------------------------------------------------------- S14-S15: admission truth
+
+
+def test_s14_checkpointed_manager_yields_its_slot_to_a_live_executor(
+    monkeypatch, mesh: SightMesh, client, store: TaskStore
+) -> None:
+    """S14: a manager with a completed turn is not a running process (#118)."""
+    monkeypatch.setenv("SIGHTMESH_MAX_ACTIVE_WORKERS", "2")
+    manager = mesh.start(worker_spec("manager", children=1))
+    mesh.checkpoint("waiting for child", "manager")
+    full = mesh.start(worker_spec("full"))
+    client.run_process(full.session_id, last_activity=time.time())
+
+    admitted = mesh.start(worker_spec("next"))
+
+    assert store.get_by_session(manager.session_id).checkpoint is not None
+    assert store.count_running(client.running_execution_processes()) == 1
+    assert admitted.state == "active"
+
+
+def test_s15_stuck_cleanup_intent_does_not_consume_an_idle_executor_slot(
+    monkeypatch, mesh: SightMesh, client, store: TaskStore
+) -> None:
+    """S15: cleanup durability never masquerades as a running process (#118)."""
+    monkeypatch.setenv("SIGHTMESH_MAX_ACTIVE_WORKERS", "1")
+    stale = mesh.start(worker_spec("stale"))
+    task = store.get("operator", "stale")
+    store.record_cleanup_intents(task.task_id, task.epoch, stale.session_id, [
+        {"id": "unacknowledged", "state": "pending"}
+    ])
+    with store.task_lock(task.task_id) as fence:
+        store.finish(task.task_id, "cancelled", fence=fence)
+
+    admitted = mesh.start(worker_spec("next"))
+
+    assert store.pending_cleanup_intents()[0]["state"] == "pending"
+    assert store.count_running(client.running_execution_processes()) == 0
+    assert admitted.state == "active"
+
+
+def test_s16_admission_counts_unmanaged_and_obsolete_live_processes(
+    monkeypatch, mesh: SightMesh, client, store: TaskStore
+) -> None:
+    """S16: process truth includes work the current task journal cannot name (#118)."""
+    monkeypatch.setenv("SIGHTMESH_MAX_ACTIVE_WORKERS", "1")
+    monkeypatch.setenv("SIGHTMESH_LAUNCH_WAIT_SECONDS", "0")
+    client.run_process("unmanaged", last_activity=time.time())
+
+    with pytest.raises(BatchError, match="capacity"):
+        mesh.start(worker_spec("blocked-by-direct"))
+
+    # Replacing a task advances its current epoch, but a process from its old
+    # epoch is still host load until the executor reports it stopped.
+    client.processes.clear()
+    old = mesh.start(worker_spec("old"))
+    client.run_process(old.session_id, last_activity=time.time())
+    task = store.get("operator", "old")
+    with store.task_lock(task.task_id) as fence:
+        store.prepare_replacement(task.task_id, fence=fence)
+
+    with pytest.raises(BatchError, match="capacity"):
+        mesh.start(worker_spec("blocked-by-old-epoch"))
+
+
+def test_s17_simultaneous_starters_never_exceed_the_process_cap(
+    monkeypatch, mesh: SightMesh, client, store: TaskStore
+) -> None:
+    """S17: the admission lock carries one process slot across concurrent starts."""
+    monkeypatch.setenv("SIGHTMESH_MAX_ACTIVE_WORKERS", "4")
+    monkeypatch.setenv("SIGHTMESH_LAUNCH_WAIT_SECONDS", "0")
+    original_launch = client.managed_launch
+
+    def launch(*args, **kwargs):
+        launched = original_launch(*args, **kwargs)
+        client.run_process(launched["session_id"], last_activity=time.time())
+        return launched
+
+    client.managed_launch = launch
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = [pool.submit(mesh.start, worker_spec(f"parallel-{index}")) for index in range(5)]
+    results = [future.result() if not future.exception() else future.exception() for future in futures]
+
+    assert sum(not isinstance(result, Exception) for result in results) == 4
+    assert sum(isinstance(result, BatchError) and "capacity" in str(result) for result in results) == 1
+    assert store.count_running(client.running_execution_processes()) == 4
+
+
+def test_s18_malformed_process_truth_refuses_the_launch(
+    mesh: SightMesh, client
+) -> None:
+    """S18: no executor truth is an admission failure, never a free slot (#118)."""
+    client.running_execution_processes = lambda: [{}]
+
+    with pytest.raises(BatchError, match="Malformed running execution-process response"):
+        mesh.start(worker_spec("malformed"))
+
+
+def test_s19_unavailable_process_truth_refuses_the_launch(mesh: SightMesh, client) -> None:
+    """S19: unavailable executor truth is also fail-closed admission (#118)."""
+    def unavailable():
+        raise CdesktopError("GET /execution-processes/running failed: HTTP 503")
+
+    client.running_execution_processes = unavailable
+
+    with pytest.raises(BatchError, match="execution-processes/running"):
+        mesh.start(worker_spec("unavailable"))

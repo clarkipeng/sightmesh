@@ -6,7 +6,7 @@ import json
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterable, Iterator
+from collections.abc import Collection, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -382,6 +382,22 @@ class TaskStore:
                 HELD_TASK_FENCE.reset(fence._token)
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
+    @contextmanager
+    def admission_lock(self) -> Iterator[None]:
+        """Serialize process admission across every local SightMesh starter.
+
+        The lock spans the executor snapshot and launch so simultaneous
+        starters cannot all observe the same spare slot. It is intentionally
+        separate from a task fence: executor I/O must remain unlocked per task.
+        """
+        path = self.path.parent / f".{self.path.name}.admission-lock"
+        with path.open("a+") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
     @staticmethod
     def _migrate_managed_tasks(conn: sqlite3.Connection) -> None:
         """Bring ``managed_tasks`` to the kernel v1 shape, forward only.
@@ -695,25 +711,19 @@ class TaskStore:
     def get(self, scope: str, key: str) -> TaskRecord | None:
         return self._one("scope = ? AND task_key = ?", (scope, key))
 
-    def count_running(self) -> int:
-        """Managed tasks currently holding an executor session (active or in a
-        handoff). This is the kernel-side admission count: direct launches
-        must not stampede past what queued coordination can live with (#88)."""
+    def count_running(self, processes: Collection[dict[str, Any]]) -> int:
+        """Count the executor's live coding-agent processes for admission.
+
+        The process list is executor truth, so managed-task state, effect
+        epoch, cleanup intent, and outgoing mail cannot alter the count.
+        """
         try:
-            with self._database._connect() as conn:
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM managed_tasks AS t WHERE "
-                    "(t.state IN ('active', 'replacing') AND NOT EXISTS ("
-                    "SELECT 1 FROM task_effects AS e WHERE e.task_id = t.task_id "
-                    "AND e.epoch = t.epoch AND e.state = 'terminal')) OR EXISTS ("
-                    "SELECT 1 FROM task_cleanup_intents AS i WHERE i.task_id = t.task_id "
-                    "AND i.epoch = t.epoch AND i.state = 'pending') OR EXISTS ("
-                    "SELECT 1 FROM task_outgoing_commands AS o WHERE o.task_id = t.task_id "
-                    "AND o.epoch = t.epoch AND o.state IN ('sending', 'cleanup'))"
-                ).fetchone()
-            return int(row[0]) if row else 0
-        except sqlite3.DatabaseError as exc:
-            raise TaskStoreError(f"Cannot count running tasks: {exc}") from exc
+            return sum(
+                process["status"] == "running" and process["run_reason"] == "codingagent"
+                for process in processes
+            )
+        except (KeyError, TypeError) as exc:
+            raise TaskStoreError("Malformed running execution-process response") from exc
 
     def record_cleanup_intents(
         self, task_id: str, epoch: int, session_id: str, commands: Iterable[Any]

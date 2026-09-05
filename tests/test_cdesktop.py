@@ -126,6 +126,31 @@ def test_running_execution_processes_normalizes_pr34_response_shape() -> None:
     ]
 
 
+def test_running_execution_processes_rejects_malformed_member() -> None:
+    """A malformed fleet member is invalid executor truth, not an empty fleet."""
+
+    class RunningClient(FakeClient):
+        def request(self, method, path, payload=None, query=None, headers=None):
+            assert_external_io_allowed()  # this override stands in for HTTP
+            self.calls.append((method, path, payload, query, headers))
+            return [None]
+
+    with pytest.raises(cdesktop.CdesktopError, match="malformed member"):
+        RunningClient().running_execution_processes()
+
+
+def test_running_execution_processes_accepts_a_normal_empty_list() -> None:
+    """An explicitly empty fleet is valid and remains a free admission slot."""
+
+    class RunningClient(FakeClient):
+        def request(self, method, path, payload=None, query=None, headers=None):
+            assert_external_io_allowed()  # this override stands in for HTTP
+            self.calls.append((method, path, payload, query, headers))
+            return []
+
+    assert RunningClient().running_execution_processes() == []
+
+
 def test_running_execution_processes_falls_back_to_pinned_028_shape() -> None:
     """Pinned 0.2.8 requires session_id and returns the bare process model."""
     class LegacyClient(FakeClient):
