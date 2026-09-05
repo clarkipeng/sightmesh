@@ -385,7 +385,7 @@ def test_parent_child_limit_is_fixed_when_parent_starts(system):
         child_mesh.start(spec("second"))
 
 
-def test_replacements_keep_workspace_and_trip_circuit_breaker(system):
+def test_manual_replacements_keep_workspace_without_spending_failure_budget(system):
     mesh, _client, _store, _ownership = system
     first = mesh.start(spec())
 
@@ -394,9 +394,7 @@ def test_replacements_keep_workspace_and_trip_circuit_breaker(system):
 
     assert second.workspace_id == first.workspace_id
     assert third.workspace_id == first.workspace_id
-    assert third.attempts == 3
-    with pytest.raises(TaskStoreError, match="circuit breaker"):
-        mesh.replace("audit", "Do not launch")
+    assert third.attempts == 0
 
 
 def test_checkpoint_content_stays_in_the_task_worktree(system):
@@ -443,7 +441,7 @@ def test_duplicate_failover_wakeups_reserve_one_successor_epoch(system):
     losers = [item for item in outcomes if isinstance(item, StaleTransition)]
     assert len(winners) == 1 and len(losers) == 1
     assert winners[0].epoch == 2
-    assert winners[0].attempts == 2
+    assert winners[0].attempts == 0
     assert losers[0].current.epoch == 2
 
 
@@ -518,7 +516,7 @@ def test_a_typed_rate_limit_moves_once_to_the_next_hop(system, monkeypatch):
     assert recovered is not None
     assert recovered.workspace_id == started.workspace_id
     assert recovered.session_id != started.session_id
-    assert recovered.attempts == 2
+    assert recovered.attempts == 1
     # One advance, not two: the retry resumed the epoch already prepared
     # (recovery is recorded on the target) instead of burning a second one.
     assert [
@@ -537,6 +535,30 @@ def test_a_typed_rate_limit_moves_once_to_the_next_hop(system, monkeypatch):
     assert record is not None
     assert record.spec["target"]["route_id"] == "sol"
     assert record.spec["target"]["route_class"] == "standard"
+
+
+def test_three_reconciled_provider_failures_end_exhausted_once(system, monkeypatch):
+    """The real reconcile path charges distinct failed epochs, never observations."""
+    mesh, client, store, _ownership = system
+    _routed(monkeypatch, FIRST_TARGET, following=execution_routing.SelectionResult(
+        "resolved", NEXT_TARGET, (), None
+    ))
+    worker = mesh.start(spec(executor=None))
+
+    for expected in (1, 2):
+        _mark_outcome(mesh, store, "rate_limited")
+        worker = mesh.reconcile_provider_outcome(worker.session_id)
+        assert worker is not None and worker.attempts == expected
+
+    _mark_outcome(mesh, store, "provider_down")
+    exhausted = mesh.reconcile_provider_outcome(worker.session_id)
+    assert exhausted is not None
+    assert (exhausted.state, exhausted.attempts, exhausted.result) == (
+        "exhausted", 3, "exhausted: provider_down on route sol"
+    )
+    assert len(client.launches) == 3
+    assert mesh.reconcile_provider_outcome(worker.session_id) is None
+    assert store.get("operator", "audit").attempts == 3
 
 
 def test_a_code_failure_blocks_visibly_and_never_reroutes(system):
@@ -643,7 +665,9 @@ def test_a_profile_with_failover_off_blocks_with_a_reason(system, monkeypatch):
     blocked = mesh.reconcile_provider_outcome(started.session_id)
 
     assert blocked is not None and blocked.state == "blocked"
-    assert "automatic failover is off" in str(store.get("operator", "audit").result)
+    task = store.get("operator", "audit")
+    assert task is not None and task.attempts == 1
+    assert "automatic failover is off" in str(task.result)
 
 
 def test_exhausted_route_chain_blocks_without_spawning(system, monkeypatch):
@@ -1226,6 +1250,7 @@ def test_expired_reservation_can_be_reissued_with_a_new_spec(system):
 
     current = store.get("operator", "audit")
     assert current.epoch == 2
+    assert current.attempts == 1
     assert current.spec["prompt"] == "new prompt"
     assert restarted.state == "active"
 
@@ -1470,9 +1495,9 @@ def test_a_temporary_refusal_keeps_the_reservation_and_says_why(system):
 
 
 def test_a_definitive_launch_failure_reports_the_executor_reason(system):
-    # A real failure stays terminal, but the error names the executor's reason
-    # instead of the bare word "lost".
-    mesh, client, _store, _ownership = system
+    # A real failure stays terminal and charges once, but the error names the
+    # executor's reason instead of the bare word "lost".
+    mesh, client, store, _ownership = system
 
     def failing_launch(task_id, epoch, launch):
         return {"state": "lost", "reason": "git worktree add failed: disk full"}
@@ -1481,4 +1506,5 @@ def test_a_definitive_launch_failure_reports_the_executor_reason(system):
     with pytest.raises(BatchError) as excinfo:
         mesh.start(spec())
     assert "disk full" in str(excinfo.value)
-    assert mesh._find("audit").state == "lost"
+    task = store.get("operator", "audit")
+    assert task is not None and (task.state, task.attempts) == ("lost", 1)

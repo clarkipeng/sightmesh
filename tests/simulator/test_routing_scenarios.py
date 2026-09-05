@@ -770,7 +770,7 @@ def test_sd13_a_task_at_its_attempt_limit_stops_instead_of_retrying_forever(
         mesh.reconcile_provider_outcomes()
 
     task = store.get("operator", "audit")
-    assert task.attempts == task.max_attempts and task.state == "blocked"
+    assert task.attempts == task.max_attempts and task.state == "exhausted"
     assert cooling("acct-d") == 0
     launches = len(mesh.client.calls("managed_launch"))
 
@@ -822,17 +822,14 @@ def test_sd15_one_task_that_cannot_advance_does_not_abort_the_sweep(
     assert sorted(states.values()) == ["active", "blocked"]
 
 
-def test_sd13_a_live_task_out_of_attempts_blocks_rather_than_hanging(
+def test_sd13_a_live_task_hits_its_final_failure_before_exhausting(
     mesh: SightMesh, store: TaskStore, pool_root, routing_settings
 ) -> None:
     """S-D13 (contrast): excluding a spent task from the sweep is not enough on
     its own.
 
-    A task can reach its attempt limit and still be *running* - it is the
-    replacement that ran out, not the work. When such a task is then refused
-    mid-run, dropping it from the sweep would be a silent hang. It blocks with
-    the reason instead, once, and the sweep filter keeps it from being retried
-    after that.
+    A running task can have prior failures without being exhausted. Its final
+    typed failure must produce the terminal exhausted outcome, not a hang.
     """
     seed_pool(
         claude_account("acct-a"), claude_account("acct-b"), claude_account("acct-c")
@@ -844,13 +841,13 @@ def test_sd13_a_live_task_out_of_attempts_blocks_rather_than_hanging(
     mesh.reconcile_provider_outcomes()
     live = mesh.reconcile_provider_outcomes()[0]
     task = store.get("operator", "audit")
-    assert task.state == "active" and task.attempts == task.max_attempts
+    assert task.state == "active" and task.attempts == task.max_attempts - 1
 
     mesh.client.fail_process(live.session_id, outcome_class="quota_exhausted")
     settled = mesh.reconcile_provider_outcome(live.session_id)
 
-    assert settled is not None and settled.state == "blocked"
-    assert "circuit breaker" in str(store.get("operator", "audit").result)
+    assert settled is not None and settled.state == "exhausted"
+    assert "rate_limited" in str(store.get("operator", "audit").result)
     assert store.get("operator", "audit").epoch == task.epoch
     # And the account it was refused on is still cooled, spent attempts or not.
     assert cooling("acct-c") > 0

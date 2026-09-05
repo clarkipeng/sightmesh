@@ -123,6 +123,7 @@ def finish_with_wake(
     result: str | None = None,
     *,
     expect_version: int | None = None,
+    charge_failure: bool = False,
     fence: TaskFence | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> tuple[TaskRecord, list[str]]:
@@ -140,18 +141,19 @@ def finish_with_wake(
                 state,
                 result,
                 expect_version=expect_version,
+                charge_failure=charge_failure,
                 fence=held,
                 conn=conn,
             )
     if conn is not None:
         return _finish_with_wake(
-            store, conn, task_id, state, result, expect_version, fence
+            store, conn, task_id, state, result, expect_version, charge_failure, fence
         )
     try:
         with store.connect() as owned:
             owned.execute("BEGIN IMMEDIATE")
             result_pair = _finish_with_wake(
-                store, owned, task_id, state, result, expect_version, fence
+                store, owned, task_id, state, result, expect_version, charge_failure, fence
             )
             owned.execute("COMMIT")
             return result_pair
@@ -168,10 +170,12 @@ def _finish_with_wake(
     state: str,
     result: str | None,
     expect_version: int | None,
+    charge_failure: bool,
     fence: TaskFence | None,
 ) -> tuple[TaskRecord, list[str]]:
     record = store.finish(
-        task_id, state, result, expect_version=expect_version, fence=fence, conn=conn
+        task_id, state, result, expect_version=expect_version,
+        charge_failure=charge_failure, fence=fence, conn=conn
     )
     created: list[str] = []
     if record.parent_task_id:
@@ -307,7 +311,7 @@ def record_liveness_wakes(
     """
     moment = time.time() if now is None else now
     row = conn.execute(
-        "SELECT task_id, parent_task_id, epoch, state, liveness, liveness_episode, "
+        "SELECT task_id, parent_task_id, epoch, state, result, liveness, liveness_episode, "
         "liveness_since, liveness_wakes, liveness_evidence, over_budget "
         "FROM managed_tasks WHERE task_id = ?",
         (str(child_task_id),),
@@ -318,7 +322,9 @@ def record_liveness_wakes(
     epoch = int(row["epoch"])
     created: list[str] = []
 
-    if str(row["state"]) == "lost":
+    if str(row["state"]) == "lost" or (
+        str(row["state"]) == "exhausted" and str(row["result"] or "").startswith("exhausted: lost:")
+    ):
         # A dead child has no stall episode and no budget left to run; the
         # loss is the whole report.
         return _arm_liveness(
@@ -584,7 +590,7 @@ def _payload(
         if child.result:
             line += f" | {child.result}"
         if child.liveness_evidence and (
-            child.liveness != "live" or child.over_budget or child.state == "lost"
+            child.liveness != "live" or child.over_budget or child.state in {"lost", "exhausted"}
         ):
             line += f" | evidence={child.liveness_evidence}"
         lines.append(line)
