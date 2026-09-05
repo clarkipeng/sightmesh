@@ -201,6 +201,7 @@ def test_install_restores_previous_definitions_when_reload_fails(
     monkeypatch.setattr(service, "plist_path", lambda: target)
     monkeypatch.setattr(service, "bridge_plist_path", lambda: bridge_target)
     monkeypatch.setattr(service, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(service, "config_dir", lambda: tmp_path / "config")
     monkeypatch.setattr(service.shutil, "which", lambda name: f"/tmp/{name}")
     attempts = []
     bootstraps = []
