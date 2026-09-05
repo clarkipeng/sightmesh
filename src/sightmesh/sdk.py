@@ -1007,11 +1007,15 @@ class SightMesh:
 
     def _start_reserved(self, task: TaskRecord) -> TaskRecord:
         """Launch a reservation while sharing terminal writers' task fence."""
-        with self.store.task_lock(task.task_id) as fence:
-            current = self.store.get_by_id(task.task_id)
-            if current is None:
-                raise SightMeshError(f"Task {task.key!r} no longer exists")
-            return self._start_reserved_locked(current, fence)
+        # Admission is the outer lock. Its executor I/O temporarily releases
+        # only the task fence, so a duplicate start waits here instead of
+        # taking that fence and deadlocking the first starter's reacquire.
+        with self.store.admission_lock():
+            with self.store.task_lock(task.task_id) as fence:
+                current = self.store.get_by_id(task.task_id)
+                if current is None:
+                    raise SightMeshError(f"Task {task.key!r} no longer exists")
+                return self._start_reserved_locked(current, fence)
 
     def _start_reserved_locked(self, task: TaskRecord, fence: TaskFence) -> TaskRecord:
         if task.state != "reserved":
@@ -1027,7 +1031,13 @@ class SightMesh:
         current = self._reload_unchanged(task)
         if current is None or current.state != "reserved":
             return self.store.get_by_id(task.task_id) or task
-        self._wait_for_launch_capacity(task)
+        self._wait_for_launch_capacity(task, fence)
+        # The fresh executor snapshot ran with this task fence open. A
+        # cancellation or epoch change that won there must not launch from
+        # the old reservation after the admission lock is acquired.
+        current = self._reload_unchanged(task)
+        if current is None or current.state != "reserved":
+            return self.store.get_by_id(task.task_id) or task
         workspace_id, session_id = self._journaled_launch(
             task, {"kind": "workspace", "request": request}, fence
         )
@@ -1037,7 +1047,7 @@ class SightMesh:
         self._record_launcher(active)
         return active
 
-    def _wait_for_launch_capacity(self, task: TaskRecord) -> None:
+    def _wait_for_launch_capacity(self, task: TaskRecord, fence: TaskFence) -> None:
         """Kernel-side admission (#88): direct launches bypass cdesktop's queued
         dispatch cap, so an unbounded fan-out starves every queued wake and
         resume. Wait (bounded) for managed concurrency to drop under the cap,
@@ -1050,7 +1060,9 @@ class SightMesh:
         )
         delay = 0.5
         while True:
-            running = self.store.count_running()
+            with fence.external_io():
+                processes = self.client.running_execution_processes()
+            running = self.store.count_running(processes)
             if running < cap:
                 return
             if time.monotonic() >= deadline:

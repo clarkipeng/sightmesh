@@ -130,6 +130,15 @@ class FakeClient:
         assert_external_io_allowed()  # the real client does HTTP here
         return self.processes.get(session_id, [])
 
+    def running_execution_processes(self):
+        assert_external_io_allowed()  # the real client does HTTP here
+        return [
+            {**process, "session_id": session_id}
+            for session_id, processes in self.processes.items()
+            for process in processes
+            if process.get("status") == "running"
+        ]
+
     def normalized_snapshot(self, process_id):
         assert_external_io_allowed()  # the real client does HTTP here
         return self.snapshots[process_id]
@@ -257,6 +266,31 @@ def test_cancel_can_win_while_managed_launch_is_in_flight(system, monkeypatch):
     effect = mesh.journal.get(task.task_id, 1)
     assert effect is not None and effect.outcome == "superseded"
     assert client.stopped == [f"workspace-{task.task_id}"]
+
+
+def test_duplicate_starts_do_not_deadlock_while_executor_io_is_paused(system, monkeypatch):
+    """Admission is acquired before a task fence, so its unlocked I/O has no cycle."""
+    mesh, client, _store, _ownership = system
+    entered = threading.Event()
+    release = threading.Event()
+    native = client.managed_launch
+
+    def paused_launch(task_id, epoch, launch):
+        entered.set()
+        assert release.wait(timeout=5)
+        return native(task_id, epoch, launch)
+
+    monkeypatch.setattr(client, "managed_launch", paused_launch)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(mesh.start, spec())
+        assert entered.wait(timeout=5)
+        duplicate = pool.submit(mesh.start, spec())
+        release.set()
+        started = first.result(timeout=5)
+        replayed = duplicate.result(timeout=5)
+
+    assert replayed == started
+    assert len(client.effects) == 1
 
 
 def test_repo_name_prefers_the_canonical_registration(system):
@@ -937,11 +971,18 @@ def test_start_waits_for_capacity_then_refuses_with_a_typed_error(monkeypatch, t
     from sightmesh.task_store import TaskRecord
 
     class Store:
-        def count_running(self):
+        def count_running(self, processes):
+            assert len(processes) == 4
             return 4
+
+    class Client:
+        @staticmethod
+        def running_execution_processes():
+            return [{"status": "running", "run_reason": "codingagent"}] * 4
 
     mesh = sdk_mod.SightMesh.__new__(sdk_mod.SightMesh)
     mesh.store = Store()
+    mesh.client = Client()
     monkeypatch.setenv("SIGHTMESH_MAX_ACTIVE_WORKERS", "4")
     monkeypatch.setenv("SIGHTMESH_LAUNCH_WAIT_SECONDS", "0")
     monkeypatch.setattr(sdk_mod.time, "sleep", lambda *_: None)
@@ -955,7 +996,9 @@ def test_start_waits_for_capacity_then_refuses_with_a_typed_error(monkeypatch, t
             "created_at","updated_at"}},
     )
     with pytest.raises(sdk_mod.SightMeshError, match="capacity"):
-        mesh._wait_for_launch_capacity(task)
+        from contextlib import nullcontext
+
+        mesh._wait_for_launch_capacity(task, SimpleNamespace(external_io=nullcontext))
 
 
 def test_admission_sweep_loses_dead_tasks_across_scopes(system):
@@ -995,7 +1038,7 @@ def test_admission_sweep_loses_dead_tasks_across_scopes(system):
     retired = ownership.get(worker.session_id)
     assert retired.state == "retired"
     assert retired.logical_key == f"task:{task.task_id}:{task.epoch}"
-    assert store.count_running() == 0
+    assert store.count_running(client.running_execution_processes()) == 0
 
     second = other_scope.sweep_admission()
     assert second["tasks_lost"] == 0
@@ -1017,7 +1060,7 @@ def test_terminalization_cancels_queued_command_before_releasing_capacity(system
 
     assert client.commands[0]["state"] == "cancelled"
     assert client.cancel_calls == [(worker.session_id, "queued-1")]
-    assert store.count_running() == 0
+    assert store.count_running(client.running_execution_processes()) == 0
 
 
 def test_send_after_terminal_snapshot_is_durably_cancelled_before_capacity_releases(system):
@@ -1052,7 +1095,7 @@ def test_send_after_terminal_snapshot_is_durably_cancelled_before_capacity_relea
     def cancel(session_id, command_id):
         assert_external_io_allowed()
         cancel_entered.set()
-        assert store.count_running() == 1
+        assert store.count_running(client.running_execution_processes()) == 0
         row = next(row for row in client.commands if row["id"] == command_id)
         row["state"] = "cancelled"
         return dict(row)
@@ -1075,7 +1118,7 @@ def test_send_after_terminal_snapshot_is_durably_cancelled_before_capacity_relea
     terminal.join(2)
     assert not terminal.is_alive()
     assert store.get("operator", "audit").state == "cancelled"
-    assert store.count_running() == 1
+    assert store.count_running(client.running_execution_processes()) == 0
     allow_enqueue.set()
     sender.join(2)
 
@@ -1086,7 +1129,7 @@ def test_send_after_terminal_snapshot_is_durably_cancelled_before_capacity_relea
     )] == []
     assert cancel_entered.is_set()
     assert client.commands[0]["state"] == "cancelled"
-    assert store.count_running() == 0
+    assert store.count_running(client.running_execution_processes()) == 0
 
 
 def test_terminalization_stops_a_running_execution_and_waits_for_its_ack(system):
@@ -1103,7 +1146,7 @@ def test_terminalization_stops_a_running_execution_and_waits_for_its_ack(system)
     assert client.execution_stops == [
         ("process-1", f"terminal:{store.get('operator', 'audit').task_id}:process-1")
     ]
-    assert store.count_running() == 0
+    assert store.count_running(client.running_execution_processes()) == 0
 
 
 def test_missing_cancel_route_keeps_terminal_capacity_and_retries_after_restart(system):
@@ -1122,14 +1165,14 @@ def test_missing_cancel_route_keeps_terminal_capacity_and_retries_after_restart(
 
     client.cancel_command = missing_route
     mesh.cancel("audit")
-    assert store.count_running() == 1
+    assert store.count_running(client.running_execution_processes()) == 0
     assert store.pending_cleanup_intents()[0]["state"] == "pending"
 
     # A fresh reconciler sees the stored intent, not a former process's memory.
     client.cancel_command = FakeClient.cancel_command.__get__(client, FakeClient)
     DurableExecutionReconciler(client, task_store=store, ownership=ownership).reconcile_cleanup_intents()
     assert client.commands[0]["state"] == "cancelled"
-    assert store.count_running() == 0
+    assert store.count_running(client.running_execution_processes()) == 0
 
 
 def test_expired_reservation_can_be_reissued_with_a_new_spec(system):
