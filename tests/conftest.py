@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from sightmesh import escalation, succession, task_store
+from sightmesh import escalation, leases, routing, service, succession, task_store
 
 
 @pytest.fixture(autouse=True)
@@ -35,6 +35,15 @@ def _isolate_escalation_store(monkeypatch, tmp_path):
         original_init(self, chosen)
 
     monkeypatch.setattr(task_store.TaskStore, "__init__", isolated_task_store)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_local_state_paths(monkeypatch, tmp_path: Path) -> None:
+    """Keep every default durable/config path below this test's temporary root."""
+    monkeypatch.setattr(leases, "default_lease_dir", lambda: tmp_path / "leases")
+    monkeypatch.setattr(routing, "routing_path", lambda: tmp_path / "config" / "bridge.json")
+    monkeypatch.setattr(service, "state_dir", lambda: tmp_path / "state")
+    monkeypatch.setattr(service, "config_dir", lambda: tmp_path / "config")
 
 
 @pytest.fixture(autouse=True)

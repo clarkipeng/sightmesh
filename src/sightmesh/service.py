@@ -58,11 +58,15 @@ def state_dir() -> Path:
     return Path.home() / ".local" / "state" / "sightmesh"
 
 
+def config_dir() -> Path:
+    return Path.home() / ".config" / "sightmesh"
+
+
 def harden_local_storage() -> list[str]:
     secured: list[str] = []
     private_trees = [
         state_dir(),
-        Path.home() / ".config" / "sightmesh",
+        config_dir(),
     ]
     for root in private_trees:
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
