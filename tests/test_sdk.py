@@ -10,7 +10,13 @@ import pytest
 
 from sightmesh import execution_routing
 from sightmesh import sdk as sdk_module
-from sightmesh.cdesktop import CdesktopError, CdesktopRejectedError, CdesktopPendingError
+from sightmesh import cdesktop as cdesktop_module
+from sightmesh.cdesktop import (
+    CdesktopClient,
+    CdesktopError,
+    CdesktopPendingError,
+    CdesktopRejectedError,
+)
 from sightmesh.durable import DurableExecutionReconciler
 from sightmesh.profiles import Profile
 from sightmesh.sdk import BatchError, Command, SightMesh, SightMeshError, WorkerSpec
@@ -999,6 +1005,39 @@ def test_start_waits_for_capacity_then_refuses_with_a_typed_error(monkeypatch, t
         from contextlib import nullcontext
 
         mesh._wait_for_launch_capacity(task, SimpleNamespace(external_io=nullcontext))
+
+
+def test_admission_rejects_malformed_fleet_member_from_real_client(
+    monkeypatch, tmp_path
+) -> None:
+    """Admission must see the real client's malformed-response rejection."""
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b"[null]"
+
+    monkeypatch.setattr(
+        cdesktop_module, "urlopen", lambda *_args, **_kwargs: Response()
+    )
+    client = CdesktopClient("http://127.0.0.1:1")
+    mesh = sdk_module.SightMesh.__new__(sdk_module.SightMesh)
+    mesh.client = client
+    mesh.store = TaskStore(tmp_path / "tasks.sqlite")
+    monkeypatch.setenv("SIGHTMESH_MAX_ACTIVE_WORKERS", "4")
+    monkeypatch.setenv("SIGHTMESH_LAUNCH_WAIT_SECONDS", "0")
+
+    from contextlib import nullcontext
+
+    with pytest.raises(CdesktopError, match="malformed member"):
+        mesh._wait_for_launch_capacity(
+            SimpleNamespace(key="malformed"), SimpleNamespace(external_io=nullcontext)
+        )
 
 
 def test_admission_sweep_loses_dead_tasks_across_scopes(system):
