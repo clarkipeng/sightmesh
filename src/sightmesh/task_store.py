@@ -31,7 +31,7 @@ FINISH_PREDECESSORS: dict[str, frozenset[str]] = {
     "blocked": frozenset({"reserved", "active", "replacing"}),
     "cancelled": frozenset({"reserved", "active", "replacing", "blocked"}),
     "lost": frozenset({"reserved", "active", "replacing"}),
-    "exhausted": frozenset({"active", "blocked"}),
+    "exhausted": frozenset({"reserved", "active", "replacing", "blocked"}),
 }
 #: ``replacing`` is included because a replacement launch activates the
 #: successor session it just spawned for the prepared epoch.
@@ -1284,6 +1284,7 @@ class TaskStore:
         result: str | None = None,
         *,
         expect_version: int | None = None,
+        charge_failure: bool = False,
         fence: TaskFence | None = None,
         conn: sqlite3.Connection | None = None,
     ) -> TaskRecord:
@@ -1297,12 +1298,18 @@ class TaskStore:
                     state,
                     result,
                     expect_version=expect_version,
+                    charge_failure=charge_failure,
                     fence=held,
                     conn=conn,
                 )
-        if state == "lost":
-            return self._record_loss(
-                task_id, result, expect_version=expect_version, fence=fence, conn=conn
+        if state == "lost" or charge_failure:
+            return self._record_failure(
+                task_id,
+                state,
+                result,
+                expect_version=expect_version,
+                fence=fence,
+                conn=conn,
             )
         if state == "exhausted":
             return self._record_exhaustion(
@@ -1319,16 +1326,17 @@ class TaskStore:
             conn=conn,
         )
 
-    def _record_loss(
+    def _record_failure(
         self,
         task_id: str,
+        state: str,
         result: str | None,
         *,
         expect_version: int | None,
         fence: TaskFence,
         conn: sqlite3.Connection | None,
     ) -> TaskRecord:
-        """Charge one durable loss, or expose the final one as exhausted.
+        """Charge one durable failure, or expose the final one as exhausted.
 
         A loss is terminal for an epoch. The guarded transition therefore also
         makes repeated reconciliation of that loss a no-op rather than a second
@@ -1338,8 +1346,9 @@ class TaskStore:
         if owned:
             with self._database._connect() as opened:
                 opened.execute("BEGIN IMMEDIATE")
-                record = self._record_loss(
-                    task_id, result, expect_version=expect_version, fence=fence, conn=opened
+                record = self._record_failure(
+                    task_id, state, result,
+                    expect_version=expect_version, fence=fence, conn=opened
                 )
                 opened.execute("COMMIT")
                 return record
@@ -1357,15 +1366,16 @@ class TaskStore:
         exhausted = task.attempts + 1 >= task.max_attempts
         return self.transition(
             task_id,
-            expect_states=FINISH_PREDECESSORS["lost"],
+            expect_states=FINISH_PREDECESSORS[state],
             expect_version=expect_version,
             assign=(
                 "state = 'exhausted', attempts = attempts + 1, result = ?"
                 if exhausted
-                else "state = 'lost', attempts = attempts + 1, result = ?"
+                else "state = ?, attempts = attempts + 1, result = ?"
             ),
-            values=(f"exhausted: {result or 'lost'}" if exhausted else result,),
-            attempted="exhausted" if exhausted else "lost",
+            values=(f"exhausted: {result or state}" if exhausted else state, result)
+            if not exhausted else (f"exhausted: {result or state}",),
+            attempted="exhausted" if exhausted else state,
             fence=fence,
             conn=conn,
         )

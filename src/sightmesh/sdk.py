@@ -442,12 +442,19 @@ class SightMesh:
             )
 
     def _finish(
-        self, task: TaskRecord, state: str, result: str | None, fence: TaskFence
+        self,
+        task: TaskRecord,
+        state: str,
+        result: str | None,
+        fence: TaskFence,
+        *,
+        charge_failure: bool = False,
     ) -> TaskRecord:
         """Make the durable terminal decision and enqueue its parent wake."""
         try:
             updated, _created = wakes.finish_with_wake(
-                self.store, task.task_id, state, result, fence=fence
+                self.store, task.task_id, state, result,
+                charge_failure=charge_failure, fence=fence
             )
         except StaleTransition as exc:
             if exc.current.state == state:
@@ -577,7 +584,7 @@ class SightMesh:
                 expect_states=frozenset({"lost"}),
                 expect_version=current.version,
                 assign=(
-                    "state = 'reserved', epoch = epoch + 1, attempts = attempts + 1, "
+                    "state = 'reserved', epoch = epoch + 1, "
                     "spec_json = ?, workspace_id = NULL, holder_session_id = NULL, "
                     "result = NULL"
                 ),
@@ -769,7 +776,7 @@ class SightMesh:
             return None
         if task.attempts >= task.max_attempts:
             return None
-        if task.attempts + 1 >= task.max_attempts:
+        if task.state == "active" and task.attempts + 1 >= task.max_attempts:
             # The circuit breaker has tripped. Saying so once is the whole
             # difference between a stopped task and a hung one. Exhaustion is
             # a terminal task outcome carrying the final failure.
@@ -828,7 +835,10 @@ class SightMesh:
         prepared = self.store.prepare_replacement(
             task.task_id,
             target=next_target,
-            charge_failure=True,
+            # A failed active epoch reaches this transition first. A blocked
+            # epoch got here after its launch failure was atomically charged
+            # with the block, so continuing that same failure costs nothing.
+            charge_failure=task.state == "active",
             expect_version=task.version,
             fence=fence,
         )
@@ -876,7 +886,9 @@ class SightMesh:
         """
         if task.state == "blocked":
             return None
-        return Worker.from_record(self._finish(task, "blocked", reason, fence))
+        return Worker.from_record(
+            self._finish(task, "blocked", reason, fence, charge_failure=True)
+        )
 
     def _record_provider_outcome(
         self, task: TaskRecord, outcome: str, retry_at: float | None
@@ -1140,7 +1152,10 @@ class SightMesh:
                 outcome = self._record_provider_outcome(
                     task, _rejection_outcome(exc.status), exc.retry_at
                 )
-                self._finish(task, "blocked", f"launch rejected: {outcome}", fence)
+                self._finish(
+                    task, "blocked", f"launch rejected: {outcome}", fence,
+                    charge_failure=True,
+                )
             raise
         workspace_id, session_id = self._effect_ids(task, native, fence)
         current = self.store.get_by_id(task.task_id)

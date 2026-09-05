@@ -665,7 +665,9 @@ def test_a_profile_with_failover_off_blocks_with_a_reason(system, monkeypatch):
     blocked = mesh.reconcile_provider_outcome(started.session_id)
 
     assert blocked is not None and blocked.state == "blocked"
-    assert "automatic failover is off" in str(store.get("operator", "audit").result)
+    task = store.get("operator", "audit")
+    assert task is not None and task.attempts == 1
+    assert "automatic failover is off" in str(task.result)
 
 
 def test_exhausted_route_chain_blocks_without_spawning(system, monkeypatch):
@@ -1248,6 +1250,7 @@ def test_expired_reservation_can_be_reissued_with_a_new_spec(system):
 
     current = store.get("operator", "audit")
     assert current.epoch == 2
+    assert current.attempts == 1
     assert current.spec["prompt"] == "new prompt"
     assert restarted.state == "active"
 
@@ -1492,9 +1495,9 @@ def test_a_temporary_refusal_keeps_the_reservation_and_says_why(system):
 
 
 def test_a_definitive_launch_failure_reports_the_executor_reason(system):
-    # A real failure stays terminal, but the error names the executor's reason
-    # instead of the bare word "lost".
-    mesh, client, _store, _ownership = system
+    # A real failure stays terminal and charges once, but the error names the
+    # executor's reason instead of the bare word "lost".
+    mesh, client, store, _ownership = system
 
     def failing_launch(task_id, epoch, launch):
         return {"state": "lost", "reason": "git worktree add failed: disk full"}
@@ -1503,4 +1506,5 @@ def test_a_definitive_launch_failure_reports_the_executor_reason(system):
     with pytest.raises(BatchError) as excinfo:
         mesh.start(spec())
     assert "disk full" in str(excinfo.value)
-    assert mesh._find("audit").state == "lost"
+    task = store.get("operator", "audit")
+    assert task is not None and (task.state, task.attempts) == ("lost", 1)

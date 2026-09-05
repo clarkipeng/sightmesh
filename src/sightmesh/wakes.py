@@ -123,6 +123,7 @@ def finish_with_wake(
     result: str | None = None,
     *,
     expect_version: int | None = None,
+    charge_failure: bool = False,
     fence: TaskFence | None = None,
     conn: sqlite3.Connection | None = None,
 ) -> tuple[TaskRecord, list[str]]:
@@ -140,18 +141,19 @@ def finish_with_wake(
                 state,
                 result,
                 expect_version=expect_version,
+                charge_failure=charge_failure,
                 fence=held,
                 conn=conn,
             )
     if conn is not None:
         return _finish_with_wake(
-            store, conn, task_id, state, result, expect_version, fence
+            store, conn, task_id, state, result, expect_version, charge_failure, fence
         )
     try:
         with store.connect() as owned:
             owned.execute("BEGIN IMMEDIATE")
             result_pair = _finish_with_wake(
-                store, owned, task_id, state, result, expect_version, fence
+                store, owned, task_id, state, result, expect_version, charge_failure, fence
             )
             owned.execute("COMMIT")
             return result_pair
@@ -168,10 +170,12 @@ def _finish_with_wake(
     state: str,
     result: str | None,
     expect_version: int | None,
+    charge_failure: bool,
     fence: TaskFence | None,
 ) -> tuple[TaskRecord, list[str]]:
     record = store.finish(
-        task_id, state, result, expect_version=expect_version, fence=fence, conn=conn
+        task_id, state, result, expect_version=expect_version,
+        charge_failure=charge_failure, fence=fence, conn=conn
     )
     created: list[str] = []
     if record.parent_task_id:
