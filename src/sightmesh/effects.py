@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .cdesktop import CdesktopError, is_effect_not_found
+from . import history
 from .task_store import TaskStore, TaskStoreError
 
 LOGGER = logging.getLogger("sightmesh.effects")
@@ -137,6 +138,11 @@ class EffectJournal:
                         ),
                     )
                     effect = self._require(conn, task_id, epoch)
+                    history.record_change(
+                        conn, entity="effect", task_id=str(task_id), epoch=int(epoch),
+                        cause="reserved", kind="created",
+                        changed=history.changed_columns(None, row := self._row(conn, task_id, epoch)),
+                    )
                     conn.execute("COMMIT")
                     return effect, False
                 existing = _decode(row)
@@ -576,6 +582,7 @@ class EffectJournal:
         try:
             with self.store.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
+                before = self._row(conn, task_id, epoch)
                 cursor = conn.execute(
                     f"UPDATE task_effects SET {assign}, updated_at = ? "
                     f"WHERE task_id = ? AND epoch = ? AND state IN ({placeholders})",
@@ -593,6 +600,12 @@ class EffectJournal:
                         "this effect transition no longer applies"
                     )
                 effect = self._require(conn, task_id, epoch)
+                after = self._row(conn, task_id, epoch)
+                if before is not None and after is not None:
+                    history.record_change(
+                        conn, entity="effect", task_id=str(task_id), epoch=int(epoch),
+                        cause="effect-transition", changed=history.changed_columns(before, after),
+                    )
                 conn.execute("COMMIT")
                 return effect
         except TaskStoreError:

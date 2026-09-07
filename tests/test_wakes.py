@@ -206,6 +206,26 @@ def test_an_undeliverable_wake_stays_in_the_outbox(cohort):
     assert WakeDelivery(client, store).pump() == 1
 
 
+def test_a_retry_reuses_the_payload_selected_before_an_uncertain_send(cohort):
+    """A changed cohort must not change bytes after the first send attempt."""
+    store, _parent, children = cohort
+    client = Recorder()
+    client.fail = True
+    finish_with_wake(store, children[0].task_id, "blocked", "first finding")
+
+    assert WakeDelivery(client, store, claim_seconds=-1.0).pump() == 0
+    frozen = _wakes(store)[0]["payload"]
+    assert frozen and "first finding" in frozen
+
+    # This later projection change is visible to a new renderer but must not
+    # rewrite the bytes associated with the already claimed occurrence.
+    finish_with_wake(store, children[1].task_id, "completed", "later finding")
+    client.fail = False
+    assert WakeDelivery(client, store).pump() == 1
+    assert client.sent[0][1] == frozen
+    assert _wakes(store)[0]["payload"] == frozen
+
+
 def test_record_wakes_is_idempotent_for_an_already_satisfied_predicate(cohort):
     """The reconciler replays this over every parent on every tick; it must
     only ever fill a real gap."""

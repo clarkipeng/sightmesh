@@ -517,6 +517,10 @@ class WakeDelivery:
             children,
             escalation=is_escalation(wake.dedupe_key),
         )
+        # Freeze the selected bytes before the first external call.  A lost
+        # response leaves the claim retryable, and its retry must not render
+        # a later cohort into a different message.
+        payload = self._persist_payload(wake, payload)
         self.client.send(
             parent.holder_session_id,
             payload,
@@ -524,24 +528,47 @@ class WakeDelivery:
             dedupe_key=wake.wake_id,
             intent="continue",
         )
-        self._settle(wake, "delivered", payload)
+        self._settle(wake, "delivered")
         return True
 
     def _resolve(self, wake: Wake, reason: str) -> bool:
         """Park a suppressed delivery with its reason; never return silently."""
         LOGGER.info("Wake %s resolved without delivery: %s", wake.wake_id, reason)
-        self._settle(wake, "resolved", f"suppressed: {reason}")
+        self._settle(wake, "resolved", reason, payload=f"suppressed: {reason}")
         return False
 
-    def _settle(self, wake: Wake, state: str, payload: str) -> None:
+    def _persist_payload(self, wake: Wake, selected: str) -> str:
+        """Store a delivery's immutable bytes before its first send."""
+        try:
+            with self.store.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE task_wakes SET payload = COALESCE(payload, ?), "
+                    "updated_at = ? WHERE wake_id = ? AND state = 'claimed'",
+                    (selected, time.time(), wake.wake_id),
+                )
+                row = conn.execute(
+                    "SELECT payload FROM task_wakes WHERE wake_id = ?", (wake.wake_id,)
+                ).fetchone()
+                if row is None or row["payload"] is None:
+                    raise TaskStoreError(f"Cannot persist wake {wake.wake_id} payload")
+                conn.execute("COMMIT")
+                return str(row["payload"])
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(f"Cannot persist task wake payload: {exc}") from exc
+
+    def _settle(
+        self, wake: Wake, state: str, resolution: str | None = None, *, payload: str | None = None
+    ) -> None:
         now = time.time()
         try:
             with self.store.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute(
-                    "UPDATE task_wakes SET state = ?, payload = ?, "
+                    "UPDATE task_wakes SET state = ?, resolution = ?, "
+                    "payload = COALESCE(payload, ?), "
                     "claim_expires_at = NULL, updated_at = ? WHERE wake_id = ?",
-                    (state, payload, now, wake.wake_id),
+                    (state, resolution, payload, now, wake.wake_id),
                 )
                 if state == "delivered" and wake.event_seq is not None:
                     # Only a real delivery advances the watermark. A resolved
