@@ -41,6 +41,11 @@ class CheckpointRetention:
     def read(self, operation_id: str, local: Path) -> bytes:
         if local.exists(): return local.read_bytes()
         with sqlite3.connect(self.db) as conn:
-            row = conn.execute("SELECT occurrence_id FROM task_artifacts WHERE operation_id=?", (operation_id,)).fetchone()
+            row = conn.execute("SELECT occurrence_id,digest FROM task_artifacts WHERE operation_id=?", (operation_id,)).fetchone()
         if row is None or row[0] is None: raise EvidenceUnavailable("checkpoint has no confirmed retained occurrence")
-        return self.client.artifact_bytes(self.execution_id, str(row[0]))
+        receipt = self.client.artifact_receipt(self.execution_id, str(row[0]))
+        if receipt.get("id") != row[0] or receipt.get("execution_id") != self.execution_id or receipt.get("durability") != "confirmed" or receipt.get("sha256") != row[1]:
+            raise EvidenceUnavailable("retained checkpoint receipt no longer verifies")
+        body = b"".join(self.client.artifact_chunks(self.execution_id, str(row[0])))
+        if hashlib.sha256(body).hexdigest() != row[1]: raise EvidenceUnavailable("retained checkpoint bytes are corrupt")
+        return body

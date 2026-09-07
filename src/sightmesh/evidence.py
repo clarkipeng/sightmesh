@@ -72,6 +72,16 @@ class EvidenceClient:
         if not self.enabled(): raise EvidenceUnavailable("execution evidence v1 is unavailable")
         with self._open("GET", f"/api/execution-processes/{execution_id}/artifacts/{occurrence_id}/file") as response: return response.read()
 
+    def artifact_chunks(self, execution_id: str, occurrence_id: str, chunk_size: int = 65536):
+        if not 1 <= chunk_size <= 1048576: raise ValueError("chunk size must be bounded")
+        if not self.enabled(): raise EvidenceUnavailable("execution evidence v1 is unavailable")
+        with self._open("GET", f"/api/execution-processes/{execution_id}/artifacts/{occurrence_id}/file") as response:
+            while chunk := response.read(chunk_size): yield chunk
+
+    def artifact_receipt(self, execution_id: str, occurrence_id: str) -> dict[str, Any]:
+        if not self.enabled(): raise EvidenceUnavailable("execution evidence v1 is unavailable")
+        return self._json("GET", f"/api/execution-processes/{execution_id}/artifacts/{occurrence_id}")
+
     def _json(self, method: str, path: str, query: Mapping[str, Any] | None = None) -> dict[str, Any]:
         with self._open(method, path, query) as response: decoded = json.loads(response.read())
         return decoded.get("data", decoded)

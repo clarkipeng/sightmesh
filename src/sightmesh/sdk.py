@@ -355,7 +355,9 @@ class SightMesh:
             raise SightMeshError("Checkpoint must not be empty")
         task = self._current() if worker is None else self._find(worker)
         digest = hashlib.sha256(text.encode()).hexdigest()
-        path = self._checkpoint_path(task, f"{uuid.uuid4()}-{digest}")
+        pending = self.store.pending_checkpoint_operation(task.task_id, task.epoch, digest)
+        reference = str(pending["checkpoint"]) if pending is not None else None
+        path = (self._task_repo_path(task) / reference) if reference else self._checkpoint_path(task, f"{uuid.uuid4()}-{digest}")
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists() and path.read_text(encoding="utf-8") != text:
             raise SightMeshError(f"Checkpoint digest collision at {path}")
@@ -368,7 +370,7 @@ class SightMesh:
                 os.fsync(stream.fileno())
                 temporary = Path(stream.name)
             os.replace(temporary, path)
-        reference = str(path.relative_to(self._task_repo_path(task)))
+        reference = reference or str(path.relative_to(self._task_repo_path(task)))
         with self.store.task_lock(task.task_id) as fence:
             operation_id = self.store.prepare_checkpoint_operation(task.task_id, task.epoch, reference, digest)
             if self.checkpoint_retention is None:

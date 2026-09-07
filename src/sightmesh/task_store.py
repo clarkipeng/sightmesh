@@ -1197,13 +1197,21 @@ class TaskStore:
             conn.execute("COMMIT")
         return operation_id
 
+    def pending_checkpoint_operation(self, task_id: str, epoch: int, digest: str) -> sqlite3.Row | None:
+        """The one unfinished logical operation eligible for publication replay."""
+        with self.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM task_checkpoint_operations WHERE task_id=? AND epoch=? AND digest=? AND occurrence_id IS NULL ORDER BY created_at LIMIT 1",
+                (task_id, epoch, digest),
+            ).fetchone()
+
     def checkpoint_with_occurrence(self, task_id: str, epoch: int, checkpoint: str, operation_id: str, occurrence_id: str) -> TaskRecord:
         """Atomically bind confirmed native evidence and the task checkpoint."""
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             op = conn.execute("SELECT * FROM task_checkpoint_operations WHERE operation_id=?", (operation_id,)).fetchone()
             task = conn.execute("SELECT * FROM managed_tasks WHERE task_id=?", (task_id,)).fetchone()
-            if op is None or task is None or int(op["epoch"]) != epoch or str(op["checkpoint"]) != checkpoint or int(task["epoch"]) != epoch or str(task["state"]) not in LIVE_STATES:
+            if op is None or task is None or str(op["task_id"]) != task_id or int(op["epoch"]) != epoch or str(op["checkpoint"]) != checkpoint or int(task["epoch"]) != epoch or str(task["state"]) not in LIVE_STATES:
                 raise TaskStoreError("checkpoint operation no longer belongs to the live task epoch")
             conn.execute("UPDATE task_checkpoint_operations SET occurrence_id=? WHERE operation_id=?", (occurrence_id, operation_id))
             record = self._transition(
