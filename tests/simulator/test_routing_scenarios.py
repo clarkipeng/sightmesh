@@ -1144,15 +1144,11 @@ def test_sd16_cancel_during_recovery_stops_the_late_successor(
     assert len(mesh.client.stopped) == 1
 
 
+@pytest.mark.parametrize("cancel_first", [True, False])
 def test_sd16_cancel_during_initial_launch_stops_the_only_native_session(
-    mesh: SightMesh, store: TaskStore, routing_settings, monkeypatch
+    mesh: SightMesh, store: TaskStore, routing_settings, monkeypatch, cancel_first
 ) -> None:
-    """Initial and recovery launches share the terminal fence.
-
-    The old initial path skipped ``task_lock``. Cancellation could then commit
-    while the native PUT was paused, leaving its later successful workspace
-    unmanaged because activation correctly rejected the terminal row.
-    """
+    """Both orderings must stop the only native workspace, never orphan it."""
     configure_chains(
         standard=(execution_routing.Route("test", "CODEX", "test", "free"),)
     )
@@ -1170,20 +1166,26 @@ def test_sd16_cancel_during_initial_launch_stops_the_only_native_session(
     with ThreadPoolExecutor(max_workers=2) as pool:
         starting = pool.submit(mesh.start, worker_spec())
         assert entered.wait(timeout=5)
-        cancelling = pool.submit(mesh.cancel, "audit")
-        assert not cancelling.done()
-        release.set()
-        launched = starting.result(timeout=5)
-        cancelled = cancelling.result(timeout=5)
+        if cancel_first:
+            # Native I/O releases the fence: cancellation can commit first.
+            cancelled = pool.submit(mesh.cancel, "audit").result(timeout=5)
+            release.set()
+            with pytest.raises(BatchError, match="superseded"):
+                starting.result(timeout=5)
+        else:
+            release.set()
+            launched = starting.result(timeout=5)
+            assert launched.state == "active"
+            cancelled = pool.submit(mesh.cancel, "audit").result(timeout=5)
 
     task = store.get("operator", "audit")
     effect = mesh.journal.get(task.task_id, task.epoch)
-    assert launched.state == "active"
     assert cancelled.state == task.state == "cancelled"
     assert effect is not None and effect.state == "terminal"
-    assert effect.outcome == "cancelled"
+    assert effect.outcome == ("superseded" if cancel_first else "cancelled")
     assert effect.workspace_id is None
-    assert mesh.client.stopped == [launched.workspace_id]
+    native_effect = mesh.client.managed_effect(task.task_id, task.epoch)
+    assert mesh.client.stopped == [native_effect["workspace_id"]]
 
 
 def test_sd16_terminal_lock_is_released_before_stop_http(

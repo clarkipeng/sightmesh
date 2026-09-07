@@ -30,15 +30,18 @@ from sightmesh.effects import EffectJournal, request_hash
 from sightmesh.escalation import EscalationStore
 from sightmesh.sdk import BatchError, SightMesh
 from sightmesh.task_store import (
-    _MANAGED_TASKS_COLUMNS,
-    _MANAGED_TASKS_DDL,
-    _REBUILD_TABLE,
     TaskStore,
     TaskStoreError,
 )
 from sightmesh.wakes import WakeDelivery, finish_with_wake
 
-from .conftest import fail_missing_kernel_v1, make_mesh, query, table_exists, worker_spec
+from .conftest import (
+    fail_missing_kernel_v1,
+    make_mesh,
+    query,
+    table_exists,
+    worker_spec,
+)
 from .fake_cdesktop import SimulatedCrash
 
 pytestmark = pytest.mark.simulator
@@ -50,30 +53,6 @@ FORENSICS_SNAPSHOT = (
     / "escalations.sqlite3"
 )
 
-_LEGACY_MANAGED_TASKS_DDL = """
-    CREATE TABLE managed_tasks (
-        task_id TEXT PRIMARY KEY,
-        scope TEXT NOT NULL,
-        task_key TEXT NOT NULL,
-        parent_task_id TEXT,
-        state TEXT NOT NULL CHECK (state IN
-            ('reserved', 'active', 'replacing', 'blocked',
-             'completed', 'cancelled', 'lost')),
-        epoch INTEGER NOT NULL CHECK (epoch > 0),
-        attempts INTEGER NOT NULL CHECK (attempts > 0),
-        max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
-        child_limit INTEGER NOT NULL CHECK (child_limit >= 0),
-        spec_json TEXT NOT NULL,
-        workspace_id TEXT,
-        holder_session_id TEXT,
-        checkpoint TEXT,
-        result TEXT,
-        created_at REAL NOT NULL,
-        updated_at REAL NOT NULL,
-        UNIQUE(scope, task_key),
-        FOREIGN KEY(parent_task_id) REFERENCES managed_tasks(task_id)
-    )
-"""
 
 
 def _manager(store: TaskStore, *, children: int) -> object:
@@ -131,30 +110,6 @@ def test_s29_three_distinct_failures_exhaust_with_the_last_reason(store):
     assert store.get_by_id(task.task_id).attempts == 3
 
 
-def _rebuild_managed_tasks_kernel_v1(conn: sqlite3.Connection) -> None:
-    """Stand in for a peer process P1 that completes the kernel-v1 rebuild.
-
-    Produces the exact table SQL the production migration checks for, so a
-    second initializer reading under its own lock recognizes the schema as
-    already migrated and returns without touching a row.
-    """
-    carried = ", ".join(
-        name
-        for name in _MANAGED_TASKS_COLUMNS
-        if name not in (
-            "parent_task_id", "version", "child_event_seq", "last_woken_seq",
-            "liveness", "liveness_episode", "liveness_since", "liveness_wakes",
-            "liveness_evidence", "over_budget", "checkpoint_at",
-        )
-    )
-    conn.execute(f"DROP TABLE IF EXISTS {_REBUILD_TABLE}")
-    conn.execute(_MANAGED_TASKS_DDL.format(name=_REBUILD_TABLE))
-    conn.execute(
-        f"INSERT INTO {_REBUILD_TABLE} (parent_task_id, version, {carried}) "
-        f"SELECT parent_task_id, 0, {carried} FROM managed_tasks"
-    )
-    conn.execute("DROP TABLE managed_tasks")
-    conn.execute(f"ALTER TABLE {_REBUILD_TABLE} RENAME TO managed_tasks")
 
 
 def test_s1_duplicate_late_complete_on_a_blocked_task(mesh: SightMesh) -> None:
@@ -672,112 +627,50 @@ def test_s21_terminal_outranks_conflict_when_the_hash_differs(store):
         journal.reserve("t21", 1, request_hash({"kind": "session"}), "owner-a")
 
 
-def _run_concurrent_first_run_migration(database, path: Path) -> object:
-    """Drive the F5 interleaving: P2 reads schema while P1 holds the lock.
-
-    A gate connection holds ``BEGIN IMMEDIATE`` while a second thread enters the
-    real ``TaskStore`` migration. A pre-fix initializer reads ``has_version`` on
-    the still-pre-kernel snapshot before it can lock, then blocks; the fixed one
-    blocks on ``BEGIN IMMEDIATE`` first and only reads after the gate commits.
-    The gate then completes the rebuild and bumps a version, so the pre-fix
-    thread wipes it and the fixed thread preserves it.
-    """
-    started = threading.Event()
-    errors: list[BaseException] = []
-
-    def initialize_under_race() -> None:
-        started.set()
-        try:
-            TaskStore(path)
-        except BaseException as exc:  # noqa: BLE001 - surfaced to the test
-            errors.append(exc)
-
-    gate = database._open()
-    gate.execute("BEGIN IMMEDIATE")
-    thread = threading.Thread(target=initialize_under_race)
-    thread.start()
-    started.wait(timeout=10)
-    # Give P2 time to reach its pre-lock read (fix: to block on BEGIN IMMEDIATE).
-    time.sleep(0.4)
-    _rebuild_managed_tasks_kernel_v1(gate)
-    first_task_id = str(
-        gate.execute("SELECT task_id FROM managed_tasks LIMIT 1").fetchone()[0]
-    )
-    gate.execute(
-        "UPDATE managed_tasks SET version = 5 WHERE task_id = ?", (first_task_id,)
-    )
-    gate.execute("COMMIT")
-    gate.close()
-    thread.join(timeout=30)
-    if errors:
-        raise errors[0]
-    return first_task_id
-
-
-def test_s22_concurrent_first_run_migration_preserves_a_bumped_version(tmp_path):
-    """S22 (F5): concurrent first-run migration resets version to 0.
-
-    Review finding F5: `_initialize` read `sqlite_master`/`PRAGMA table_info`
-    before `BEGIN IMMEDIATE`, so two processes on a pre-kernel DB both saw
-    `has_version=False` and P2's rebuild wiped P1's preserved counters. Schema
-    detection must move inside the lock: a version bumped between them must
-    survive (final version >= 1, never reset to 0).
-    """
-    from sightmesh.escalation import EscalationStore
-
+def test_s22_concurrent_accounting_confirmation_preserves_a_bumped_version(tmp_path):
+    """S22: initialization must read the accounting contract AFTER its write lock."""
     path = tmp_path / "state.sqlite3"
-    database = EscalationStore(path)
-    now = time.time()
-    with database._connect() as conn:
-        conn.execute(_LEGACY_MANAGED_TASKS_DDL)
-        conn.execute(
-            "INSERT INTO managed_tasks VALUES "
-            "('task-a', 'operator', 'one', NULL, 'active', 1, 1, 3, 0, '{}', "
-            "NULL, 'sess-a', NULL, NULL, ?, ?)",
-            (now, now),
-        )
+    store = TaskStore(path)
+    task = _manager(store, children=0)
+    with store.connect() as conn:
+        conn.execute("DELETE FROM evidence_contract WHERE component='failure_accounting'")
 
-    task_id = _run_concurrent_first_run_migration(database, path)
+    started = threading.Event()
+    def initialize():
+        started.set()
+        return TaskStore(path)
 
-    final = TaskStore(path).get_by_id(task_id)
-    assert final is not None
-    assert final.version >= 1
-    assert final.version == 5
+    with store.connect() as gate, ThreadPoolExecutor(max_workers=1) as pool:
+        gate.execute("BEGIN IMMEDIATE")
+        pending = pool.submit(initialize)
+        assert started.wait(timeout=10)
+        # P2 must wait while P1 confirms the cutover and fences its old readers.
+        time.sleep(0.4)
+        gate.execute("UPDATE managed_tasks SET attempts=0,version=5")
+        gate.execute("INSERT INTO evidence_contract VALUES('failure_accounting',1)")
+        gate.execute("COMMIT")
+        reopened = pending.result(timeout=30)
+    assert reopened.get_by_id(task.task_id).version == 5
+    assert reopened.get_by_id(task.task_id).attempts == 0
 
 
 @pytest.mark.skipif(
     not FORENSICS_SNAPSHOT.exists(),
     reason="real escalations.sqlite3 forensics snapshot is not present",
 )
-def test_s22_forensics_snapshot_concurrent_migration_preserves_a_bumped_version(
-    tmp_path,
-):
-    """S22 (F5): re-prove the concurrency fix against the real 28-row store.
-
-    Runs the same interleaving against a COPY of the forensic
-    `escalations.sqlite3` (28 pre-kernel `managed_tasks` rows); the original
-    snapshot is never touched.
-    """
-    from sightmesh.escalation import EscalationStore
-
+def test_s22_forensics_snapshot_is_refused_without_rewriting_saved_tasks(tmp_path):
+    """The retired legacy rebuild cannot silently mutate the real 28-row store."""
     path = tmp_path / "escalations.sqlite3"
     shutil.copy2(FORENSICS_SNAPSHOT, path)
     database = EscalationStore(path)
     with database._connect() as conn:
-        before = int(
-            conn.execute("SELECT COUNT(*) FROM managed_tasks").fetchone()[0]
-        )
-    assert before == 28
-
-    task_id = _run_concurrent_first_run_migration(database, path)
-
-    reopened = TaskStore(path)
-    final = reopened.get_by_id(task_id)
-    assert final is not None
-    assert final.version == 5
+        before = list(conn.iterdump())
+        assert conn.execute("SELECT COUNT(*) FROM managed_tasks").fetchone()[0] == 28
+    for _ in range(2):
+        with pytest.raises(TaskStoreError, match="Unversioned failure accounting"):
+            TaskStore(path)
     with database._connect() as conn:
-        after = int(conn.execute("SELECT COUNT(*) FROM managed_tasks").fetchone()[0])
-    assert after == before  # no rows lost to the rebuild race
+        assert list(conn.iterdump()) == before
 
 
 def test_s23_a_wake_for_a_retired_parent_resolves_and_re_arms(client, store, ownership):
