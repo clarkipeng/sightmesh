@@ -29,6 +29,7 @@ from .cdesktop import (
     process_failure_reason,
     process_provider_outcome,
 )
+from .durable import DurableExecutionReconciler, NativeCommandQueue
 from .effects import (
     Effect,
     EffectBusy,
@@ -36,15 +37,14 @@ from .effects import (
     new_owner_instance,
     request_hash,
 )
-from .durable import DurableExecutionReconciler, NativeCommandQueue
 from .escalation import CDESKTOP_SESSION_ENV, EscalationStore, LauncherIdentity
 from .evidence import EvidenceClient, EvidenceError, EvidenceUnavailable
-from .retention import CheckpointRetention
-from .sqlite_durability import DurabilityUnavailable, confirm_directory_entries
 from .execution_routing import ExecutionRoutingError
 from .liveness import Budget, resolve_policy, trusted_policy
 from .pool.core import PoolError
 from .profiles import ProfileStore, validate_provider
+from .retention import CheckpointRetention
+from .sqlite_durability import DurabilityUnavailable, confirm_directory_entries
 from .succession import (
     COMMAND_TERMINAL_STATES,
     REROUTE_OUTCOMES,
@@ -1634,15 +1634,6 @@ class SightMesh:
             raise SightMeshError(f"Task {task.key!r} has no worktree path")
         return Path(str(container)).expanduser().resolve() / str(task.spec["repo"])
 
-    def _checkpoint_path(self, task: TaskRecord, digest: str) -> Path:
-        return (
-            self._task_repo_path(task)
-            / ".context"
-            / "sightmesh"
-            / "checkpoints"
-            / f"{digest}.md"
-        )
-
     def _read_checkpoint(self, task: TaskRecord) -> str | None:
         if not task.checkpoint:
             return None
@@ -1675,7 +1666,7 @@ class SightMesh:
         if operation is not None:
             native = self._checkpoint_evidence()
             if native is not None:
-                return CheckpointRetention(native).read(operation, None).decode("utf-8")
+                return CheckpointRetention(native).read(operation).decode("utf-8")
         raise SightMeshError(
             "Checkpoint working copy is unavailable and no verified native reference can recover it"
         ) from local_error

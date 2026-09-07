@@ -11,11 +11,14 @@ import hashlib
 import json
 import uuid
 from contextlib import closing
-from datetime import datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .evidence import EvidenceClient, EvidenceUnavailable
+from .evidence import (
+    EvidenceClient,
+    EvidenceUnavailable,
+    receipt_facts,
+    verified_chunks,
+)
 
 if TYPE_CHECKING:
     from .task_store import CheckpointOperation
@@ -25,6 +28,10 @@ def verified_receipt(
     operation: CheckpointOperation, receipt: dict[str, Any]
 ) -> dict[str, Any]:
     facts = operation.facts
+    result = {
+        **receipt_facts(receipt, facts["execution_id"]),
+        "durability": "confirmed",
+    }
     expected = {
         "execution_id": facts["execution_id"],
         "publication_key": f"checkpoint:{operation.operation_id}",
@@ -35,34 +42,16 @@ def verified_receipt(
         "size_bytes": facts["size_bytes"],
         "durability": "confirmed",
     }
-    if (
-        not isinstance(receipt, dict)
-        or type(receipt.get("size_bytes")) is not int
-        or any(receipt.get(key) != value for key, value in expected.items())
-    ):
+    if any(result[key] != value for key, value in expected.items()):
         raise EvidenceUnavailable(
             "checkpoint receipt is not a confirmed immutable fact match"
         )
-    for key in ("id", "attachment_id", "captured_at"):
-        if not isinstance(receipt.get(key), str) or not receipt[key]:
-            raise EvidenceUnavailable("checkpoint receipt is missing native provenance")
     for key in ("id", "attachment_id", "execution_id"):
         try:
             if str(uuid.UUID(receipt[key])) != receipt[key]:
                 raise ValueError("not canonical")
         except (ValueError, TypeError, AttributeError) as exc:
             raise EvidenceUnavailable("invalid native checkpoint identity") from exc
-    try:
-        captured = datetime.fromisoformat(receipt["captured_at"])
-    except ValueError as exc:
-        raise EvidenceUnavailable("invalid checkpoint receipt time") from exc
-    if captured.tzinfo is None:
-        raise EvidenceUnavailable("checkpoint receipt time has no timezone")
-    # Keep only native contract fields, not an unexpected response body.
-    result = {
-        **expected,
-        **{key: receipt[key] for key in ("id", "attachment_id", "captured_at")},
-    }
     if len(json.dumps(result).encode()) > 8192:
         raise EvidenceUnavailable("checkpoint receipt exceeds metadata bound")
     if operation.receipt is not None and operation.receipt != result:
@@ -91,17 +80,7 @@ class CheckpointRetention:
             )
         return verified_receipt(operation, receipt)
 
-    def read(self, operation: CheckpointOperation, local: Path | None) -> bytes:
-        # A mutable worktree file must not silently replace saved checkpoint facts.
-        try:
-            if local is None:
-                raise EvidenceUnavailable("working copy unavailable")
-            with local.open("rb") as stream:
-                body = stream.read(operation.facts["size_bytes"] + 1)
-            self._verify_bytes(operation, body)
-            return body
-        except (OSError, EvidenceUnavailable):
-            pass
+    def read(self, operation: CheckpointOperation) -> bytes:
         if operation.receipt is None or not operation.durable_commit:
             raise EvidenceUnavailable(
                 "checkpoint has no confirmed task occurrence reference"
@@ -113,19 +92,8 @@ class CheckpointRetention:
                 operation.receipt["id"],
             ),
         )
-        body = bytearray()
-        with closing(
-            self.client.artifact_chunks(operation.facts["execution_id"], receipt["id"])
-        ) as chunks:
-            for chunk in chunks:
-                if len(body) + len(chunk) > operation.facts["size_bytes"]:
-                    raise EvidenceUnavailable(
-                        "checkpoint original exceeds its saved byte size"
-                    )
-                body.extend(chunk)
-        result = bytes(body)
-        self._verify_bytes(operation, result)
-        return result
+        with closing(verified_chunks(self.client, receipt)) as chunks:
+            return b"".join(chunks)
 
     @staticmethod
     def _verify_bytes(operation: CheckpointOperation, body: bytes) -> None:

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import closing
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -33,6 +36,79 @@ class RawRange:
     end: int
     durability: str
     body: bytes
+
+
+def receipt_facts(
+    native: dict[str, Any], execution_id: str, occurrence_id: str | None = None
+) -> dict[str, Any]:
+    """Validate a confirmed receipt; return only its immutable native facts."""
+    if (
+        not isinstance(native, dict)
+        or native.get("durability") != "confirmed"
+        or native.get("execution_id") != execution_id
+        or (occurrence_id is not None and native.get("id") != occurrence_id)
+    ):
+        raise EvidenceUnavailable("unconfirmed artifact occurrence identity")
+    fields = (
+        "id",
+        "execution_id",
+        "attachment_id",
+        "original_path",
+        "original_name",
+        "producer_ref",
+        "publication_key",
+        "captured_at",
+        "sha256",
+        "size_bytes",
+    )
+    try:
+        facts = {field: native[field] for field in fields}
+        if (
+            type(facts["size_bytes"]) is not int
+            or not 0 <= facts["size_bytes"] <= 2**63 - 1
+            or not isinstance(facts["sha256"], str)
+            or not re.fullmatch("[0-9a-f]{64}", facts["sha256"])
+        ):
+            raise ValueError("invalid artifact byte identity")
+        for field in (
+            "id",
+            "execution_id",
+            "attachment_id",
+            "original_path",
+            "captured_at",
+        ):
+            if not isinstance(facts[field], str) or not facts[field]:
+                raise ValueError("missing artifact provenance")
+        for field in ("original_name", "producer_ref", "publication_key"):
+            if facts[field] is not None and not isinstance(facts[field], str):
+                raise ValueError("invalid artifact provenance")
+        if datetime.fromisoformat(facts["captured_at"]).tzinfo is None:
+            raise ValueError("capture time has no timezone")
+        if len(json.dumps(facts).encode()) > 8192:
+            raise ValueError("artifact metadata exceeds consumer bound")
+    except (KeyError, ValueError, TypeError) as exc:
+        raise EvidenceUnavailable("invalid artifact receipt") from exc
+    return facts
+
+
+def verified_chunks(client: EvidenceClient, receipt: dict[str, Any]) -> Iterator[bytes]:
+    """Stream bounded bytes; exhaustion verifies the complete receipt digest."""
+    digest, size = hashlib.sha256(), 0
+    with closing(
+        client.artifact_chunks(
+            receipt["execution_id"], receipt["id"], chunk_size=TRANSFER_BYTES
+        )
+    ) as chunks:
+        for chunk in chunks:
+            if not isinstance(chunk, bytes) or not 0 < len(chunk) <= TRANSFER_BYTES:
+                raise EvidenceUnavailable("unbounded artifact response chunk")
+            size += len(chunk)
+            if size > receipt["size_bytes"]:
+                raise EvidenceUnavailable("artifact response exceeds receipt size")
+            digest.update(chunk)
+            yield chunk
+        if size != receipt["size_bytes"] or digest.hexdigest() != receipt["sha256"]:
+            raise EvidenceUnavailable("artifact original no longer matches its receipt")
 
 
 class EvidenceClient:

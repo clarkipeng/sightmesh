@@ -27,8 +27,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from .cdesktop import CdesktopClient, CdesktopError
 from . import history
+from .cdesktop import CdesktopClient, CdesktopError
 from .succession import OwnershipStore, QuarantinedSessionError
 from .task_store import (
     LIVE_STATES,
@@ -288,17 +288,25 @@ def record_wakes(conn: sqlite3.Connection, parent_task_id: str) -> list[str]:
         key = dedupe_key(parent_task_id, predicate)
         wake_id = str(uuid.uuid4())
         now = time.time()
-        cursor = conn.execute(
-            """
-            INSERT OR IGNORE INTO task_wakes
-            (wake_id, parent_task_id, predicate, dedupe_key, event_seq,
-             state, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
-            """,
-            (wake_id, str(parent_task_id), predicate, key, child_event_seq, now, now),
-        )
+        with history.change(conn, "wake", (wake_id,), "armed"):
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO task_wakes
+                (wake_id, parent_task_id, predicate, dedupe_key, event_seq,
+                 state, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    wake_id,
+                    str(parent_task_id),
+                    predicate,
+                    key,
+                    child_event_seq,
+                    now,
+                    now,
+                ),
+            )
         if cursor.rowcount:
-            _record_wake_history(conn, wake_id, "armed", None, "created")
             created.append(wake_id)
     return created
 
@@ -440,17 +448,17 @@ def _arm_liveness(
     ):
         return []
     wake_id = str(uuid.uuid4())
-    cursor = conn.execute(
-        """
-        INSERT OR IGNORE INTO task_wakes
-        (wake_id, parent_task_id, predicate, dedupe_key, event_seq,
-         state, created_at, updated_at)
-        VALUES (?, ?, ?, ?, NULL, 'pending', ?, ?)
-        """,
-        (wake_id, parent_task_id, LIVENESS_PREDICATES[reason], key, now, now),
-    )
+    with history.change(conn, "wake", (wake_id,), "liveness-armed"):
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO task_wakes
+            (wake_id, parent_task_id, predicate, dedupe_key, event_seq,
+             state, created_at, updated_at)
+            VALUES (?, ?, ?, ?, NULL, 'pending', ?, ?)
+            """,
+            (wake_id, parent_task_id, LIVENESS_PREDICATES[reason], key, now, now),
+        )
     if cursor.rowcount:
-        _record_wake_history(conn, wake_id, "liveness-armed", None, "created")
         return [wake_id]
     return []
 
@@ -497,19 +505,13 @@ class WakeDelivery:
                 claimed = []
                 for before in rows:
                     wake_id = str(before["wake_id"])
-                    conn.execute(
-                        "UPDATE task_wakes SET state = 'claimed', "
-                        "claim_expires_at = ?, claim_token = ?, updated_at = ? WHERE wake_id = ?",
-                        (now + self.claim_seconds, str(uuid.uuid4()), now, wake_id),
-                    )
-                    _record_wake_history(conn, wake_id, "claimed", before)
-                    claimed.append(
-                        _decode(
-                            conn.execute(
-                                "SELECT * FROM task_wakes WHERE wake_id = ?", (wake_id,)
-                            ).fetchone()
+                    with history.change(conn, "wake", (wake_id,), "claimed") as change:
+                        conn.execute(
+                            "UPDATE task_wakes SET state = 'claimed', "
+                            "claim_expires_at = ?, claim_token = ?, updated_at = ? WHERE wake_id = ?",
+                            (now + self.claim_seconds, str(uuid.uuid4()), now, wake_id),
                         )
-                    )
+                    claimed.append(_decode(change.after))
                 conn.execute("COMMIT")
                 return claimed
         except sqlite3.DatabaseError as exc:
@@ -609,20 +611,24 @@ class WakeDelivery:
         try:
             with self.store.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                before = conn.execute(
-                    "SELECT * FROM task_wakes WHERE wake_id = ?", (wake.wake_id,)
-                ).fetchone()
-                updated = conn.execute(
-                    "UPDATE task_wakes SET state = ?, resolution = ?, "
-                    "payload = COALESCE(payload, ?), "
-                    "claim_expires_at = NULL, updated_at = ? WHERE wake_id = ? "
-                    "AND state = 'claimed' AND claim_token = ?",
-                    (state, resolution, payload, now, wake.wake_id, wake.claim_token),
-                )
+                with history.change(conn, "wake", (wake.wake_id,), "settled"):
+                    updated = conn.execute(
+                        "UPDATE task_wakes SET state = ?, resolution = ?, "
+                        "payload = COALESCE(payload, ?), "
+                        "claim_expires_at = NULL, updated_at = ? WHERE wake_id = ? "
+                        "AND state = 'claimed' AND claim_token = ?",
+                        (
+                            state,
+                            resolution,
+                            payload,
+                            now,
+                            wake.wake_id,
+                            wake.claim_token,
+                        ),
+                    )
                 if not updated.rowcount:
                     conn.execute("COMMIT")
                     return False
-                _record_wake_history(conn, wake.wake_id, "settled", before)
                 if state == "delivered" and wake.event_seq is not None:
                     # Only a real delivery advances the watermark. A resolved
                     # (suppressed) wake leaves it where it was, so the same
@@ -687,31 +693,4 @@ def _decode(row: Any) -> Wake:
         claim_expires_at=row["claim_expires_at"],
         payload=row["payload"],
         claim_token=row["claim_token"],
-    )
-
-
-def _record_wake_history(
-    conn: sqlite3.Connection,
-    wake_id: str,
-    cause: str,
-    before: Any,
-    kind: str = "transition",
-) -> None:
-    after = conn.execute(
-        "SELECT * FROM task_wakes WHERE wake_id = ?", (wake_id,)
-    ).fetchone()
-    if after is None:
-        return
-    changed = history.changed_columns(before, after)
-    changed.pop(
-        "payload", None
-    )  # row identity, not copied evidence, is the history link
-    history.record_change(
-        conn,
-        entity="wake",
-        task_id=str(after["parent_task_id"]),
-        entity_id=wake_id,
-        cause=cause,
-        kind=kind,
-        changed=changed,
     )
