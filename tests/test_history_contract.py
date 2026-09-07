@@ -53,10 +53,14 @@ def test_effect_side_doors_each_leave_an_observed_history_entry(tmp_path):
     assert {'reservation-takeover','cleanup-workspace','cleanup-acknowledged'} <= set(task_causes)
     assert 'reservation-expired' in expired_causes
 
-def test_baseline_marks_existing_projection_as_unknown_history():
-    conn=sqlite3.connect(':memory:'); conn.row_factory=sqlite3.Row
-    conn.execute('CREATE TABLE managed_tasks (task_id TEXT, epoch INTEGER, state TEXT)')
-    conn.execute("INSERT INTO managed_tasks VALUES ('old',2,'blocked')")
-    history.ensure_schema(conn)
-    row=history.task_history(conn,'old')[0]
-    assert row['kind'] == 'baseline' and row['missing_history'] == 1 and row['cause'] == 'observed-baseline'
+def test_real_old_shape_upgrade_baselines_migrated_task_and_effect(tmp_path):
+    from test_task_store import _round1_kernel_store
+    path=tmp_path/'old.sqlite'
+    database=_round1_kernel_store(path, [('old','operator','legacy',None,'blocked','session-old')])
+    with database._connect() as conn:
+        conn.execute("CREATE TABLE task_effects (task_id TEXT, epoch INTEGER, request_hash TEXT, state TEXT, workspace_id TEXT, session_id TEXT, outcome TEXT, owner_instance TEXT, lease_expires_at REAL, created_at REAL, updated_at REAL, PRIMARY KEY(task_id,epoch))")
+        conn.execute("INSERT INTO task_effects VALUES ('old',1,'h','terminal','ws','session-old','legacy','owner',1,1,1)")
+    store=TaskStore(path)
+    with store.connect() as conn:
+        rows=history.task_history(conn,'old')
+    assert {(row['entity'],row['kind'],row['missing_history'],row['cause']) for row in rows} >= {('task','baseline',1,'observed-baseline'),('effect','baseline',1,'observed-baseline')}
