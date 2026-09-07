@@ -72,7 +72,7 @@ _DERIVED_COLUMNS = frozenset({"updated_at"})
 _ENTITY_CHECK = "entity IN (" + ", ".join(f"'{value}'" for value in ENTITIES) + ")"
 _KIND_CHECK = "kind IN (" + ", ".join(f"'{value}'" for value in KINDS) + ")"
 
-_CONTRACT_DDL = """
+CONTRACT_DDL = """
     CREATE TABLE IF NOT EXISTS evidence_contract (
         component TEXT PRIMARY KEY,
         version INTEGER NOT NULL CHECK (version > 0)
@@ -177,7 +177,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     * anything else: refuse. A future component rewrote the semantics and
       guessing from table shape is exactly the #123 failure.
     """
-    conn.execute(_CONTRACT_DDL)
+    conn.execute(CONTRACT_DDL)
     row = conn.execute(
         "SELECT version FROM evidence_contract WHERE component = ?",
         (HISTORY_COMPONENT,),

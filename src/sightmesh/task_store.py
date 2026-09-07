@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import history
+from . import failure_accounting, history
 from .escalation import EscalationStore, escalation_db_path
 from .fence import HELD_TASK_FENCE
 
@@ -66,21 +66,6 @@ def liveness_stretch(liveness: str) -> str:
     return liveness if liveness in {"live", "parked"} else "silent"
 
 
-_LIVENESS_CHECK = "liveness IN (" + ", ".join(f"'{v}'" for v in LIVENESS_STATES) + ")"
-#: Forward-only liveness columns, in ``ALTER TABLE ADD COLUMN`` form. Each
-#: carries a constant default so it is a legal in-place addition; the fresh
-#: DDL above lists the identical definitions, so an upgraded database and a
-#: newly created one are the same schema.
-_LIVENESS_COLUMNS: tuple[tuple[str, str], ...] = (
-    ("liveness", f"TEXT NOT NULL DEFAULT 'live' CHECK ({_LIVENESS_CHECK})"),
-    ("liveness_episode", "INTEGER NOT NULL DEFAULT 0"),
-    ("liveness_since", "REAL"),
-    ("liveness_wakes", "INTEGER NOT NULL DEFAULT 0"),
-    ("liveness_evidence", "TEXT"),
-    ("over_budget", "INTEGER NOT NULL DEFAULT 0 CHECK (over_budget IN (0, 1))"),
-    ("checkpoint_at", "REAL"),
-)
-
 _MANAGED_TASKS_DDL = """
     CREATE TABLE {name} (
         task_id TEXT PRIMARY KEY,
@@ -117,37 +102,6 @@ _MANAGED_TASKS_DDL = """
         FOREIGN KEY(parent_task_id) REFERENCES managed_tasks(task_id)
     )
 """
-_MANAGED_TASKS_COLUMNS = (
-    "task_id",
-    "scope",
-    "task_key",
-    "parent_task_id",
-    "state",
-    "epoch",
-    "attempts",
-    "max_attempts",
-    "child_limit",
-    "spec_json",
-    "workspace_id",
-    "holder_session_id",
-    "checkpoint",
-    "result",
-    "version",
-    "child_event_seq",
-    "last_woken_seq",
-    "liveness",
-    "liveness_episode",
-    "liveness_since",
-    "liveness_wakes",
-    "liveness_evidence",
-    "over_budget",
-    "checkpoint_at",
-    "created_at",
-    "updated_at",
-)
-_SELF_PARENT_CHECK = "parent_task_id != task_id"
-_REBUILD_TABLE = "managed_tasks_kernel_v1"
-
 #: ``dedupe_key`` (``{parent}:{predicate}``) carries no column-level
 #: ``UNIQUE``: uniqueness binds only *live* wakes through ``idx_task_wakes_live``
 #: below, so a consumed wake's key can arm again for the next cohort transition
@@ -304,13 +258,14 @@ class TaskStore:
     def _initialize(self) -> None:
         try:
             with self._database._connect() as conn:
-                # Take the write lock BEFORE reading any schema state. Two
-                # processes racing a first-run migration would otherwise both
-                # observe a pre-kernel database and P2's rebuild would wipe the
-                # rows P1 just preserved; serializing here means P2 re-reads the
-                # schema under the lock and sees P1's completed rebuild.
+                # Read the contract only after acquiring the write lock: a
+                # concurrent initializer/cutover may be establishing it now.
                 conn.execute("BEGIN IMMEDIATE")
-                self._migrate_managed_tasks(conn)
+                existing = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='managed_tasks'"
+                ).fetchone()
+                failure_accounting.initialize(conn, existing=existing is not None)
+                conn.execute(_MANAGED_TASKS_DDL.format(name="IF NOT EXISTS managed_tasks"))
                 conn.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_tasks_holder "
                     "ON managed_tasks(holder_session_id) "
@@ -416,7 +371,7 @@ class TaskStore:
                 elif checkpoint_contract["version"] != 1:
                     raise TaskStoreError("Unsupported checkpoint retention contract")
                 conn.execute("COMMIT")
-        except sqlite3.DatabaseError as exc:
+        except (sqlite3.DatabaseError, failure_accounting.AccountingContractError) as exc:
             raise TaskStoreError(f"Cannot initialize managed tasks: {exc}") from exc
 
     @contextmanager
@@ -460,139 +415,6 @@ class TaskStore:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
     @staticmethod
-    def _migrate_managed_tasks(conn: sqlite3.Connection) -> None:
-        """Bring ``managed_tasks`` to the kernel v1 shape, forward only.
-
-        SQLite cannot add a CHECK constraint in place, so an existing table
-        without the self-parent constraint or the ``version`` column is
-        rebuilt. Running this twice is a no-op: the second pass sees both
-        additions and returns before touching any row. The caller holds
-        ``BEGIN IMMEDIATE``, so this reads the schema under the write lock and
-        never races a peer process into a double rebuild.
-        """
-        existing = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'managed_tasks'"
-        ).fetchone()
-        if existing is None:
-            conn.execute(_MANAGED_TASKS_DDL.format(name="managed_tasks"))
-            return
-        columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(managed_tasks)").fetchall()
-        }
-        has_version = "version" in columns
-        current_sql = str(existing["sql"])
-        if (
-            has_version
-            and _SELF_PARENT_CHECK in current_sql
-            and "attempts >= 0" in current_sql
-        ):
-            # The table is already at the kernel-v1 shape; only the watermark
-            # and liveness columns may still be missing. Re-read table_info
-            # under the same write lock and add them forward-only, never a
-            # pre-lock read.
-            TaskStore._ensure_watermark_columns(conn)
-            TaskStore._ensure_liveness_columns(conn)
-            return
-        carried = ", ".join(
-            name for name in _MANAGED_TASKS_COLUMNS if name != "parent_task_id"
-        )
-        conn.execute(f"DROP TABLE IF EXISTS {_REBUILD_TABLE}")
-        conn.execute(_MANAGED_TASKS_DDL.format(name=_REBUILD_TABLE))
-        conn.execute(
-            f"INSERT INTO {_REBUILD_TABLE} (parent_task_id, {carried}) "
-            # A legacy self-parent row cannot satisfy the new CHECK; keeping
-            # the row and dropping the impossible link preserves history.
-            "SELECT CASE WHEN parent_task_id = task_id THEN NULL "
-            "ELSE parent_task_id END, "
-            + ", ".join(
-                # Pre-#119 attempts counted launches, not failures. That
-                # number has no recoverable failure meaning, so migration
-                # starts the new failure budget at its only sound value: zero.
-                "0"
-                if name == "attempts"
-                else name
-                if name in columns
-                else {
-                    "version": "0",
-                    "child_event_seq": "0",
-                    "last_woken_seq": "0",
-                    "liveness": "'live'",
-                    "liveness_episode": "0",
-                    "liveness_since": "NULL",
-                    "liveness_wakes": "0",
-                    "liveness_evidence": "NULL",
-                    "over_budget": "0",
-                    "checkpoint_at": "NULL",
-                }[name]
-                for name in _MANAGED_TASKS_COLUMNS
-                if name != "parent_task_id"
-            )
-            + " FROM managed_tasks"
-        )
-        conn.execute("DROP TABLE managed_tasks")
-        conn.execute(f"ALTER TABLE {_REBUILD_TABLE} RENAME TO managed_tasks")
-        # Carried rows inherit the DDL ``DEFAULT 0`` watermark columns, so a
-        # cohort already satisfied before this upgrade must be backfilled or it
-        # can never arm.
-        TaskStore._backfill_child_event_seq(conn)
-
-    @staticmethod
-    def _backfill_child_event_seq(conn: sqlite3.Connection) -> None:
-        """Seed ``child_event_seq`` from durable history for pre-watermark rows.
-
-        The counter only ever counts child terminal/blocked events. A database
-        upgraded from before the watermark starts every parent at ``0``, so a
-        parent whose cohort was already satisfied but whose wake was never
-        delivered (the exact crash gap the reconciler heals) would stay at
-        ``0 <= last_woken_seq(0)`` and never arm. Setting the counter to the
-        count of children already in a blocked-or-terminal state makes the
-        first reconciler pass arm any genuinely satisfied pre-migration cohort;
-        ``last_woken_seq`` stays ``0``, and the live predicate check still gates
-        an unsatisfied cohort, so the only effect on an already-delivered cohort
-        is one harmless re-wake. Runs once, only when the columns were just
-        added, so it never clobbers a live counter.
-        """
-        conn.execute(
-            "UPDATE managed_tasks SET child_event_seq = ("
-            "  SELECT COUNT(*) FROM managed_tasks AS child"
-            "  WHERE child.parent_task_id = managed_tasks.task_id"
-            "    AND child.state IN ('blocked', 'completed', 'cancelled', 'lost', 'exhausted')"
-            ") WHERE EXISTS ("
-            "  SELECT 1 FROM managed_tasks AS child"
-            "  WHERE child.parent_task_id = managed_tasks.task_id"
-            ")"
-        )
-
-    @staticmethod
-    def _ensure_watermark_columns(conn: sqlite3.Connection) -> None:
-        """Add the wake watermark columns forward-only, under the write lock.
-
-        ``child_event_seq`` counts child terminal/blocked events observed by a
-        parent; ``last_woken_seq`` records how far its manager has already been
-        woken. A wake arms only while the former outruns the latter, so the two
-        counters are all the state re-arm and idempotent re-scan need. Both
-        carry a constant ``DEFAULT 0``, so ``ADD COLUMN`` is a legal forward
-        migration where a CHECK-adding change would need a full rebuild.
-        """
-        columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(managed_tasks)").fetchall()
-        }
-        added = False
-        for column in ("child_event_seq", "last_woken_seq"):
-            if column not in columns:
-                conn.execute(
-                    f"ALTER TABLE managed_tasks ADD COLUMN {column} "
-                    "INTEGER NOT NULL DEFAULT 0"
-                )
-                added = True
-        if added:
-            # Only on the first upgrade, when the counter was just introduced -
-            # never on a re-open, which would clobber live counters.
-            TaskStore._backfill_child_event_seq(conn)
-
-    @staticmethod
     def _ensure_effect_retry_at(conn: sqlite3.Connection) -> None:
         """Add the provider reset timestamp to existing effect journals."""
         columns = {
@@ -601,35 +423,6 @@ class TaskStore:
         }
         if "retry_at" not in columns:
             conn.execute("ALTER TABLE task_effects ADD COLUMN retry_at REAL")
-
-    @staticmethod
-    def _ensure_liveness_columns(conn: sqlite3.Connection) -> None:
-        """Add the kernel v1.1 liveness columns forward-only, under the write lock.
-
-        ``liveness`` is the typed classification the detector writes;
-        ``liveness_episode`` names the current stall episode, ``liveness_since``
-        marks when the current episode *phase* began (episode open, then reset
-        at each wake so the escalation clock is "one further progress_timeout
-        after the manager was told"), ``liveness_wakes`` caps an episode at two
-        wakes, and ``liveness_evidence`` carries the JSON the wake payload
-        quotes - including the detector's own confidence, so a degraded read is
-        never dressed up as a typed one. ``over_budget`` is a soft latch that
-        never changes a task's state.
-
-        Every column has a constant default, so ``ADD COLUMN`` is legal here
-        where the widened ``task_wakes`` CHECK needed a rebuild. No backfill:
-        the defaults ("no finding yet", episode 0) are exactly right for a task
-        the detector has never looked at.
-        """
-        columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(managed_tasks)").fetchall()
-        }
-        for column, definition in _LIVENESS_COLUMNS:
-            if column not in columns:
-                conn.execute(
-                    f"ALTER TABLE managed_tasks ADD COLUMN {column} {definition}"
-                )
 
     @staticmethod
     def _migrate_task_wakes(conn: sqlite3.Connection) -> None:

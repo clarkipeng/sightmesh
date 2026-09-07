@@ -167,23 +167,24 @@ def test_effect_side_doors_each_leave_an_observed_history_entry(tmp_path):
     assert "reservation-expired" in expired_causes
 
 
-def test_real_old_shape_upgrade_baselines_migrated_task_and_effect(tmp_path):
-    from test_task_store import _round1_kernel_store
+def test_explicit_cutover_baselines_current_task_and_existing_effect(tmp_path):
+    from test_failure_accounting import digest, unversioned_store
+
+    from sightmesh import failure_accounting
 
     path = tmp_path / "old.sqlite"
-    database = _round1_kernel_store(
-        path, [("old", "operator", "legacy", None, "blocked", "session-old")]
-    )
+    database = unversioned_store(path)
     with database._connect() as conn:
         conn.execute(
             "CREATE TABLE task_effects (task_id TEXT, epoch INTEGER, request_hash TEXT, state TEXT, workspace_id TEXT, session_id TEXT, outcome TEXT, owner_instance TEXT, lease_expires_at REAL, created_at REAL, updated_at REAL, PRIMARY KEY(task_id,epoch))"
         )
         conn.execute(
-            "INSERT INTO task_effects VALUES ('old',1,'h','terminal','ws','session-old','legacy','owner',1,1,1)"
+            "INSERT INTO task_effects VALUES ('t',1,'h','terminal','ws','session-old','legacy','owner',1,1,1)"
         )
+    failure_accounting.reset_budget(path, expected_fingerprint=digest(path))
     store = TaskStore(path)
     with store.connect() as conn:
-        rows = history.task_history(conn, "old")
+        rows = history.task_history(conn, "t")
     assert {
         (row["entity"], row["kind"], row["missing_history"], row["cause"])
         for row in rows

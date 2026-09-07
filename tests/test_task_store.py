@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 
 from sightmesh.escalation import EscalationStore
-from sightmesh.task_store import _MANAGED_TASKS_DDL, StaleTransition, TaskStore, TaskStoreError
+from sightmesh.task_store import (
+    StaleTransition,
+    TaskStore,
+    TaskStoreError,
+)
 
 LEGACY_DDL = """
     CREATE TABLE managed_tasks (
@@ -38,7 +42,7 @@ LEGACY_DDL = """
 
 
 def _legacy_store(path, rows):
-    """Materialize the pre-kernel schema so the migration has real work."""
+    """Materialize an unsupported pre-kernel store to prove safe refusal."""
     database = EscalationStore(path)
     with database._connect() as conn:
         conn.execute(LEGACY_DDL)
@@ -60,16 +64,6 @@ def _legacy_store(path, rows):
                 (*row, now, now),
             )
     return database
-
-
-def _schema(database):
-    with database._connect() as conn:
-        return str(
-            conn.execute(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' "
-                "AND name = 'managed_tasks'"
-            ).fetchone()["sql"]
-        )
 
 
 def _reserve(store, key, *, parent_task_id=None, children=0):
@@ -126,11 +120,7 @@ ROUND1_KERNEL_DDL = """
 
 
 def _round1_kernel_store(path, rows):
-    """The round-1 kernel shape: version + self-parent CHECK, NO watermark.
-
-    This is the shape a live 0.11.x database is in at upgrade time, so it routes
-    through ``_ensure_watermark_columns`` (add-column path), not the rebuild.
-    """
+    """An unsupported intermediate shape with no watermark or accounting marker."""
     database = EscalationStore(path)
     with database._connect() as conn:
         conn.execute(ROUND1_KERNEL_DDL)
@@ -147,140 +137,42 @@ def _round1_kernel_store(path, rows):
     return database
 
 
-def test_upgrade_backfills_seq_so_a_satisfied_cohort_still_wakes(tmp_path):
-    """Round-3 review HIGH: a cohort already satisfied before the watermark
-    upgrade must still arm its manager.
-
-    Without backfill, ``child_event_seq``/``last_woken_seq`` both start at 0, so
-    ``0 <= 0`` short-circuits ``record_wakes`` before the predicate is even
-    checked, and the reconciler - whose whole job is closing the child-terminal
-    to wake gap - is silently defeated for pre-migration rows. This guards the
-    backfill that seeds the counter from durable child history.
-    """
-    from sightmesh.wakes import record_wakes
-
-    path = tmp_path / "round1.sqlite3"
-    # Parent mid-wait; both children already completed but no wake was delivered
-    # (the exact crash gap). row = (task_id, scope, task_key, parent, state, holder)
-    _round1_kernel_store(
-        path,
-        rows=[
-            ("p", "operator", "mgr", None, "active", "session-p"),
-            ("c1", "operator", "c1", "p", "completed", None),
-            ("c2", "operator", "c2", "p", "completed", None),
-        ],
-    )
-
-    store = TaskStore(path)  # opening runs the forward migration + backfill
-    with store._database._connect() as conn:
-        seq, woken = conn.execute(
-            "SELECT child_event_seq, last_woken_seq FROM managed_tasks "
-            "WHERE task_id = 'p'"
-        ).fetchone()
-        assert seq == 2  # backfilled from the two terminal children
-        assert woken == 0
-        armed = record_wakes(conn, "p")
-    assert armed, "a satisfied pre-migration cohort must arm after upgrade"
-
-
-def test_migration_preserves_rows_and_runs_twice_without_effect(tmp_path):
-    """The rebuild only exists to add a CHECK, so it must not lose history.
-
-    Running it twice is the real operational case: every process that opens
-    the store re-enters _initialize, and a second rebuild would churn rows
-    and drop the partial holder index under live readers.
-    """
-    path = tmp_path / "state.sqlite3"
-    database = _legacy_store(
-        path, [("task-a", "operator", "one", None, "active", "session-a")]
-    )
-
-    TaskStore(path)
-    once = _schema(database)
-    TaskStore(path)
-    twice = _schema(database)
-
-    assert once == twice
-    assert "parent_task_id != task_id" in once
-    with database._connect() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM managed_tasks").fetchone()[0] == 1
-        assert conn.execute("SELECT version FROM managed_tasks").fetchone()[0] == 0
-        indexes = {
-            str(row["name"])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'index'"
-            ).fetchall()
-        }
-        assert {"idx_managed_tasks_holder", "idx_managed_tasks_parent"} <= indexes
-        assert "managed_tasks_kernel_v1" not in {
-            str(row["name"])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
-        }
-
-
-def test_migration_restarts_legacy_launch_counts_as_zero_failures(tmp_path):
-    """Pre-#119 attempts counted starts, so preserving them would keep exhausted healthy tasks."""
-    path = tmp_path / "state.sqlite3"
-    database = _legacy_store(
-        path, [("task-a", "operator", "one", None, "active", "session-a")]
+@pytest.mark.parametrize("factory", [_legacy_store, _round1_kernel_store])
+@pytest.mark.parametrize("self_parent", [False, True])
+def test_unversioned_legacy_store_is_refused_without_rewriting_rows(tmp_path, factory, self_parent):
+    """Unsupported saved formats remain untouched, never silently rebuilt/reset."""
+    if self_parent and factory is _round1_kernel_store:
+        # This schema already prevents self-parentage at insertion.
+        with pytest.raises(sqlite3.IntegrityError):
+            factory(tmp_path / "state.sqlite3", [("t", "operator", "one", "t", "active", "s")])
+        return
+    database = factory(
+        tmp_path / "state.sqlite3",
+        [("t", "operator", "one", "t" if self_parent else None, "active", "s")],
     )
     with database._connect() as conn:
-        conn.execute("UPDATE managed_tasks SET attempts = 3")
+        conn.execute("UPDATE managed_tasks SET attempts=3")
+        before = list(conn.iterdump())
+    for _ in range(2):
+        with pytest.raises(TaskStoreError, match="Unversioned failure accounting"):
+            TaskStore(database.path)
+        with database._connect() as conn:
+            assert list(conn.iterdump()) == before
 
-    upgraded = TaskStore(path)
-    task = upgraded.get_by_id("task-a")
-    assert task is not None and task.attempts == 0
-    assert "attempts >= 0" in _schema(database)
 
-
-def test_migration_rebuilds_current_schema_without_losing_liveness_state(tmp_path):
-    """The attempts CHECK rebuild must carry every field current stores own."""
-    path = tmp_path / "state.sqlite3"
-    database = EscalationStore(path)
-    old_ddl = _MANAGED_TASKS_DDL.replace("attempts >= 0", "attempts > 0")
+def test_unversioned_cohort_is_not_backfilled_or_rewritten(tmp_path):
+    """Refusal cannot fabricate a wake or consume an already-satisfied cohort."""
+    database = _round1_kernel_store(tmp_path / "cohort.sqlite3", [
+        ("p", "operator", "manager", None, "active", "session-p"),
+        ("c1", "operator", "c1", "p", "completed", None),
+        ("c2", "operator", "c2", "p", "completed", None),
+    ])
     with database._connect() as conn:
-        conn.execute(old_ddl.format(name="managed_tasks"))
-        conn.execute(
-            "INSERT INTO managed_tasks "
-            "(task_id, scope, task_key, state, epoch, attempts, max_attempts, child_limit, "
-            "spec_json, version, child_event_seq, last_woken_seq, liveness, liveness_episode, "
-            "liveness_since, liveness_wakes, liveness_evidence, over_budget, checkpoint_at, "
-            "created_at, updated_at) VALUES "
-            "('t', 'operator', 'worker', 'active', 4, 3, 3, 0, '{}', 7, 11, 9, 'stalled', "
-            "2, 10, 1, '{\"proof\":true}', 1, 12, 1, 2)"
-        )
-
-    upgraded = TaskStore(path)
-    once = _schema(database)
-    reopened = TaskStore(path)
-    twice = _schema(database)
-    task = upgraded.get_by_id("t")
-    assert task is not None and reopened.get_by_id("t") == task
-    assert (task.attempts, task.epoch, task.version, task.liveness, task.liveness_episode,
-            task.liveness_since, task.liveness_wakes, task.liveness_evidence,
-            task.over_budget, task.checkpoint_at) == (0, 4, 7, "stalled", 2, 10, 1,
-                                                       '{"proof":true}', True, 12)
-    assert once == twice
-
-
-def test_migration_repairs_a_legacy_self_parent_row(tmp_path):
-    """A self-parent row predates the constraint that now forbids it.
-
-    Failing the migration would strand the whole store, and deleting the row
-    would lose a real task, so the impossible link is what gets dropped.
-    """
-    path = tmp_path / "state.sqlite3"
-    database = _legacy_store(
-        path, [("task-a", "operator", "one", "task-a", "active", "session-a")]
-    )
-
-    store = TaskStore(path)
-
-    assert store.get("operator", "one").parent_task_id is None
+        before = list(conn.iterdump())
+    with pytest.raises(TaskStoreError, match="Unversioned failure accounting"):
+        TaskStore(database.path)
     with database._connect() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM managed_tasks").fetchone()[0] == 1
+        assert list(conn.iterdump()) == before
 
 
 def test_self_parentage_is_unrepresentable(tmp_path):
@@ -429,49 +321,22 @@ def test_a_missing_task_is_not_reported_as_a_stale_transition(tmp_path):
         store.finish("00000000-0000-0000-0000-000000000000", "completed")
 
 
-def test_a_round1_upgrade_gains_the_liveness_columns_at_their_safe_defaults(tmp_path):
-    """A live 0.11.x/0.12.x database must gain the v1.1 liveness columns without
-    a rebuild and without inventing findings.
-
-    The defaults matter as much as the columns: a task the detector has never
-    looked at must read as `live`, episode 0, never woken. Backfilling anything
-    else would make the first tick after an upgrade wake every manager in the
-    fleet about tasks that were never in trouble.
-    """
-    path = tmp_path / "round1-liveness.sqlite3"
-    _round1_kernel_store(
-        path, rows=[("p", "operator", "mgr", None, "active", "session-p")]
-    )
-
+def test_fresh_liveness_columns_start_at_safe_defaults(tmp_path):
+    """A task never observed by the detector must not invent a finding."""
+    path = tmp_path / "liveness.sqlite3"
     store = TaskStore(path)
-
-    task = store.get_by_id("p")
+    task = _active(store, "manager")
     assert (task.liveness, task.liveness_episode, task.liveness_wakes) == ("live", 0, 0)
-    assert (task.liveness_since, task.liveness_evidence, task.checkpoint_at) == (
-        None,
-        None,
-        None,
-    )
+    assert (task.liveness_since, task.liveness_evidence, task.checkpoint_at) == (None, None, None)
     assert task.over_budget is False
-    # Re-opening must be a no-op, not a second ALTER that errors the process out.
-    assert TaskStore(path).get_by_id("p").liveness == "live"
+    assert TaskStore(path).get_by_id(task.task_id) == task
 
 
-def test_the_upgraded_liveness_column_still_rejects_an_unknown_classification(tmp_path):
-    """ADD COLUMN carries the CHECK, so an upgraded database enforces the same
-    typed vocabulary a freshly created one does.
-
-    Without the constraint on the alter path the two schemas would diverge, and
-    a typo in a future detector branch would silently persist a classification
-    no predicate can ever match - a task stuck in a state nothing reads.
-    """
-    path = tmp_path / "round1-check.sqlite3"
-    _round1_kernel_store(
-        path, rows=[("p", "operator", "mgr", None, "active", "session-p")]
-    )
-    store = TaskStore(path)
-
-    with pytest.raises(sqlite3.IntegrityError), store._database._connect() as conn:
+def test_liveness_column_rejects_an_unknown_classification(tmp_path):
+    """The schema enforces the detector's typed vocabulary."""
+    store = TaskStore(tmp_path / "liveness.sqlite3")
+    _active(store, "manager")
+    with pytest.raises(sqlite3.IntegrityError), store.connect() as conn:
         conn.execute("UPDATE managed_tasks SET liveness = 'wedged'")
 
 

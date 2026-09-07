@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from sightmesh import escalation, leases, succession, task_store
+from sightmesh import escalation, failure_accounting, leases, succession, task_store
 
 
 @pytest.fixture(autouse=True)
@@ -35,6 +35,14 @@ def _isolate_escalation_store(monkeypatch, tmp_path):
         original_init(self, chosen)
 
     monkeypatch.setattr(task_store.TaskStore, "__init__", isolated_task_store)
+    original_reset = failure_accounting.reset_budget
+
+    def isolated_reset(path, **kwargs):
+        if not Path(path).resolve().is_relative_to(tmp_path.resolve()):
+            raise AssertionError(f"test attempted a non-isolated budget reset: {path}")
+        return original_reset(path, **kwargs)
+
+    monkeypatch.setattr(failure_accounting, "reset_budget", isolated_reset)
 
 
 @pytest.fixture(autouse=True)
