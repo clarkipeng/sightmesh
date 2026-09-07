@@ -34,6 +34,7 @@ from typing import Any
 
 from .cdesktop import CdesktopClient, CdesktopError
 from .service import state_dir
+from .sqlite_durability import configure_connection
 
 CDESKTOP_SESSION_ENV = "CDESKTOP_SESSION_ID"
 CONDUCTOR_ENV_HINTS = ("CONDUCTOR_WORKSPACE_NAME", "CONDUCTOR_ROOT_PATH")
@@ -363,6 +364,7 @@ class EscalationStore:
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout = 30000")
+            configure_connection(conn)
             for path in (
                 self.path,
                 self.path.with_name(f"{self.path.name}-wal"),

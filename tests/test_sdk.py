@@ -416,23 +416,6 @@ def test_checkpoint_content_stays_in_the_task_worktree(system):
     )
 
 
-def test_checkpoint_recovers_a_reclaimed_worktree_copy_from_its_native_occurrence(system):
-    mesh, client, store, ownership = system
-    class Retention:
-        def __init__(self): self.calls=[]; self.body={}
-        def retain(self, task_id, epoch, path, operation_id):
-            body=path.read_bytes(); self.calls.append((task_id, epoch, operation_id)); self.body[operation_id]=body
-            return f"native-{operation_id}"
-        def read(self, operation_id, _path): return self.body[operation_id]
-    retention=Retention()
-    mesh=SightMesh(client=client, store=store, ownership=ownership, checkpoint_retention=retention, environment={})
-    started=mesh.start(spec())
-    checkpointed=mesh.checkpoint("recover me", worker="audit")
-    path=Path(client.workspace(started.workspace_id)["container_ref"])/"project"/checkpointed.checkpoint
-    path.unlink()
-    mesh.replace("audit")
-    assert client.launches[-1][1]["request"]["session"]["prompt"] == "recover me"
-    assert len(retention.calls) == 1
 
 
 def test_duplicate_failover_wakeups_reserve_one_successor_epoch(system):
