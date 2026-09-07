@@ -187,11 +187,13 @@ class SightMesh:
         client: CdesktopClient | None = None,
         store: TaskStore | None = None,
         ownership: OwnershipStore | None = None,
+        checkpoint_retention: Any | None = None,
         environment: Mapping[str, str] | None = None,
     ) -> None:
         self.client = client or CdesktopClient(url)
         self.store = store or TaskStore()
         self.ownership = ownership or OwnershipStore()
+        self.checkpoint_retention = checkpoint_retention
         self.environment = environment if environment is not None else os.environ
         self.owner_instance = new_owner_instance()
         self.journal = EffectJournal(self.store)
@@ -352,7 +354,8 @@ class SightMesh:
         if not text.strip():
             raise SightMeshError("Checkpoint must not be empty")
         task = self._current() if worker is None else self._find(worker)
-        path = self._checkpoint_path(task, hashlib.sha256(text.encode()).hexdigest())
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        path = self._checkpoint_path(task, f"{uuid.uuid4()}-{digest}")
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists() and path.read_text(encoding="utf-8") != text:
             raise SightMeshError(f"Checkpoint digest collision at {path}")
@@ -366,7 +369,13 @@ class SightMesh:
                 temporary = Path(stream.name)
             os.replace(temporary, path)
         reference = str(path.relative_to(self._task_repo_path(task)))
-        return Worker.from_record(self.store.checkpoint(task.task_id, reference))
+        with self.store.task_lock(task.task_id) as fence:
+            operation_id = self.store.prepare_checkpoint_operation(task.task_id, task.epoch, reference, digest)
+            if self.checkpoint_retention is None:
+                return Worker.from_record(self.store.checkpoint(task.task_id, reference))
+            with fence.external_io():
+                occurrence_id = self.checkpoint_retention.retain(task.task_id, task.epoch, path, operation_id)
+            return Worker.from_record(self.store.checkpoint_with_occurrence(task.task_id, task.epoch, reference, operation_id, occurrence_id))
 
     def complete(self, summary: str | None = None, worker: str | None = None) -> Worker:
         task = self._current() if worker is None else self._find(worker)
@@ -1461,9 +1470,11 @@ class SightMesh:
         path = (root / task.checkpoint).resolve()
         if root not in path.parents:
             raise SightMeshError("Checkpoint reference escapes the task worktree")
-        try:
-            return path.read_text(encoding="utf-8")
+        try: return path.read_text(encoding="utf-8")
         except OSError as exc:
+            operation = self.store.checkpoint_operation(task.task_id, task.checkpoint)
+            if self.checkpoint_retention is not None and operation is not None:
+                return self.checkpoint_retention.read(str(operation["operation_id"]), path).decode("utf-8")
             raise SightMeshError(f"Cannot read checkpoint {path}: {exc}") from exc
 
     def _require_contract(self) -> str:

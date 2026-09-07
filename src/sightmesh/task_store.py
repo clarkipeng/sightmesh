@@ -366,6 +366,15 @@ class TaskStore:
                     "CREATE INDEX IF NOT EXISTS idx_task_outgoing_pending "
                     "ON task_outgoing_commands(state, created_at)"
                 )
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS task_checkpoint_operations (
+                        operation_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
+                        epoch INTEGER NOT NULL, checkpoint TEXT NOT NULL,
+                        digest TEXT NOT NULL, occurrence_id TEXT,
+                        created_at REAL NOT NULL,
+                        UNIQUE(task_id, epoch, checkpoint)
+                    )
+                """)
                 # Last, so a first-upgrade baseline observes every projection
                 # table at its migrated shape, inside this same transaction.
                 history.ensure_schema(conn)
@@ -1174,6 +1183,39 @@ class TaskStore:
             values=(checkpoint, time.time()),
             attempted="checkpoint",
         )
+
+    def prepare_checkpoint_operation(self, task_id: str, epoch: int, checkpoint: str, digest: str) -> str:
+        """Persist the logical checkpoint identity before native publication."""
+        operation_id = str(uuid.uuid4())
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT operation_id FROM task_checkpoint_operations WHERE task_id=? AND epoch=? AND checkpoint=?", (task_id, epoch, checkpoint)).fetchone()
+            if row is None:
+                conn.execute("INSERT INTO task_checkpoint_operations(operation_id,task_id,epoch,checkpoint,digest,created_at) VALUES(?,?,?,?,?,?)", (operation_id, task_id, epoch, checkpoint, digest, time.time()))
+            else:
+                operation_id = str(row["operation_id"])
+            conn.execute("COMMIT")
+        return operation_id
+
+    def checkpoint_with_occurrence(self, task_id: str, epoch: int, checkpoint: str, operation_id: str, occurrence_id: str) -> TaskRecord:
+        """Atomically bind confirmed native evidence and the task checkpoint."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            op = conn.execute("SELECT * FROM task_checkpoint_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            task = conn.execute("SELECT * FROM managed_tasks WHERE task_id=?", (task_id,)).fetchone()
+            if op is None or task is None or int(op["epoch"]) != epoch or str(op["checkpoint"]) != checkpoint or int(task["epoch"]) != epoch or str(task["state"]) not in LIVE_STATES:
+                raise TaskStoreError("checkpoint operation no longer belongs to the live task epoch")
+            conn.execute("UPDATE task_checkpoint_operations SET occurrence_id=? WHERE operation_id=?", (occurrence_id, operation_id))
+            record = self._transition(
+                conn, task_id, LIVE_STATES, None,
+                "checkpoint = ?, checkpoint_at = ?", (checkpoint, time.time()), "checkpoint",
+            )
+            conn.execute("COMMIT")
+        return record
+
+    def checkpoint_operation(self, task_id: str, checkpoint: str) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM task_checkpoint_operations WHERE task_id=? AND checkpoint=? ORDER BY created_at DESC LIMIT 1", (task_id, checkpoint)).fetchone()
 
     def record_liveness(
         self,
