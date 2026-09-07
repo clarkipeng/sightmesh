@@ -435,7 +435,10 @@ def _arm_liveness(
         """,
         (wake_id, parent_task_id, LIVENESS_PREDICATES[reason], key, now, now),
     )
-    return [wake_id] if cursor.rowcount else []
+    if cursor.rowcount:
+        _record_wake_history(conn, wake_id, "liveness-armed", None, "created")
+        return [wake_id]
+    return []
 
 
 class WakeDelivery:
@@ -551,7 +554,8 @@ class WakeDelivery:
                     "updated_at = ? WHERE wake_id = ? AND state = 'claimed'",
                     (selected, time.time(), wake.wake_id),
                 )
-                _record_wake_history(conn, wake.wake_id, "payload-selected", None)
+                # Payload bytes are immutable evidence owned by this row;
+                # selection is not a second history occurrence.
                 row = conn.execute(
                     "SELECT payload FROM task_wakes WHERE wake_id = ?", (wake.wake_id,)
                 ).fetchone()
@@ -617,6 +621,8 @@ def _payload(
     lines = [f"{heading} {predicate}: {parent.key}"]
     for child in children:
         line = f"- {child.key} task={child.task_id} state={child.state} epoch={child.epoch}"
+        if child.liveness != "live": line += f" liveness={child.liveness}"
+        if child.over_budget: line += " over_budget=1"
         if child.holder_session_id: line += f" session={child.holder_session_id}"
         if child.checkpoint: line += f" checkpoint={child.checkpoint}"
         lines.append(line)

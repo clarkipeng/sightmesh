@@ -155,11 +155,15 @@ def _record_baselines(conn: sqlite3.Connection) -> None:
             continue
         for row in conn.execute(f"SELECT * FROM {table}").fetchall():
             values = {key: row[key] for key in row.keys()}
+            # A wake payload is the durable evidence object itself. History
+            # links the wake occurrence; copying those bytes would make a
+            # second transcript store.
+            if entity == "wake": values.pop("payload", None)
             epoch = values.get("epoch")
             entity_id = (
                 values.get("wake_id")
                 or values.get("dedupe_key")
-                or values.get("native_id")
+                or (f"{values['kind']}:{values['native_id']}" if entity == "cleanup_intent" else values.get("native_id"))
             )
             conn.execute(
                 "INSERT INTO task_history (entity, task_id, epoch, entity_id, "
