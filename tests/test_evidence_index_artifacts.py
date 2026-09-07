@@ -181,7 +181,8 @@ def test_log_and_artifact_sources_share_one_projection_without_cursor_collision(
         == "complete"
     )
     found = index.search(wire.client(), "shared literal", execution_id=EXECUTION)
-    assert found.complete and len(found.hits) == 2 and len(found.sources) == 2
+    assert not found.complete and found.unchecked_sources == (EXECUTION,)
+    assert len(found.hits) == 2 and len(found.sources) == 2
     assert {hit.artifact_id for hit in found.hits} == {None, "artifact"}
     assert (
         index.status(EXECUTION).after_frame

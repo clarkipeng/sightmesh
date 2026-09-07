@@ -417,15 +417,6 @@ class EvidenceIndex:
                 where.append(f"f.captured_time{op}?")
                 values.append(value)
         with self._connect() as conn:
-            selected = tuple(
-                _status(row)
-                for row in conn.execute(
-                    "SELECT s.* FROM sources s WHERE "
-                    + source_where
-                    + " ORDER BY s.execution_id",
-                    source_values,
-                )
-            )
             rows = conn.execute(
                 "SELECT f.*,s.execution_id,s.task_id,s.repo,s.artifact_id,s.receipt FROM postings p JOIN frames f ON f.rowid=p.rowid "
                 "JOIN sources s ON s.source_key=f.source_key WHERE "
@@ -434,20 +425,11 @@ class EvidenceIndex:
                 (*values, '"' + query.replace('"', '""') + '"', after, limit + 1),
             ).fetchall()
         # A contentless index cannot turn a stale earlier observation into a
-        # current availability claim. A bounded log read proves only that this
-        # source is presently reachable; artifact bytes stay unchecked unless
-        # their candidate-window stream is verified below.
+        # current availability claim. Log candidate windows prove only their
+        # own bytes, so logs stay unchecked without a deliberate full-source
+        # re-verification. An artifact candidate streams and verifies its full
+        # immutable original below.
         checked = set()
-        for source in selected:
-            if source.artifact_id is not None:
-                continue
-            try:
-                _confirmed_range(
-                    client, source.execution_id, 0, min(source.raw_end, 1)
-                )
-                checked.add(source.source_key)
-            except (EvidenceUnavailable, OSError, ValueError) as exc:
-                self._mark_unavailable(source.source_key, type(exc).__name__)
         next_after = rows[limit - 1]["rowid"] if len(rows) > limit else None
         hits = []
         for row in rows[:limit]:
@@ -470,7 +452,8 @@ class EvidenceIndex:
                     )
                 if hashlib.sha256(body).hexdigest() != row["sha256"]:
                     raise EvidenceUnavailable("indexed original bytes changed")
-                checked.add(row["source_key"])
+                if row["artifact_id"] is not None:
+                    checked.add(row["source_key"])
                 text = body.decode("utf-8")
                 position = text.find(query)
                 # A match wholly inside the overlap belongs to its older frame.

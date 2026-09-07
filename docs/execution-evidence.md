@@ -47,16 +47,15 @@ a next cursor. Restart that disposable cursor after a rebuild.
 
 Read `sources`, `unchecked_sources`, and `complete`, not only `hits`. Coverage
 describes the **selected indexed sources**, not undiscovered tasks or sources.
-Before a log search is complete, the consumer makes one bounded `[0, 1)` native
-range probe for each selected log source. That proves the current source route,
-identity, and availability, but does not certify arbitrary historic bytes; each
-hit is separately hash-verified from its own original-backed window. An artifact
-without a candidate window stays in `unchecked_sources`, because proving its
-bytes requires streaming and hashing the full immutable artifact. Live,
-legacy-unknown, unavailable, binary, corrupt, or unchecked evidence is not an
-empty complete search. Frame cursors use compressed frame starts, including empty
-legacy rows and terminal seals; an available physical end is not itself terminal
-capture completeness.
+Logs stay in `unchecked_sources` during search: a candidate read only verifies
+that window, and search deliberately does not re-read every retained log. An
+artifact candidate may be checked because its required full stream verifies the
+entire immutable original; an artifact without a candidate stays unchecked.
+Historical capture completion and current query verification are separate facts.
+Live, legacy-unknown, unavailable, binary, corrupt, or unchecked evidence is not
+an empty complete search. Frame cursors use compressed frame starts, including
+empty legacy rows and terminal seals; an available physical end is not itself
+terminal capture completeness.
 
 Log frames commit cursor and postings in one transaction. Artifact bytes have no
 native range endpoint, so each occurrence streams under one disposable-index

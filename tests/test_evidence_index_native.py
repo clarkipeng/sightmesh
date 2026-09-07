@@ -147,7 +147,8 @@ def test_cross_frame_utf8_literal_queries_and_empty_frame_cursor(tmp_path):
     assert complete.raw_end == len(encoded) and complete.outcome == "complete"
     for query in ("unique.job_id", '"一🙂二"', "cross-frame target"):
         result = index.search(wire.client(), query, task_id="task", repo="repo")
-        assert result.complete and len(result.hits) == 1
+        assert not result.complete and result.unchecked_sources == (EXECUTION,)
+        assert len(result.hits) == 1
         hit = result.hits[0]
         assert encoded[hit.match_start : hit.match_end].decode() == query
         assert query in hit.snippet
@@ -289,20 +290,18 @@ def test_rebuild_compaction_filters_and_missing_originals_are_honest(tmp_path):
     )
 
 
-def test_zero_candidate_search_checks_native_source_availability(tmp_path):
+def test_zero_candidate_search_keeps_truncated_log_source_explicitly_unchecked(tmp_path):
     wire = NativeWire([b"known searchable native evidence"])
     wire.append(b"", outcome="complete")
     index = EvidenceIndex(tmp_path / "index.sqlite")
     assert index.sync(wire.client(), EXECUTION).at_available_end
-    wire.fail_after = 0
+    wire.body = wire.body[:1]  # Owner no longer retains the captured extent.
     wire.requests.clear()
     result = index.search(wire.client(), "absent literal")
     assert not result.hits and not result.complete
-    assert result.sources[0].error == "EvidenceUnavailable"
-    assert any(
-        path.endswith("/raw-log") and query == {"start": ["0"], "end": ["1"]}
-        for path, query in wire.requests
-    )
+    assert result.sources[0].error is None
+    assert result.unchecked_sources == (EXECUTION,)
+    assert not any(path.endswith("/raw-log") for path, _ in wire.requests)
 
 
 def test_explicit_query_limits_and_foreign_database_refusal(tmp_path):

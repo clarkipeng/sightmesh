@@ -132,7 +132,8 @@ def derive(
     samples: dict[tuple[Any, ...], UsageSample] = {}
     warnings: set[str] = set()
     stream_messages: dict[str | None, str] = {}
-    pending_stdout = ""
+    pending_stdout: list[str] = []
+    pending_stdout_bytes = 0
     discarding_stdout = False
     derivation_error: str | None = None
 
@@ -244,7 +245,7 @@ def derive(
             warnings.add("unsupported_provider_usage")
 
     def consume_stdout(chunk: str) -> None:
-        nonlocal pending_stdout, discarding_stdout
+        nonlocal pending_stdout, pending_stdout_bytes, discarding_stdout
         while chunk:
             if discarding_stdout:
                 _, newline, chunk = chunk.partition("\n")
@@ -253,17 +254,22 @@ def derive(
                 discarding_stdout = False
                 continue
             part, newline, chunk = chunk.partition("\n")
-            pending_stdout += part
-            if len(pending_stdout.encode()) > MAX_RECORD_BYTES:
+            part_bytes = len(part.encode())
+            if pending_stdout_bytes + part_bytes > MAX_RECORD_BYTES:
                 provider_error("provider_jsonl_record_exceeds_bound")
-                pending_stdout = ""
+                pending_stdout.clear()
+                pending_stdout_bytes = 0
                 if not newline:
                     discarding_stdout = True
                     return
             elif newline:
-                consume_provider_line(pending_stdout.rstrip("\r"))
-                pending_stdout = ""
+                pending_stdout.append(part)
+                consume_provider_line("".join(pending_stdout).rstrip("\r"))
+                pending_stdout.clear()
+                pending_stdout_bytes = 0
             else:
+                pending_stdout.append(part)
+                pending_stdout_bytes += part_bytes
                 return
 
     for record in records:
