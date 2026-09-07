@@ -115,6 +115,8 @@ def test_confirmed_retry_never_resets_new_failures_or_history(tmp_path):
         ("INSERT INTO extra VALUES(?)", (b"new\x00bytes",)),
         ("CREATE INDEX changed ON extra(value)", ()),
         ("CREATE VIEW changed AS SELECT * FROM extra", ()),
+        ("PRAGMA user_version=99", ()),
+        ("PRAGMA application_id=99", ()),
     ],
 )
 def test_any_snapshot_drift_refuses_without_further_changes(tmp_path, sql, args):
@@ -261,3 +263,18 @@ def test_fingerprint_requires_consistency_and_preserves_value_types(tmp_path):
             conn.execute("INSERT INTO values_to_check VALUES(?)", (value,))
             hashes.add(accounting.fingerprint(conn))
         assert len(hashes) == len(values)
+
+
+def test_reset_refuses_triggers_that_can_change_unrelated_facts(tmp_path):
+    """An approved fingerprint must not authorize trigger-driven extra mutations."""
+    path = tmp_path / "tasks.sqlite"
+    database = unversioned_store(path)
+    with database._connect() as conn:
+        conn.execute(
+            "CREATE TRIGGER rewrite AFTER UPDATE ON managed_tasks BEGIN "
+            "UPDATE managed_tasks SET checkpoint='overwritten'; END"
+        )
+    before = digest(path)
+    with pytest.raises(accounting.AccountingContractError, match="current task schema"):
+        accounting.reset_budget(path, expected_fingerprint=before)
+    assert digest(path) == before

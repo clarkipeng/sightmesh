@@ -7,7 +7,8 @@ Automatic legacy task-table rebuilds have been removed.
 
 An operator-approved reset starts a new budget, not a reconstruction of past
 failures. `failure_accounting.reset_budget(path, expected_fingerprint=...)`
-accepts only the current task schema in an existing WAL database. It preserves
+accepts only the current task schema in an existing, trigger-free WAL database.
+The fingerprint also covers application ID and schema-version metadata. It preserves
 every task field except `attempts` (zero) and `version` (incremented once).
 It does not resurrect terminal tasks or retain a separate legacy counter copy.
 Existing history stays intact; a store without history begins with the new

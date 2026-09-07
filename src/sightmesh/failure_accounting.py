@@ -57,6 +57,10 @@ def fingerprint(conn: sqlite3.Connection) -> str:
             "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
         )
     ]
+    contents.extend(
+        (name, conn.execute(f"PRAGMA {name}").fetchone()[0])
+        for name in ("user_version", "application_id")
+    )
     for (name,) in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
     ).fetchall():
@@ -98,12 +102,17 @@ def reset_budget(path: Path, *, expected_fingerprint: str) -> bool:
                         "Database changed since approved snapshot"
                     )
                 schema = conn.execute(
-                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='managed_tasks'"
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='managed_tasks' "
+                    "AND NOT EXISTS (SELECT 1 FROM sqlite_master WHERE type='trigger')"
                 ).fetchone()
                 expected_sql = _MANAGED_TASKS_DDL.format(name="managed_tasks")
-                if schema is None or " ".join(
-                    schema[0].replace('"managed_tasks"', "managed_tasks").split()
-                ) != " ".join(expected_sql.split()):
+                if (
+                    schema is None
+                    or " ".join(
+                        schema[0].replace('"managed_tasks"', "managed_tasks").split()
+                    )
+                    != " ".join(expected_sql.split())
+                ):
                     raise AccountingContractError(
                         "Budget reset requires the current task schema"
                     )
