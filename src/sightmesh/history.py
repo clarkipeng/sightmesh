@@ -119,9 +119,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             )
         return
     conn.execute(_HISTORY_DDL)
-    conn.execute(
-        "CREATE INDEX idx_task_history_task ON task_history(task_id, seq)"
-    )
+    conn.execute("CREATE INDEX idx_task_history_task ON task_history(task_id, seq)")
     _record_baselines(conn)
     conn.execute(
         "INSERT INTO evidence_contract (component, version) VALUES (?, ?)",
@@ -158,12 +156,17 @@ def _record_baselines(conn: sqlite3.Connection) -> None:
             # A wake payload is the durable evidence object itself. History
             # links the wake occurrence; copying those bytes would make a
             # second transcript store.
-            if entity == "wake": values.pop("payload", None)
+            if entity == "wake":
+                values.pop("payload", None)
             epoch = values.get("epoch")
             entity_id = (
                 values.get("wake_id")
                 or values.get("dedupe_key")
-                or (f"{values['kind']}:{values['native_id']}" if entity == "cleanup_intent" else values.get("native_id"))
+                or (
+                    f"{values['kind']}:{values['native_id']}"
+                    if entity == "cleanup_intent"
+                    else values.get("native_id")
+                )
             )
             conn.execute(
                 "INSERT INTO task_history (entity, task_id, epoch, entity_id, "
@@ -188,9 +191,7 @@ def changed_columns(
     current = {key: after[key] for key in after.keys()}
     if before is None:
         return {
-            key: value
-            for key, value in current.items()
-            if key not in _DERIVED_COLUMNS
+            key: value for key, value in current.items() if key not in _DERIVED_COLUMNS
         }
     previous = {key: before[key] for key in before.keys()}
     return {
@@ -247,8 +248,7 @@ def task_history(
             (str(task_id),),
         ).fetchall()
     return conn.execute(
-        "SELECT * FROM task_history WHERE task_id = ? AND entity = ? "
-        "ORDER BY seq",
+        "SELECT * FROM task_history WHERE task_id = ? AND entity = ? ORDER BY seq",
         (str(task_id), entity),
     ).fetchall()
 

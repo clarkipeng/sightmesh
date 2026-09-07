@@ -139,9 +139,15 @@ class EffectJournal:
                     )
                     effect = self._require(conn, task_id, epoch)
                     history.record_change(
-                        conn, entity="effect", task_id=str(task_id), epoch=int(epoch),
-                        cause="reserved", kind="created",
-                        changed=history.changed_columns(None, row := self._row(conn, task_id, epoch)),
+                        conn,
+                        entity="effect",
+                        task_id=str(task_id),
+                        epoch=int(epoch),
+                        cause="reserved",
+                        kind="created",
+                        changed=history.changed_columns(
+                            None, row := self._row(conn, task_id, epoch)
+                        ),
                     )
                     conn.execute("COMMIT")
                     return effect, False
@@ -229,7 +235,11 @@ class EffectJournal:
         of forking a new epoch; the executor's own sentence is the outcome the
         operator reads, and ``retry_at`` says when trying again makes sense.
         """
-        retry_at = None if retry_after_seconds is None else time.time() + float(retry_after_seconds)
+        retry_at = (
+            None
+            if retry_after_seconds is None
+            else time.time() + float(retry_after_seconds)
+        )
         return self._advance(
             task_id,
             epoch,
@@ -238,9 +248,7 @@ class EffectJournal:
             frozenset({"reserved"}),
         )
 
-    def mark_superseded(
-        self, task_id: str, epoch: int, workspace_id: str
-    ) -> Effect:
+    def mark_superseded(self, task_id: str, epoch: int, workspace_id: str) -> Effect:
         """Persist the native workspace that a newer task decision invalidated.
 
         The terminal row is the cleanup intent.  It is written before the
@@ -308,7 +316,9 @@ class EffectJournal:
                         effect.workspace_id,
                     ),
                 )
-                self._history(conn, effect.task_id, effect.epoch, "cleanup-acknowledged", before)
+                self._history(
+                    conn, effect.task_id, effect.epoch, "cleanup-acknowledged", before
+                )
                 conn.execute("COMMIT")
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(
@@ -639,10 +649,24 @@ class EffectJournal:
         return _decode(row)
 
     @classmethod
-    def _history(cls, conn: sqlite3.Connection, task_id: str, epoch: int, cause: str, before: sqlite3.Row | None) -> None:
+    def _history(
+        cls,
+        conn: sqlite3.Connection,
+        task_id: str,
+        epoch: int,
+        cause: str,
+        before: sqlite3.Row | None,
+    ) -> None:
         after = cls._row(conn, task_id, epoch)
         if before is not None and after is not None:
-            history.record_change(conn, entity="effect", task_id=str(task_id), epoch=int(epoch), cause=cause, changed=history.changed_columns(before, after))
+            history.record_change(
+                conn,
+                entity="effect",
+                task_id=str(task_id),
+                epoch=int(epoch),
+                cause=cause,
+                changed=history.changed_columns(before, after),
+            )
 
 
 def _decode(row: sqlite3.Row) -> Effect:

@@ -154,7 +154,14 @@ def finish_with_wake(
         with store.connect() as owned:
             owned.execute("BEGIN IMMEDIATE")
             result_pair = _finish_with_wake(
-                store, owned, task_id, state, result, expect_version, charge_failure, fence
+                store,
+                owned,
+                task_id,
+                state,
+                result,
+                expect_version,
+                charge_failure,
+                fence,
             )
             owned.execute("COMMIT")
             return result_pair
@@ -175,8 +182,13 @@ def _finish_with_wake(
     fence: TaskFence | None,
 ) -> tuple[TaskRecord, list[str]]:
     record = store.finish(
-        task_id, state, result, expect_version=expect_version,
-        charge_failure=charge_failure, fence=fence, conn=conn
+        task_id,
+        state,
+        result,
+        expect_version=expect_version,
+        charge_failure=charge_failure,
+        fence=fence,
+        conn=conn,
     )
     created: list[str] = []
     if record.parent_task_id:
@@ -325,7 +337,8 @@ def record_liveness_wakes(
     created: list[str] = []
 
     if str(row["state"]) == "lost" or (
-        str(row["state"]) == "exhausted" and str(row["result"] or "").startswith("exhausted: lost:")
+        str(row["state"]) == "exhausted"
+        and str(row["result"] or "").startswith("exhausted: lost:")
     ):
         # A dead child has no stall episode and no budget left to run; the
         # loss is the whole report.
@@ -482,7 +495,9 @@ class WakeDelivery:
                 ).fetchall()
                 claimed = [_decode(row) for row in rows]
                 for wake in claimed:
-                    before = conn.execute("SELECT * FROM task_wakes WHERE wake_id = ?", (wake.wake_id,)).fetchone()
+                    before = conn.execute(
+                        "SELECT * FROM task_wakes WHERE wake_id = ?", (wake.wake_id,)
+                    ).fetchone()
                     conn.execute(
                         "UPDATE task_wakes SET state = 'claimed', "
                         "claim_expires_at = ?, updated_at = ? WHERE wake_id = ?",
@@ -567,13 +582,20 @@ class WakeDelivery:
             raise TaskStoreError(f"Cannot persist task wake payload: {exc}") from exc
 
     def _settle(
-        self, wake: Wake, state: str, resolution: str | None = None, *, payload: str | None = None
+        self,
+        wake: Wake,
+        state: str,
+        resolution: str | None = None,
+        *,
+        payload: str | None = None,
     ) -> None:
         now = time.time()
         try:
             with self.store.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                before = conn.execute("SELECT * FROM task_wakes WHERE wake_id = ?", (wake.wake_id,)).fetchone()
+                before = conn.execute(
+                    "SELECT * FROM task_wakes WHERE wake_id = ?", (wake.wake_id,)
+                ).fetchone()
                 conn.execute(
                     "UPDATE task_wakes SET state = ?, resolution = ?, "
                     "payload = COALESCE(payload, ?), "
@@ -621,10 +643,14 @@ def _payload(
     lines = [f"{heading} {predicate}: {parent.key}"]
     for child in children:
         line = f"- {child.key} task={child.task_id} state={child.state} epoch={child.epoch}"
-        if child.liveness != "live": line += f" liveness={child.liveness}"
-        if child.over_budget: line += " over_budget=1"
-        if child.holder_session_id: line += f" session={child.holder_session_id}"
-        if child.checkpoint: line += f" checkpoint={child.checkpoint}"
+        if child.liveness != "live":
+            line += f" liveness={child.liveness}"
+        if child.over_budget:
+            line += " over_budget=1"
+        if child.holder_session_id:
+            line += f" session={child.holder_session_id}"
+        if child.checkpoint:
+            line += f" checkpoint={child.checkpoint}"
         lines.append(line)
     return "\n".join(lines)
 
@@ -642,9 +668,28 @@ def _decode(row: Any) -> Wake:
     )
 
 
-def _record_wake_history(conn: sqlite3.Connection, wake_id: str, cause: str, before: Any, kind: str = "transition") -> None:
-    after = conn.execute("SELECT * FROM task_wakes WHERE wake_id = ?", (wake_id,)).fetchone()
-    if after is None: return
+def _record_wake_history(
+    conn: sqlite3.Connection,
+    wake_id: str,
+    cause: str,
+    before: Any,
+    kind: str = "transition",
+) -> None:
+    after = conn.execute(
+        "SELECT * FROM task_wakes WHERE wake_id = ?", (wake_id,)
+    ).fetchone()
+    if after is None:
+        return
     changed = history.changed_columns(before, after)
-    changed.pop("payload", None)  # row identity, not copied evidence, is the history link
-    history.record_change(conn, entity="wake", task_id=str(after["parent_task_id"]), entity_id=wake_id, cause=cause, kind=kind, changed=changed)
+    changed.pop(
+        "payload", None
+    )  # row identity, not copied evidence, is the history link
+    history.record_change(
+        conn,
+        entity="wake",
+        task_id=str(after["parent_task_id"]),
+        entity_id=wake_id,
+        cause=cause,
+        kind=kind,
+        changed=changed,
+    )
