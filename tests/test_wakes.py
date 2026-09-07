@@ -136,8 +136,9 @@ def test_the_payload_consolidates_every_child_row(cohort):
     WakeDelivery(client, store).pump()
 
     payload = client.sent[0][1]
-    assert "first: completed | one done" in payload
-    assert "second: blocked | two stuck" in payload
+    assert "first task=" in payload and "state=completed" in payload
+    assert "second task=" in payload and "state=blocked" in payload
+    assert "one done" not in payload and "two stuck" not in payload
 
 
 def test_a_delivered_wake_is_not_delivered_again(cohort):
@@ -215,7 +216,7 @@ def test_a_retry_reuses_the_payload_selected_before_an_uncertain_send(cohort):
 
     assert WakeDelivery(client, store, claim_seconds=-1.0).pump() == 0
     frozen = _wakes(store)[0]["payload"]
-    assert frozen and "first finding" in frozen
+    assert frozen and "task=" in frozen and "first finding" not in frozen
 
     # This later projection change is visible to a new renderer but must not
     # rewrite the bytes associated with the already claimed occurrence.

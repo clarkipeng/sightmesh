@@ -167,6 +167,7 @@ class EffectJournal:
                             "different launch specification"
                         )
                 took_over = existing.lease_expires_at <= now
+                before = self._row(conn, task_id, epoch)
                 conn.execute(
                     "UPDATE task_effects SET owner_instance = ?, "
                     "lease_expires_at = ?, updated_at = ? "
@@ -174,6 +175,7 @@ class EffectJournal:
                     (str(owner), now + ttl, now, str(task_id), int(epoch)),
                 )
                 effect = self._require(conn, task_id, epoch)
+                self._history(conn, task_id, epoch, "reservation-takeover", before)
                 conn.execute("COMMIT")
                 return effect, took_over
         except TaskStoreError:
@@ -260,6 +262,7 @@ class EffectJournal:
         try:
             with self.store.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
+                before = self._row(conn, task_id, epoch)
                 conn.execute(
                     "UPDATE task_effects SET workspace_id = ?, outcome = 'superseded', "
                     "updated_at = ? "
@@ -267,6 +270,7 @@ class EffectJournal:
                     (str(workspace_id), time.time(), str(task_id), int(epoch)),
                 )
                 effect = self._require(conn, task_id, epoch)
+                self._history(conn, task_id, epoch, "cleanup-workspace", before)
                 conn.execute("COMMIT")
                 return effect
         except sqlite3.DatabaseError as exc:
@@ -292,6 +296,7 @@ class EffectJournal:
         try:
             with self.store.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
+                before = self._row(conn, effect.task_id, effect.epoch)
                 conn.execute(
                     "UPDATE task_effects SET workspace_id = NULL, updated_at = ? "
                     "WHERE task_id = ? AND epoch = ? AND state = 'terminal' "
@@ -303,6 +308,7 @@ class EffectJournal:
                         effect.workspace_id,
                     ),
                 )
+                self._history(conn, effect.task_id, effect.epoch, "cleanup-acknowledged", before)
                 conn.execute("COMMIT")
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(
@@ -552,6 +558,7 @@ class EffectJournal:
         try:
             with self.store.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
+                before = self._row(conn, task_id, epoch)
                 cursor = conn.execute(
                     "UPDATE task_effects SET state = 'terminal', outcome = ?, "
                     "updated_at = ? WHERE task_id = ? AND epoch = ? "
@@ -561,6 +568,8 @@ class EffectJournal:
                 effect = (
                     self._require(conn, task_id, epoch) if cursor.rowcount else None
                 )
+                if effect is not None:
+                    self._history(conn, task_id, epoch, "reservation-expired", before)
                 conn.execute("COMMIT")
                 return effect
         except TaskStoreError:
@@ -600,12 +609,7 @@ class EffectJournal:
                         "this effect transition no longer applies"
                     )
                 effect = self._require(conn, task_id, epoch)
-                after = self._row(conn, task_id, epoch)
-                if before is not None and after is not None:
-                    history.record_change(
-                        conn, entity="effect", task_id=str(task_id), epoch=int(epoch),
-                        cause="effect-transition", changed=history.changed_columns(before, after),
-                    )
+                self._history(conn, task_id, epoch, "effect-transition", before)
                 conn.execute("COMMIT")
                 return effect
         except TaskStoreError:
@@ -633,6 +637,12 @@ class EffectJournal:
         if row is None:
             raise TaskStoreError(f"Task effect {task_id}/{epoch} not found")
         return _decode(row)
+
+    @classmethod
+    def _history(cls, conn: sqlite3.Connection, task_id: str, epoch: int, cause: str, before: sqlite3.Row | None) -> None:
+        after = cls._row(conn, task_id, epoch)
+        if before is not None and after is not None:
+            history.record_change(conn, entity="effect", task_id=str(task_id), epoch=int(epoch), cause=cause, changed=history.changed_columns(before, after))
 
 
 def _decode(row: sqlite3.Row) -> Effect:
