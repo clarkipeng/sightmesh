@@ -3,6 +3,7 @@ import sqlite3
 import pytest
 from sightmesh import history
 from sightmesh.effects import EffectJournal, request_hash
+from sightmesh import effects
 from sightmesh.task_store import TaskStore
 
 def test_effect_projection_mutations_append_distinct_history(tmp_path):
@@ -28,6 +29,29 @@ def test_history_write_rolls_back_with_projection(tmp_path):
     with store.connect() as conn:
         assert conn.execute("SELECT count(*) FROM task_effects WHERE task_id='x'").fetchone()[0] == 0
         assert history.task_history(conn,'x') == []
+
+def test_real_effect_reserve_rolls_back_when_its_history_append_fails(tmp_path, monkeypatch):
+    store=TaskStore(tmp_path/'state.sqlite'); journal=EffectJournal(store)
+    monkeypatch.setattr(effects.history, 'record_change', lambda *_a, **_k: (_ for _ in ()).throw(sqlite3.DatabaseError('history failed')))
+    with pytest.raises(Exception): journal.reserve('task',1,request_hash({'x':1}),'owner')
+    assert journal.get('task',1) is None
+
+def test_effect_side_doors_each_leave_an_observed_history_entry(tmp_path):
+    store=TaskStore(tmp_path/'state.sqlite'); journal=EffectJournal(store)
+    journal.reserve('task',1,request_hash({'x':1}),'a',ttl=-1)
+    journal.reserve('task',1,request_hash({'x':1}),'b') # takeover
+    journal.mark_terminal('task',1,'done')
+    journal.mark_cleanup_workspace('task',1,'workspace')
+    class Client:
+        def stop_workspace(self, _workspace): return None
+    journal.stop_terminal(Client(), journal.get('task',1))
+    journal.reserve('expired',1,request_hash({'x':2}),'a',ttl=-1)
+    journal.expire_reservations()
+    with store.connect() as conn:
+        task_causes=[row['cause'] for row in history.task_history(conn,'task',entity='effect')]
+        expired_causes=[row['cause'] for row in history.task_history(conn,'expired',entity='effect')]
+    assert {'reservation-takeover','cleanup-workspace','cleanup-acknowledged'} <= set(task_causes)
+    assert 'reservation-expired' in expired_causes
 
 def test_baseline_marks_existing_projection_as_unknown_history():
     conn=sqlite3.connect(':memory:'); conn.row_factory=sqlite3.Row
