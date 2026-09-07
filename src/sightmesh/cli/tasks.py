@@ -102,7 +102,12 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
 
 def cmd_checkpoint(args: argparse.Namespace) -> int:
-    _emit(_mesh(args).checkpoint(args.text, worker=args.worker).to_dict(), args.json)
+    _emit(
+        _mesh(args)
+        .checkpoint(args.text, worker=args.worker, operation_id=args.operation_id)
+        .to_dict(),
+        args.json,
+    )
     return 0
 
 
@@ -207,6 +212,10 @@ def add_parser(sub: argparse._SubParsersAction[Any]) -> None:
     checkpoint = sub.add_parser("checkpoint", help="Save a recovery checkpoint")
     checkpoint.add_argument("text")
     checkpoint.add_argument("--worker")
+    checkpoint.add_argument(
+        "--operation-id",
+        help="Retry the same saved checkpoint operation after an uncertain acknowledgement",
+    )
     checkpoint.set_defaults(func=cmd_checkpoint)
 
     complete = sub.add_parser("complete", help="Complete the current managed task")

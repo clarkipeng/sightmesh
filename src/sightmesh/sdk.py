@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -37,6 +38,9 @@ from .effects import (
 )
 from .durable import DurableExecutionReconciler, NativeCommandQueue
 from .escalation import CDESKTOP_SESSION_ENV, EscalationStore, LauncherIdentity
+from .evidence import EvidenceClient, EvidenceError, EvidenceUnavailable
+from .retention import CheckpointRetention
+from .sqlite_durability import DurabilityUnavailable, confirm_directory_entries
 from .execution_routing import ExecutionRoutingError
 from .liveness import Budget, resolve_policy, trusted_policy
 from .pool.core import PoolError
@@ -53,6 +57,7 @@ from .succession import (
     transfer_ownership,
 )
 from .task_store import (
+    LIVE_STATES,
     StaleTransition,
     TaskFence,
     TaskRecord,
@@ -77,6 +82,16 @@ T = TypeVar("T")
 
 class SightMeshError(RuntimeError):
     pass
+
+
+class CheckpointPending(SightMeshError):
+    """A saved logical checkpoint can be retried without republishing its effect."""
+
+    def __init__(self, operation_id: str):
+        self.operation_id = operation_id
+        super().__init__(
+            f"Checkpoint {operation_id} was not acknowledged; retain its working copy and retry with this operation_id"
+        )
 
 
 class BatchError(SightMeshError):
@@ -187,11 +202,13 @@ class SightMesh:
         client: CdesktopClient | None = None,
         store: TaskStore | None = None,
         ownership: OwnershipStore | None = None,
+        evidence_client: EvidenceClient | None = None,
         environment: Mapping[str, str] | None = None,
     ) -> None:
         self.client = client or CdesktopClient(url)
         self.store = store or TaskStore()
         self.ownership = ownership or OwnershipStore()
+        self.evidence_client = evidence_client
         self.environment = environment if environment is not None else os.environ
         self.owner_instance = new_owner_instance()
         self.journal = EffectJournal(self.store)
@@ -300,7 +317,10 @@ class SightMesh:
                         )
                     self.ownership.assert_deliverable(current.holder_session_id)
                     self.store.begin_outgoing_command(
-                        current.task_id, current.epoch, current.holder_session_id, dedupe_key
+                        current.task_id,
+                        current.epoch,
+                        current.holder_session_id,
+                        dedupe_key,
                     )
                     with fence.external_io():
                         result = self.client.send(
@@ -316,7 +336,9 @@ class SightMesh:
                             else None
                         )
                         if native_id is None:
-                            for command in NativeCommandQueue(self.client).commands(current.holder_session_id):
+                            for command in NativeCommandQueue(self.client).commands(
+                                current.holder_session_id
+                            ):
                                 if command.dedupe_key == dedupe_key:
                                     native_id = command.id
                                     break
@@ -325,10 +347,15 @@ class SightMesh:
                         latest
                         and latest.epoch == current.epoch
                         and latest.holder_session_id == current.holder_session_id
-                        and latest.state in {"completed", "cancelled", "lost", "exhausted"}
+                        and latest.state
+                        in {"completed", "cancelled", "lost", "exhausted"}
                     )
                     self.store.settle_outgoing_command(
-                        current.task_id, current.epoch, dedupe_key, native_id, terminal=terminal
+                        current.task_id,
+                        current.epoch,
+                        dedupe_key,
+                        native_id,
+                        terminal=terminal,
                     )
                     results[entry.worker] = result
             except CdesktopError as exc:
@@ -348,25 +375,157 @@ class SightMesh:
         scope, _parent = self._context()
         return [Worker.from_record(item) for item in self.store.list_scope(scope)]
 
-    def checkpoint(self, text: str, worker: str | None = None) -> Worker:
+    def checkpoint(
+        self,
+        text: str,
+        worker: str | None = None,
+        *,
+        operation_id: str | None = None,
+    ) -> Worker:
+        """Save a new checkpoint, or explicitly retry one persisted operation ID."""
         if not text.strip():
             raise SightMeshError("Checkpoint must not be empty")
         task = self._current() if worker is None else self._find(worker)
-        path = self._checkpoint_path(task, hashlib.sha256(text.encode()).hexdigest())
+        body = text.encode("utf-8")
+        digest = hashlib.sha256(body).hexdigest()
+        native = self._checkpoint_evidence()
+        saved = (
+            self.store.checkpoint_operation_by_id(operation_id)
+            if operation_id
+            else None
+        )
+        if saved is not None and (
+            saved.task_id != task.task_id
+            or saved.epoch != task.epoch
+            or saved.facts["sha256"] != digest
+            or saved.facts["size_bytes"] != len(body)
+        ):
+            raise SightMeshError(
+                "Checkpoint retry does not match the saved task/epoch/bytes"
+            )
+        if operation_id is not None and native is None:
+            raise EvidenceUnavailable(
+                "explicit checkpoint retries require native evidence v1"
+            )
+        operation_id = (
+            str(uuid.uuid4()) if operation_id is None else str(uuid.UUID(operation_id))
+        )
+        root = self._task_repo_path(task)
+        reference = (
+            saved.checkpoint
+            if saved is not None
+            else str(
+                Path(".context/sightmesh/checkpoints") / f"{operation_id}-{digest}.md"
+            )
+        )
+        path = (root / reference).resolve()
+        if root not in path.parents:
+            raise SightMeshError("Checkpoint reference escapes the task worktree")
+        facts = (
+            saved.facts
+            if saved is not None
+            else {
+                "execution_id": self._checkpoint_execution(task)
+                if native is not None
+                else None,
+                "original_path": str(path),
+                "original_name": path.name,
+                "sha256": digest,
+                "size_bytes": len(body),
+            }
+        )
         path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists() and path.read_text(encoding="utf-8") != text:
-            raise SightMeshError(f"Checkpoint digest collision at {path}")
-        if not path.exists():
+        if path.exists():
+            if path.read_bytes() != body:
+                raise SightMeshError(f"Checkpoint bytes changed at {path}")
+        else:
             with tempfile.NamedTemporaryFile(
-                "w", encoding="utf-8", dir=path.parent, delete=False
+                "wb", dir=path.parent, delete=False
             ) as stream:
-                stream.write(text)
+                stream.write(body)
                 stream.flush()
                 os.fsync(stream.fileno())
                 temporary = Path(stream.name)
-            os.replace(temporary, path)
-        reference = str(path.relative_to(self._task_repo_path(task)))
-        return Worker.from_record(self.store.checkpoint(task.task_id, reference))
+            try:
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+            confirm_directory_entries(path)
+        with self.store.task_lock(task.task_id) as fence:
+            if native is None:
+                # Older native versions keep the supported local-only behavior.
+                # This path never creates or acknowledges a retained occurrence.
+                return Worker.from_record(
+                    self.store.transition(
+                        task.task_id,
+                        expect_states=LIVE_STATES,
+                        expect_version=task.version,
+                        assign="checkpoint = ?, checkpoint_at = ?",
+                        values=(reference, time.time()),
+                        attempted="checkpoint",
+                        fence=fence,
+                    )
+                )
+            try:
+                operation = self.store.prepare_checkpoint_operation(
+                    task,
+                    operation_id,
+                    reference,
+                    facts,
+                    fence=fence,
+                )
+                with fence.external_io():
+                    receipt = CheckpointRetention(native).publish(operation, body)
+                return Worker.from_record(
+                    self.store.checkpoint_with_occurrence(
+                        operation, receipt, fence=fence
+                    )
+                )
+            except (
+                EvidenceError,
+                DurabilityUnavailable,
+                OSError,
+                sqlite3.Error,
+            ) as exc:
+                raise CheckpointPending(operation_id) from exc
+
+    def _checkpoint_evidence(self) -> EvidenceClient | None:
+        if self.evidence_client is not None:
+            return self.evidence_client if self.evidence_client.enabled() else None
+        version = (
+            self.client.info().get("service_capabilities", {}).get("execution_evidence")
+        )
+        if type(version) is not int or version != 1:
+            return None
+        self.evidence_client = EvidenceClient(self.client.base_url)
+        if not self.evidence_client.enabled():
+            raise EvidenceUnavailable(
+                "native evidence capability changed during discovery"
+            )
+        return self.evidence_client
+
+    def _checkpoint_execution(self, task: TaskRecord) -> str:
+        if not task.holder_session_id:
+            raise SightMeshError("Checkpoint task has no native holder")
+        processes = self.client.execution_processes(task.holder_session_id)
+        eligible = [
+            p
+            for p in processes
+            if p.get("run_reason") == "codingagent"
+            and p.get("session_id") == task.holder_session_id
+            and not p.get("dropped")
+        ]
+        running = [p for p in eligible if p.get("status") == "running"]
+        if len(running) > 1:
+            raise SightMeshError("Checkpoint native execution is ambiguous")
+        process = running[0] if running else latest_execution_process(eligible)
+        if (
+            process is None
+            or not isinstance(process.get("id"), str)
+            or not process["id"]
+        ):
+            raise SightMeshError("Checkpoint has no verified native execution")
+        return process["id"]
 
     def complete(self, summary: str | None = None, worker: str | None = None) -> Worker:
         task = self._current() if worker is None else self._find(worker)
@@ -453,8 +612,12 @@ class SightMesh:
         """Make the durable terminal decision and enqueue its parent wake."""
         try:
             updated, _created = wakes.finish_with_wake(
-                self.store, task.task_id, state, result,
-                charge_failure=charge_failure, fence=fence
+                self.store,
+                task.task_id,
+                state,
+                result,
+                charge_failure=charge_failure,
+                fence=fence,
             )
         except StaleTransition as exc:
             if exc.current.state == state:
@@ -479,10 +642,15 @@ class SightMesh:
         a task's lifecycle gate. Re-entry fences delivery against a newer row.
         """
         commands = []
-        if state in {"completed", "cancelled", "lost", "exhausted"} and task.holder_session_id:
+        if (
+            state in {"completed", "cancelled", "lost", "exhausted"}
+            and task.holder_session_id
+        ):
             with self.store.task_lock(task.task_id) as snapshot_fence:
                 with snapshot_fence.external_io():
-                    commands = NativeCommandQueue(self.client).commands(task.holder_session_id)
+                    commands = NativeCommandQueue(self.client).commands(
+                        task.holder_session_id
+                    )
         with self.store.task_lock(task.task_id) as fence:
             current = self.store.get_by_id(task.task_id)
             if current is None:
@@ -511,14 +679,20 @@ class SightMesh:
             updated = self._finish(current, state, result, fence)
             workspace_id = current.workspace_id if stop_workspace else None
             effect = self.journal.get(current.task_id, current.epoch)
-            if state in {"completed", "cancelled", "lost", "exhausted"} and effect is not None:
+            if (
+                state in {"completed", "cancelled", "lost", "exhausted"}
+                and effect is not None
+            ):
                 if effect.state != "terminal":
                     effect = self.journal.mark_terminal(
                         current.task_id, current.epoch, state
                     )
                 if effect.workspace_id is None:
                     workspace_id = None
-            if state in {"completed", "cancelled", "lost", "exhausted"} and current.holder_session_id:
+            if (
+                state in {"completed", "cancelled", "lost", "exhausted"}
+                and current.holder_session_id
+            ):
                 self.ownership.retire(
                     current.holder_session_id,
                     state="retired",
@@ -588,7 +762,9 @@ class SightMesh:
                     "spec_json = ?, workspace_id = NULL, holder_session_id = NULL, "
                     "result = NULL"
                 ),
-                values=(json.dumps(resolved_spec, sort_keys=True, separators=(",", ":")),),
+                values=(
+                    json.dumps(resolved_spec, sort_keys=True, separators=(",", ":")),
+                ),
                 attempted="reservation retry",
                 fence=fence,
             )
@@ -1015,7 +1191,10 @@ class SightMesh:
     def _reload_unchanged(self, task: TaskRecord) -> TaskRecord | None:
         """The task's current row if its epoch and version still match, else None."""
         current = self.store.get_by_id(task.task_id)
-        if current is None or (current.epoch, current.version) != (task.epoch, task.version):
+        if current is None or (current.epoch, current.version) != (
+            task.epoch,
+            task.version,
+        ):
             return None
         return current
 
@@ -1146,20 +1325,29 @@ class SightMesh:
             # task so it is not left `reserved` and relaunchable - a retry is an
             # explicit new epoch via replace().
             current = self.store.get_by_id(task.task_id)
-            if current is None or (current.epoch, current.version) != (task.epoch, task.version):
+            if current is None or (current.epoch, current.version) != (
+                task.epoch,
+                task.version,
+            ):
                 self.journal.mark_terminal(task.task_id, task.epoch, "superseded")
             elif not isinstance(exc, (CdesktopInterruptedError, CdesktopPendingError)):
                 outcome = self._record_provider_outcome(
                     task, _rejection_outcome(exc.status), exc.retry_at
                 )
                 self._finish(
-                    task, "blocked", f"launch rejected: {outcome}", fence,
+                    task,
+                    "blocked",
+                    f"launch rejected: {outcome}",
+                    fence,
                     charge_failure=True,
                 )
             raise
         workspace_id, session_id = self._effect_ids(task, native, fence)
         current = self.store.get_by_id(task.task_id)
-        if current is None or (current.epoch, current.version) != (task.epoch, task.version):
+        if current is None or (current.epoch, current.version) != (
+            task.epoch,
+            task.version,
+        ):
             existing = self.journal.get(task.task_id, task.epoch)
             superseded = (
                 self.journal.mark_cleanup_workspace(
@@ -1188,7 +1376,9 @@ class SightMesh:
             # condition clears. Nothing is terminalized, and the operator reads
             # the executor's sentence, never a bare "lost".
             retry_after = effect.get("retry_after_seconds")
-            self.journal.mark_refused(task.task_id, task.epoch, reason or "refused", retry_after)
+            self.journal.mark_refused(
+                task.task_id, task.epoch, reason or "refused", retry_after
+            )
             wait = f"; retry after {int(retry_after)}s" if retry_after else ""
             raise CdesktopPendingError(
                 f"launch refused for {task.key!r}: {reason or 'temporary refusal'}{wait}",
@@ -1241,8 +1431,7 @@ class SightMesh:
             # have recorded, and its absence describes no disagreement about
             # the work - so an upgrade mid-flight must not read as one.
             expired = (
-                existing.state == "lost"
-                and existing.result == "reservation expired"
+                existing.state == "lost" and existing.result == "reservation expired"
             )
             if not expired and old_public != {
                 key: value for key, value in public.items() if key in old_public
@@ -1457,14 +1646,39 @@ class SightMesh:
     def _read_checkpoint(self, task: TaskRecord) -> str | None:
         if not task.checkpoint:
             return None
-        root = self._task_repo_path(task)
-        path = (root / task.checkpoint).resolve()
-        if root not in path.parents:
-            raise SightMeshError("Checkpoint reference escapes the task worktree")
+        operation = self.store.checkpoint_operation(task.task_id, task.checkpoint)
+        local_error: Exception | None = None
         try:
-            return path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise SightMeshError(f"Cannot read checkpoint {path}: {exc}") from exc
+            root = self._task_repo_path(task)
+        except (SightMeshError, CdesktopError) as exc:
+            if operation is None:
+                raise
+            local_error = exc
+            root = None
+        try:
+            if root is None:
+                raise EvidenceUnavailable("checkpoint worktree no longer exists")
+            path = (root / task.checkpoint).resolve()
+            if root not in path.parents:
+                raise SightMeshError("Checkpoint reference escapes the task worktree")
+            with path.open("rb") as stream:
+                body = (
+                    stream.read(operation.facts["size_bytes"] + 1)
+                    if operation is not None
+                    else stream.read()
+                )
+            if operation is not None:
+                CheckpointRetention._verify_bytes(operation, body)
+            return body.decode("utf-8")
+        except (OSError, EvidenceUnavailable, CdesktopError) as exc:
+            local_error = exc
+        if operation is not None:
+            native = self._checkpoint_evidence()
+            if native is not None:
+                return CheckpointRetention(native).read(operation, None).decode("utf-8")
+        raise SightMeshError(
+            "Checkpoint working copy is unavailable and no verified native reference can recover it"
+        ) from local_error
 
     def _require_contract(self) -> str:
         """Probe the managed-launch seam instead of trusting the advertisement.

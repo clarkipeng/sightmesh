@@ -102,7 +102,7 @@ mesh.send_all([
 ])
 ```
 
-`start` is idempotent for a key in the current manager scope. `start_all` validates and reserves the full batch before launching its members, then returns one result or error per key. `send_all` validates every destination before queueing any command. A replacement gets a new session in the same task-owned worktree only after the old session is quarantined. Checkpoint content stays in that worktree under `.context`, addressed by its content hash; SightMesh stores only the reference. Three total launch attempts trip the circuit breaker.
+`start` is idempotent for a key in the current manager scope. `start_all` validates and reserves the full batch before launching its members, then returns one result or error per key. `send_all` validates every destination before queueing any command. A replacement gets a new session in the same task-owned worktree only after the old session is quarantined. Checkpoint working copies stay under that worktree's `.context`. With native execution-evidence version 1, [checkpoint retention](docs/checkpoint-retention.md) also preserves each occurrence with cdesktop and makes it recoverable without the worktree; older native versions remain local-only. The circuit breaker counts charged failures, not successful launches.
 
 Repository names resolve to the one canonical checkout even when old managed-worktree registrations share that name. For a routed managed task, the bridge recognizes a terminal subscription quota refusal, cools only that opaque account binding, and transfers the task once to the next eligible configured route. Explicit profiles are never changed automatically.
 

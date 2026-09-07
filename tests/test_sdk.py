@@ -416,6 +416,8 @@ def test_checkpoint_content_stays_in_the_task_worktree(system):
     )
 
 
+
+
 def test_duplicate_failover_wakeups_reserve_one_successor_epoch(system):
     """Two managers observing the same failure must not burn two epochs.
 

@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .cdesktop import CdesktopClient, CdesktopError
+from . import history
 from .succession import OwnershipStore, QuarantinedSessionError
 from .task_store import (
     LIVE_STATES,
@@ -84,6 +85,7 @@ class Wake:
     state: str
     claim_expires_at: float | None
     payload: str | None
+    claim_token: str | None
 
 
 def dedupe_key(parent_task_id: str, predicate: str) -> str:
@@ -153,7 +155,14 @@ def finish_with_wake(
         with store.connect() as owned:
             owned.execute("BEGIN IMMEDIATE")
             result_pair = _finish_with_wake(
-                store, owned, task_id, state, result, expect_version, charge_failure, fence
+                store,
+                owned,
+                task_id,
+                state,
+                result,
+                expect_version,
+                charge_failure,
+                fence,
             )
             owned.execute("COMMIT")
             return result_pair
@@ -174,8 +183,13 @@ def _finish_with_wake(
     fence: TaskFence | None,
 ) -> tuple[TaskRecord, list[str]]:
     record = store.finish(
-        task_id, state, result, expect_version=expect_version,
-        charge_failure=charge_failure, fence=fence, conn=conn
+        task_id,
+        state,
+        result,
+        expect_version=expect_version,
+        charge_failure=charge_failure,
+        fence=fence,
+        conn=conn,
     )
     created: list[str] = []
     if record.parent_task_id:
@@ -284,6 +298,7 @@ def record_wakes(conn: sqlite3.Connection, parent_task_id: str) -> list[str]:
             (wake_id, str(parent_task_id), predicate, key, child_event_seq, now, now),
         )
         if cursor.rowcount:
+            _record_wake_history(conn, wake_id, "armed", None, "created")
             created.append(wake_id)
     return created
 
@@ -323,7 +338,8 @@ def record_liveness_wakes(
     created: list[str] = []
 
     if str(row["state"]) == "lost" or (
-        str(row["state"]) == "exhausted" and str(row["result"] or "").startswith("exhausted: lost:")
+        str(row["state"]) == "exhausted"
+        and str(row["result"] or "").startswith("exhausted: lost:")
     ):
         # A dead child has no stall episode and no budget left to run; the
         # loss is the whole report.
@@ -433,7 +449,10 @@ def _arm_liveness(
         """,
         (wake_id, parent_task_id, LIVENESS_PREDICATES[reason], key, now, now),
     )
-    return [wake_id] if cursor.rowcount else []
+    if cursor.rowcount:
+        _record_wake_history(conn, wake_id, "liveness-armed", None, "created")
+        return [wake_id]
+    return []
 
 
 class WakeDelivery:
@@ -475,12 +494,21 @@ class WakeDelivery:
                     "ORDER BY created_at",
                     (now,),
                 ).fetchall()
-                claimed = [_decode(row) for row in rows]
-                for wake in claimed:
+                claimed = []
+                for before in rows:
+                    wake_id = str(before["wake_id"])
                     conn.execute(
                         "UPDATE task_wakes SET state = 'claimed', "
-                        "claim_expires_at = ?, updated_at = ? WHERE wake_id = ?",
-                        (now + self.claim_seconds, now, wake.wake_id),
+                        "claim_expires_at = ?, claim_token = ?, updated_at = ? WHERE wake_id = ?",
+                        (now + self.claim_seconds, str(uuid.uuid4()), now, wake_id),
+                    )
+                    _record_wake_history(conn, wake_id, "claimed", before)
+                    claimed.append(
+                        _decode(
+                            conn.execute(
+                                "SELECT * FROM task_wakes WHERE wake_id = ?", (wake_id,)
+                            ).fetchone()
+                        )
                     )
                 conn.execute("COMMIT")
                 return claimed
@@ -517,6 +545,12 @@ class WakeDelivery:
             children,
             escalation=is_escalation(wake.dedupe_key),
         )
+        # Freeze the selected bytes before the first external call.  A lost
+        # response leaves the claim retryable, and its retry must not render
+        # a later cohort into a different message.
+        payload = self._persist_payload(wake, payload)
+        if payload is None:
+            return False  # Another pump reclaimed or settled this wake.
         self.client.send(
             parent.holder_session_id,
             payload,
@@ -524,25 +558,71 @@ class WakeDelivery:
             dedupe_key=wake.wake_id,
             intent="continue",
         )
-        self._settle(wake, "delivered", payload)
-        return True
+        return self._settle(wake, "delivered")
 
     def _resolve(self, wake: Wake, reason: str) -> bool:
         """Park a suppressed delivery with its reason; never return silently."""
         LOGGER.info("Wake %s resolved without delivery: %s", wake.wake_id, reason)
-        self._settle(wake, "resolved", f"suppressed: {reason}")
+        self._settle(wake, "resolved", reason, payload=f"suppressed: {reason}")
         return False
 
-    def _settle(self, wake: Wake, state: str, payload: str) -> None:
+    def _persist_payload(self, wake: Wake, selected: str) -> str | None:
+        """Store a delivery's immutable bytes before its first send."""
+        try:
+            with self.store.connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                updated = conn.execute(
+                    "UPDATE task_wakes SET payload = COALESCE(payload, ?), "
+                    "updated_at = ? WHERE wake_id = ? AND state = 'claimed' AND claim_token = ?",
+                    (selected, time.time(), wake.wake_id, wake.claim_token),
+                )
+                if not updated.rowcount:
+                    conn.execute("COMMIT")
+                    return None
+                # Payload bytes are immutable evidence owned by this row;
+                # selection is not a second history occurrence.
+                row = conn.execute(
+                    "SELECT payload FROM task_wakes WHERE wake_id = ?", (wake.wake_id,)
+                ).fetchone()
+                if row is None or row["payload"] is None:
+                    raise TaskStoreError(f"Cannot persist wake {wake.wake_id} payload")
+                conn.execute("COMMIT")
+                return str(row["payload"])
+        except sqlite3.DatabaseError as exc:
+            raise TaskStoreError(f"Cannot persist task wake payload: {exc}") from exc
+
+    def _settle(
+        self,
+        wake: Wake,
+        state: str,
+        resolution: str | None = None,
+        *,
+        payload: str | None = None,
+    ) -> bool:
+        """Only the current claim may choose a terminal outcome and watermark.
+
+        A lease grants another pump permission to claim, not permission for an
+        expired caller to overwrite its successor. The token fences both paths;
+        the existing wake ID still owns native deduplication across retries.
+        """
         now = time.time()
         try:
             with self.store.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                conn.execute(
-                    "UPDATE task_wakes SET state = ?, payload = ?, "
-                    "claim_expires_at = NULL, updated_at = ? WHERE wake_id = ?",
-                    (state, payload, now, wake.wake_id),
+                before = conn.execute(
+                    "SELECT * FROM task_wakes WHERE wake_id = ?", (wake.wake_id,)
+                ).fetchone()
+                updated = conn.execute(
+                    "UPDATE task_wakes SET state = ?, resolution = ?, "
+                    "payload = COALESCE(payload, ?), "
+                    "claim_expires_at = NULL, updated_at = ? WHERE wake_id = ? "
+                    "AND state = 'claimed' AND claim_token = ?",
+                    (state, resolution, payload, now, wake.wake_id, wake.claim_token),
                 )
+                if not updated.rowcount:
+                    conn.execute("COMMIT")
+                    return False
+                _record_wake_history(conn, wake.wake_id, "settled", before)
                 if state == "delivered" and wake.event_seq is not None:
                     # Only a real delivery advances the watermark. A resolved
                     # (suppressed) wake leaves it where it was, so the same
@@ -555,6 +635,7 @@ class WakeDelivery:
                         (int(wake.event_seq), now, wake.parent_task_id),
                     )
                 conn.execute("COMMIT")
+                return True
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(f"Cannot settle task wake: {exc}") from exc
 
@@ -582,17 +663,15 @@ def _payload(
     heading = "ESCALATION" if escalation else "COHORT"
     lines = [f"{heading} {predicate}: {parent.key}"]
     for child in children:
-        line = f"- {child.key}: {child.state}"
+        line = f"- {child.key} task={child.task_id} state={child.state} epoch={child.epoch}"
         if child.liveness != "live":
-            line += f" | liveness={child.liveness}"
+            line += f" liveness={child.liveness}"
         if child.over_budget:
-            line += " | over_budget"
-        if child.result:
-            line += f" | {child.result}"
-        if child.liveness_evidence and (
-            child.liveness != "live" or child.over_budget or child.state in {"lost", "exhausted"}
-        ):
-            line += f" | evidence={child.liveness_evidence}"
+            line += " over_budget=1"
+        if child.holder_session_id:
+            line += f" session={child.holder_session_id}"
+        if child.checkpoint:
+            line += f" checkpoint={child.checkpoint}"
         lines.append(line)
     return "\n".join(lines)
 
@@ -607,4 +686,32 @@ def _decode(row: Any) -> Wake:
         state=str(row["state"]),
         claim_expires_at=row["claim_expires_at"],
         payload=row["payload"],
+        claim_token=row["claim_token"],
+    )
+
+
+def _record_wake_history(
+    conn: sqlite3.Connection,
+    wake_id: str,
+    cause: str,
+    before: Any,
+    kind: str = "transition",
+) -> None:
+    after = conn.execute(
+        "SELECT * FROM task_wakes WHERE wake_id = ?", (wake_id,)
+    ).fetchone()
+    if after is None:
+        return
+    changed = history.changed_columns(before, after)
+    changed.pop(
+        "payload", None
+    )  # row identity, not copied evidence, is the history link
+    history.record_change(
+        conn,
+        entity="wake",
+        task_id=str(after["parent_task_id"]),
+        entity_id=wake_id,
+        cause=cause,
+        kind=kind,
+        changed=changed,
     )

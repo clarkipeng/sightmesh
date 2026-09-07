@@ -18,6 +18,20 @@ SightMesh keeps orchestration data local and separates durable source state from
 
 ## Workspace lifecycle
 
+Managed task history preserves sparse task, effect, outgoing-command, cleanup and
+wake changes in the same SQLite transaction as their current rows. Pre-upgrade
+rows become observed baselines with missing history explicitly marked. Scheduler
+reads still use current rows. Wake rows retain their selected compact payload once;
+history links that occurrence without copying its bytes. Native acceptance, not a
+completed agent judgment, advances the delivery watermark.
+
+Selective [checkpoint retention](checkpoint-retention.md) is capability-gated and
+keeps original bytes with cdesktop. Other `.context` files remain workspace-local;
+archiving does not turn them into retained artifacts. The optional
+[execution-evidence index](execution-evidence.md) is disposable and contentless.
+Rebuilding or compacting it never removes originals. Source retention does not
+authorize deleting the native execution or archive that owns the references.
+
 Archive is the ordinary retirement action. It stops execution, disables message routing, releases the ownership lease, and preserves the cdesktop workspace record and session history. SightMesh refuses to archive a dirty cdesktop-managed worktree because cdesktop may reclaim that directory after about one hour. A worktree cdesktop has already reclaimed holds no uncommitted work, so it never counts as dirty. A direct workspace may preserve reconciled dirty state only with `--preserve-dirty`; cdesktop never owns or removes its repository.
 
 Restore reactivates the same cdesktop record, reacquires its ownership lease, and re-enables routing. If cdesktop already reclaimed a clean managed worktree, it recreates the worktree from the preserved Git branch when execution resumes.

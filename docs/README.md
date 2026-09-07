@@ -8,6 +8,8 @@ The README covers evaluation and the core workflow. Use these focused references
 - [Compatibility](compatibility.md): tested operating system, Python, cdesktop, and provider CLI behavior.
 - [Operations](operations.md): fleet inspection, updates, approvals, provider failover, leases, and recovery gates.
 - [Storage and retention](storage.md): local files, transcripts, archives, and deletion behavior.
+- [Checkpoint retention](checkpoint-retention.md): durable native references, explicit retries, and recovery without a worktree.
+- [Execution evidence](execution-evidence.md): opt-in contentless search, coverage, and source-derived usage without guessed bills.
 - [Trace efficiency](trace-efficiency.md): measured trace and coordination tradeoffs.
 
 ## Adopt or compare

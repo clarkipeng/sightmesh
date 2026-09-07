@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import history
 from .escalation import EscalationStore, escalation_db_path
 from .fence import HELD_TASK_FENCE
 
@@ -166,7 +167,9 @@ _TASK_WAKES_DDL = """
         state TEXT NOT NULL CHECK (state IN
             ('pending', 'claimed', 'delivered', 'resolved')),
         claim_expires_at REAL,
+        claim_token TEXT,
         payload TEXT,
+        resolution TEXT,
         created_at REAL NOT NULL,
         updated_at REAL NOT NULL
     )
@@ -275,6 +278,21 @@ class TaskRecord:
     checkpoint_at: float | None = None
 
 
+@dataclass(frozen=True)
+class CheckpointOperation:
+    operation_id: str
+    task_id: str
+    epoch: int
+    holder_session_id: str
+    expected_version: int
+    checkpoint: str
+    facts: dict[str, Any]
+    receipt: dict[str, Any] | None
+    durable_commit: bool
+    created_at: float
+    committed_at: float | None
+
+
 class TaskStore:
     """Persist semantic parentage and budgets cdesktop cannot reconstruct."""
 
@@ -364,6 +382,39 @@ class TaskStore:
                     "CREATE INDEX IF NOT EXISTS idx_task_outgoing_pending "
                     "ON task_outgoing_commands(state, created_at)"
                 )
+                checkpoint_table_existed = (
+                    conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_checkpoint_operations'"
+                    ).fetchone()
+                    is not None
+                )
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS task_checkpoint_operations (
+                        operation_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
+                        epoch INTEGER NOT NULL, holder_session_id TEXT NOT NULL,
+                        expected_version INTEGER NOT NULL, checkpoint TEXT NOT NULL,
+                        facts TEXT NOT NULL, receipt TEXT,
+                        durable_commit INTEGER NOT NULL DEFAULT 0 CHECK(durable_commit IN (0,1)),
+                        created_at REAL NOT NULL, committed_at REAL,
+                        UNIQUE(task_id, epoch, checkpoint)
+                    )
+                """)
+                # Last, so a first-upgrade baseline observes every projection
+                # table at its migrated shape, inside this same transaction.
+                history.ensure_schema(conn)
+                checkpoint_contract = conn.execute(
+                    "SELECT version FROM evidence_contract WHERE component='checkpoint_retention'"
+                ).fetchone()
+                if checkpoint_contract is None:
+                    if checkpoint_table_existed:
+                        raise TaskStoreError(
+                            "Unversioned checkpoint operations require explicit migration; refusing to infer durability"
+                        )
+                    conn.execute(
+                        "INSERT INTO evidence_contract(component,version) VALUES('checkpoint_retention',1)"
+                    )
+                elif checkpoint_contract["version"] != 1:
+                    raise TaskStoreError("Unsupported checkpoint retention contract")
                 conn.execute("COMMIT")
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(f"Cannot initialize managed tasks: {exc}") from exc
@@ -458,8 +509,11 @@ class TaskStore:
                 # Pre-#119 attempts counted launches, not failures. That
                 # number has no recoverable failure meaning, so migration
                 # starts the new failure budget at its only sound value: zero.
-                "0" if name == "attempts" else
-                name if name in columns else {
+                "0"
+                if name == "attempts"
+                else name
+                if name in columns
+                else {
                     "version": "0",
                     "child_event_seq": "0",
                     "last_woken_seq": "0",
@@ -471,7 +525,8 @@ class TaskStore:
                     "over_budget": "0",
                     "checkpoint_at": "NULL",
                 }[name]
-                for name in _MANAGED_TASKS_COLUMNS if name != "parent_task_id"
+                for name in _MANAGED_TASKS_COLUMNS
+                if name != "parent_task_id"
             )
             + " FROM managed_tasks"
         )
@@ -611,7 +666,12 @@ class TaskStore:
                 # naming a missing column would fail the whole upgrade.
                 carried = ", ".join(
                     name
-                    for name in (*_TASK_WAKES_LEGACY_COLUMNS, "event_seq")
+                    for name in (
+                        *_TASK_WAKES_LEGACY_COLUMNS,
+                        "event_seq",
+                        "resolution",
+                        "claim_token",
+                    )
                     if name in columns
                 )
                 conn.execute(f"DROP TABLE IF EXISTS {_TASK_WAKES_REBUILD_TABLE}")
@@ -624,6 +684,15 @@ class TaskStore:
                 conn.execute(
                     f"ALTER TABLE {_TASK_WAKES_REBUILD_TABLE} RENAME TO task_wakes"
                 )
+                columns.update(("resolution", "claim_token"))
+            # Payload used to be written only after a successful send.  A
+            # retry must instead reuse the exact bytes selected before its
+            # first send; settlement notes live separately so they cannot
+            # overwrite those bytes.
+            if "resolution" not in columns:
+                conn.execute("ALTER TABLE task_wakes ADD COLUMN resolution TEXT")
+            if "claim_token" not in columns:
+                conn.execute("ALTER TABLE task_wakes ADD COLUMN claim_token TEXT")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_task_wakes_pending "
             "ON task_wakes(state, created_at)"
@@ -725,6 +794,18 @@ class TaskStore:
                         row = conn.execute(
                             "SELECT * FROM managed_tasks WHERE task_id = ?", (task_id,)
                         ).fetchone()
+                        # The row's initial values are the facts its first
+                        # update will start destroying; recorded here, in the
+                        # reservation's own transaction.
+                        history.record_change(
+                            conn,
+                            entity="task",
+                            task_id=task_id,
+                            epoch=1,
+                            cause="reserved",
+                            kind="created",
+                            changed=history.changed_columns(None, row),
+                        )
                     elif str(row["spec_json"]) != encoded:
                         raise TaskStoreError(
                             f"Task {key!r} already exists with a different specification"
@@ -748,11 +829,14 @@ class TaskStore:
         """
         try:
             return sum(
-                process["status"] == "running" and process["run_reason"] == "codingagent"
+                process["status"] == "running"
+                and process["run_reason"] == "codingagent"
                 for process in processes
             )
         except (KeyError, TypeError) as exc:
-            raise TaskStoreError("Malformed running execution-process response") from exc
+            raise TaskStoreError(
+                "Malformed running execution-process response"
+            ) from exc
 
     def record_cleanup_intents(
         self, task_id: str, epoch: int, session_id: str, commands: Iterable[Any]
@@ -766,12 +850,20 @@ class TaskStore:
         now = time.time()
         rows: list[tuple[str, str]] = []
         for command in commands:
-            state = str(command.get("state", "") if isinstance(command, dict) else command.state)
+            state = str(
+                command.get("state", "") if isinstance(command, dict) else command.state
+            )
             if state in {"done", "failed", "cancelled", "completed", "killed"}:
                 continue
-            command_id = str(command.get("id") if isinstance(command, dict) else command.id)
+            command_id = str(
+                command.get("id") if isinstance(command, dict) else command.id
+            )
             rows.append(("command_cancel", command_id))
-            process_id = command.get("execution_process_id") if isinstance(command, dict) else command.execution_process_id
+            process_id = (
+                command.get("execution_process_id")
+                if isinstance(command, dict)
+                else command.execution_process_id
+            )
             if process_id:
                 rows.append(("execution_stop", str(process_id)))
         if not rows:
@@ -779,40 +871,121 @@ class TaskStore:
         try:
             with self.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                conn.executemany(
-                    "INSERT OR IGNORE INTO task_cleanup_intents "
-                    "(task_id, epoch, kind, native_id, session_id, state, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
-                    [(str(task_id), int(epoch), kind, native_id, str(session_id), now, now) for kind, native_id in rows],
-                )
+                for kind, native_id in rows:
+                    cursor = conn.execute(
+                        "INSERT OR IGNORE INTO task_cleanup_intents "
+                        "(task_id, epoch, kind, native_id, session_id, state, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+                        (
+                            str(task_id),
+                            int(epoch),
+                            kind,
+                            native_id,
+                            str(session_id),
+                            now,
+                            now,
+                        ),
+                    )
+                    if cursor.rowcount:
+                        history.record_change(
+                            conn,
+                            entity="cleanup_intent",
+                            task_id=str(task_id),
+                            epoch=int(epoch),
+                            entity_id=f"{kind}:{native_id}",
+                            cause="fenced",
+                            kind="created",
+                            changed=history.changed_columns(
+                                None,
+                                conn.execute(
+                                    "SELECT * FROM task_cleanup_intents WHERE task_id=? AND epoch=? AND kind=? AND native_id=?",
+                                    (str(task_id), int(epoch), kind, native_id),
+                                ).fetchone(),
+                            ),
+                        )
                 conn.execute("COMMIT")
         except sqlite3.DatabaseError as exc:
-            raise TaskStoreError(f"Cannot record terminal cleanup intents: {exc}") from exc
+            raise TaskStoreError(
+                f"Cannot record terminal cleanup intents: {exc}"
+            ) from exc
 
-    def begin_outgoing_command(self, task_id: str, epoch: int, session_id: str, dedupe_key: str) -> None:
+    def begin_outgoing_command(
+        self, task_id: str, epoch: int, session_id: str, dedupe_key: str
+    ) -> None:
         """Persist the send admission before opening the task fence for HTTP."""
         now = time.time()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT OR IGNORE INTO task_outgoing_commands "
                 "(task_id, epoch, dedupe_key, session_id, state, created_at, updated_at) "
                 "VALUES (?, ?, ?, ?, 'sending', ?, ?)",
                 (str(task_id), int(epoch), str(dedupe_key), str(session_id), now, now),
             )
+            if cursor.rowcount:
+                history.record_change(
+                    conn,
+                    entity="outgoing_command",
+                    task_id=str(task_id),
+                    epoch=int(epoch),
+                    entity_id=str(dedupe_key),
+                    cause="sending",
+                    kind="created",
+                    changed=history.changed_columns(
+                        None,
+                        conn.execute(
+                            "SELECT * FROM task_outgoing_commands WHERE task_id=? AND epoch=? AND dedupe_key=?",
+                            (str(task_id), int(epoch), str(dedupe_key)),
+                        ).fetchone(),
+                    ),
+                )
             conn.execute("COMMIT")
 
     def settle_outgoing_command(
-        self, task_id: str, epoch: int, dedupe_key: str, native_id: str | None, *, terminal: bool
+        self,
+        task_id: str,
+        epoch: int,
+        dedupe_key: str,
+        native_id: str | None,
+        *,
+        terminal: bool,
     ) -> None:
         """Publish the native id, then bind a terminal send to durable cleanup."""
         now = time.time()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            before = conn.execute(
+                "SELECT * FROM task_outgoing_commands WHERE task_id=? AND epoch=? AND dedupe_key=?",
+                (str(task_id), int(epoch), str(dedupe_key)),
+            ).fetchone()
+            if before is None:
+                raise TaskStoreError("outgoing command was not prepared")
             conn.execute(
                 "UPDATE task_outgoing_commands SET native_id = COALESCE(?, native_id), "
                 "state = ?, updated_at = ? WHERE task_id = ? AND epoch = ? AND dedupe_key = ?",
-                (native_id, "cleanup" if terminal else "settled", now, str(task_id), int(epoch), str(dedupe_key)),
+                (
+                    native_id,
+                    "cleanup" if terminal else "settled",
+                    now,
+                    str(task_id),
+                    int(epoch),
+                    str(dedupe_key),
+                ),
+            )
+            history.record_change(
+                conn,
+                entity="outgoing_command",
+                task_id=str(task_id),
+                epoch=int(epoch),
+                entity_id=str(dedupe_key),
+                cause="cleanup" if terminal else "settled",
+                changed=history.changed_columns(
+                    before,
+                    conn.execute(
+                        "SELECT * FROM task_outgoing_commands WHERE task_id=? AND epoch=? AND dedupe_key=?",
+                        (str(task_id), int(epoch), str(dedupe_key)),
+                    ).fetchone(),
+                ),
             )
             if terminal and native_id:
                 row = conn.execute(
@@ -820,12 +993,36 @@ class TaskStore:
                     "AND epoch = ? AND dedupe_key = ?",
                     (str(task_id), int(epoch), str(dedupe_key)),
                 ).fetchone()
-                conn.execute(
+                inserted = conn.execute(
                     "INSERT OR IGNORE INTO task_cleanup_intents "
                     "(task_id, epoch, kind, native_id, session_id, state, created_at, updated_at) "
                     "VALUES (?, ?, 'command_cancel', ?, ?, 'pending', ?, ?)",
-                    (str(task_id), int(epoch), str(native_id), str(row["session_id"]), now, now),
+                    (
+                        str(task_id),
+                        int(epoch),
+                        str(native_id),
+                        str(row["session_id"]),
+                        now,
+                        now,
+                    ),
                 )
+                if inserted.rowcount:
+                    history.record_change(
+                        conn,
+                        entity="cleanup_intent",
+                        task_id=str(task_id),
+                        epoch=int(epoch),
+                        entity_id=f"command_cancel:{native_id}",
+                        cause="terminal-send",
+                        kind="created",
+                        changed=history.changed_columns(
+                            None,
+                            conn.execute(
+                                "SELECT * FROM task_cleanup_intents WHERE task_id=? AND epoch=? AND kind='command_cancel' AND native_id=?",
+                                (str(task_id), int(epoch), str(native_id)),
+                            ).fetchone(),
+                        ),
+                    )
             conn.execute("COMMIT")
 
     def terminal_outgoing_commands(self, task_id: str, epoch: int) -> list[sqlite3.Row]:
@@ -853,20 +1050,62 @@ class TaskStore:
                 "SELECT * FROM task_cleanup_intents WHERE state = 'pending' ORDER BY created_at"
             ).fetchall()
 
-    def acknowledge_cleanup_intent(self, task_id: str, epoch: int, kind: str, native_id: str) -> None:
+    def acknowledge_cleanup_intent(
+        self, task_id: str, epoch: int, kind: str, native_id: str
+    ) -> None:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            before = conn.execute(
+                "SELECT * FROM task_cleanup_intents WHERE task_id=? AND epoch=? AND kind=? AND native_id=?",
+                (str(task_id), int(epoch), str(kind), str(native_id)),
+            ).fetchone()
             conn.execute(
                 "UPDATE task_cleanup_intents SET state = 'acknowledged', updated_at = ? "
                 "WHERE task_id = ? AND epoch = ? AND kind = ? AND native_id = ? AND state = 'pending'",
                 (time.time(), str(task_id), int(epoch), str(kind), str(native_id)),
             )
+            if before is not None:
+                history.record_change(
+                    conn,
+                    entity="cleanup_intent",
+                    task_id=str(task_id),
+                    epoch=int(epoch),
+                    entity_id=f"{kind}:{native_id}",
+                    cause="acknowledged",
+                    changed=history.changed_columns(
+                        before,
+                        conn.execute(
+                            "SELECT * FROM task_cleanup_intents WHERE task_id=? AND epoch=? AND kind=? AND native_id=?",
+                            (str(task_id), int(epoch), str(kind), str(native_id)),
+                        ).fetchone(),
+                    ),
+                )
             if kind == "command_cancel":
+                outgoing = conn.execute(
+                    "SELECT * FROM task_outgoing_commands WHERE task_id=? AND epoch=? AND native_id=? AND state='cleanup'",
+                    (str(task_id), int(epoch), str(native_id)),
+                ).fetchall()
                 conn.execute(
                     "UPDATE task_outgoing_commands SET state = 'acknowledged', updated_at = ? "
                     "WHERE task_id = ? AND epoch = ? AND native_id = ? AND state = 'cleanup'",
                     (time.time(), str(task_id), int(epoch), str(native_id)),
                 )
+                for command in outgoing:
+                    history.record_change(
+                        conn,
+                        entity="outgoing_command",
+                        task_id=str(task_id),
+                        epoch=int(epoch),
+                        entity_id=command["dedupe_key"],
+                        cause="acknowledged",
+                        changed=history.changed_columns(
+                            command,
+                            conn.execute(
+                                "SELECT * FROM task_outgoing_commands WHERE task_id=? AND epoch=? AND dedupe_key=?",
+                                (str(task_id), int(epoch), command["dedupe_key"]),
+                            ).fetchone(),
+                        ),
+                    )
             conn.execute("COMMIT")
 
     def get_by_id(self, task_id: str) -> TaskRecord | None:
@@ -947,21 +1186,17 @@ class TaskStore:
             return self._transition(
                 conn, task_id, expect_states, expect_version, assign, values, attempted
             )
-        try:
-            with self._database._connect() as owned:
-                return self._transition(
-                    owned,
-                    task_id,
-                    expect_states,
-                    expect_version,
-                    assign,
-                    values,
-                    attempted,
-                )
-        except TaskStoreError:
-            raise
-        except sqlite3.DatabaseError as exc:
-            raise TaskStoreError(f"Cannot update managed task: {exc}") from exc
+        # An owned connection wraps the guarded UPDATE, its readback, and the
+        # history append in one BEGIN IMMEDIATE, so the appended fact can never
+        # commit without its projection mutation or vice versa.
+        return self._transaction(
+            task_id=task_id,
+            expect_states=expect_states,
+            expect_version=expect_version,
+            assign=assign,
+            values=values,
+            attempted=attempted,
+        )
 
     def _transition(
         self,
@@ -975,6 +1210,9 @@ class TaskStore:
     ) -> TaskRecord:
         states = sorted(expect_states)
         placeholders = ", ".join("?" for _ in states)
+        before = conn.execute(
+            "SELECT * FROM managed_tasks WHERE task_id = ?", (str(task_id),)
+        ).fetchone()
         cursor = conn.execute(
             f"UPDATE managed_tasks SET {assign}, version = version + 1, updated_at = ? "
             f"WHERE task_id = ? AND state IN ({placeholders}) "
@@ -995,10 +1233,29 @@ class TaskStore:
             raise TaskStoreError("Managed task not found")
         if cursor.rowcount != 1:
             raise StaleTransition(self._decode(row), attempted)
-        return self._decode(row)
+        record = self._decode(row)
+        # Every lifecycle mutation funnels through here, so this one append is
+        # the whole "no second write to remember" invariant for managed tasks.
+        # Same connection, same transaction: rollback discards both.
+        history.record_change(
+            conn,
+            entity="task",
+            task_id=str(task_id),
+            epoch=record.epoch,
+            cause=attempted,
+            changed=history.changed_columns(before, row),
+        )
+        return record
 
     def _require_fence(self, task_id: str, fence: TaskFence | None) -> None:
-        if fence is None or fence._store is not self or fence.task_id != str(task_id):
+        if (
+            fence is None
+            or fence._store is not self
+            or fence.task_id != str(task_id)
+            or fence._external_depth
+            or fence._stream.closed
+            or HELD_TASK_FENCE.get() != str(task_id)
+        ):
             raise TaskStoreError("Lifecycle state writes require the task fence")
 
     def activate(
@@ -1113,6 +1370,221 @@ class TaskStore:
             attempted="checkpoint",
         )
 
+    def prepare_checkpoint_operation(
+        self,
+        task: TaskRecord,
+        operation_id: str,
+        checkpoint: str,
+        facts: dict[str, Any],
+        *,
+        fence: TaskFence,
+    ) -> CheckpointOperation:
+        """Persist one explicit logical identity before any native publication."""
+        from .sqlite_durability import require_policy, confirm_database
+
+        self._require_fence(task.task_id, fence)
+        if str(uuid.UUID(operation_id)) != operation_id:
+            raise TaskStoreError("checkpoint operation ID must be a canonical UUID")
+        encoded = json.dumps(facts, sort_keys=True, separators=(",", ":"))
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM task_checkpoint_operations WHERE operation_id=?",
+                (operation_id,),
+            ).fetchone()
+            current_row = conn.execute(
+                "SELECT * FROM managed_tasks WHERE task_id=?", (task.task_id,)
+            ).fetchone()
+            if current_row is None:
+                raise TaskStoreError("checkpoint task no longer exists")
+            current = self._decode(current_row)
+            if row is not None:
+                operation = self._checkpoint_operation(row)
+                if (
+                    operation.task_id,
+                    operation.epoch,
+                    operation.holder_session_id,
+                    operation.checkpoint,
+                    operation.facts,
+                ) != (
+                    task.task_id,
+                    task.epoch,
+                    task.holder_session_id,
+                    checkpoint,
+                    facts,
+                ):
+                    raise TaskStoreError("checkpoint operation immutable facts changed")
+                if operation.receipt is None:
+                    self._check_checkpoint_owner(
+                        current,
+                        operation.epoch,
+                        operation.holder_session_id,
+                        operation.expected_version,
+                    )
+            else:
+                self._check_checkpoint_owner(
+                    current, task.epoch, task.holder_session_id, task.version
+                )
+                conn.execute(
+                    "INSERT INTO task_checkpoint_operations(operation_id,task_id,epoch,holder_session_id,"
+                    "expected_version,checkpoint,facts,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        operation_id,
+                        task.task_id,
+                        task.epoch,
+                        task.holder_session_id,
+                        task.version,
+                        checkpoint,
+                        encoded,
+                        time.time(),
+                    ),
+                )
+                operation = self._checkpoint_operation(
+                    conn.execute(
+                        "SELECT * FROM task_checkpoint_operations WHERE operation_id=?",
+                        (operation_id,),
+                    ).fetchone()
+                )
+            require_policy(conn)
+            conn.execute("COMMIT")
+            confirm_database(conn, self.path)
+        return operation
+
+    @staticmethod
+    def _check_checkpoint_owner(
+        current: TaskRecord, epoch: int, holder: str | None, version: int
+    ) -> None:
+        if (
+            current.state not in LIVE_STATES
+            or current.epoch != epoch
+            or not holder
+            or current.holder_session_id != holder
+            or current.version != version
+        ):
+            raise StaleTransition(current, "checkpoint")
+
+    def checkpoint_with_occurrence(
+        self,
+        operation: CheckpointOperation,
+        receipt: dict[str, Any],
+        *,
+        fence: TaskFence,
+    ) -> TaskRecord:
+        """Commit the confirmed occurrence and projection/history as one fact."""
+        from .retention import verified_receipt
+        from .sqlite_durability import require_policy, confirm_database
+
+        self._require_fence(operation.task_id, fence)
+        receipt = verified_receipt(operation, receipt)
+        encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM task_checkpoint_operations WHERE operation_id=?",
+                (operation.operation_id,),
+            ).fetchone()
+            if row is None:
+                raise TaskStoreError("checkpoint operation was not prepared")
+            stored = self._checkpoint_operation(row)
+            if (
+                stored.task_id,
+                stored.epoch,
+                stored.holder_session_id,
+                stored.expected_version,
+                stored.checkpoint,
+                stored.facts,
+            ) != (
+                operation.task_id,
+                operation.epoch,
+                operation.holder_session_id,
+                operation.expected_version,
+                operation.checkpoint,
+                operation.facts,
+            ):
+                raise TaskStoreError("checkpoint operation immutable facts changed")
+            current_row = conn.execute(
+                "SELECT * FROM managed_tasks WHERE task_id=?", (stored.task_id,)
+            ).fetchone()
+            if current_row is None:
+                raise TaskStoreError("checkpoint task no longer exists")
+            current = self._decode(current_row)
+            if stored.receipt is not None:
+                if stored.receipt != receipt:
+                    raise TaskStoreError("checkpoint occurrence changed during replay")
+                record = current
+            else:
+                self._check_checkpoint_owner(
+                    current,
+                    stored.epoch,
+                    stored.holder_session_id,
+                    stored.expected_version,
+                )
+                record = self._transition(
+                    conn,
+                    stored.task_id,
+                    LIVE_STATES,
+                    stored.expected_version,
+                    "checkpoint = ?, checkpoint_at = ?",
+                    (stored.checkpoint, time.time()),
+                    "checkpoint",
+                )
+            require_policy(conn)
+            conn.execute(
+                "UPDATE task_checkpoint_operations SET receipt=?,durable_commit=1,"
+                "committed_at=COALESCE(committed_at,?) WHERE operation_id=?",
+                (encoded, time.time(), stored.operation_id),
+            )
+            conn.execute("COMMIT")
+            confirm_database(conn, self.path)
+        return record
+
+    def checkpoint_operation(
+        self, task_id: str, checkpoint: str
+    ) -> CheckpointOperation | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM task_checkpoint_operations WHERE task_id=? AND checkpoint=?",
+                (task_id, checkpoint),
+            ).fetchone()
+        return self._checkpoint_operation(row) if row is not None else None
+
+    def checkpoint_operation_by_id(
+        self, operation_id: str
+    ) -> CheckpointOperation | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM task_checkpoint_operations WHERE operation_id=?",
+                (operation_id,),
+            ).fetchone()
+        return self._checkpoint_operation(row) if row is not None else None
+
+    def pending_checkpoint_operations(self, task_id: str) -> list[CheckpointOperation]:
+        """Recover explicit retry IDs after interruption, without replaying effects."""
+        with self.connect() as conn:
+            return [
+                self._checkpoint_operation(row)
+                for row in conn.execute(
+                    "SELECT * FROM task_checkpoint_operations WHERE task_id=? AND receipt IS NULL ORDER BY created_at,operation_id",
+                    (task_id,),
+                )
+            ]
+
+    @staticmethod
+    def _checkpoint_operation(row: sqlite3.Row) -> CheckpointOperation:
+        return CheckpointOperation(
+            row["operation_id"],
+            row["task_id"],
+            row["epoch"],
+            row["holder_session_id"],
+            row["expected_version"],
+            row["checkpoint"],
+            json.loads(row["facts"]),
+            json.loads(row["receipt"]) if row["receipt"] is not None else None,
+            bool(row["durable_commit"]),
+            row["created_at"],
+            row["committed_at"],
+        )
+
     def record_liveness(
         self,
         task_id: str,
@@ -1162,7 +1634,7 @@ class TaskStore:
 
         def apply(active: sqlite3.Connection) -> TaskRecord:
             row = active.execute(
-                "SELECT liveness, liveness_episode FROM managed_tasks WHERE task_id = ?",
+                "SELECT * FROM managed_tasks WHERE task_id = ?",
                 (str(task_id),),
             ).fetchone()
             if row is None:
@@ -1185,7 +1657,7 @@ class TaskStore:
                     None if closing else moment,
                     None if closing else evidence,
                 )
-            active.execute(
+            cursor = active.execute(
                 f"UPDATE managed_tasks SET {assign} "
                 f"WHERE task_id = ? AND state IN ({placeholders})",
                 (*values, str(task_id), *states),
@@ -1193,6 +1665,19 @@ class TaskStore:
             updated = active.execute(
                 "SELECT * FROM managed_tasks WHERE task_id = ?", (str(task_id),)
             ).fetchone()
+            if cursor.rowcount:
+                # An ``observation`` entry, never a ``transition``: preserved
+                # liveness findings must stay distinguishable from task
+                # progress, exactly as the live column skips ``version``.
+                history.record_change(
+                    active,
+                    entity="task",
+                    task_id=str(task_id),
+                    epoch=int(updated["epoch"]),
+                    cause="liveness",
+                    kind="observation",
+                    changed=history.changed_columns(row, updated),
+                )
             return self._decode(updated)
 
         if conn is not None:
@@ -1234,6 +1719,20 @@ class TaskStore:
                 f"WHERE task_id = ? AND over_budget = 0 AND state IN ({placeholders})",
                 (str(task_id), *states),
             )
+            if cursor.rowcount:
+                epoch = active.execute(
+                    "SELECT epoch FROM managed_tasks WHERE task_id = ?",
+                    (str(task_id),),
+                ).fetchone()
+                history.record_change(
+                    active,
+                    entity="task",
+                    task_id=str(task_id),
+                    epoch=int(epoch["epoch"]) if epoch is not None else None,
+                    cause="over-budget",
+                    kind="observation",
+                    changed={"over_budget": 1},
+                )
             return bool(cursor.rowcount)
 
         if conn is not None:
@@ -1347,8 +1846,12 @@ class TaskStore:
             with self._database._connect() as opened:
                 opened.execute("BEGIN IMMEDIATE")
                 record = self._record_failure(
-                    task_id, state, result,
-                    expect_version=expect_version, fence=fence, conn=opened
+                    task_id,
+                    state,
+                    result,
+                    expect_version=expect_version,
+                    fence=fence,
+                    conn=opened,
                 )
                 opened.execute("COMMIT")
                 return record
@@ -1374,7 +1877,8 @@ class TaskStore:
                 else "state = ?, attempts = attempts + 1, result = ?"
             ),
             values=(f"exhausted: {result or state}" if exhausted else state, result)
-            if not exhausted else (f"exhausted: {result or state}",),
+            if not exhausted
+            else (f"exhausted: {result or state}",),
             attempted="exhausted" if exhausted else state,
             fence=fence,
             conn=conn,
