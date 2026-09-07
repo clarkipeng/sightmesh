@@ -1,10 +1,74 @@
 from __future__ import annotations
+
 import sqlite3
+
 import pytest
-from sightmesh import history
+
+from sightmesh import effects, history
 from sightmesh.effects import EffectJournal, request_hash
-from sightmesh import effects
 from sightmesh.task_store import TaskStore
+
+
+@pytest.mark.parametrize("outer_transaction", [False, True])
+@pytest.mark.parametrize("failure", [None, "mutation", "history"])
+def test_change_preserves_atomicity_and_transaction_ownership(
+    tmp_path, monkeypatch, outer_transaction, failure
+):
+    """A caught inner failure cannot leave half a fact or commit the caller."""
+    store = TaskStore(tmp_path / "state.sqlite")
+    journal = EffectJournal(store)
+    journal.reserve("task", 1, "hash", "original")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected failure")
+
+    if failure == "history":
+        monkeypatch.setattr(history, "record_change", fail)
+    with store.connect() as conn:
+        if outer_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+
+        def mutate():
+            with history.change(conn, "effect", ("task", 1), "test") as change:
+                assert change.before["owner_instance"] == "original"
+                conn.execute("UPDATE task_effects SET owner_instance='replacement'")
+                if failure == "mutation":
+                    fail()
+            assert change.after["owner_instance"] == "replacement"
+
+        if failure:
+            with pytest.raises(RuntimeError, match="injected failure"):
+                mutate()
+        else:
+            mutate()
+        assert conn.in_transaction == outer_transaction
+        assert journal.get_within(conn, "task", 1).owner_instance == (
+            "original" if failure else "replacement"
+        )
+        assert len(history.task_history(conn, "task")) == (1 if failure else 2)
+        if outer_transaction:
+            conn.execute("ROLLBACK")
+    assert journal.get("task", 1).owner_instance == (
+        "original" if failure or outer_transaction else "replacement"
+    )
+    with store.connect() as conn:
+        assert len(history.task_history(conn, "task")) == (
+            1 if failure or outer_transaction else 2
+        )
+
+
+def test_change_records_no_history_for_a_bookkeeping_only_update(tmp_path):
+    store = TaskStore(tmp_path / "state.sqlite")
+    EffectJournal(store).reserve("task", 1, "hash", "owner")
+    with store.connect() as conn:
+        before = [tuple(row) for row in history.task_history(conn, "task")]
+        with history.change(conn, "effect", ("task", 1), "unchanged"):
+            conn.execute("UPDATE task_effects SET updated_at=0")
+        with history.change(conn, "effect", ("missing", 1), "missing"):
+            conn.execute(
+                "UPDATE task_effects SET state='terminal' WHERE task_id='missing'"
+            )
+        assert [tuple(row) for row in history.task_history(conn, "task")] == before
 
 
 def test_effect_projection_mutations_append_distinct_history(tmp_path):

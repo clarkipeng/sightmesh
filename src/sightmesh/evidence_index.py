@@ -10,18 +10,28 @@ from __future__ import annotations
 import codecs
 import hashlib
 import json
-import re
 import sqlite3
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
-from .evidence import EvidenceClient, EvidenceUnavailable
+from .evidence import (
+    EvidenceClient,
+    EvidenceUnavailable,
+    receipt_facts,
+    verified_chunks,
+)
 from .evidence_stream import (
-    MAX_FRAME_BYTES,
+    MAX_FRAME_BYTES as MAX_FRAME_BYTES,
+)
+from .evidence_stream import (
     confirmed_range as _confirmed_range,
+)
+from .evidence_stream import (
     timestamp as _timestamp,
+)
+from .evidence_stream import (
     validate_page as _validate_page,
 )
 
@@ -74,10 +84,14 @@ class SearchResult:
     @property
     def complete(self) -> bool:
         """Capture completeness of the selected indexed sources, not all tasks."""
-        return bool(self.sources) and all(
-            s.outcome == "complete" and s.at_available_end and not s.error
-            for s in self.sources
-        ) and not self.unchecked_sources
+        return (
+            bool(self.sources)
+            and all(
+                s.outcome == "complete" and s.at_available_end and not s.error
+                for s in self.sources
+            )
+            and not self.unchecked_sources
+        )
 
 
 class EvidenceIndex:
@@ -201,13 +215,12 @@ class EvidenceIndex:
                     raw = frame["raw_range"]
                     window_start = max(0, raw["start"] - OVERLAP_BYTES)
                     if raw["start"] == raw["end"]:
-                        window_start, body, text = raw["end"], b"", ""
+                        window_start, body = raw["end"], b""
                     else:
                         body = _confirmed_range(
                             client, execution_id, window_start, raw["end"]
                         )
-                        window_start, body, text = _utf8_window(window_start, body)
-                    self._commit_frame(state, frame, window_start, body, text)
+                    self._commit_frame(state, frame, window_start, body)
                     state = self.status(execution_id)
                     assert state is not None
                 with self._connect() as conn, conn:
@@ -234,7 +247,6 @@ class EvidenceIndex:
         frame: dict[str, Any],
         window_start: int,
         body: bytes,
-        text: str,
     ) -> None:
         raw, compressed = frame["raw_range"], frame["compressed_range"]
         with self._connect() as conn, conn:
@@ -246,29 +258,22 @@ class EvidenceIndex:
                 raise EvidenceUnavailable(
                     "index cursor changed during ingestion; retry from its new position"
                 )
-            inserted = conn.execute(
-                "INSERT INTO frames(source_key,frame_start,frame_end,raw_start,raw_end,"
-                "window_start,window_end,sha256,captured_at,captured_time,metadata) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    expected.source_key,
-                    compressed["start"],
-                    compressed["end"],
-                    raw["start"],
-                    raw["end"],
-                    window_start,
-                    window_start + len(body),
-                    hashlib.sha256(body).hexdigest(),
-                    frame["captured_at"],
-                    _timestamp(frame["captured_at"]),
-                    json.dumps(frame, sort_keys=True, separators=(",", ":")),
-                ),
+            _index_window(
+                conn,
+                expected.source_key,
+                window_start,
+                body,
+                {
+                    "frame_start": compressed["start"],
+                    "frame_end": compressed["end"],
+                    "raw_start": raw["start"],
+                    "raw_end": raw["end"],
+                    "captured_at": frame["captured_at"],
+                    "metadata": json.dumps(
+                        frame, sort_keys=True, separators=(",", ":")
+                    ),
+                },
             )
-            if text:
-                conn.execute(
-                    "INSERT INTO postings(rowid,text) VALUES(?,?)",
-                    (inserted.lastrowid, text),
-                )
             conn.execute(
                 "UPDATE sources SET after_frame=?,raw_end=?,compressed_end=?,outcome=?,"
                 "at_available_end=0,error=NULL WHERE source_key=?",
@@ -307,7 +312,11 @@ class EvidenceIndex:
         self._register(execution_id, task_id, repo, artifact_id)
         key = _source_key(execution_id, artifact_id)
         try:
-            receipt = _artifact_receipt(client, execution_id, artifact_id)
+            receipt = receipt_facts(
+                client.artifact_receipt(execution_id, artifact_id),
+                execution_id,
+                artifact_id,
+            )
             with self._connect() as conn, conn:
                 conn.execute("BEGIN IMMEDIATE")
                 current = _status(
@@ -324,37 +333,23 @@ class EvidenceIndex:
                 else:
                     offset, tail = 0, b""
                     decoder = codecs.getincrementaldecoder("utf-8")()
-                    with _artifact_stream(
-                        client, execution_id, artifact_id, receipt
-                    ) as chunks:
+                    with closing(verified_chunks(client, receipt)) as chunks:
                         for chunk in chunks:
                             decoder.decode(chunk, final=False)
-                            start, body, text = _utf8_window(
-                                offset - len(tail), tail + chunk
+                            _index_window(
+                                conn,
+                                key,
+                                offset - len(tail),
+                                tail + chunk,
+                                {
+                                    "frame_start": offset,
+                                    "frame_end": offset + len(chunk),
+                                    "raw_start": offset,
+                                    "raw_end": offset + len(chunk),
+                                    "captured_at": receipt["captured_at"],
+                                    "metadata": "{}",
+                                },
                             )
-                            inserted = conn.execute(
-                                "INSERT INTO frames(source_key,frame_start,frame_end,raw_start,raw_end,"
-                                "window_start,window_end,sha256,captured_at,captured_time,metadata) "
-                                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                                (
-                                    key,
-                                    offset,
-                                    offset + len(chunk),
-                                    offset,
-                                    offset + len(chunk),
-                                    start,
-                                    start + len(body),
-                                    hashlib.sha256(body).hexdigest(),
-                                    receipt["captured_at"],
-                                    _timestamp(receipt["captured_at"]),
-                                    "{}",
-                                ),
-                            )
-                            if text:
-                                conn.execute(
-                                    "INSERT INTO postings(rowid,text) VALUES(?,?)",
-                                    (inserted.lastrowid, text),
-                                )
                             tail = (tail + chunk)[-OVERLAP_BYTES:]
                             offset += len(chunk)
                     decoder.decode(b"", final=True)
@@ -578,75 +573,34 @@ def _source_key(execution_id: str, artifact_id: str | None = None) -> str:
     )
 
 
-def _artifact_receipt(
-    client: EvidenceClient, execution_id: str, artifact_id: str
-) -> dict[str, Any]:
-    native = client.artifact_receipt(execution_id, artifact_id)
-    if (
-        native.get("durability") != "confirmed"
-        or native.get("id") != artifact_id
-        or native.get("execution_id") != execution_id
-    ):
-        raise EvidenceUnavailable("unconfirmed artifact occurrence identity")
-    fields = (
-        "id",
-        "execution_id",
-        "attachment_id",
-        "original_path",
-        "original_name",
-        "producer_ref",
-        "publication_key",
-        "captured_at",
-        "sha256",
-        "size_bytes",
+def _index_window(
+    conn: sqlite3.Connection,
+    source_key: str,
+    start: int,
+    body: bytes,
+    position: dict[str, Any],
+) -> None:
+    """One UTF-8 window/locator/postings writer, inside the caller's transaction."""
+    start, body, text = _utf8_window(start, body)
+    values = {
+        **position,
+        "source_key": source_key,
+        "window_start": start,
+        "window_end": start + len(body),
+        "sha256": hashlib.sha256(body).hexdigest(),
+        "captured_time": _timestamp(position["captured_at"]),
+    }
+    inserted = conn.execute(
+        "INSERT INTO frames(source_key,frame_start,frame_end,raw_start,raw_end,"
+        "window_start,window_end,sha256,captured_at,captured_time,metadata) "
+        "VALUES(:source_key,:frame_start,:frame_end,:raw_start,:raw_end,"
+        ":window_start,:window_end,:sha256,:captured_at,:captured_time,:metadata)",
+        values,
     )
-    receipt = {field: native[field] for field in fields}
-    if (
-        type(receipt["size_bytes"]) is not int
-        or not 0 <= receipt["size_bytes"] <= 2**63 - 1
-        or not isinstance(receipt["sha256"], str)
-        or not re.fullmatch("[0-9a-f]{64}", receipt["sha256"])
-    ):
-        raise EvidenceUnavailable("invalid artifact byte identity")
-    for field in ("attachment_id", "original_path", "captured_at"):
-        if not isinstance(receipt[field], str) or not receipt[field]:
-            raise EvidenceUnavailable("missing artifact provenance")
-    for field in ("original_name", "producer_ref", "publication_key"):
-        if receipt[field] is not None and not isinstance(receipt[field], str):
-            raise EvidenceUnavailable("invalid artifact provenance")
-    _timestamp(receipt["captured_at"])
-    if len(json.dumps(receipt).encode()) > 8192:
-        raise EvidenceUnavailable("artifact metadata exceeds consumer bound")
-    return receipt
-
-
-@contextmanager
-def _artifact_stream(
-    client: EvidenceClient, execution_id: str, artifact_id: str, receipt: dict[str, Any]
-) -> Iterator[Iterator[bytes]]:
-    with closing(
-        client.artifact_chunks(execution_id, artifact_id, chunk_size=MAX_FRAME_BYTES)
-    ) as chunks:
-
-        def verified() -> Iterator[bytes]:
-            digest, size = hashlib.sha256(), 0
-            for chunk in chunks:
-                if (
-                    not isinstance(chunk, bytes)
-                    or not 0 < len(chunk) <= MAX_FRAME_BYTES
-                ):
-                    raise EvidenceUnavailable("unbounded artifact response chunk")
-                size += len(chunk)
-                if size > receipt["size_bytes"]:
-                    raise EvidenceUnavailable("artifact response exceeds receipt size")
-                digest.update(chunk)
-                yield chunk
-            if size != receipt["size_bytes"] or digest.hexdigest() != receipt["sha256"]:
-                raise EvidenceUnavailable(
-                    "artifact original no longer matches its receipt"
-                )
-
-        yield verified()
+    if text:
+        conn.execute(
+            "INSERT INTO postings(rowid,text) VALUES(?,?)", (inserted.lastrowid, text)
+        )
 
 
 def _artifact_window(
@@ -657,11 +611,13 @@ def _artifact_window(
     start: int,
     end: int,
 ) -> bytes:
-    receipt = _artifact_receipt(client, execution_id, artifact_id)
+    receipt = receipt_facts(
+        client.artifact_receipt(execution_id, artifact_id), execution_id, artifact_id
+    )
     if receipt != expected:
         raise EvidenceUnavailable("indexed artifact occurrence facts changed")
     window, offset = bytearray(), 0
-    with _artifact_stream(client, execution_id, artifact_id, receipt) as chunks:
+    with closing(verified_chunks(client, receipt)) as chunks:
         for chunk in chunks:
             first, last = max(start - offset, 0), min(end - offset, len(chunk))
             if first < last:

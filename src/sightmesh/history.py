@@ -39,7 +39,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
 #: Component names in ``evidence_contract``.
@@ -47,7 +49,17 @@ HISTORY_COMPONENT = "task_history"
 HISTORY_VERSION = 1
 
 #: Entities whose projection rows this history preserves.
-ENTITIES = ("task", "effect", "wake", "outgoing_command", "cleanup_intent")
+_PROJECTIONS = {
+    "task": ("managed_tasks", ("task_id",)),
+    "effect": ("task_effects", ("task_id", "epoch")),
+    "wake": ("task_wakes", ("wake_id",)),
+    "outgoing_command": ("task_outgoing_commands", ("task_id", "epoch", "dedupe_key")),
+    "cleanup_intent": (
+        "task_cleanup_intents",
+        ("task_id", "epoch", "kind", "native_id"),
+    ),
+}
+ENTITIES = tuple(_PROJECTIONS)
 #: ``created`` records a row's full initial values; ``transition`` a sparse
 #: change to them; ``observation`` a liveness/budget finding that is not task
 #: progress; ``baseline`` the one observed pre-upgrade snapshot per row.
@@ -88,6 +100,67 @@ _HISTORY_DDL = f"""
 
 class HistoryContractError(RuntimeError):
     """The stored contract names a version this code does not implement."""
+
+
+@dataclass
+class Change:
+    before: sqlite3.Row | None
+    after: sqlite3.Row | None = None
+
+
+@contextmanager
+def change(
+    conn: sqlite3.Connection,
+    entity: str,
+    key: tuple[object, ...],
+    cause: str,
+    *,
+    kind: str = "transition",
+) -> Iterator[Change]:
+    """Record one projection mutation atomically on the caller's connection.
+
+    The savepoint nests without committing an enclosing transaction, and also
+    protects direct callers using an autocommit connection. Callers retain their
+    write locks, guards and domain errors; this owns only the sparse history.
+    """
+    table, columns = _PROJECTIONS[entity]
+    query = f"SELECT * FROM {table} WHERE " + " AND ".join(f"{c}=?" for c in columns)
+    conn.execute("SAVEPOINT history_change")
+    try:
+        snapshot = Change(conn.execute(query, key).fetchone())
+        yield snapshot
+        snapshot.after = conn.execute(query, key).fetchone()
+        if snapshot.after is not None:
+            changed = changed_columns(snapshot.before, snapshot.after)
+            if entity == "wake":
+                changed.pop("payload", None)
+            record_change(
+                conn,
+                entity=entity,
+                **_identity(entity, snapshot.after),
+                cause=cause,
+                kind="created" if snapshot.before is None else kind,
+                changed=changed,
+            )
+    except BaseException:
+        conn.execute("ROLLBACK TO history_change")
+        raise
+    finally:
+        conn.execute("RELEASE history_change")
+
+
+def _identity(entity: str, values: Mapping[str, Any] | sqlite3.Row) -> dict[str, Any]:
+    _, columns = _PROJECTIONS[entity]
+    return {
+        "task_id": values["parent_task_id" if entity == "wake" else "task_id"],
+        "epoch": None if entity == "wake" else values["epoch"],
+        "entity_id": ":".join(
+            str(values[column])
+            for column in columns
+            if column not in {"task_id", "epoch"}
+        )
+        or None,
+    }
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -136,13 +209,7 @@ def _record_baselines(conn: sqlite3.Connection) -> None:
     fabricating transitions, failures, or times that were never recorded.
     """
     now = time.time()
-    for entity, table, id_column in (
-        ("task", "managed_tasks", "task_id"),
-        ("effect", "task_effects", "task_id"),
-        ("wake", "task_wakes", "parent_task_id"),
-        ("outgoing_command", "task_outgoing_commands", "task_id"),
-        ("cleanup_intent", "task_cleanup_intents", "task_id"),
-    ):
+    for entity, (table, _) in _PROJECTIONS.items():
         if (
             conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -152,34 +219,21 @@ def _record_baselines(conn: sqlite3.Connection) -> None:
         ):
             continue
         for row in conn.execute(f"SELECT * FROM {table}").fetchall():
-            values = {key: row[key] for key in row.keys()}
+            values = dict(row)
             # A wake payload is the durable evidence object itself. History
             # links the wake occurrence; copying those bytes would make a
             # second transcript store.
             if entity == "wake":
                 values.pop("payload", None)
-            epoch = values.get("epoch")
-            entity_id = (
-                values.get("wake_id")
-                or values.get("dedupe_key")
-                or (
-                    f"{values['kind']}:{values['native_id']}"
-                    if entity == "cleanup_intent"
-                    else values.get("native_id")
-                )
-            )
-            conn.execute(
-                "INSERT INTO task_history (entity, task_id, epoch, entity_id, "
-                "kind, cause, changed, missing_history, recorded_at) "
-                "VALUES (?, ?, ?, ?, 'baseline', 'observed-baseline', ?, 1, ?)",
-                (
-                    entity,
-                    str(values[id_column]),
-                    int(epoch) if epoch is not None else None,
-                    entity_id if entity != "task" else None,
-                    _encode(values),
-                    now,
-                ),
+            record_change(
+                conn,
+                entity=entity,
+                **_identity(entity, values),
+                kind="baseline",
+                cause="observed-baseline",
+                changed=values,
+                missing_history=True,
+                now=now,
             )
 
 
@@ -188,16 +242,12 @@ def changed_columns(
     after: Mapping[str, Any] | sqlite3.Row,
 ) -> dict[str, Any]:
     """The sparse new values an update just wrote; empty when nothing moved."""
-    current = {key: after[key] for key in after.keys()}
-    if before is None:
-        return {
-            key: value for key, value in current.items() if key not in _DERIVED_COLUMNS
-        }
-    previous = {key: before[key] for key in before.keys()}
+    previous = {} if before is None else dict(before)
     return {
         key: value
-        for key, value in current.items()
-        if key not in _DERIVED_COLUMNS and previous.get(key) != value
+        for key, value in dict(after).items()
+        if key not in _DERIVED_COLUMNS
+        and (key not in previous or previous[key] != value)
     }
 
 
@@ -212,6 +262,7 @@ def record_change(
     entity_id: str | None = None,
     kind: str = "transition",
     now: float | None = None,
+    missing_history: bool = False,
 ) -> None:
     """Append one history entry on the caller's own connection.
 
@@ -224,7 +275,7 @@ def record_change(
     conn.execute(
         "INSERT INTO task_history (entity, task_id, epoch, entity_id, kind, "
         "cause, changed, missing_history, recorded_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             entity,
             str(task_id),
@@ -233,6 +284,7 @@ def record_change(
             kind,
             str(cause),
             _encode(changed),
+            int(missing_history),
             time.time() if now is None else now,
         ),
     )

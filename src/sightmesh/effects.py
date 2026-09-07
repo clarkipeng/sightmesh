@@ -23,8 +23,8 @@ from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .cdesktop import CdesktopError, is_effect_not_found
 from . import history
+from .cdesktop import CdesktopError, is_effect_not_found
 from .task_store import TaskStore, TaskStoreError
 
 LOGGER = logging.getLogger("sightmesh.effects")
@@ -120,35 +120,27 @@ class EffectJournal:
                 conn.execute("BEGIN IMMEDIATE")
                 row = self._row(conn, task_id, epoch)
                 if row is None:
-                    conn.execute(
-                        """
-                        INSERT INTO task_effects
-                        (task_id, epoch, request_hash, state, owner_instance,
-                         lease_expires_at, created_at, updated_at)
-                        VALUES (?, ?, ?, 'reserved', ?, ?, ?, ?)
-                        """,
-                        (
-                            str(task_id),
-                            int(epoch),
-                            str(request_hash),
-                            str(owner),
-                            now + ttl,
-                            now,
-                            now,
-                        ),
-                    )
-                    effect = self._require(conn, task_id, epoch)
-                    history.record_change(
-                        conn,
-                        entity="effect",
-                        task_id=str(task_id),
-                        epoch=int(epoch),
-                        cause="reserved",
-                        kind="created",
-                        changed=history.changed_columns(
-                            None, row := self._row(conn, task_id, epoch)
-                        ),
-                    )
+                    with history.change(
+                        conn, "effect", (str(task_id), int(epoch)), "reserved"
+                    ) as change:
+                        conn.execute(
+                            """
+                            INSERT INTO task_effects
+                            (task_id, epoch, request_hash, state, owner_instance,
+                             lease_expires_at, created_at, updated_at)
+                            VALUES (?, ?, ?, 'reserved', ?, ?, ?, ?)
+                            """,
+                            (
+                                str(task_id),
+                                int(epoch),
+                                str(request_hash),
+                                str(owner),
+                                now + ttl,
+                                now,
+                                now,
+                            ),
+                        )
+                    effect = _decode(change.after)
                     conn.execute("COMMIT")
                     return effect, False
                 existing = _decode(row)
@@ -173,15 +165,16 @@ class EffectJournal:
                             "different launch specification"
                         )
                 took_over = existing.lease_expires_at <= now
-                before = self._row(conn, task_id, epoch)
-                conn.execute(
-                    "UPDATE task_effects SET owner_instance = ?, "
-                    "lease_expires_at = ?, updated_at = ? "
-                    "WHERE task_id = ? AND epoch = ?",
-                    (str(owner), now + ttl, now, str(task_id), int(epoch)),
-                )
-                effect = self._require(conn, task_id, epoch)
-                self._history(conn, task_id, epoch, "reservation-takeover", before)
+                with history.change(
+                    conn, "effect", (str(task_id), int(epoch)), "reservation-takeover"
+                ) as change:
+                    conn.execute(
+                        "UPDATE task_effects SET owner_instance = ?, "
+                        "lease_expires_at = ?, updated_at = ? "
+                        "WHERE task_id = ? AND epoch = ?",
+                        (str(owner), now + ttl, now, str(task_id), int(epoch)),
+                    )
+                effect = _decode(change.after)
                 conn.execute("COMMIT")
                 return effect, took_over
         except TaskStoreError:
@@ -270,15 +263,18 @@ class EffectJournal:
         try:
             with self.store.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                before = self._row(conn, task_id, epoch)
-                conn.execute(
-                    "UPDATE task_effects SET workspace_id = ?, outcome = 'superseded', "
-                    "updated_at = ? "
-                    "WHERE task_id = ? AND epoch = ? AND state = 'terminal'",
-                    (str(workspace_id), time.time(), str(task_id), int(epoch)),
-                )
-                effect = self._require(conn, task_id, epoch)
-                self._history(conn, task_id, epoch, "cleanup-workspace", before)
+                with history.change(
+                    conn, "effect", (str(task_id), int(epoch)), "cleanup-workspace"
+                ) as change:
+                    conn.execute(
+                        "UPDATE task_effects SET workspace_id = ?, outcome = 'superseded', "
+                        "updated_at = ? "
+                        "WHERE task_id = ? AND epoch = ? AND state = 'terminal'",
+                        (str(workspace_id), time.time(), str(task_id), int(epoch)),
+                    )
+                if change.after is None:
+                    raise TaskStoreError(f"Task effect {task_id}/{epoch} not found")
+                effect = _decode(change.after)
                 conn.execute("COMMIT")
                 return effect
         except sqlite3.DatabaseError as exc:
@@ -304,21 +300,23 @@ class EffectJournal:
         try:
             with self.store.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                before = self._row(conn, effect.task_id, effect.epoch)
-                conn.execute(
-                    "UPDATE task_effects SET workspace_id = NULL, updated_at = ? "
-                    "WHERE task_id = ? AND epoch = ? AND state = 'terminal' "
-                    "AND workspace_id = ?",
-                    (
-                        time.time(),
-                        effect.task_id,
-                        effect.epoch,
-                        effect.workspace_id,
-                    ),
-                )
-                self._history(
-                    conn, effect.task_id, effect.epoch, "cleanup-acknowledged", before
-                )
+                with history.change(
+                    conn,
+                    "effect",
+                    (effect.task_id, effect.epoch),
+                    "cleanup-acknowledged",
+                ):
+                    conn.execute(
+                        "UPDATE task_effects SET workspace_id = NULL, updated_at = ? "
+                        "WHERE task_id = ? AND epoch = ? AND state = 'terminal' "
+                        "AND workspace_id = ?",
+                        (
+                            time.time(),
+                            effect.task_id,
+                            effect.epoch,
+                            effect.workspace_id,
+                        ),
+                    )
                 conn.execute("COMMIT")
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(
@@ -568,18 +566,16 @@ class EffectJournal:
         try:
             with self.store.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                before = self._row(conn, task_id, epoch)
-                cursor = conn.execute(
-                    "UPDATE task_effects SET state = 'terminal', outcome = ?, "
-                    "updated_at = ? WHERE task_id = ? AND epoch = ? "
-                    "AND state = 'reserved' AND lease_expires_at < ?",
-                    ("lost:reservation-expired", moment, task_id, epoch, moment),
-                )
-                effect = (
-                    self._require(conn, task_id, epoch) if cursor.rowcount else None
-                )
-                if effect is not None:
-                    self._history(conn, task_id, epoch, "reservation-expired", before)
+                with history.change(
+                    conn, "effect", (str(task_id), int(epoch)), "reservation-expired"
+                ) as change:
+                    cursor = conn.execute(
+                        "UPDATE task_effects SET state = 'terminal', outcome = ?, "
+                        "updated_at = ? WHERE task_id = ? AND epoch = ? "
+                        "AND state = 'reserved' AND lease_expires_at < ?",
+                        ("lost:reservation-expired", moment, task_id, epoch, moment),
+                    )
+                effect = _decode(change.after) if cursor.rowcount else None
                 conn.execute("COMMIT")
                 return effect
         except TaskStoreError:
@@ -601,12 +597,14 @@ class EffectJournal:
         try:
             with self.store.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                before = self._row(conn, task_id, epoch)
-                cursor = conn.execute(
-                    f"UPDATE task_effects SET {assign}, updated_at = ? "
-                    f"WHERE task_id = ? AND epoch = ? AND state IN ({placeholders})",
-                    (*values, now, str(task_id), int(epoch), *states),
-                )
+                with history.change(
+                    conn, "effect", (str(task_id), int(epoch)), "effect-transition"
+                ) as change:
+                    cursor = conn.execute(
+                        f"UPDATE task_effects SET {assign}, updated_at = ? "
+                        f"WHERE task_id = ? AND epoch = ? AND state IN ({placeholders})",
+                        (*values, now, str(task_id), int(epoch), *states),
+                    )
                 if cursor.rowcount != 1:
                     # A no-op UPDATE means the row is missing or already past the
                     # states this advance is allowed to move; surfacing it stops
@@ -618,8 +616,7 @@ class EffectJournal:
                         f"{effect.state if effect else 'missing'}; "
                         "this effect transition no longer applies"
                     )
-                effect = self._require(conn, task_id, epoch)
-                self._history(conn, task_id, epoch, "effect-transition", before)
+                effect = _decode(change.after)
                 conn.execute("COMMIT")
                 return effect
         except TaskStoreError:
@@ -640,33 +637,6 @@ class EffectJournal:
             "SELECT * FROM task_effects WHERE task_id = ? AND epoch = ?",
             (str(task_id), int(epoch)),
         ).fetchone()
-
-    @classmethod
-    def _require(cls, conn: sqlite3.Connection, task_id: str, epoch: int) -> Effect:
-        row = cls._row(conn, task_id, epoch)
-        if row is None:
-            raise TaskStoreError(f"Task effect {task_id}/{epoch} not found")
-        return _decode(row)
-
-    @classmethod
-    def _history(
-        cls,
-        conn: sqlite3.Connection,
-        task_id: str,
-        epoch: int,
-        cause: str,
-        before: sqlite3.Row | None,
-    ) -> None:
-        after = cls._row(conn, task_id, epoch)
-        if before is not None and after is not None:
-            history.record_change(
-                conn,
-                entity="effect",
-                task_id=str(task_id),
-                epoch=int(epoch),
-                cause=cause,
-                changed=history.changed_columns(before, after),
-            )
 
 
 def _decode(row: sqlite3.Row) -> Effect:

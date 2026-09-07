@@ -771,41 +771,30 @@ class TaskStore:
                     ).fetchone()
                     inserted = row is None
                     if row is None:
-                        conn.execute(
-                            """
-                            INSERT INTO managed_tasks
-                            (task_id, scope, task_key, parent_task_id, state, epoch,
-                             attempts, max_attempts, child_limit, spec_json,
-                             created_at, updated_at)
-                            VALUES (?, ?, ?, ?, 'reserved', 1, 0, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                task_id,
-                                scope,
-                                key,
-                                parent_task_id,
-                                max_attempts,
-                                int(spec.get("children", 0)),
-                                encoded,
-                                now,
-                                now,
-                            ),
-                        )
-                        row = conn.execute(
-                            "SELECT * FROM managed_tasks WHERE task_id = ?", (task_id,)
-                        ).fetchone()
-                        # The row's initial values are the facts its first
-                        # update will start destroying; recorded here, in the
-                        # reservation's own transaction.
-                        history.record_change(
-                            conn,
-                            entity="task",
-                            task_id=task_id,
-                            epoch=1,
-                            cause="reserved",
-                            kind="created",
-                            changed=history.changed_columns(None, row),
-                        )
+                        with history.change(
+                            conn, "task", (task_id,), "reserved"
+                        ) as change:
+                            conn.execute(
+                                """
+                                INSERT INTO managed_tasks
+                                (task_id, scope, task_key, parent_task_id, state, epoch,
+                                 attempts, max_attempts, child_limit, spec_json,
+                                 created_at, updated_at)
+                                VALUES (?, ?, ?, ?, 'reserved', 1, 0, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    task_id,
+                                    scope,
+                                    key,
+                                    parent_task_id,
+                                    max_attempts,
+                                    int(spec.get("children", 0)),
+                                    encoded,
+                                    now,
+                                    now,
+                                ),
+                            )
+                        row = change.after
                     elif str(row["spec_json"]) != encoded:
                         raise TaskStoreError(
                             f"Task {key!r} already exists with a different specification"
@@ -872,35 +861,24 @@ class TaskStore:
             with self.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 for kind, native_id in rows:
-                    cursor = conn.execute(
-                        "INSERT OR IGNORE INTO task_cleanup_intents "
-                        "(task_id, epoch, kind, native_id, session_id, state, created_at, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
-                        (
-                            str(task_id),
-                            int(epoch),
-                            kind,
-                            native_id,
-                            str(session_id),
-                            now,
-                            now,
-                        ),
-                    )
-                    if cursor.rowcount:
-                        history.record_change(
-                            conn,
-                            entity="cleanup_intent",
-                            task_id=str(task_id),
-                            epoch=int(epoch),
-                            entity_id=f"{kind}:{native_id}",
-                            cause="fenced",
-                            kind="created",
-                            changed=history.changed_columns(
-                                None,
-                                conn.execute(
-                                    "SELECT * FROM task_cleanup_intents WHERE task_id=? AND epoch=? AND kind=? AND native_id=?",
-                                    (str(task_id), int(epoch), kind, native_id),
-                                ).fetchone(),
+                    with history.change(
+                        conn,
+                        "cleanup_intent",
+                        (str(task_id), int(epoch), kind, native_id),
+                        "fenced",
+                    ):
+                        conn.execute(
+                            "INSERT OR IGNORE INTO task_cleanup_intents "
+                            "(task_id, epoch, kind, native_id, session_id, state, created_at, updated_at) "
+                            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+                            (
+                                str(task_id),
+                                int(epoch),
+                                kind,
+                                native_id,
+                                str(session_id),
+                                now,
+                                now,
                             ),
                         )
                 conn.execute("COMMIT")
@@ -916,27 +894,23 @@ class TaskStore:
         now = time.time()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            cursor = conn.execute(
-                "INSERT OR IGNORE INTO task_outgoing_commands "
-                "(task_id, epoch, dedupe_key, session_id, state, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, 'sending', ?, ?)",
-                (str(task_id), int(epoch), str(dedupe_key), str(session_id), now, now),
-            )
-            if cursor.rowcount:
-                history.record_change(
-                    conn,
-                    entity="outgoing_command",
-                    task_id=str(task_id),
-                    epoch=int(epoch),
-                    entity_id=str(dedupe_key),
-                    cause="sending",
-                    kind="created",
-                    changed=history.changed_columns(
-                        None,
-                        conn.execute(
-                            "SELECT * FROM task_outgoing_commands WHERE task_id=? AND epoch=? AND dedupe_key=?",
-                            (str(task_id), int(epoch), str(dedupe_key)),
-                        ).fetchone(),
+            with history.change(
+                conn,
+                "outgoing_command",
+                (str(task_id), int(epoch), str(dedupe_key)),
+                "sending",
+            ):
+                conn.execute(
+                    "INSERT OR IGNORE INTO task_outgoing_commands "
+                    "(task_id, epoch, dedupe_key, session_id, state, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, 'sending', ?, ?)",
+                    (
+                        str(task_id),
+                        int(epoch),
+                        str(dedupe_key),
+                        str(session_id),
+                        now,
+                        now,
                     ),
                 )
             conn.execute("COMMIT")
@@ -954,73 +928,44 @@ class TaskStore:
         now = time.time()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            before = conn.execute(
-                "SELECT * FROM task_outgoing_commands WHERE task_id=? AND epoch=? AND dedupe_key=?",
-                (str(task_id), int(epoch), str(dedupe_key)),
-            ).fetchone()
-            if before is None:
-                raise TaskStoreError("outgoing command was not prepared")
-            conn.execute(
-                "UPDATE task_outgoing_commands SET native_id = COALESCE(?, native_id), "
-                "state = ?, updated_at = ? WHERE task_id = ? AND epoch = ? AND dedupe_key = ?",
-                (
-                    native_id,
-                    "cleanup" if terminal else "settled",
-                    now,
-                    str(task_id),
-                    int(epoch),
-                    str(dedupe_key),
-                ),
-            )
-            history.record_change(
+            with history.change(
                 conn,
-                entity="outgoing_command",
-                task_id=str(task_id),
-                epoch=int(epoch),
-                entity_id=str(dedupe_key),
-                cause="cleanup" if terminal else "settled",
-                changed=history.changed_columns(
-                    before,
-                    conn.execute(
-                        "SELECT * FROM task_outgoing_commands WHERE task_id=? AND epoch=? AND dedupe_key=?",
-                        (str(task_id), int(epoch), str(dedupe_key)),
-                    ).fetchone(),
-                ),
-            )
-            if terminal and native_id:
-                row = conn.execute(
-                    "SELECT session_id FROM task_outgoing_commands WHERE task_id = ? "
-                    "AND epoch = ? AND dedupe_key = ?",
-                    (str(task_id), int(epoch), str(dedupe_key)),
-                ).fetchone()
-                inserted = conn.execute(
-                    "INSERT OR IGNORE INTO task_cleanup_intents "
-                    "(task_id, epoch, kind, native_id, session_id, state, created_at, updated_at) "
-                    "VALUES (?, ?, 'command_cancel', ?, ?, 'pending', ?, ?)",
+                "outgoing_command",
+                (str(task_id), int(epoch), str(dedupe_key)),
+                "cleanup" if terminal else "settled",
+            ) as change:
+                if change.before is None:
+                    raise TaskStoreError("outgoing command was not prepared")
+                conn.execute(
+                    "UPDATE task_outgoing_commands SET native_id = COALESCE(?, native_id), "
+                    "state = ?, updated_at = ? WHERE task_id = ? AND epoch = ? AND dedupe_key = ?",
                     (
+                        native_id,
+                        "cleanup" if terminal else "settled",
+                        now,
                         str(task_id),
                         int(epoch),
-                        str(native_id),
-                        str(row["session_id"]),
-                        now,
-                        now,
+                        str(dedupe_key),
                     ),
                 )
-                if inserted.rowcount:
-                    history.record_change(
-                        conn,
-                        entity="cleanup_intent",
-                        task_id=str(task_id),
-                        epoch=int(epoch),
-                        entity_id=f"command_cancel:{native_id}",
-                        cause="terminal-send",
-                        kind="created",
-                        changed=history.changed_columns(
-                            None,
-                            conn.execute(
-                                "SELECT * FROM task_cleanup_intents WHERE task_id=? AND epoch=? AND kind='command_cancel' AND native_id=?",
-                                (str(task_id), int(epoch), str(native_id)),
-                            ).fetchone(),
+            if terminal and native_id:
+                with history.change(
+                    conn,
+                    "cleanup_intent",
+                    (str(task_id), int(epoch), "command_cancel", str(native_id)),
+                    "terminal-send",
+                ):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO task_cleanup_intents "
+                        "(task_id, epoch, kind, native_id, session_id, state, created_at, updated_at) "
+                        "VALUES (?, ?, 'command_cancel', ?, ?, 'pending', ?, ?)",
+                        (
+                            str(task_id),
+                            int(epoch),
+                            str(native_id),
+                            str(change.after["session_id"]),
+                            now,
+                            now,
                         ),
                     )
             conn.execute("COMMIT")
@@ -1055,57 +1000,39 @@ class TaskStore:
     ) -> None:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            before = conn.execute(
-                "SELECT * FROM task_cleanup_intents WHERE task_id=? AND epoch=? AND kind=? AND native_id=?",
+            with history.change(
+                conn,
+                "cleanup_intent",
                 (str(task_id), int(epoch), str(kind), str(native_id)),
-            ).fetchone()
-            conn.execute(
-                "UPDATE task_cleanup_intents SET state = 'acknowledged', updated_at = ? "
-                "WHERE task_id = ? AND epoch = ? AND kind = ? AND native_id = ? AND state = 'pending'",
-                (time.time(), str(task_id), int(epoch), str(kind), str(native_id)),
-            )
-            if before is not None:
-                history.record_change(
-                    conn,
-                    entity="cleanup_intent",
-                    task_id=str(task_id),
-                    epoch=int(epoch),
-                    entity_id=f"{kind}:{native_id}",
-                    cause="acknowledged",
-                    changed=history.changed_columns(
-                        before,
-                        conn.execute(
-                            "SELECT * FROM task_cleanup_intents WHERE task_id=? AND epoch=? AND kind=? AND native_id=?",
-                            (str(task_id), int(epoch), str(kind), str(native_id)),
-                        ).fetchone(),
-                    ),
+                "acknowledged",
+            ):
+                conn.execute(
+                    "UPDATE task_cleanup_intents SET state = 'acknowledged', updated_at = ? "
+                    "WHERE task_id = ? AND epoch = ? AND kind = ? AND native_id = ? AND state = 'pending'",
+                    (time.time(), str(task_id), int(epoch), str(kind), str(native_id)),
                 )
             if kind == "command_cancel":
                 outgoing = conn.execute(
                     "SELECT * FROM task_outgoing_commands WHERE task_id=? AND epoch=? AND native_id=? AND state='cleanup'",
                     (str(task_id), int(epoch), str(native_id)),
                 ).fetchall()
-                conn.execute(
-                    "UPDATE task_outgoing_commands SET state = 'acknowledged', updated_at = ? "
-                    "WHERE task_id = ? AND epoch = ? AND native_id = ? AND state = 'cleanup'",
-                    (time.time(), str(task_id), int(epoch), str(native_id)),
-                )
                 for command in outgoing:
-                    history.record_change(
+                    with history.change(
                         conn,
-                        entity="outgoing_command",
-                        task_id=str(task_id),
-                        epoch=int(epoch),
-                        entity_id=command["dedupe_key"],
-                        cause="acknowledged",
-                        changed=history.changed_columns(
-                            command,
-                            conn.execute(
-                                "SELECT * FROM task_outgoing_commands WHERE task_id=? AND epoch=? AND dedupe_key=?",
-                                (str(task_id), int(epoch), command["dedupe_key"]),
-                            ).fetchone(),
-                        ),
-                    )
+                        "outgoing_command",
+                        (str(task_id), int(epoch), command["dedupe_key"]),
+                        "acknowledged",
+                    ):
+                        conn.execute(
+                            "UPDATE task_outgoing_commands SET state = 'acknowledged', updated_at = ? "
+                            "WHERE task_id = ? AND epoch = ? AND dedupe_key = ? AND state = 'cleanup'",
+                            (
+                                time.time(),
+                                str(task_id),
+                                int(epoch),
+                                command["dedupe_key"],
+                            ),
+                        )
             conn.execute("COMMIT")
 
     def get_by_id(self, task_id: str) -> TaskRecord | None:
@@ -1210,42 +1137,26 @@ class TaskStore:
     ) -> TaskRecord:
         states = sorted(expect_states)
         placeholders = ", ".join("?" for _ in states)
-        before = conn.execute(
-            "SELECT * FROM managed_tasks WHERE task_id = ?", (str(task_id),)
-        ).fetchone()
-        cursor = conn.execute(
-            f"UPDATE managed_tasks SET {assign}, version = version + 1, updated_at = ? "
-            f"WHERE task_id = ? AND state IN ({placeholders}) "
-            "AND (? IS NULL OR version = ?)",
-            (
-                *values,
-                time.time(),
-                str(task_id),
-                *states,
-                expect_version,
-                expect_version,
-            ),
-        )
-        row = conn.execute(
-            "SELECT * FROM managed_tasks WHERE task_id = ?", (str(task_id),)
-        ).fetchone()
+        with history.change(conn, "task", (str(task_id),), attempted) as change:
+            cursor = conn.execute(
+                f"UPDATE managed_tasks SET {assign}, version = version + 1, updated_at = ? "
+                f"WHERE task_id = ? AND state IN ({placeholders}) "
+                "AND (? IS NULL OR version = ?)",
+                (
+                    *values,
+                    time.time(),
+                    str(task_id),
+                    *states,
+                    expect_version,
+                    expect_version,
+                ),
+            )
+        row = change.after
         if row is None:
             raise TaskStoreError("Managed task not found")
         if cursor.rowcount != 1:
             raise StaleTransition(self._decode(row), attempted)
-        record = self._decode(row)
-        # Every lifecycle mutation funnels through here, so this one append is
-        # the whole "no second write to remember" invariant for managed tasks.
-        # Same connection, same transaction: rollback discards both.
-        history.record_change(
-            conn,
-            entity="task",
-            task_id=str(task_id),
-            epoch=record.epoch,
-            cause=attempted,
-            changed=history.changed_columns(before, row),
-        )
-        return record
+        return self._decode(row)
 
     def _require_fence(self, task_id: str, fence: TaskFence | None) -> None:
         if (
@@ -1380,7 +1291,7 @@ class TaskStore:
         fence: TaskFence,
     ) -> CheckpointOperation:
         """Persist one explicit logical identity before any native publication."""
-        from .sqlite_durability import require_policy, confirm_database
+        from .sqlite_durability import confirm_database, require_policy
 
         self._require_fence(task.task_id, fence)
         if str(uuid.UUID(operation_id)) != operation_id:
@@ -1472,7 +1383,7 @@ class TaskStore:
     ) -> TaskRecord:
         """Commit the confirmed occurrence and projection/history as one fact."""
         from .retention import verified_receipt
-        from .sqlite_durability import require_policy, confirm_database
+        from .sqlite_durability import confirm_database, require_policy
 
         self._require_fence(operation.task_id, fence)
         receipt = verified_receipt(operation, receipt)
@@ -1633,52 +1544,36 @@ class TaskStore:
         placeholders = ", ".join("?" for _ in states)
 
         def apply(active: sqlite3.Connection) -> TaskRecord:
-            row = active.execute(
-                "SELECT * FROM managed_tasks WHERE task_id = ?",
-                (str(task_id),),
-            ).fetchone()
-            if row is None:
-                raise TaskStoreError("Managed task not found")
-            current = str(row["liveness"])
-            if liveness_stretch(current) == liveness_stretch(liveness):
-                # Same stretch: the reason may be refined, but nothing about
-                # the incident restarted.
-                assign = "liveness = ?, liveness_evidence = ?"
-                values = (liveness, evidence)
-            else:
-                closing = liveness == "live"
-                assign = (
-                    "liveness = ?, liveness_episode = ?, liveness_since = ?, "
-                    "liveness_wakes = 0, liveness_evidence = ?"
+            with history.change(
+                active, "task", (str(task_id),), "liveness", kind="observation"
+            ) as change:
+                row = change.before
+                if row is None:
+                    raise TaskStoreError("Managed task not found")
+                current = str(row["liveness"])
+                if liveness_stretch(current) == liveness_stretch(liveness):
+                    # Same stretch: the reason may be refined, but nothing about
+                    # the incident restarted.
+                    assign = "liveness = ?, liveness_evidence = ?"
+                    values = (liveness, evidence)
+                else:
+                    closing = liveness == "live"
+                    assign = (
+                        "liveness = ?, liveness_episode = ?, liveness_since = ?, "
+                        "liveness_wakes = 0, liveness_evidence = ?"
+                    )
+                    values = (
+                        liveness,
+                        int(row["liveness_episode"]) + (0 if closing else 1),
+                        None if closing else moment,
+                        None if closing else evidence,
+                    )
+                active.execute(
+                    f"UPDATE managed_tasks SET {assign} "
+                    f"WHERE task_id = ? AND state IN ({placeholders})",
+                    (*values, str(task_id), *states),
                 )
-                values = (
-                    liveness,
-                    int(row["liveness_episode"]) + (0 if closing else 1),
-                    None if closing else moment,
-                    None if closing else evidence,
-                )
-            cursor = active.execute(
-                f"UPDATE managed_tasks SET {assign} "
-                f"WHERE task_id = ? AND state IN ({placeholders})",
-                (*values, str(task_id), *states),
-            )
-            updated = active.execute(
-                "SELECT * FROM managed_tasks WHERE task_id = ?", (str(task_id),)
-            ).fetchone()
-            if cursor.rowcount:
-                # An ``observation`` entry, never a ``transition``: preserved
-                # liveness findings must stay distinguishable from task
-                # progress, exactly as the live column skips ``version``.
-                history.record_change(
-                    active,
-                    entity="task",
-                    task_id=str(task_id),
-                    epoch=int(updated["epoch"]),
-                    cause="liveness",
-                    kind="observation",
-                    changed=history.changed_columns(row, updated),
-                )
-            return self._decode(updated)
+            return self._decode(change.after)
 
         if conn is not None:
             return apply(conn)
@@ -1714,24 +1609,13 @@ class TaskStore:
         placeholders = ", ".join("?" for _ in states)
 
         def apply(active: sqlite3.Connection) -> bool:
-            cursor = active.execute(
-                "UPDATE managed_tasks SET over_budget = 1 "
-                f"WHERE task_id = ? AND over_budget = 0 AND state IN ({placeholders})",
-                (str(task_id), *states),
-            )
-            if cursor.rowcount:
-                epoch = active.execute(
-                    "SELECT epoch FROM managed_tasks WHERE task_id = ?",
-                    (str(task_id),),
-                ).fetchone()
-                history.record_change(
-                    active,
-                    entity="task",
-                    task_id=str(task_id),
-                    epoch=int(epoch["epoch"]) if epoch is not None else None,
-                    cause="over-budget",
-                    kind="observation",
-                    changed={"over_budget": 1},
+            with history.change(
+                active, "task", (str(task_id),), "over-budget", kind="observation"
+            ):
+                cursor = active.execute(
+                    "UPDATE managed_tasks SET over_budget = 1 "
+                    f"WHERE task_id = ? AND over_budget = 0 AND state IN ({placeholders})",
+                    (str(task_id), *states),
                 )
             return bool(cursor.rowcount)
 
