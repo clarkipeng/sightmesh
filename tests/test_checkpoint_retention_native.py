@@ -17,6 +17,7 @@ import pytest
 from sightmesh import sdk as sdk_module
 from sightmesh import sqlite_durability
 from sightmesh.evidence import EvidenceClient, EvidenceUnavailable
+from sightmesh.evidence_index import EvidenceIndex
 from sightmesh.sdk import CheckpointPending, SightMesh, SightMeshError
 from sightmesh.task_store import StaleTransition, TaskStoreError
 from test_sdk import spec, system
@@ -141,6 +142,7 @@ def operation_for(store, worker):
 
 def test_sdk_native_checkpoint_recovers_after_worktree_disappears_and_keeps_equal_operations_distinct(
     system,
+    tmp_path,
 ):
     mesh, client, store, native = native_system(system)
     started = mesh.start(spec())
@@ -153,6 +155,24 @@ def test_sdk_native_checkpoint_recovers_after_worktree_disappears_and_keeps_equa
         mesh._read_checkpoint(store.get_by_id(task_for(store, first).task_id))
         == "same bytes"
     )
+    # Search consumes the receipt the production SDK actually committed, not a
+    # separately fabricated artifact fixture. Neither consumer needs the worktree.
+    index = EvidenceIndex(tmp_path / "checkpoint-search.sqlite3")
+    indexed = index.sync_artifact(
+        mesh.evidence_client,
+        op.facts["execution_id"],
+        op.receipt["id"],
+        task_id=op.task_id,
+        repo="sightmesh",
+    )
+    assert indexed.outcome == "complete" and not indexed.error
+    found = index.search(mesh.evidence_client, "same bytes", task_id=op.task_id)
+    assert found.complete and len(found.hits) == 1
+    assert found.hits[0].artifact_id == op.receipt["id"]
+    # The index persists immutable receipt facts, not a cached durability verdict.
+    assert found.sources[0].receipt == {
+        key: value for key, value in op.receipt.items() if key != "durability"
+    }
     client.workspace = original_workspace
     mesh.replace("audit")
     assert client.launches[-1][1]["request"]["session"]["prompt"] == "same bytes"

@@ -3,8 +3,29 @@ from __future__ import annotations
 import pytest
 
 from sightmesh import history, wakes
+from sightmesh.task_store import TaskStore
 from sightmesh.wakes import WakeDelivery, finish_with_wake
 from test_wakes import Recorder, cohort
+
+
+def test_pre_token_wake_migration_preserves_saved_payload_and_reclaims(cohort):
+    """An old claim has no invented owner; its successor keeps the saved bytes."""
+    store, _parent, children = cohort
+    finish_with_wake(store, children[0].task_id, "blocked", "ready")
+    client = Recorder()
+    client.fail = True
+    WakeDelivery(client, store, claim_seconds=-1).pump()
+    with store.connect() as conn:
+        conn.execute("ALTER TABLE task_wakes DROP COLUMN claim_token")
+        before = dict(conn.execute("SELECT * FROM task_wakes").fetchone())
+    reopened = TaskStore(store.path)
+    with reopened.connect() as conn:
+        after = dict(conn.execute("SELECT * FROM task_wakes").fetchone())
+    assert after.pop("claim_token") is None
+    assert after == before
+    client.fail = False
+    assert WakeDelivery(client, reopened).pump() == 1
+    assert client.sent[0][1] == before["payload"]
 
 
 def test_wake_uses_references_without_copying_child_evidence(cohort):
@@ -114,3 +135,42 @@ def test_history_failure_keeps_wake_and_watermark_retryable(cohort, monkeypatch,
         )
     if cause == "settled":
         assert client.sent[0] == client.sent[1]  # same native dedupe key and bytes
+
+
+@pytest.mark.parametrize("settlement", ["delivered", "resolved"])
+def test_expired_claim_cannot_settle_another_claim_or_overwrite_delivery(
+    cohort, settlement
+):
+    """An expired pump owns neither its successor's claim nor its final result."""
+    store, parent, children = cohort
+    finish_with_wake(store, children[0].task_id, "blocked", "ready")
+    client = Recorder()
+    stale = WakeDelivery(client, store, claim_seconds=-1)
+    old_wake = stale.claim()[0]
+    current = WakeDelivery(client, store)
+    current_wake = current.claim()[0]
+    with store.connect() as conn:
+        before = dict(conn.execute("SELECT * FROM task_wakes").fetchone())
+        history_before = conn.execute("SELECT count(*) FROM task_history").fetchone()[0]
+    stale._settle(old_wake, settlement, "late decision")
+    with store.connect() as conn:
+        assert dict(conn.execute("SELECT * FROM task_wakes").fetchone()) == before
+        assert (
+            conn.execute("SELECT count(*) FROM task_history").fetchone()[0]
+            == history_before
+        )
+    assert stale._deliver(old_wake) is False
+    assert client.sent == []
+    assert current._deliver(current_wake) is True
+    with store.connect() as conn:
+        delivered = dict(conn.execute("SELECT * FROM task_wakes").fetchone())
+    stale._settle(old_wake, settlement, "even later decision")
+    with store.connect() as conn:
+        assert dict(conn.execute("SELECT * FROM task_wakes").fetchone()) == delivered
+        assert (
+            conn.execute(
+                "SELECT last_woken_seq FROM managed_tasks WHERE task_id=?",
+                (parent.task_id,),
+            ).fetchone()[0]
+            == current_wake.event_seq
+        )

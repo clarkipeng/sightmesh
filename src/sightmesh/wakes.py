@@ -85,6 +85,7 @@ class Wake:
     state: str
     claim_expires_at: float | None
     payload: str | None
+    claim_token: str | None
 
 
 def dedupe_key(parent_task_id: str, predicate: str) -> str:
@@ -493,17 +494,22 @@ class WakeDelivery:
                     "ORDER BY created_at",
                     (now,),
                 ).fetchall()
-                claimed = [_decode(row) for row in rows]
-                for wake in claimed:
-                    before = conn.execute(
-                        "SELECT * FROM task_wakes WHERE wake_id = ?", (wake.wake_id,)
-                    ).fetchone()
+                claimed = []
+                for before in rows:
+                    wake_id = str(before["wake_id"])
                     conn.execute(
                         "UPDATE task_wakes SET state = 'claimed', "
-                        "claim_expires_at = ?, updated_at = ? WHERE wake_id = ?",
-                        (now + self.claim_seconds, now, wake.wake_id),
+                        "claim_expires_at = ?, claim_token = ?, updated_at = ? WHERE wake_id = ?",
+                        (now + self.claim_seconds, str(uuid.uuid4()), now, wake_id),
                     )
-                    _record_wake_history(conn, wake.wake_id, "claimed", before)
+                    _record_wake_history(conn, wake_id, "claimed", before)
+                    claimed.append(
+                        _decode(
+                            conn.execute(
+                                "SELECT * FROM task_wakes WHERE wake_id = ?", (wake_id,)
+                            ).fetchone()
+                        )
+                    )
                 conn.execute("COMMIT")
                 return claimed
         except sqlite3.DatabaseError as exc:
@@ -543,6 +549,8 @@ class WakeDelivery:
         # response leaves the claim retryable, and its retry must not render
         # a later cohort into a different message.
         payload = self._persist_payload(wake, payload)
+        if payload is None:
+            return False  # Another pump reclaimed or settled this wake.
         self.client.send(
             parent.holder_session_id,
             payload,
@@ -550,8 +558,7 @@ class WakeDelivery:
             dedupe_key=wake.wake_id,
             intent="continue",
         )
-        self._settle(wake, "delivered")
-        return True
+        return self._settle(wake, "delivered")
 
     def _resolve(self, wake: Wake, reason: str) -> bool:
         """Park a suppressed delivery with its reason; never return silently."""
@@ -559,16 +566,19 @@ class WakeDelivery:
         self._settle(wake, "resolved", reason, payload=f"suppressed: {reason}")
         return False
 
-    def _persist_payload(self, wake: Wake, selected: str) -> str:
+    def _persist_payload(self, wake: Wake, selected: str) -> str | None:
         """Store a delivery's immutable bytes before its first send."""
         try:
             with self.store.connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                conn.execute(
+                updated = conn.execute(
                     "UPDATE task_wakes SET payload = COALESCE(payload, ?), "
-                    "updated_at = ? WHERE wake_id = ? AND state = 'claimed'",
-                    (selected, time.time(), wake.wake_id),
+                    "updated_at = ? WHERE wake_id = ? AND state = 'claimed' AND claim_token = ?",
+                    (selected, time.time(), wake.wake_id, wake.claim_token),
                 )
+                if not updated.rowcount:
+                    conn.execute("COMMIT")
+                    return None
                 # Payload bytes are immutable evidence owned by this row;
                 # selection is not a second history occurrence.
                 row = conn.execute(
@@ -588,7 +598,13 @@ class WakeDelivery:
         resolution: str | None = None,
         *,
         payload: str | None = None,
-    ) -> None:
+    ) -> bool:
+        """Only the current claim may choose a terminal outcome and watermark.
+
+        A lease grants another pump permission to claim, not permission for an
+        expired caller to overwrite its successor. The token fences both paths;
+        the existing wake ID still owns native deduplication across retries.
+        """
         now = time.time()
         try:
             with self.store.connect() as conn:
@@ -596,12 +612,16 @@ class WakeDelivery:
                 before = conn.execute(
                     "SELECT * FROM task_wakes WHERE wake_id = ?", (wake.wake_id,)
                 ).fetchone()
-                conn.execute(
+                updated = conn.execute(
                     "UPDATE task_wakes SET state = ?, resolution = ?, "
                     "payload = COALESCE(payload, ?), "
-                    "claim_expires_at = NULL, updated_at = ? WHERE wake_id = ?",
-                    (state, resolution, payload, now, wake.wake_id),
+                    "claim_expires_at = NULL, updated_at = ? WHERE wake_id = ? "
+                    "AND state = 'claimed' AND claim_token = ?",
+                    (state, resolution, payload, now, wake.wake_id, wake.claim_token),
                 )
+                if not updated.rowcount:
+                    conn.execute("COMMIT")
+                    return False
                 _record_wake_history(conn, wake.wake_id, "settled", before)
                 if state == "delivered" and wake.event_seq is not None:
                     # Only a real delivery advances the watermark. A resolved
@@ -615,6 +635,7 @@ class WakeDelivery:
                         (int(wake.event_seq), now, wake.parent_task_id),
                     )
                 conn.execute("COMMIT")
+                return True
         except sqlite3.DatabaseError as exc:
             raise TaskStoreError(f"Cannot settle task wake: {exc}") from exc
 
@@ -665,6 +686,7 @@ def _decode(row: Any) -> Wake:
         state=str(row["state"]),
         claim_expires_at=row["claim_expires_at"],
         payload=row["payload"],
+        claim_token=row["claim_token"],
     )
 
 

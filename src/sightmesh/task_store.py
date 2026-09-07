@@ -167,6 +167,7 @@ _TASK_WAKES_DDL = """
         state TEXT NOT NULL CHECK (state IN
             ('pending', 'claimed', 'delivered', 'resolved')),
         claim_expires_at REAL,
+        claim_token TEXT,
         payload TEXT,
         resolution TEXT,
         created_at REAL NOT NULL,
@@ -665,7 +666,12 @@ class TaskStore:
                 # naming a missing column would fail the whole upgrade.
                 carried = ", ".join(
                     name
-                    for name in (*_TASK_WAKES_LEGACY_COLUMNS, "event_seq")
+                    for name in (
+                        *_TASK_WAKES_LEGACY_COLUMNS,
+                        "event_seq",
+                        "resolution",
+                        "claim_token",
+                    )
                     if name in columns
                 )
                 conn.execute(f"DROP TABLE IF EXISTS {_TASK_WAKES_REBUILD_TABLE}")
@@ -678,13 +684,15 @@ class TaskStore:
                 conn.execute(
                     f"ALTER TABLE {_TASK_WAKES_REBUILD_TABLE} RENAME TO task_wakes"
                 )
-                columns.add("resolution")
+                columns.update(("resolution", "claim_token"))
             # Payload used to be written only after a successful send.  A
             # retry must instead reuse the exact bytes selected before its
             # first send; settlement notes live separately so they cannot
             # overwrite those bytes.
             if "resolution" not in columns:
                 conn.execute("ALTER TABLE task_wakes ADD COLUMN resolution TEXT")
+            if "claim_token" not in columns:
+                conn.execute("ALTER TABLE task_wakes ADD COLUMN claim_token TEXT")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_task_wakes_pending "
             "ON task_wakes(state, created_at)"
