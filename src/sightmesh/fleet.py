@@ -19,7 +19,7 @@ TERMINAL = frozenset({"completed", "done", "failed", "cancelled", "stopped", "ki
 RUNNING = frozenset({"queued", "claimed", "running", "active"})
 #: Managed task states, as the kernel store writes them.
 TASK_RUNNING_STATES = frozenset({"reserved", "active", "replacing"})
-TASK_DONE_STATES = frozenset({"completed", "cancelled"})
+TASK_DONE_STATES = frozenset({"completed", "cancelled", "lost", "exhausted"})
 #: Facts only the executor can produce, named here so an absent one is
 #: reported as degraded rather than silently dropped from the queue.
 DEGRADABLE_SOURCES = ("dirty_closeouts", "failing_checks")
@@ -285,7 +285,7 @@ def breaker_tripped(task: Mapping[str, Any]) -> bool:
     ``TaskStore.prepare_replacement`` rejects outright. A finished task never
     counts, however many attempts it spent.
     """
-    if str(task.get("state") or "") in TASK_DONE_STATES:
+    if str(task.get("state") or "") in TASK_DONE_STATES - {"exhausted"}:
         return False
     try:
         return int(task["attempts"]) >= int(task["max_attempts"])

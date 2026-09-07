@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from sightmesh.escalation import EscalationStore
-from sightmesh.task_store import StaleTransition, TaskStore, TaskStoreError
+from sightmesh.task_store import _MANAGED_TASKS_DDL, StaleTransition, TaskStore, TaskStoreError
 
 LEGACY_DDL = """
     CREATE TABLE managed_tasks (
@@ -87,6 +87,14 @@ def _active(store, key, *, parent_task_id=None, children=0):
     return store.activate(
         record.task_id, workspace_id=f"ws-{key}", session_id=f"session-{key}"
     )
+
+
+def test_test_store_guard_rejects_any_path_outside_its_tmp_root(tmp_path):
+    """A test must fail before SQLite can initialize a non-isolated store (#123)."""
+    implicit = TaskStore()
+    assert implicit.path.is_relative_to(tmp_path)
+    with pytest.raises(AssertionError, match="non-isolated TaskStore"):
+        TaskStore(tmp_path.parent / "forbidden.sqlite3")
 
 
 ROUND1_KERNEL_DDL = """
@@ -210,6 +218,51 @@ def test_migration_preserves_rows_and_runs_twice_without_effect(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
+
+
+def test_migration_restarts_legacy_launch_counts_as_zero_failures(tmp_path):
+    """Pre-#119 attempts counted starts, so preserving them would keep exhausted healthy tasks."""
+    path = tmp_path / "state.sqlite3"
+    database = _legacy_store(
+        path, [("task-a", "operator", "one", None, "active", "session-a")]
+    )
+    with database._connect() as conn:
+        conn.execute("UPDATE managed_tasks SET attempts = 3")
+
+    upgraded = TaskStore(path)
+    task = upgraded.get_by_id("task-a")
+    assert task is not None and task.attempts == 0
+    assert "attempts >= 0" in _schema(database)
+
+
+def test_migration_rebuilds_current_schema_without_losing_liveness_state(tmp_path):
+    """The attempts CHECK rebuild must carry every field current stores own."""
+    path = tmp_path / "state.sqlite3"
+    database = EscalationStore(path)
+    old_ddl = _MANAGED_TASKS_DDL.replace("attempts >= 0", "attempts > 0")
+    with database._connect() as conn:
+        conn.execute(old_ddl.format(name="managed_tasks"))
+        conn.execute(
+            "INSERT INTO managed_tasks "
+            "(task_id, scope, task_key, state, epoch, attempts, max_attempts, child_limit, "
+            "spec_json, version, child_event_seq, last_woken_seq, liveness, liveness_episode, "
+            "liveness_since, liveness_wakes, liveness_evidence, over_budget, checkpoint_at, "
+            "created_at, updated_at) VALUES "
+            "('t', 'operator', 'worker', 'active', 4, 3, 3, 0, '{}', 7, 11, 9, 'stalled', "
+            "2, 10, 1, '{\"proof\":true}', 1, 12, 1, 2)"
+        )
+
+    upgraded = TaskStore(path)
+    once = _schema(database)
+    reopened = TaskStore(path)
+    twice = _schema(database)
+    task = upgraded.get_by_id("t")
+    assert task is not None and reopened.get_by_id("t") == task
+    assert (task.attempts, task.epoch, task.version, task.liveness, task.liveness_episode,
+            task.liveness_since, task.liveness_wakes, task.liveness_evidence,
+            task.over_budget, task.checkpoint_at) == (0, 4, 7, "stalled", 2, 10, 1,
+                                                       '{"proof":true}', True, 12)
+    assert once == twice
 
 
 def test_migration_repairs_a_legacy_self_parent_row(tmp_path):

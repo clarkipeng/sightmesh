@@ -3,6 +3,12 @@ import pytest
 from sightmesh import service
 
 
+@pytest.fixture(autouse=True)
+def _isolated_service_home(monkeypatch, tmp_path) -> None:
+    """Installation and hardening must never inspect or chmod the operator's home."""
+    monkeypatch.setattr(service.Path, "home", lambda: tmp_path)
+
+
 def test_service_definition_is_local_and_uses_native_cleanup(
     monkeypatch, tmp_path
 ) -> None:
@@ -113,8 +119,7 @@ def test_service_paths_are_scoped_to_sightmesh() -> None:
     assert service.state_dir().name == "sightmesh"
 
 
-def test_harden_local_storage_makes_state_private(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path))
+def test_harden_local_storage_makes_state_private(tmp_path) -> None:
     state = tmp_path / ".local" / "state" / "sightmesh"
     state.mkdir(parents=True)
     log = state / "service.log"
@@ -122,10 +127,22 @@ def test_harden_local_storage_makes_state_private(monkeypatch, tmp_path) -> None
     state.chmod(0o755)
     log.chmod(0o644)
 
-    service.harden_local_storage()
+    private_roots = [
+        tmp_path / ".repowire",
+        tmp_path / "Library" / "Application Support" / "ai.cdesktop.cdesktop",
+        tmp_path / ".local" / "share" / "sightmesh",
+    ]
+    for root in private_roots:
+        root.mkdir(parents=True)
+        root.chmod(0o755)
+
+    secured = service.harden_local_storage()
 
     assert state.stat().st_mode & 0o777 == 0o700
     assert log.stat().st_mode & 0o777 == 0o600
+    assert all(root.stat().st_mode & 0o777 == 0o700 for root in private_roots)
+    assert {str(root) for root in private_roots}.issubset(secured)
+    assert all(service.Path(path).is_relative_to(tmp_path) for path in secured)
     assert service.local_storage_is_private() == (True, [])
 
 
@@ -201,6 +218,7 @@ def test_install_restores_previous_definitions_when_reload_fails(
     monkeypatch.setattr(service, "plist_path", lambda: target)
     monkeypatch.setattr(service, "bridge_plist_path", lambda: bridge_target)
     monkeypatch.setattr(service, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(service, "config_dir", lambda: tmp_path / "config")
     monkeypatch.setattr(service.shutil, "which", lambda name: f"/tmp/{name}")
     attempts = []
     bootstraps = []
@@ -237,8 +255,7 @@ def test_wait_until_healthy_retries_until_ready(monkeypatch) -> None:
     service.wait_until_healthy(4321, timeout=1)
 
 
-def test_migrate_legacy_state_copies_routing_and_leases(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("HOME", str(tmp_path))
+def test_migrate_legacy_state_copies_routing_and_leases(tmp_path) -> None:
     old_config = tmp_path / ".config" / "agent-deck" / "bridge.json"
     old_config.parent.mkdir(parents=True)
     old_config.write_text('{"enabled_workspaces": ["workspace-a"]}', encoding="utf-8")

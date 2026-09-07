@@ -85,6 +85,7 @@ def test_breaker_headroom_is_derived_not_stored(store: TaskStore) -> None:
     )
     record, _inserted = reservations[0]
     store.activate(record.task_id, workspace_id="workspace-1", session_id="session-1")
+    store.finish(record.task_id, "lost", "no durable output")
 
     view = observability.read_tasks(store)[0]
     assert view.breaker_tripped is True
@@ -131,7 +132,7 @@ def test_counts_and_the_attention_queue_agree_on_one_breaker(
     )
     by_key = {record.key: record for record, _inserted in reservations}
     store.activate(by_key["stuck"].task_id, workspace_id="w-s", session_id="s-s")
-    store.finish(by_key["stuck"].task_id, "blocked", "waiting on approval to merge")
+    store.finish(by_key["stuck"].task_id, "lost", "no durable output")
     store.activate(by_key["finished"].task_id, workspace_id="w-f", session_id="s-f")
     store.finish(by_key["finished"].task_id, "completed", "shipped")
 

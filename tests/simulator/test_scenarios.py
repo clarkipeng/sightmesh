@@ -100,6 +100,37 @@ def _reserve_child(store: TaskStore, parent_task_id: str, key: str, session: str
     )
 
 
+def test_s28_three_clean_checkpoints_leave_the_next_failure_at_one_of_three(store):
+    """S28: progress is success, so it never spends the failure budget."""
+    task = _reserve_child(store, _manager(store, children=1).task_id, "worker", "s1")
+
+    for checkpoint in ("one", "two", "three"):
+        task = store.checkpoint(task.task_id, checkpoint)
+        assert task.attempts == 0
+
+    failed = store.finish(task.task_id, "lost", "no durable output")
+    assert (failed.state, failed.attempts, failed.max_attempts) == ("lost", 1, 3)
+
+
+def test_s29_three_distinct_failures_exhaust_with_the_last_reason(store):
+    """S29: each lost epoch charges once; the final reason remains inspectable."""
+    task = _reserve_child(store, _manager(store, children=1).task_id, "worker", "s1")
+    reasons = ("lost: first", "lost: second", "no durable output")
+
+    for index, reason in enumerate(reasons, start=1):
+        task = store.finish(task.task_id, "lost", reason)
+        if index < len(reasons):
+            task = store.prepare_replacement(task.task_id)
+            task = store.activate(task.task_id, workspace_id=f"ws-{index + 1}", session_id=f"s{index + 1}")
+
+    assert (task.state, task.attempts, task.result) == (
+        "exhausted", 3, "exhausted: no durable output"
+    )
+    with pytest.raises(TaskStoreError):
+        store.finish(task.task_id, "lost", "no durable output")
+    assert store.get_by_id(task.task_id).attempts == 3
+
+
 def _rebuild_managed_tasks_kernel_v1(conn: sqlite3.Connection) -> None:
     """Stand in for a peer process P1 that completes the kernel-v1 rebuild.
 
@@ -110,7 +141,11 @@ def _rebuild_managed_tasks_kernel_v1(conn: sqlite3.Connection) -> None:
     carried = ", ".join(
         name
         for name in _MANAGED_TASKS_COLUMNS
-        if name not in ("parent_task_id", "version")
+        if name not in (
+            "parent_task_id", "version", "child_event_seq", "last_woken_seq",
+            "liveness", "liveness_episode", "liveness_since", "liveness_wakes",
+            "liveness_evidence", "over_budget", "checkpoint_at",
+        )
     )
     conn.execute(f"DROP TABLE IF EXISTS {_REBUILD_TABLE}")
     conn.execute(_MANAGED_TASKS_DDL.format(name=_REBUILD_TABLE))

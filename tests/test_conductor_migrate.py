@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from sightmesh import cli
+from sightmesh import cli, routing
 from sightmesh.conductor_migrate import (
     apply_plan,
     build_plan,
@@ -181,7 +181,8 @@ def _fixture(tmp_path: Path, *, dirty: bool = False, status: str = "idle"):
     return conductor, checkout, database
 
 
-def test_plan_apply_status_and_rollback(tmp_path: Path, capsys) -> None:
+def test_plan_apply_status_and_rollback(tmp_path: Path, capsys, monkeypatch) -> None:
+    monkeypatch.setattr(routing, "routing_path", lambda: tmp_path / "config" / "bridge.json")
     conductor, checkout, database = _fixture(tmp_path)
     plan = build_plan(conductor_roots=[conductor], database=database)
     assert plan["workspace_count"] == 1

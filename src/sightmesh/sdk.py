@@ -325,7 +325,7 @@ class SightMesh:
                         latest
                         and latest.epoch == current.epoch
                         and latest.holder_session_id == current.holder_session_id
-                        and latest.state in {"completed", "cancelled", "lost"}
+                        and latest.state in {"completed", "cancelled", "lost", "exhausted"}
                     )
                     self.store.settle_outgoing_command(
                         current.task_id, current.epoch, dedupe_key, native_id, terminal=terminal
@@ -442,12 +442,19 @@ class SightMesh:
             )
 
     def _finish(
-        self, task: TaskRecord, state: str, result: str | None, fence: TaskFence
+        self,
+        task: TaskRecord,
+        state: str,
+        result: str | None,
+        fence: TaskFence,
+        *,
+        charge_failure: bool = False,
     ) -> TaskRecord:
         """Make the durable terminal decision and enqueue its parent wake."""
         try:
             updated, _created = wakes.finish_with_wake(
-                self.store, task.task_id, state, result, fence=fence
+                self.store, task.task_id, state, result,
+                charge_failure=charge_failure, fence=fence
             )
         except StaleTransition as exc:
             if exc.current.state == state:
@@ -472,7 +479,7 @@ class SightMesh:
         a task's lifecycle gate. Re-entry fences delivery against a newer row.
         """
         commands = []
-        if state in {"completed", "cancelled", "lost"} and task.holder_session_id:
+        if state in {"completed", "cancelled", "lost", "exhausted"} and task.holder_session_id:
             with self.store.task_lock(task.task_id) as snapshot_fence:
                 with snapshot_fence.external_io():
                     commands = NativeCommandQueue(self.client).commands(task.holder_session_id)
@@ -485,7 +492,7 @@ class SightMesh:
             # terminal task cannot release admission while cdesktop can still
             # dispatch one of its commands.
             if (
-                state in {"completed", "cancelled", "lost"}
+                state in {"completed", "cancelled", "lost", "exhausted"}
                 and current.holder_session_id == task.holder_session_id
             ):
                 self.store.record_cleanup_intents(
@@ -504,14 +511,14 @@ class SightMesh:
             updated = self._finish(current, state, result, fence)
             workspace_id = current.workspace_id if stop_workspace else None
             effect = self.journal.get(current.task_id, current.epoch)
-            if state in {"completed", "cancelled", "lost"} and effect is not None:
+            if state in {"completed", "cancelled", "lost", "exhausted"} and effect is not None:
                 if effect.state != "terminal":
                     effect = self.journal.mark_terminal(
                         current.task_id, current.epoch, state
                     )
                 if effect.workspace_id is None:
                     workspace_id = None
-            if state in {"completed", "cancelled", "lost"} and current.holder_session_id:
+            if state in {"completed", "cancelled", "lost", "exhausted"} and current.holder_session_id:
                 self.ownership.retire(
                     current.holder_session_id,
                     state="retired",
@@ -577,7 +584,7 @@ class SightMesh:
                 expect_states=frozenset({"lost"}),
                 expect_version=current.version,
                 assign=(
-                    "state = 'reserved', epoch = epoch + 1, attempts = attempts + 1, "
+                    "state = 'reserved', epoch = epoch + 1, "
                     "spec_json = ?, workspace_id = NULL, holder_session_id = NULL, "
                     "result = NULL"
                 ),
@@ -768,14 +775,22 @@ class SightMesh:
         if outcome is None:
             return None
         if task.attempts >= task.max_attempts:
+            return None
+        if task.state == "active" and task.attempts + 1 >= task.max_attempts:
             # The circuit breaker has tripped. Saying so once is the whole
-            # difference between a stopped task and a hung one.
-            return self._block_unroutable(
-                task,
-                f"{outcome} on route {target.get('route_id')}; "
-                f"{task.max_attempts}-attempt circuit breaker tripped",
-                fence,
+            # difference between a stopped task and a hung one. Exhaustion is
+            # a terminal task outcome carrying the final failure.
+            exhausted = self._finish(
+                task, "exhausted", f"{outcome} on route {target.get('route_id')}", fence
             )
+            if task.holder_session_id:
+                self.ownership.retire(
+                    task.holder_session_id,
+                    state="retired",
+                    reason="managed task exhausted",
+                    logical_key=f"task:{task.task_id}:{task.epoch}",
+                )
+            return Worker.from_record(exhausted)
 
         route_id = target.get("route_id")
         route_class = target.get("route_class") or execution_routing.DEFAULT_ROUTE_CLASS
@@ -818,7 +833,14 @@ class SightMesh:
             "recovery": outcome,
         }
         prepared = self.store.prepare_replacement(
-            task.task_id, target=next_target, expect_version=task.version, fence=fence
+            task.task_id,
+            target=next_target,
+            # A failed active epoch reaches this transition first. A blocked
+            # epoch got here after its launch failure was atomically charged
+            # with the block, so continuing that same failure costs nothing.
+            charge_failure=task.state == "active",
+            expect_version=task.version,
+            fence=fence,
         )
         return Worker.from_record(
             self._launch_prepared(prepared, str(task.spec["prompt"]), fence)
@@ -864,7 +886,9 @@ class SightMesh:
         """
         if task.state == "blocked":
             return None
-        return Worker.from_record(self._finish(task, "blocked", reason, fence))
+        return Worker.from_record(
+            self._finish(task, "blocked", reason, fence, charge_failure=True)
+        )
 
     def _record_provider_outcome(
         self, task: TaskRecord, outcome: str, retry_at: float | None
@@ -1128,7 +1152,10 @@ class SightMesh:
                 outcome = self._record_provider_outcome(
                     task, _rejection_outcome(exc.status), exc.retry_at
                 )
-                self._finish(task, "blocked", f"launch rejected: {outcome}", fence)
+                self._finish(
+                    task, "blocked", f"launch rejected: {outcome}", fence,
+                    charge_failure=True,
+                )
             raise
         workspace_id, session_id = self._effect_ids(task, native, fence)
         current = self.store.get_by_id(task.task_id)
