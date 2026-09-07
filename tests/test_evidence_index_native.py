@@ -170,8 +170,8 @@ def test_resume_rereads_only_bounded_overlap_and_never_duplicates(tmp_path):
     result = index.search(wire.client(), "job.id")
     assert len(result.hits) == 1 and not result.complete
     reads = [q for path, q in wire.requests if path.endswith("/raw-log")]
-    assert (
-        reads and min(int(q["start"][0]) for q in reads) == len(first) - OVERLAP_BYTES
+    assert any(
+        int(q["start"][0]) == len(first) - OVERLAP_BYTES for q in reads
     )
     assert (
         max(int(q["end"][0]) - int(q["start"][0]) for q in reads)
@@ -286,6 +286,22 @@ def test_rebuild_compaction_filters_and_missing_originals_are_honest(tmp_path):
         not unavailable.hits
         and unavailable.sources[0].error
         and not unavailable.complete
+    )
+
+
+def test_zero_candidate_search_checks_native_source_availability(tmp_path):
+    wire = NativeWire([b"known searchable native evidence"])
+    wire.append(b"", outcome="complete")
+    index = EvidenceIndex(tmp_path / "index.sqlite")
+    assert index.sync(wire.client(), EXECUTION).at_available_end
+    wire.fail_after = 0
+    wire.requests.clear()
+    result = index.search(wire.client(), "absent literal")
+    assert not result.hits and not result.complete
+    assert result.sources[0].error == "EvidenceUnavailable"
+    assert any(
+        path.endswith("/raw-log") and query == {"start": ["0"], "end": ["1"]}
+        for path, query in wire.requests
     )
 
 

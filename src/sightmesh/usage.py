@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from .evidence import EvidenceClient
-from .evidence_stream import NativeRecords
+from .evidence_stream import MAX_RECORD_BYTES, NativeRecords
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,7 @@ class UsageReport:
     capture_outcome: str | None = None
     at_available_end: bool = False
     source_error: str | None = None
+    derivation_error: str | None = None
 
     @property
     def complete(self) -> bool:
@@ -56,6 +57,11 @@ class UsageReport:
         )
 
     @property
+    def derivation_complete(self) -> bool:
+        """Whether provider JSONL was fully and boundedly derived from capture."""
+        return self.complete and not self.derivation_error
+
+    @property
     def execution_tokens(self) -> int | None:
         """Only an explicit complete Claude main-loop result can establish this.
 
@@ -63,7 +69,7 @@ class UsageReport:
         work. Unknown provider/capture semantics are never represented as zero.
         """
         results = [s for s in self.samples if s.scope == "execution_result"]
-        if not self.complete or self.warnings or len(results) != 1:
+        if not self.derivation_complete or self.warnings or len(results) != 1:
             return None
         return results[0].tokens.total
 
@@ -126,6 +132,14 @@ def derive(
     samples: dict[tuple[Any, ...], UsageSample] = {}
     warnings: set[str] = set()
     stream_messages: dict[str | None, str] = {}
+    pending_stdout = ""
+    discarding_stdout = False
+    derivation_error: str | None = None
+
+    def provider_error(error: str) -> None:
+        nonlocal derivation_error
+        if derivation_error is None:
+            derivation_error = error
 
     def save(sample: UsageSample) -> None:
         if sample.identity is None:
@@ -139,6 +153,118 @@ def derive(
             if before is not None and after is not None and after < before:
                 warnings.add("thread_total_decreased_or_reordered")
         samples[key] = sample
+
+    def consume_provider_line(line: str) -> None:
+        try:
+            event = _mapping(json.loads(line))
+        except (ValueError, TypeError):
+            if line.lstrip().startswith("{"):
+                warnings.add("unparsed_provider_json")
+                provider_error("malformed_provider_json")
+            return
+        consume_event(event)
+
+    def consume_event(event: Mapping[str, Any]) -> None:
+        nonlocal stream_messages
+        if event.get("method") == "thread/tokenUsage/updated":
+            params = _mapping(event.get("params"))
+            usage = _mapping(params.get("tokenUsage"))
+            save(
+                UsageSample(
+                    "codex",
+                    "last_request_snapshot",
+                    _identity(params.get("threadId"), params.get("turnId")),
+                    _codex(usage.get("last")),
+                )
+            )
+            save(
+                UsageSample(
+                    "codex",
+                    "thread_lifetime",
+                    _identity(params.get("threadId")),
+                    _codex(usage.get("total")),
+                )
+            )
+            return
+        parent = event.get("parent_tool_use_id")
+        if parent is not None and not isinstance(parent, str):
+            warnings.add("invalid_parent_identity")
+            return
+        kind = event.get("type")
+        if kind == "assistant":
+            message = _mapping(event.get("message"))
+            save(
+                UsageSample(
+                    "claude",
+                    "message_input",
+                    _identity(message.get("id")),
+                    _claude(message.get("usage"), output=False),
+                    parent,
+                )
+            )
+        elif kind == "result":
+            tokens = _claude(event.get("usage"), output=True)
+            if event.get("subtype") != "success" or event.get("is_error") is True:
+                warnings.add("error_result_may_omit_usage")
+                tokens = replace(tokens, total=None)
+            save(
+                UsageSample(
+                    "claude",
+                    "execution_result",
+                    _identity(source_id),
+                    tokens,
+                    parent,
+                )
+            )
+        elif kind == "stream_event":
+            partial = _mapping(event.get("event"))
+            if partial.get("type") == "message_start":
+                message = _mapping(partial.get("message"))
+                message_id = message.get("id")
+                if _identity(message_id) is not None:
+                    stream_messages[parent] = message_id
+            elif partial.get("type") == "message_delta":
+                # These are cumulative output snapshots, not additive deltas.
+                save(
+                    UsageSample(
+                        "claude",
+                        "message_stream_output",
+                        _identity(stream_messages.get(parent)),
+                        Tokens(
+                            output=_count(
+                                _mapping(partial.get("usage")).get("output_tokens")
+                            )
+                        ),
+                        parent,
+                    )
+                )
+            elif partial.get("type") == "message_stop":
+                stream_messages.pop(parent, None)
+        elif "usage" in event or "tokenUsage" in event:
+            warnings.add("unsupported_provider_usage")
+
+    def consume_stdout(chunk: str) -> None:
+        nonlocal pending_stdout, discarding_stdout
+        while chunk:
+            if discarding_stdout:
+                _, newline, chunk = chunk.partition("\n")
+                if not newline:
+                    return
+                discarding_stdout = False
+                continue
+            part, newline, chunk = chunk.partition("\n")
+            pending_stdout += part
+            if len(pending_stdout.encode()) > MAX_RECORD_BYTES:
+                provider_error("provider_jsonl_record_exceeds_bound")
+                pending_stdout = ""
+                if not newline:
+                    discarding_stdout = True
+                    return
+            elif newline:
+                consume_provider_line(pending_stdout.rstrip("\r"))
+                pending_stdout = ""
+            else:
+                return
 
     for record in records:
         if isinstance(record, str) and record in {"Ready", "Finished"}:
@@ -155,90 +281,13 @@ def derive(
         if not isinstance(stdout, str):
             warnings.add("invalid_native_stdout")
             continue
-        for line in stdout.splitlines():
-            try:
-                event = _mapping(json.loads(line))
-            except (ValueError, TypeError):
-                if line.lstrip().startswith("{"):
-                    warnings.add("unparsed_provider_json")
-                continue
-            if event.get("method") == "thread/tokenUsage/updated":
-                params = _mapping(event.get("params"))
-                usage = _mapping(params.get("tokenUsage"))
-                save(
-                    UsageSample(
-                        "codex",
-                        "last_request_snapshot",
-                        _identity(params.get("threadId"), params.get("turnId")),
-                        _codex(usage.get("last")),
-                    )
-                )
-                save(
-                    UsageSample(
-                        "codex",
-                        "thread_lifetime",
-                        _identity(params.get("threadId")),
-                        _codex(usage.get("total")),
-                    )
-                )
-                continue
-            parent = event.get("parent_tool_use_id")
-            if parent is not None and not isinstance(parent, str):
-                warnings.add("invalid_parent_identity")
-                continue
-            kind = event.get("type")
-            if kind == "assistant":
-                message = _mapping(event.get("message"))
-                save(
-                    UsageSample(
-                        "claude",
-                        "message_input",
-                        _identity(message.get("id")),
-                        _claude(message.get("usage"), output=False),
-                        parent,
-                    )
-                )
-            elif kind == "result":
-                tokens = _claude(event.get("usage"), output=True)
-                if event.get("subtype") != "success" or event.get("is_error") is True:
-                    warnings.add("error_result_may_omit_usage")
-                    tokens = replace(tokens, total=None)
-                save(
-                    UsageSample(
-                        "claude",
-                        "execution_result",
-                        _identity(source_id),
-                        tokens,
-                        parent,
-                    )
-                )
-            elif kind == "stream_event":
-                partial = _mapping(event.get("event"))
-                if partial.get("type") == "message_start":
-                    message = _mapping(partial.get("message"))
-                    message_id = message.get("id")
-                    if _identity(message_id) is not None:
-                        stream_messages[parent] = message_id
-                elif partial.get("type") == "message_delta":
-                    # These are cumulative output snapshots, not additive deltas.
-                    save(
-                        UsageSample(
-                            "claude",
-                            "message_stream_output",
-                            _identity(stream_messages.get(parent)),
-                            Tokens(
-                                output=_count(
-                                    _mapping(partial.get("usage")).get("output_tokens")
-                                )
-                            ),
-                            parent,
-                        )
-                    )
-                elif partial.get("type") == "message_stop":
-                    stream_messages.pop(parent, None)
-            elif "usage" in event or "tokenUsage" in event:
-                warnings.add("unsupported_provider_usage")
-    return UsageReport(tuple(samples.values()), tuple(sorted(warnings)), source_id)
+        consume_stdout(stdout)
+    if pending_stdout or discarding_stdout:
+        provider_error("partial_provider_jsonl_record")
+    return UsageReport(
+        tuple(samples.values()), tuple(sorted(warnings)), source_id,
+        derivation_error=derivation_error,
+    )
 
 
 def derive_native(

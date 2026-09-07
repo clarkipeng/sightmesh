@@ -45,11 +45,18 @@ earlier window. Results are not a list of every individual matching occurrence.
 `next_after` pages candidate windows, so a page can have no hits while still having
 a next cursor. Restart that disposable cursor after a rebuild.
 
-Read `sources` and `complete`, not only `hits`. Coverage describes the **selected
-indexed sources**, not undiscovered tasks or sources. Live, legacy-unknown,
-unavailable, binary, or corrupt evidence is not an empty complete search. Frame
-cursors use compressed frame starts, including empty legacy rows and terminal
-seals; an available physical end is not itself terminal capture completeness.
+Read `sources`, `unchecked_sources`, and `complete`, not only `hits`. Coverage
+describes the **selected indexed sources**, not undiscovered tasks or sources.
+Before a log search is complete, the consumer makes one bounded `[0, 1)` native
+range probe for each selected log source. That proves the current source route,
+identity, and availability, but does not certify arbitrary historic bytes; each
+hit is separately hash-verified from its own original-backed window. An artifact
+without a candidate window stays in `unchecked_sources`, because proving its
+bytes requires streaming and hashing the full immutable artifact. Live,
+legacy-unknown, unavailable, binary, corrupt, or unchecked evidence is not an
+empty complete search. Frame cursors use compressed frame starts, including empty
+legacy rows and terminal seals; an available physical end is not itself terminal
+capture completeness.
 
 Log frames commit cursor and postings in one transaction. Artifact bytes have no
 native range endpoint, so each occurrence streams under one disposable-index
@@ -65,8 +72,11 @@ only the index. Neither operation deletes, migrates, or changes originals.
 
 ## Usage observations, not guessed bills
 
-`derive_native` streams confirmed original JSONL with a bounded 1 MiB record buffer
-and explicit page budget. Unavailable bytes, malformed/oversized records, partial
+`derive_native` streams confirmed original JSONL with a bounded 1 MiB outer record
+buffer and explicit page budget. It separately buffers the provider's JSONL across
+arbitrary native `Stdout` chunks, with the same 1 MiB bound. Native capture
+`complete` and `derivation_complete` are distinct: unavailable bytes,
+malformed/oversized provider records, partial provider records, outer partial
 records, budget exhaustion, and unknown capture outcomes stay visible. It has no
 telemetry database or copied source body.
 

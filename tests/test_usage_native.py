@@ -10,7 +10,9 @@ from test_evidence_index_native import EXECUTION, NativeWire
 
 
 def log(event):
-    return {"Stdout": json.dumps(event)}
+    # Codex's LogWriter appends a newline to each provider JSON event. Native
+    # LogMsg chunks may still split this string at arbitrary byte boundaries.
+    return {"Stdout": json.dumps(event) + "\n"}
 
 
 def codex(turn="turn-1", last=12, total=112, **changes):
@@ -239,3 +241,40 @@ def test_reader_preserves_utf8_split_inside_native_jsonl():
     wire = wire_records(records, split=1)
     report = derive_native(wire.client(), EXECUTION, max_pages=4096)
     assert report.complete and report.execution_tokens == 100
+
+
+def test_provider_jsonl_spans_native_stdout_chunks_and_keeps_interleaved_records():
+    event = codex()["Stdout"]
+    midpoint = len(event) // 2
+    records = [
+        {"Stdout": event[:midpoint]},
+        {"JsonPatch": []},
+        {"Stdout": event[midpoint:]},
+    ]
+    report = derive_native(wire_records(records).client(), EXECUTION)
+    assert report.complete and report.derivation_error is None
+    assert len(report.samples) == 2
+
+
+@pytest.mark.parametrize(
+    "stdout,error",
+    [
+        ('{"type":}\n', "malformed_provider_json"),
+        ('{"type":"result"', "partial_provider_jsonl_record"),
+    ],
+)
+def test_provider_jsonl_failures_are_not_native_capture_failures(stdout, error):
+    report = derive_native(wire_records([{"Stdout": stdout}]).client(), EXECUTION)
+    assert report.capture_outcome == "complete" and report.complete
+    assert report.derivation_error == error and not report.derivation_complete
+
+
+def test_provider_jsonl_buffer_has_a_bound_independent_of_outer_logmsg_records():
+    half = MAX_RECORD_BYTES // 2
+    records = [{"Stdout": "{" + "x" * half}, {"Stdout": "x" * (half + 2)}]
+    report = derive_native(
+        wire_records(records, split=MAX_FRAME_BYTES).client(), EXECUTION, max_pages=128
+    )
+    assert report.complete
+    assert report.derivation_error == "provider_jsonl_record_exceeds_bound"
+    assert not report.derivation_complete
