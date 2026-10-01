@@ -6,7 +6,7 @@ SightMesh keeps orchestration data local and separates durable source state from
 | --- | --- | --- | --- |
 | Git and the repository host | Repository and Git refs | Source, commits, branches, and review history | Explicit Git lifecycle |
 | cdesktop | `~/Library/Application Support/ai.cdesktop.cdesktop` | Workspace records, visible session history, and process metadata | Until the archive is explicitly deleted |
-| cdesktop | `~/.local/share/sightmesh/.cdesktop-workspaces` | SightMesh-managed isolated worktrees | Active lifetime; a clean archived worktree may be reclaimed after about one hour |
+| cdesktop | `~/.local/share/sightmesh/.cdesktop-workspaces` | SightMesh-managed isolated worktrees | Reclaimed about one hour after archive or 72 hours idle; never while it has uncommitted or untracked files |
 | Repowire | `~/.repowire` | Local peer identity, discovery, and request/reply state | Until explicitly reset |
 | SightMesh | `~/.local/state/sightmesh` | Ownership leases, route policy, approval audit, logs, migration plans, and bounded handoffs | Lifecycle-specific; approval audit, migration plans, and handoffs remain until explicitly removed |
 | SightMesh | `~/.local/share/sightmesh/updates` | Checksum-verified, versioned cdesktop update installations | Active and pending packages plus one recent spare; superseded packages are pruned automatically |
@@ -33,6 +33,8 @@ Rebuilding or compacting it never removes originals. Source retention does not
 authorize deleting the native execution or archive that owns the references.
 
 Archive is the ordinary retirement action. It stops execution, disables message routing, releases the ownership lease, and preserves the cdesktop workspace record and session history. SightMesh refuses to archive a dirty cdesktop-managed worktree because cdesktop may reclaim that directory after about one hour. A worktree cdesktop has already reclaimed holds no uncommitted work, so it never counts as dirty. A direct workspace may preserve reconciled dirty state only with `--preserve-dirty`; cdesktop never owns or removes its repository.
+
+Reclamation is what keeps worktrees from piling up, so the managed service must run with cleanup enabled. `sightmesh doctor` fails when the installed service sets an environment variable SightMesh does not write, such as a hand-added `DISABLE_WORKTREE_CLEANUP`; `sightmesh service install` restores the managed definition.
 
 Restore reactivates the same cdesktop record, reacquires its ownership lease, and re-enables routing. If cdesktop already reclaimed a clean managed worktree, it recreates the worktree from the preserved Git branch when execution resumes.
 

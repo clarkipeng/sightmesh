@@ -22,6 +22,12 @@ OBSOLETE_UPDATER_LABEL = "io.sightmesh.updater"
 LEGACY_LABEL = "io.agent-deck.cdesktop"
 LEGACY_BRIDGE_LABEL = "io.agent-deck.bridge"
 DEFAULT_PORT = 3210
+# The only variables SightMesh writes into the cdesktop service. Anything else
+# is a hand edit that survives every restart, like the "temporary"
+# DISABLE_WORKTREE_CLEANUP=1 that stopped worktree reclamation for weeks.
+MANAGED_ENVIRONMENT = frozenset(
+    {"CDESKTOP_NO_BROWSER", "HOST", "PORT", "PATH", MAX_LOG_ENV}
+)
 
 
 def command_path() -> str:
@@ -443,6 +449,16 @@ def status(port: int = DEFAULT_PORT) -> dict[str, Any]:
         "log_bytes": log_sizes,
         "log_total_bytes": sum(log_sizes.values()),
     }
+
+
+def unmanaged_environment() -> list[str]:
+    """Names the installed cdesktop service sets that SightMesh never writes."""
+    target = plist_path()
+    try:
+        installed = plistlib.loads(target.read_bytes())["EnvironmentVariables"]
+    except (FileNotFoundError, KeyError):
+        return []
+    return sorted(set(installed) - MANAGED_ENVIRONMENT)
 
 
 def _installed_log_limit() -> int:

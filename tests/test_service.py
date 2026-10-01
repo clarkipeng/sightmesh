@@ -32,6 +32,7 @@ def test_service_definition_is_local_and_uses_native_cleanup(
     assert definition["EnvironmentVariables"]["PATH"] == "/user/bin:/usr/bin"
     assert definition["WorkingDirectory"] == str(service.Path.home())
     assert "DISABLE_WORKTREE_CLEANUP" not in definition["EnvironmentVariables"]
+    assert set(definition["EnvironmentVariables"]) == service.MANAGED_ENVIRONMENT
     assert definition["Umask"] == 0o077
     assert definition["Label"] == "io.sightmesh.cdesktop"
     assert definition["StandardOutPath"] == "/dev/null"
@@ -274,3 +275,23 @@ def test_migrate_legacy_state_copies_routing_and_leases(tmp_path) -> None:
     assert (
         tmp_path / ".local" / "state" / "sightmesh" / "leases" / "lease.json"
     ).exists()
+
+
+def test_unmanaged_environment_reports_hand_edits(monkeypatch, tmp_path) -> None:
+    """A hand-added DISABLE_WORKTREE_CLEANUP=1 silently stopped worktree
+    reclamation for weeks; doctor must name any variable SightMesh never writes."""
+    monkeypatch.setattr(service.shutil, "which", lambda _: "/tmp/cdesktop")
+    monkeypatch.setattr(service, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(service, "command_path", lambda: "/usr/bin")
+    target = tmp_path / "io.sightmesh.cdesktop.plist"
+    monkeypatch.setattr(service, "plist_path", lambda: target)
+
+    assert service.unmanaged_environment() == []
+
+    definition = service.definition(4321)
+    target.write_bytes(service.plistlib.dumps(definition))
+    assert service.unmanaged_environment() == []
+
+    definition["EnvironmentVariables"]["DISABLE_WORKTREE_CLEANUP"] = "1"
+    target.write_bytes(service.plistlib.dumps(definition))
+    assert service.unmanaged_environment() == ["DISABLE_WORKTREE_CLEANUP"]
