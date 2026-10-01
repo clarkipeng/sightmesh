@@ -126,6 +126,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     )
     failures += int(not private)
 
+    unmanaged = service.unmanaged_environment()
+    checks.append(
+        {
+            "check": "service-environment",
+            "ok": not unmanaged,
+            "detail": "managed"
+            if not unmanaged
+            else {
+                "unmanaged": unmanaged,
+                "fix": "sightmesh service install",
+            },
+        }
+    )
+    failures += int(bool(unmanaged))
+
     for command in ("repowire", "codex", "claude", "cdesktop"):
         found = shutil.which(command)
         checks.append(
